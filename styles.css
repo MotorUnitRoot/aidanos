@@ -1,0 +1,26 @@
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #1a1b1d;
+  --surface: #25262a;
+  --text: #f0efeb;
+  --muted: #9b9a97;
+  --faint: #6f6e6b;
+  --border: #33353a;
+  --border-strong: #45474d;
+  --accent: #efe8dc;
+  --accent-hover: #f5f0e6;
+  --accent-soft: #242220;
+  --ok: #6a9a78;
+  --green: #5a9a72;
+  --yellow: #a39a8c;
+  --red: #c45c4e;
+  --flex: #5a5956;
+  --rest: #3a3b3e;
+  --parked: #8a8986;
+  --radius: 8px;
+  --tap: 44px;
+  --bar: 48px;
+  --font: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+}

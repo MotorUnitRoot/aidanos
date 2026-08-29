@@ -13,4 +13,4 @@ A letter is work. This file is the map. Copy the file to take the map. Smash it 
 - A reply from them
 
 ## Last-mile
-None yet. When UI is generated for this map, those files live next to this one in the vault.
+[[the-reply]]

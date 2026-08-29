@@ -26,3 +26,13 @@ A stranger can clone, run, and use:
 ## How to tell it is done
 
 A stranger can run it from this repo by Christmas. Door, Today, Plan, Ask, and a vault of files. Clay is files. Nothing listed under What does not is in the tree.
+
+## Run
+
+You need Node 18 or newer. Clone and start:
+
+git clone https://github.com/MotorUnitRoot/aidanos.git && cd aidanos && ./start.sh
+
+Open http://127.0.0.1:3847/. The first screen is Door: What do you want to do today?
+
+It binds 127.0.0.1 only. The vault is the sibling vault/ folder, or wherever AIDANOS_VAULT points.

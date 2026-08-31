@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Door — AidanOS pattern</title>
+  <link rel="stylesheet" href="../foundations/tokens.css" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #000;
+      color: var(--ink);
+      min-height: 100dvh;
+    }
+    .caption {
+      position: absolute;
+      top: var(--space-3);
+      left: var(--space-3);
+      margin: 0;
+      max-width: 22rem;
+      color: var(--faint);
+      font-size: 0.8rem;
+      line-height: 1.45;
+    }
+    .door {
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: var(--space-4);
+      padding: var(--space-5);
+    }
+    button, input {
+      font: inherit;
+    }
+    .prompt {
+      display: flex;
+      align-items: center;
+      width: min(38rem, 92vw);
+      padding: 0.85rem 1rem;
+      border: var(--line) solid var(--quiet);
+      border-radius: var(--radius);
+      background: transparent;
+    }
+    .prompt input {
+      flex: 1;
+      min-width: 0;
+      border: 0;
+      background: transparent;
+      color: var(--quiet);
+      font-size: 1.15rem;
+      outline: none;
+    }
+    .prompt input::placeholder {
+      color: var(--quiet);
+      opacity: 1;
+    }
+    .work {
+      padding: var(--space-2) var(--space-3);
+      border: var(--line) solid var(--quiet);
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--quiet);
+      cursor: pointer;
+    }
+    .work:hover {
+      color: var(--ink);
+      border-color: var(--ink);
+    }
+    .capture {
+      padding: 0;
+      border: 0;
+      background: none;
+      color: var(--quiet);
+      text-decoration: underline;
+      text-underline-offset: 0.2em;
+      cursor: pointer;
+    }
+    .capture:hover {
+      color: var(--ink);
+    }
+  </style>
+</head>
+<body>
+  <p class="caption">Empty Door. The prompt bar, Get to Work, and Capture thoughts. No thread. No nav mall.</p>
+  <div class="door">
+    <div class="prompt">
+      <input type="text" placeholder="What do you want to do today?" />
+    </div>
+    <button type="button" class="work">Get to Work</button>
+    <button type="button" class="capture">Capture thoughts</button>
+  </div>
+</body>
+</html>

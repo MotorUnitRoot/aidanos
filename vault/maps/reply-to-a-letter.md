@@ -8,6 +8,7 @@ A letter is work. This file is the map. Copy the file to take the map. Smash it 
 - [ ] Write the reply in the vault
 - [ ] Send it
 - [ ] Keep the sent copy
+[[today]]
 
 ## Waiting
 - A reply from them

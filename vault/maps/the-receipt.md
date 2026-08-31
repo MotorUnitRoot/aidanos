@@ -1,0 +1,3 @@
+# The receipt
+
+Write here.

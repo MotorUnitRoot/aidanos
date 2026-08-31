@@ -1,0 +1,30 @@
+/* AidanOS foundations. Tokens as a file. Skin.css in a vault may override color and type only. */
+
+:root {
+  --bg: #161513;
+  --surface: #1d1c19;
+  --ink: #f2eee6;
+  --quiet: #9a9488;
+  --faint: #6d6960;
+  --hairline: #2c2a26;
+  --hairline-strong: #3e3b35;
+  --ok: #7a8f7a;
+  --danger: #b56a5c;
+  --font: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+  --paper: 42rem;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 1rem;
+  --space-4: 1.5rem;
+  --space-5: 2.5rem;
+  --space-6: 4rem;
+  --slot: 2rem;
+  --line: 1px;
+  --radius: 0;
+}
+
+html, body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--ink);
+}

@@ -1597,6 +1597,73 @@ function openVaultPath(rel) {
   openVaultNote(path);
 }
 
+function applyLandedDay(date, markdown, mtime) {
+  if (!state.day || state.day.date !== date || isNoteDoc()) return;
+  const dump = $("dump");
+  if (dump) dump.value = markdown;
+  state.day.paper = markdown;
+  state.day.markdown = markdown;
+  if (mtime != null) state.day.mtime = Number(mtime) || 0;
+  state.dirty = false;
+  paintPaper();
+  renderRail();
+}
+
+async function landMapNextSteps(paths) {
+  const maps = workMapPathsFromHits((paths || []).map((p) => ({ path: p })));
+  if (!maps.length) return false;
+  const mapMarkdowns = [];
+  for (const rel of maps) {
+    try {
+      const data = await api("/api/file?path=" + encodeURIComponent(rel));
+      mapMarkdowns.push(typeof data.markdown === "string" ? data.markdown : "");
+    } catch (e) {}
+  }
+  if (!mapMarkdowns.length) return false;
+  const date = todayIso();
+  const viewing = !!(state.day && state.day.date === date && !isNoteDoc());
+  let existing = "";
+  let mtime = 0;
+  if (viewing) {
+    flushActiveLineToDump();
+    const dump = $("dump");
+    existing = dump ? dump.value : dayMarkdown(state.day);
+    mtime = Number(state.day.mtime) || 0;
+  } else {
+    const body = await api("/api/day?date=" + date);
+    existing = typeof body.markdown === "string" ? body.markdown : "";
+    mtime = Number(body.mtime) || 0;
+  }
+  const next = landedDayMarkdown(existing, mapMarkdowns);
+  if (next === existing) return false;
+  let res = await fetch("/api/day?date=" + date, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    cache: "no-store",
+    body: JSON.stringify({ date, paper: next, markdown: next, mtime }),
+  });
+  let written = next;
+  if (res.status === 409) {
+    const body = await res.json().catch(() => ({}));
+    written = landedDayMarkdown(typeof body.markdown === "string" ? body.markdown : "", mapMarkdowns);
+    res = await fetch("/api/day?date=" + date, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({
+        date,
+        paper: written,
+        markdown: written,
+        mtime: Number(body.mtime) || 0,
+      }),
+    });
+  }
+  if (!res.ok) return false;
+  const out = await res.json().catch(() => ({}));
+  if (viewing) applyLandedDay(date, written, out && out.mtime);
+  return true;
+}
+
 async function runAsk(q) {
   const gen = ++state.askGen;
   const hits = $("ask-hits");
@@ -1713,6 +1780,13 @@ async function runAsk(q) {
         visible.forEach((h) => {
           add({ kind: "vault", text: vaultHitLabel(h), path: h.path, line: h.line });
         });
+      }
+      const mapPaths = workMapPathsFromHits(vaultHits);
+      if (mapPaths.length) {
+        try {
+          await landMapNextSteps(mapPaths);
+        } catch (e) {}
+        if (gen !== state.askGen) return;
       }
     } catch (e) {
       if (gen !== state.askGen) return;
@@ -2254,15 +2328,85 @@ function proposeDoorLines(sentence) {
   return lines;
 }
 
+function taskKey(line) {
+  const item = parseTaskLine(line);
+  if (!item) return "";
+  return stripWhen(item.text).toLowerCase();
+}
+
 function appendDoorTasks(markdown, lines) {
-  const tasks = (Array.isArray(lines) ? lines : []).filter((line) => /^- \[ \] /.test(String(line)));
+  const seen = new Set();
+  const tasks = [];
+  for (const line of (Array.isArray(lines) ? lines : [])) {
+    const s = String(line);
+    if (!/^- \[ \] /.test(s)) continue;
+    const key = taskKey(s);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    tasks.push(s);
+  }
   const existing = markdown == null ? "" : String(markdown);
   if (!tasks.length) return existing;
-  const block = tasks.join("\n") + "\n";
+  const have = new Set();
+  for (const line of existing.split("\n")) {
+    const key = taskKey(line);
+    if (key) have.add(key);
+  }
+  const fresh = tasks.filter((line) => !have.has(taskKey(line)));
+  if (!fresh.length) return existing;
+  const block = fresh.join("\n") + "\n";
   if (!existing.trim()) return block;
   if (existing.endsWith("\n\n")) return existing + block;
   if (existing.endsWith("\n")) return existing + "\n" + block;
   return existing + "\n\n" + block;
+}
+
+function isWorkMapPath(rel) {
+  const p = String(rel || "").replace(/\\/g, "/");
+  if (!p.startsWith("maps/") || !/\.md$/i.test(p)) return false;
+  const rest = p.slice(5);
+  if (!rest || rest.includes("/")) return false;
+  if (/^the-/i.test(rest)) return false;
+  return true;
+}
+
+function nextStepTaskLines(markdown) {
+  const lines = String(markdown || "").split("\n");
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s+Next steps\s*$/i.test(lines[i])) {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) return [];
+  const out = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) break;
+    const line = lines[i].replace(/\r$/, "");
+    if (/^- \[ \] /.test(line)) out.push(line);
+  }
+  return out;
+}
+
+function workMapPathsFromHits(hits) {
+  const out = [];
+  const seen = new Set();
+  for (const h of hits || []) {
+    const p = String((h && h.path) || "").replace(/\\/g, "/");
+    if (!isWorkMapPath(p) || seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return out;
+}
+
+function landedDayMarkdown(existing, mapMarkdowns) {
+  const tasks = [];
+  for (const md of mapMarkdowns || []) {
+    for (const line of nextStepTaskLines(md)) tasks.push(line);
+  }
+  return appendDoorTasks(existing, tasks);
 }
 
 let doorProposed = [];

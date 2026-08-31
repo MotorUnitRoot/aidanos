@@ -325,12 +325,26 @@
       line-height: 1.3;
       opacity: 0.78;
     }
+
+    .quiet-label {
+      margin: 0;
+      font-size: 0.75rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--faint);
+    }
+    .empty {
+      margin: 0;
+      color: var(--faint);
+      font-size: 1.08rem;
+      line-height: 1.8;
+    }
   </style>
 </head>
 <body>
   <div class="page">
     <h1>Component library</h1>
-    <p class="lead">These are the reusable parts of Door, Today, and Plan. Each part names the tokens it uses and how it behaves. Last-mile screens may use only these parts.</p>
+    <p class="lead">Closed library. Generated screens may use only these parts. If a last-mile file would need a new look, the system is wrong.</p>
   </div>
 
   <section>
@@ -473,5 +487,22 @@
       </div>
     </div>
   </section>
+
+  <section>
+    <h2>Quiet label</h2>
+    <p class="why">A section heading on paper. It uses --faint, the same serif, and letter spacing. Plan uses it for next steps and waiting. Generated screens may use it. It is not a second typeface and not a tab.</p>
+    <div class="stage">
+      <p class="quiet-label">Next steps</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Empty state</h2>
+    <p class="why">An empty day or an empty generated page says Write. The words use --faint. This is not an Architecture line, not a tutorial, and not an error banner.</p>
+    <div class="stage">
+      <p class="empty">Write.</p>
+    </div>
+  </section>
 </body>
 </html>
+

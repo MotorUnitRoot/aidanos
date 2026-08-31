@@ -1,5 +1,20 @@
 # Component library
 
-These are the reusable parts of Door, Today, and Plan. Last-mile screens may use only these parts. Each part names the tokens it uses and how it behaves. Open `library.html` to see them.
+This is a closed list. Last-mile generation may use only these parts. If a control is not on this list, do not invent it.
 
-This is not a dump of every widget. If a control is not on this list, do not invent it for chrome.
+- Door prompt bar
+- Get to Work
+- Capture thoughts
+- week card
+- 42rem paper
+- checkbox
+- hanging list
+- wiki link
+- Ask strip
+- search hit
+- half-hour agenda slot
+- drag preview
+- quiet label
+- empty state
+
+Each part names the tokens it uses and how it behaves. Open `library.html` to see them.

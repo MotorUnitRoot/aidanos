@@ -1,0 +1,374 @@
+/* Closed AidanOS primitives. Patterns assemble these. They do not invent a look. */
+
+.prompt {
+  display: flex;
+  align-items: center;
+  width: min(38rem, 100%);
+  padding: 0.85rem 1rem;
+  border: var(--line) solid var(--quiet);
+  border-radius: var(--radius);
+  background: transparent;
+}
+
+.prompt input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--quiet);
+  font: inherit;
+  font-size: 1.15rem;
+  outline: none;
+}
+
+.prompt input::placeholder {
+  color: var(--quiet);
+  opacity: 1;
+}
+
+.prompt input:focus {
+  color: var(--ink);
+}
+
+.hairline-button {
+  display: inline-block;
+  padding: var(--space-2) var(--space-3);
+  border: var(--line) solid var(--quiet);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--quiet);
+  font: inherit;
+  cursor: pointer;
+}
+
+.hairline-button:hover {
+  color: var(--ink);
+  border-color: var(--ink);
+}
+
+.hairline-button:focus {
+  outline: var(--line) solid var(--ink);
+  outline-offset: 2px;
+}
+
+.text-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--quiet);
+  font: inherit;
+  font-size: 0.95rem;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.text-link:hover {
+  color: var(--ink);
+}
+
+.text-link:focus {
+  outline: var(--line) solid var(--quiet);
+  outline-offset: 3px;
+}
+
+.text-link.is-current {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.week {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 5rem;
+  padding: var(--space-2) var(--space-1);
+  border: var(--line) solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.week .dow {
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+  color: var(--quiet);
+}
+
+.week .dom {
+  font-size: 1.15rem;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.week.selected {
+  border-color: var(--hairline-strong);
+  background: transparent;
+}
+
+.week.today {
+  box-shadow: inset 0 -1px 0 var(--hairline-strong);
+}
+
+.week-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.7rem;
+  min-height: 1.7rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--quiet);
+  font: inherit;
+  font-size: 1.15rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.week-chevron:hover {
+  color: var(--ink);
+}
+
+.week-chevron:focus {
+  outline: var(--line) solid var(--quiet);
+  outline-offset: 2px;
+}
+
+.day-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  font: inherit;
+  font-size: 1.15rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.day-chevron:hover {
+  color: var(--ink);
+}
+
+.day-chevron:focus {
+  outline: var(--line) solid var(--quiet);
+  outline-offset: 2px;
+}
+
+.paper {
+  width: var(--paper);
+  max-width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.paper h1,
+.paper h2,
+.paper h3 {
+  margin: 0 0 var(--space-3);
+  font-size: clamp(1.7rem, 3.2vw, 2.25rem);
+  font-weight: 500;
+  letter-spacing: -0.025em;
+  line-height: 1.12;
+}
+
+.paper p {
+  margin: 0 0 var(--space-3);
+  font-size: 1.08rem;
+  line-height: 1.8;
+}
+
+.task {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55em;
+  margin: 0 0 var(--space-2);
+  font-size: 1.08rem;
+  line-height: 1.8;
+}
+
+.box {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 1.15em;
+  height: 1.15em;
+  margin-top: 0.32em;
+  border: var(--line) solid var(--quiet);
+  border-radius: var(--radius);
+  background: transparent;
+  cursor: pointer;
+}
+
+.box.checked {
+  background: var(--ok);
+  border-color: var(--ok);
+}
+
+.task .words {
+  flex: 1;
+  min-width: 0;
+}
+
+.hang {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  font-size: 1.08rem;
+  line-height: 1.8;
+}
+
+.hang .mark {
+  flex: 0 0 1.25rem;
+  width: 1.25rem;
+  color: var(--faint);
+  text-align: center;
+}
+
+.hang .words {
+  flex: 1;
+  min-width: 0;
+}
+
+.wiki {
+  display: inline;
+  padding: 0 0.12em;
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.wiki .brack {
+  display: none;
+}
+
+.quiet-label {
+  margin: 0 0 var(--space-2);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.empty {
+  margin: 0;
+  color: var(--faint);
+  font-size: 1.08rem;
+  line-height: 1.8;
+}
+
+.ask-strip {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 0.7rem var(--space-3);
+  border-top: var(--line) solid var(--hairline);
+  background: var(--bg);
+}
+
+.ask-strip input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  outline: none;
+}
+
+.ask-strip input::placeholder {
+  color: var(--quiet);
+}
+
+.hit {
+  padding: var(--space-2) 0;
+  border-top: var(--line) solid var(--hairline);
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.hit:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.hit .file {
+  color: var(--quiet);
+}
+
+.slot {
+  display: grid;
+  grid-template-columns: 3.15rem minmax(0, 1fr);
+  gap: var(--space-2);
+  min-height: var(--slot);
+  border-top: var(--line) solid var(--hairline);
+  padding: var(--space-1) 0;
+}
+
+.slot:last-child {
+  border-bottom: var(--line) solid var(--hairline);
+}
+
+.slot .hour {
+  font-size: 0.7rem;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.ghost {
+  margin: 0.08rem 0;
+  padding: 0.22rem 0.4rem;
+  border: var(--line) dashed var(--hairline-strong);
+  border-radius: var(--radius);
+  color: var(--quiet);
+  font-size: 0.8rem;
+  line-height: 1.3;
+  opacity: 0.78;
+}
+
+.month-day {
+  min-height: 1.85rem;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 0.12rem;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.75rem;
+}
+
+.month-day.has-note {
+  box-shadow: inset 0 -1px 0 var(--hairline-strong);
+}
+
+.month-day.selected {
+  color: var(--ink);
+  box-shadow: inset 0 -1px 0 var(--ink);
+}
+
+.saved {
+  display: inline-block;
+  min-width: 4.5em;
+  min-height: 1.2em;
+  height: 1.2em;
+  margin: 0;
+  font-size: 0.75rem;
+  line-height: 1.2;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  color: var(--quiet);
+}
+
+.saved.is-saved {
+  color: var(--ok);
+}

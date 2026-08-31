@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Today — AidanOS pattern</title>
   <link rel="stylesheet" href="../foundations/tokens.css" />
+  <link rel="stylesheet" href="../components/primitives.css" />
   <style>
     * { box-sizing: border-box; }
     html, body {
@@ -12,9 +13,6 @@
       padding: 0;
       height: 100%;
       overflow: hidden;
-    }
-    button, input, a {
-      font: inherit;
     }
     a {
       color: inherit;
@@ -43,109 +41,67 @@
       border-bottom: var(--line) solid var(--hairline);
       flex-shrink: 0;
     }
-    .nav a {
-      color: var(--quiet);
+    .nav .saved {
+      margin-left: auto;
     }
-    .nav a:hover {
-      color: var(--ink);
-    }
-    .nav .now {
-      color: var(--ink);
-      font-weight: 700;
+    .week-row {
+      display: flex;
+      align-items: stretch;
+      gap: var(--space-2);
+      margin: 0 0 var(--space-3);
+      flex-shrink: 0;
     }
     .weeks {
       display: grid;
       grid-template-columns: repeat(7, 1fr);
       gap: 0.35rem;
-      margin: 0 0 var(--space-3);
-      flex-shrink: 0;
+      flex: 1;
+      min-width: 0;
     }
-    .week {
+    .week-arrows {
       display: flex;
       flex-direction: column;
-      align-items: center;
-      gap: 0.12rem;
-      min-height: 5rem;
-      padding: 0.45rem 0.2rem 0.4rem;
-      border: var(--line) solid var(--hairline);
-      border-radius: var(--radius);
-      background: var(--surface);
-    }
-    .week .dow {
-      font-size: 0.62rem;
-      letter-spacing: 0.08em;
-      color: var(--quiet);
-    }
-    .week .dom {
-      font-size: 1.15rem;
-      font-weight: 600;
-      line-height: 1.1;
-    }
-    .week.selected {
-      border-color: var(--hairline-strong);
-      background: transparent;
-    }
-    .week.today {
-      box-shadow: inset 0 -1px 0 var(--hairline-strong);
+      justify-content: center;
+      gap: var(--space-1);
     }
     .paper-wrap {
       flex: 1;
       min-height: 0;
       overflow: auto;
       display: flex;
-      justify-content: center;
+      flex-direction: column;
+      align-items: center;
       padding: 0.9rem 1rem 2.2rem;
     }
-    .paper {
+    .paper-head {
       width: var(--paper);
       max-width: 100%;
-    }
-    .paper h1 {
-      margin: 0 0 var(--space-4);
-      font-size: clamp(1.7rem, 3.2vw, 2.25rem);
-      font-weight: 500;
-      letter-spacing: -0.025em;
-      line-height: 1.12;
-    }
-    .task {
       display: flex;
-      align-items: flex-start;
-      gap: 0.55em;
-      margin: 0 0 var(--space-2);
-      font-size: 1.08rem;
-      line-height: 1.8;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: var(--space-3);
+      margin: 0 auto var(--space-4);
     }
-    .box {
-      display: inline-flex;
-      width: 1.15em;
-      height: 1.15em;
-      margin-top: 0.32em;
-      border: var(--line) solid var(--quiet);
-      border-radius: var(--radius);
+    .paper-head h1 {
+      margin: 0;
+      flex: 1;
+      min-width: 0;
+    }
+    .day-shift {
+      display: flex;
+      gap: var(--space-2);
+      margin: 0;
       flex: 0 0 auto;
     }
-    .ask {
+    .ask-dock {
       position: absolute;
       left: 0;
       right: 0;
       bottom: 0;
-      display: flex;
-      align-items: center;
-      padding: 0.7rem 1.1rem;
-      border: 0;
-      border-top: var(--line) solid var(--hairline);
       background: var(--bg);
-      color: var(--quiet);
     }
-    .ask input {
-      flex: 1;
-      border: 0;
-      background: transparent;
-      color: var(--ink);
-      outline: none;
-    }
-    .ask input::placeholder {
-      color: var(--quiet);
+    .ask-dock .hits {
+      padding: 0 var(--space-3);
     }
     .rail {
       display: flex;
@@ -154,19 +110,16 @@
       padding: 0.9rem 1rem 1rem;
     }
     .rail-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: var(--space-3);
       margin: 0 0 0.7rem;
-      font-size: 0.95rem;
     }
     .month {
       margin: 0 0 0.85rem;
       padding-bottom: 0.7rem;
       border-bottom: var(--line) solid var(--hairline);
-    }
-    .month-name {
-      margin: 0 0 var(--space-2);
-      text-align: center;
-      font-size: 0.8rem;
-      color: var(--quiet);
     }
     .dows, .cells {
       display: grid;
@@ -179,47 +132,10 @@
       letter-spacing: 0.04em;
       color: var(--faint);
     }
-    .cell {
-      min-height: 1.85rem;
-      display: flex;
-      align-items: flex-start;
-      justify-content: center;
-      padding-top: 0.12rem;
-      font-size: 0.75rem;
-    }
-    .cell.marked {
-      box-shadow: inset 0 -1px 0 var(--hairline-strong);
-    }
     .agenda {
       flex: 1;
       min-height: 0;
       overflow: auto;
-    }
-    .slot {
-      display: grid;
-      grid-template-columns: 3.15rem minmax(0, 1fr);
-      gap: var(--space-2);
-      min-height: var(--slot);
-      border-top: var(--line) solid var(--hairline);
-      padding: var(--space-1) 0;
-    }
-    .slot:last-child {
-      border-bottom: var(--line) solid var(--hairline);
-    }
-    .slot .hour {
-      font-size: 0.7rem;
-      color: var(--faint);
-      font-variant-numeric: tabular-nums;
-    }
-    .ghost {
-      margin: 0.08rem 0;
-      padding: 0.22rem 0.4rem;
-      border: var(--line) dashed var(--hairline-strong);
-      border-radius: var(--radius);
-      color: var(--quiet);
-      font-size: 0.8rem;
-      line-height: 1.3;
-      opacity: 0.78;
     }
     @media (max-width: 820px) {
       .room { grid-template-columns: 1fr; }
@@ -231,74 +147,100 @@
   <div class="room">
     <section class="left">
       <header class="nav">
-        <a href="today.html" class="now">Today</a>
-        <a href="plan.html">Plan</a>
+        <a href="today.html" class="text-link is-current">Today</a>
+        <a href="plan.html" class="text-link">Plan</a>
+        <p class="saved is-saved">Saved</p>
       </header>
-      <div class="weeks" aria-label="Week">
-        <div class="week today"><span class="dow">MON</span><span class="dom">31</span></div>
-        <div class="week selected"><span class="dow">TUE</span><span class="dom">1</span></div>
-        <div class="week"><span class="dow">WED</span><span class="dom">2</span></div>
-        <div class="week"><span class="dow">THU</span><span class="dom">3</span></div>
-        <div class="week"><span class="dow">FRI</span><span class="dom">4</span></div>
-        <div class="week"><span class="dow">SAT</span><span class="dom">5</span></div>
-        <div class="week"><span class="dow">SUN</span><span class="dom">6</span></div>
+      <div class="week-row" aria-label="Week">
+        <div class="weeks">
+          <div class="week today"><span class="dow">MON</span><span class="dom">31</span></div>
+          <div class="week selected"><span class="dow">TUE</span><span class="dom">1</span></div>
+          <div class="week"><span class="dow">WED</span><span class="dom">2</span></div>
+          <div class="week"><span class="dow">THU</span><span class="dom">3</span></div>
+          <div class="week"><span class="dow">FRI</span><span class="dom">4</span></div>
+          <div class="week"><span class="dow">SAT</span><span class="dom">5</span></div>
+          <div class="week"><span class="dow">SUN</span><span class="dom">6</span></div>
+        </div>
+        <div class="week-arrows">
+          <button type="button" class="week-chevron" aria-label="Previous week">‹</button>
+          <button type="button" class="week-chevron" aria-label="Next week">›</button>
+        </div>
       </div>
       <div class="paper-wrap">
         <div class="paper">
-          <h1>Tuesday September 1</h1>
-          <div class="task">
-            <span class="box" aria-hidden="true"></span>
-            <span>Read the letter</span>
+          <div class="paper-head">
+            <h1>Tuesday September 1</h1>
+            <p class="day-shift">
+              <button type="button" class="day-chevron" aria-label="Previous day">‹</button>
+              <button type="button" class="day-chevron" aria-label="Next day">›</button>
+            </p>
           </div>
           <div class="task">
             <span class="box" aria-hidden="true"></span>
-            <span>Write the reply in the vault</span>
+            <span class="words">Read the letter</span>
+          </div>
+          <div class="task">
+            <span class="box" aria-hidden="true"></span>
+            <span class="words">Write the reply in the vault</span>
+          </div>
+          <div class="hang">
+            <span class="mark">•</span>
+            <span class="words">Open <a class="wiki" href="#"><span class="brack">[[</span>the-reply<span class="brack">]]</span></a></span>
           </div>
         </div>
       </div>
-      <div class="ask">
-        <input type="text" placeholder="Ask or find" />
+      <div class="ask-dock">
+        <div class="hits">
+          <div class="hit"><span class="file">reply-to-a-letter</span> · Reply to a letter</div>
+          <div class="hit"><span class="file">2026-08-31</span> · Read the letter</div>
+        </div>
+        <div class="ask-strip">
+          <input type="text" placeholder="Ask or find" />
+          <button type="button" class="text-link">close</button>
+        </div>
       </div>
     </section>
     <aside class="rail" aria-label="Day">
-      <p class="rail-head">September 2026</p>
+      <div class="rail-head">
+        <p class="quiet-label">September 2026</p>
+        <button type="button" class="text-link">Month</button>
+      </div>
       <div class="month">
-        <p class="month-name">September</p>
         <div class="dows">
           <span>M</span><span>T</span><span>W</span><span>T</span><span>F</span><span>S</span><span>S</span>
         </div>
         <div class="cells">
-          <span class="cell"></span>
-          <span class="cell marked">1</span>
-          <span class="cell">2</span>
-          <span class="cell">3</span>
-          <span class="cell">4</span>
-          <span class="cell">5</span>
-          <span class="cell">6</span>
-          <span class="cell">7</span>
-          <span class="cell">8</span>
-          <span class="cell">9</span>
-          <span class="cell">10</span>
-          <span class="cell">11</span>
-          <span class="cell">12</span>
-          <span class="cell">13</span>
-          <span class="cell">14</span>
-          <span class="cell">15</span>
-          <span class="cell">16</span>
-          <span class="cell">17</span>
-          <span class="cell">18</span>
-          <span class="cell">19</span>
-          <span class="cell">20</span>
-          <span class="cell">21</span>
-          <span class="cell">22</span>
-          <span class="cell">23</span>
-          <span class="cell">24</span>
-          <span class="cell">25</span>
-          <span class="cell">26</span>
-          <span class="cell">27</span>
-          <span class="cell">28</span>
-          <span class="cell">29</span>
-          <span class="cell">30</span>
+          <span class="month-day"></span>
+          <span class="month-day has-note selected">1</span>
+          <span class="month-day">2</span>
+          <span class="month-day">3</span>
+          <span class="month-day">4</span>
+          <span class="month-day">5</span>
+          <span class="month-day">6</span>
+          <span class="month-day">7</span>
+          <span class="month-day">8</span>
+          <span class="month-day">9</span>
+          <span class="month-day">10</span>
+          <span class="month-day">11</span>
+          <span class="month-day">12</span>
+          <span class="month-day">13</span>
+          <span class="month-day">14</span>
+          <span class="month-day">15</span>
+          <span class="month-day">16</span>
+          <span class="month-day">17</span>
+          <span class="month-day">18</span>
+          <span class="month-day">19</span>
+          <span class="month-day">20</span>
+          <span class="month-day">21</span>
+          <span class="month-day">22</span>
+          <span class="month-day">23</span>
+          <span class="month-day">24</span>
+          <span class="month-day">25</span>
+          <span class="month-day">26</span>
+          <span class="month-day">27</span>
+          <span class="month-day">28</span>
+          <span class="month-day">29</span>
+          <span class="month-day">30</span>
         </div>
       </div>
       <div class="agenda">

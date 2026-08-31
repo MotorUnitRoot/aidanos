@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Plan — AidanOS pattern</title>
   <link rel="stylesheet" href="../foundations/tokens.css" />
+  <link rel="stylesheet" href="../components/primitives.css" />
   <style>
     * { box-sizing: border-box; }
     html, body {
@@ -12,7 +13,6 @@
       padding: 0;
     }
     a {
-      font: inherit;
       color: inherit;
       text-decoration: none;
     }
@@ -30,76 +30,29 @@
       padding-bottom: 0.55rem;
       border-bottom: var(--line) solid var(--hairline);
     }
-    .nav a {
-      color: var(--quiet);
-    }
-    .nav a:hover {
-      color: var(--ink);
-    }
-    .nav .now {
-      color: var(--ink);
-      font-weight: 700;
-    }
-    h1 {
-      margin: 0 0 var(--space-3);
-      font-size: 1.7rem;
-      font-weight: 500;
-      letter-spacing: -0.02em;
-    }
-    .why {
-      margin: 0 0 var(--space-5);
-      line-height: 1.7;
-    }
-    .kicker {
-      margin: var(--space-4) 0 var(--space-2);
-      font-size: 0.75rem;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--faint);
-    }
-    .task {
-      display: flex;
-      align-items: flex-start;
-      gap: 0.55em;
-      margin: 0 0 var(--space-2);
-      font-size: 1.08rem;
-      line-height: 1.8;
-    }
-    .box {
-      display: inline-flex;
-      width: 1.15em;
-      height: 1.15em;
-      margin-top: 0.32em;
-      border: var(--line) solid var(--quiet);
-      border-radius: var(--radius);
-      flex: 0 0 auto;
-    }
-    .waiting {
-      margin: 0;
-      color: var(--quiet);
-      line-height: 1.7;
-    }
   </style>
 </head>
 <body>
   <div class="sheet">
     <header class="nav">
-      <a href="today.html">Today</a>
-      <a href="plan.html" class="now">Plan</a>
+      <a href="today.html" class="text-link">Today</a>
+      <a href="plan.html" class="text-link is-current">Plan</a>
     </header>
-    <h1>Stay on the plan</h1>
-    <p class="why">The thing standing in the way is staying on the plan.</p>
-    <p class="kicker">Next steps</p>
-    <div class="task">
-      <span class="box" aria-hidden="true"></span>
-      <span>Live this week as written</span>
+    <div class="paper">
+      <h1>Stay on the plan</h1>
+      <p>The thing standing in the way is staying on the plan.</p>
+      <p class="quiet-label">Next steps</p>
+      <div class="task">
+        <span class="box" aria-hidden="true"></span>
+        <span class="words">Live this week as written</span>
+      </div>
+      <div class="task">
+        <span class="box" aria-hidden="true"></span>
+        <span class="words">Writing floor each train day</span>
+      </div>
+      <p class="quiet-label">Waiting</p>
+      <p>Personal app polish beyond what serves this week.</p>
     </div>
-    <div class="task">
-      <span class="box" aria-hidden="true"></span>
-      <span>Writing floor each train day</span>
-    </div>
-    <p class="kicker">Waiting</p>
-    <p class="waiting">Personal app polish beyond what serves this week.</p>
   </div>
 </body>
 </html>

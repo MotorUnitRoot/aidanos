@@ -135,6 +135,8 @@ const states = [
 const refuse = [
   "Switch / toggle",
   "Slider",
+  "Reaction kit",
+  "Chart zoo",
   "Stepper",
   "Icon-only button",
   "Badge count",

@@ -119,6 +119,8 @@ True atoms. Each row has one mark.
 | Save state | Already | Use the saved chip. Saving, Saved, or quiet empty. Does not shove the paper. |
 | Switch / toggle | Refuse | A binary fact uses the checkbox. |
 | Slider | Refuse | Use number, money, time, and skip or jump hairline buttons. Not a scrub bar. |
+| Reaction kit | Refuse | Never. A letter uses log activity and a hairline button. |
+| Chart zoo | Refuse | A number is a labeled field or key fact. A register is a data table. Empty is Write. |
 | Stepper | Refuse | Use number. |
 | Icon-only button | Refuse | Chevrons excepted. Actions have words. |
 | Badge count | Refuse | Use a quiet number or progress fraction. |

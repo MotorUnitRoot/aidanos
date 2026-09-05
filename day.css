@@ -1,1 +1,146 @@
-FILE_FROM_DISK
+
+/* Signed cut: door, Today room, Plan. Skin may change color/type only. */
+
+.day-page .app-bar,
+.day-page .nav-screens,
+.day-page .theme-toggle { display: none !important; }
+
+.hidden { display: none !important; }
+
+body.day-page,
+.day-page {
+  font-family: var(--font);
+}
+
+.day-page .text-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.95rem;
+  text-decoration: none;
+  cursor: pointer;
+}
+.day-page .text-link:hover { color: var(--text); }
+.day-page .text-link.is-current { color: var(--text); }
+.day-page .text-link.month-link { text-decoration: underline; text-underline-offset: 0.2em; }
+.day-page .text-link.month-link.is-on { color: var(--text); }
+
+/* ——— Door ——— */
+body.view-door {
+  background: #000;
+  color: #f4f1ea;
+  min-height: 100dvh;
+}
+body.view-door.day-page {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+}
+.view-door-screen {
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: #000;
+}
+.door-only {
+  width: min(38rem, 92vw);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.15rem;
+}
+.door-bar {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  border: 1px solid #a89f91;
+  border-radius: 0;
+  background: transparent;
+  padding: 0.85rem 1rem 0.85rem 1.05rem;
+}
+.door-only input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: #a89f91;
+  font-family: var(--font);
+  font-size: 1.15rem;
+  font-weight: 400;
+  line-height: 1.4;
+  text-align: left;
+  padding: 0;
+  outline: none;
+  caret-color: #a89f91;
+}
+.door-only input::placeholder {
+  color: #a89f91;
+  opacity: 1;
+}
+.door-return {
+  flex: 0 0 auto;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: #a89f91;
+  font-size: 1.15rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.hairline-button {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border: 1px solid #a89f91;
+  border-radius: 0;
+  background: transparent;
+  color: #a89f91;
+  font: inherit;
+  font-family: var(--font);
+  font-size: 1.05rem;
+  cursor: pointer;
+}
+.hairline-button:hover {
+  color: #d4cbb8;
+  border-color: #d4cbb8;
+}
+.hairline-button:focus {
+  outline: 1px solid #d4cbb8;
+  outline-offset: 2px;
+}
+.door-skip {
+  /* alias kept for older tests; same hairline */
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border: 1px solid #a89f91;
+  border-radius: 0;
+  background: transparent;
+  color: #a89f91;
+  font-family: var(--font);
+  font-size: 1.05rem;
+  cursor: pointer;
+}
+.door-skip:hover,
+.door-return:hover { color: #d4cbb8; }
+.door-skip:hover { border-color: #d4cbb8; }
+.door-proposals {
+  width: 100%;
+  color: #a89f91;
+  font-family: var(--font);
+  font-size: 1.05rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  text-align: left;
+}
+.door-decide {
+  display: flex;
+  align-items: center;
+  gap: 1.15rem;
+}
+.door-decide[hidden] {
+  display: none;
+}

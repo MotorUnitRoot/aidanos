@@ -53,13 +53,72 @@ check("Get to Work and Capture thoughts are hairline-button", () => {
 
 check("Capture thoughts calls openCaptureNote", () => {
   const capture = doorBlock(
-    '$("door-capture").addEventListener("click"',
+    "(function wireDoorCapture()",
     '$("door-accept").addEventListener("click"'
   );
   assert(src.includes("async function openCaptureNote("), "openCaptureNote exists");
   assert(capture.includes("openCaptureNote()"), "Capture thoughts openCaptureNote");
+  assert(capture.includes("preventDefault()"), "Capture click preventDefault");
+  assert(capture.includes("stopPropagation()"), "Capture click stopPropagation");
+  assert(capture.includes("pointerup"), "Capture pointerup");
+  assert(capture.includes("450"), "Capture debounce");
   assert(!capture.includes("goToday()"), "Capture does not goToday");
   assert(capture.includes("hideDoorProposals()"), "Capture hides proposals");
+});
+
+check("Capture is not stolen back to Today", () => {
+  const open = src.slice(src.indexOf("async function openVaultNote("), src.indexOf("async function openVaultSearchHit("));
+  assert(open.includes("const noteGen = ++state.openDayGen"), "openVaultNote bumps openDayGen");
+  assert(open.includes("if (noteGen !== state.openDayGen) return"), "openVaultNote cancels stale fetch");
+  const day = src.slice(src.indexOf("async function openDay("), src.indexOf("function renderDay("));
+  assert(day.includes("if (!force && (isCaptureHash() || isCaptureDoc())) return"), "openDay early return on Capture");
+  assert(day.includes("if (isNoteDoc()) return;"), "openDay does not wipe a note");
+  const week = src.slice(src.indexOf("async function loadWeek("), src.indexOf("function renderWeek("));
+  assert(week.includes("if (isNoteDoc())"), "loadWeek returns when a note is open");
+  assert(!/if \(inWeek\) await openDay/.test(week.split("if (isNoteDoc())")[0] || ""), "loadWeek does not openDay before the note check");
+});
+
+check("Empty Write. cue and save snapshot stay on Capture", () => {
+  assert(src.includes("function paperHasVisibleText("), "paperHasVisibleText");
+  assert(src.includes("function syncPaperEmptyClass("), "syncPaperEmptyClass");
+  assert(src.includes("function ensureDumpMatchesPaper("), "ensureDumpMatchesPaper");
+  const save = src.slice(src.indexOf("async function saveDay("), src.indexOf("function currentView("));
+  assert(save.indexOf("const snap = paperSaveSnapshot()") > save.indexOf("const run = async ()"), "saveDay snapshots inside the chain");
+  assert(!src.includes('classList.remove("is-empty")'), "focus does not drop is-empty");
+  const paperRule = css.slice(css.indexOf(".paper {"), css.indexOf("}", css.indexOf(".paper {")) + 1);
+  assert(/position:\s*relative/.test(paperRule), "paper is relative");
+  const cue = css.slice(css.indexOf(".paper.is-empty:before"), css.indexOf(".paper.is-empty:before") + 220);
+  assert(/position:\s*absolute/.test(cue), "Write. cue is absolute");
+  assert(/z-index:\s*1/.test(cue), "Write. cue sits over the seed line");
+  const phone = css.slice(css.lastIndexOf("@media (max-width: 720px)"));
+  assert(phone.includes("body.doc-capture .week-row"), "phone hides week-row on Capture");
+  assert(phone.includes("body.doc-capture .today-rail"), "phone hides today-rail on Capture");
+  assert(phone.includes("body.doc-capture .day-shift"), "phone hides day-shift on Capture");
+  assert(phone.includes("body.doc-capture #timeline"), "phone hides timeline on Capture");
+});
+
+check("#capture hash and setCaptureHash stay on main", () => {
+  assert(src.includes("function isCaptureHash("), "isCaptureHash");
+  assert(src.includes("function setCaptureHash("), "setCaptureHash");
+  const setHash = src.slice(src.indexOf("function setCaptureHash("), src.indexOf("function notePaperTitle("));
+  assert(setHash.includes("#capture"), "setCaptureHash writes #capture");
+  assert(setHash.includes("history.replaceState"), "setCaptureHash uses replaceState");
+  const view = src.slice(src.indexOf("function currentView("), src.indexOf("function showView("));
+  assert(view.includes('h === "plan"'), "currentView treats #plan");
+  assert(view.includes('h === "today" || h === "capture"'), "currentView treats #capture");
+  const cap = src.slice(src.indexOf("async function openCaptureNote("), src.indexOf("document.querySelectorAll(\"a[href='#today']\")"));
+  assert(cap.indexOf("setCaptureHash()") < cap.indexOf("await fetch"), "openCaptureNote paints hash before awaits");
+  assert(cap.indexOf("renderNote()") < cap.indexOf("await fetch"), "openCaptureNote paints Capture before awaits");
+  assert(cap.includes('document.body.classList.add("doc-note", "doc-capture")'), "openCaptureNote adds doc-capture before fetch");
+  const sw = fs.readFileSync(new URL("./sw.js", import.meta.url), "utf8");
+  assert(sw.includes('const CACHE = "aidanos-shell-v9"'), "sw.js CACHE aidanos-shell-v9");
+  const formEnd = html.indexOf("</form>", html.indexOf('id="door-form"'));
+  const actions = html.indexOf('class="door-actions"');
+  assert(formEnd >= 0 && actions > formEnd, "door-actions sits outside #door-form");
+  assert(html.includes(">Get to Work<") && html.includes(">Capture thoughts<"), "Get to Work + Capture side by side");
+  const phoneActions = css.slice(css.indexOf(".door-only .door-actions"));
+  assert(/z-index:\s*2/.test(phoneActions.slice(0, 700)), "door-actions z-index 2");
+  assert(css.includes(".door-only form"), "door-only form reset");
 });
 
 check("Door actions row and Capture chrome locks", () => {

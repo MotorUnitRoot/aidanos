@@ -123,7 +123,7 @@ check("submit-with-text proposes and does not write", () => {
 check("Get to Work / empty still skip, no dump write", () => {
   const skip = doorBlock(
     '$("door-skip").addEventListener("click"',
-    '$("door-capture").addEventListener("click"'
+    "(function wireDoorCapture()"
   );
   assert(skip.includes('input.value = ""') || skip.includes("input.value = ''"), "clears input");
   assert(skip.includes("hideDoorProposals()"), "hides proposals");
@@ -146,7 +146,7 @@ check("applyDoorPending stays dead", () => {
   assert(!/dump\.value\s*=/.test(submit), "Door submit must not write dump.value");
   const skip = doorBlock(
     '$("door-skip").addEventListener("click"',
-    '$("door-capture").addEventListener("click"'
+    "(function wireDoorCapture()"
   );
   assert(!/dump\.value\s*=/.test(skip), "Get to Work must not write dump.value");
 });
@@ -169,7 +169,7 @@ check("Capture thoughts opens a blank Capture note", () => {
   assert(html.includes('class="hairline-button"'), "hairline-button class");
   assert(html.includes('class="door-actions"'), "side-by-side wrapper");
   const capture = doorBlock(
-    '$("door-capture").addEventListener("click"',
+    "(function wireDoorCapture()",
     '$("door-accept").addEventListener("click"'
   );
   assert(src.includes("async function openCaptureNote("), "openCaptureNote exists");

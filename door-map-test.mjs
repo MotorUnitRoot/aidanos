@@ -16,11 +16,11 @@ const submit = src.slice(src.indexOf('$("door-form")'), src.indexOf('$("door-ski
 assert(submit.includes('if (!String(raw || "").trim())'), "empty Door skips land");
 assert(submit.indexOf("landDoorQueryOnToday") < submit.indexOf("proposeDoorLines"), "map before sentence split");
 assert(src.includes('$("door-skip").addEventListener("click"'), "Get to Work still exists");
-const skip = src.slice(src.indexOf('$("door-skip")'), src.indexOf('$("door-capture")'));
+const skip = src.slice(src.indexOf('$("door-skip")'), src.indexOf("(function wireDoorCapture()"));
 assert(!skip.includes("landDoorQueryOnToday"), "empty Get to Work does not land maps");
 assert(!skip.includes("proposeDoorLines"), "Get to Work does not invent tasks");
-assert(src.includes('$("door-capture").addEventListener("click"'), "Capture thoughts exists");
-const capture = src.slice(src.indexOf('$("door-capture")'), src.indexOf('$("door-accept")'));
+assert(src.includes("(function wireDoorCapture()"), "Capture thoughts exists");
+const capture = src.slice(src.indexOf("(function wireDoorCapture()"), src.indexOf('$("door-accept")'));
 assert(src.includes("async function openCaptureNote("), "openCaptureNote exists");
 assert(capture.includes("openCaptureNote()"), "Capture thoughts opens Capture.md");
 assert(!capture.includes("goToday()"), "Capture thoughts does not goToday");

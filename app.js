@@ -504,6 +504,7 @@ function syncDumpFromPaper() {
   return dump;
 }
 
+
 function paperHasVisibleText() {
   const dump = $("dump");
   if (dump && String(dump.value || "").trim()) return true;
@@ -695,6 +696,7 @@ function setCaptureHash() {
     history.replaceState(null, "", next);
   }
 }
+
 
 function notePaperTitle(doc) {
   const rel = String((doc && doc.path) || "").replace(/\\/g, "/");
@@ -1246,6 +1248,7 @@ async function renderMonth() {
   });
 }
 
+
 function ensureDumpMatchesPaper() {
   const dump = $("dump");
   const paper = $("paper");
@@ -1717,9 +1720,9 @@ async function openVaultNote(rel) {
   showView("today");
   renderNote();
   if (isCaptureDoc()) {
-    document.body.classList.add("doc-note", "doc-capture");
     const days = $("days");
     if (days) days.innerHTML = "";
+    document.body.classList.add("doc-note", "doc-capture");
   } else {
     renderWeek();
   }
@@ -2707,7 +2710,6 @@ async function openCaptureNote() {
     syncPaperEmptyClass();
   }
 }
-
 document.querySelectorAll("a[href='#today']").forEach((a) => {
   a.addEventListener("click", (e) => {
     e.preventDefault();

@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Periodic table — AidanOS</title>
+  <link rel="stylesheet" href="../foundations/tokens.css" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+    }
+    button, input, select, textarea {
+      font: inherit;
+    }
+    body {
+      padding: var(--space-6) var(--space-4) var(--space-6);
+    }
+    .paper {
+      width: var(--paper);
+      max-width: 100%;
+      margin: 0 auto;
+    }
+    h1 {
+      margin: 0 0 var(--space-3);
+      font-size: clamp(1.7rem, 3.2vw, 2.25rem);
+      font-weight: 500;
+      letter-spacing: -0.025em;
+      line-height: 1.12;
+    }
+    .lead {
+      margin: 0 0 var(--space-6);
+      color: var(--quiet);
+      font-size: 1.08rem;
+      line-height: 1.8;
+    }
+    section {
+      margin: 0 0 var(--space-6);
+    }
+    h2 {
+      margin: 0 0 var(--space-2);
+      font-size: 1.15rem;
+      font-weight: 500;
+    }
+    .why {
+      margin: 0 0 var(--space-3);
+      color: var(--quiet);
+      line-height: 1.55;
+    }
+    .stage {
+      background: var(--surface);
+      border: var(--line) solid var(--hairline);
+      border-radius: var(--radius);
+      padding: var(--space-4);
+    }
+    .quiet-label {
+      margin: 0 0 var(--space-1);
+      font-size: 0.75rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--faint);
+    }
+    .facts {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-3);
+    }
+    .fact .value {
+      font-size: 1.08rem;
+      line-height: 1.5;
+    }
+    .who {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: var(--space-3);
+    }
+    .person {
+      display: inline;
+      padding: 0 0.12em;
+      background: color-mix(in srgb, var(--ink) 10%, transparent);
+      color: var(--ink);
+    }
+    .status {
+      color: var(--quiet);
+    }
+    .duration {
+      color: var(--faint);
+      font-variant-numeric: tabular-nums;
+    }
+    .field {
+      margin: 0 0 var(--space-3);
+    }
+    .field:last-child {
+      margin-bottom: 0;
+    }
+    .line,
+    .area,
+    .choice,
+    .toggle {
+      width: 100%;
+      max-width: 100%;
+      padding: var(--space-2) 0;
+      border: 0;
+      border-bottom: var(--line) solid var(--hairline);
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--ink);
+      outline: none;
+    }
+    .area {
+      display: block;
+      min-height: 5.5rem;
+      resize: vertical;
+      line-height: 1.7;
+    }
+    .choice {
+      appearance: none;
+      padding-right: 1.2rem;
+    }
+    .nums {
+      font-variant-numeric: tabular-nums;
+    }
+    .toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-3);
+      color: var(--ink);
+      cursor: pointer;
+    }
+    .toggle .box {
+      display: inline-flex;
+      width: 1.15em;
+      height: 1.15em;
+      border: var(--line) solid var(--quiet);
+      border-radius: var(--radius);
+      background: var(--ok);
+      border-color: var(--ok);
+      flex: 0 0 auto;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: minmax(0, 1.6fr) 7rem 5rem;
+      gap: var(--space-3);
+      align-items: baseline;
+      padding: var(--space-2) 0;
+      border-top: var(--line) solid var(--hairline);
+      font-size: 1.08rem;
+      line-height: 1.6;
+    }
+    .row.head {
+      border-top: 0;
+      padding-top: 0;
+    }
+    .row.head span {
+      font-size: 0.75rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--faint);
+    }
+    .row .amt,
+    .row .qty {
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+      margin: 0 0 var(--space-3);
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-2);
+      padding: var(--space-1) var(--space-2);
+      border: var(--line) solid var(--hairline);
+      border-radius: var(--radius);
+      color: var(--quiet);
+      font-size: 0.95rem;
+    }
+    .chip button {
+      padding: 0;
+      border: 0;
+      background: none;
+      color: var(--faint);
+      cursor: pointer;
+    }
+    .chip button:hover {
+      color: var(--ink);
+    }
+    .list-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: var(--space-3);
+      padding: var(--space-2) 0;
+      border-top: var(--line) solid var(--hairline);
+      font-size: 1.08rem;
+      line-height: 1.6;
+    }
+    .list-row:first-child {
+      border-top: 0;
+      padding-top: 0;
+    }
+    .list-row .meta {
+      color: var(--quiet);
+      white-space: nowrap;
+    }
+    .related {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2) var(--space-3);
+      line-height: 1.7;
+    }
+    .attach {
+      color: var(--quiet);
+      text-decoration: none;
+    }
+    .attach:hover {
+      color: var(--ink);
+    }
+    .rule {
+      height: 0;
+      margin: var(--space-4) 0;
+      border: 0;
+      border-top: var(--line) solid var(--hairline);
+    }
+    .sheet {
+      padding: var(--space-4);
+      border: var(--line) solid var(--hairline);
+    }
+    .sheet p {
+      margin: 0 0 var(--space-4);
+      line-height: 1.7;
+    }
+    .pair {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-3);
+    }
+    .hairline-button {
+      display: inline-block;
+      padding: var(--space-2) var(--space-3);
+      border: var(--line) solid var(--quiet);
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--quiet);
+      cursor: pointer;
+    }
+    .hairline-button:hover {
+      color: var(--ink);
+      border-color: var(--ink);
+    }
+    .notice {
+      margin: 0 0 var(--space-3);
+      color: var(--quiet);
+      line-height: 1.7;
+    }
+    .progress {
+      margin: 0 0 var(--space-3);
+      color: var(--quiet);
+      font-variant-numeric: tabular-nums;
+    }
+    .validation {
+      margin: var(--space-1) 0 0;
+      color: var(--danger);
+      font-size: 0.95rem;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="paper">
+    <h1>Periodic table</h1>
+    <p class="lead">The new Keep elements for generated work. Stoic paper. One serif. No Salesforce chrome. Generation may use these and the Door, Today, and Plan library. Open TABLE.md to mark the closed list.</p>
+
+    <section>
+      <h2>Key facts</h2>
+      <p class="why">The few facts a tired person needs. No highlights card. No colored path.</p>
+      <div class="stage">
+        <div class="facts">
+          <div class="fact">
+            <p class="quiet-label">Vendor</p>
+            <p class="value">North Mill Paper</p>
+          </div>
+          <div class="fact">
+            <p class="quiet-label">Due</p>
+            <p class="value">Tuesday September 1</p>
+          </div>
+          <div class="fact">
+            <p class="quiet-label">Amount</p>
+            <p class="value">$240.00</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Person chip and status mark</h2>
+      <p class="why">A name, not an avatar stack. One word of status, not a colored pill.</p>
+      <div class="stage">
+        <div class="who">
+          <span class="person">Colby Ricker</span>
+          <span class="status">Waiting</span>
+          <span class="duration">45 min</span>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Fields</h2>
+      <p class="why">Labeled, text, multiline, choice, date, number, money, and toggle. Same serif. Hairline edges. No rich-text toolbar.</p>
+      <div class="stage">
+        <div class="field">
+          <p class="quiet-label">Title</p>
+          <input class="line" type="text" value="File the receipt" />
+        </div>
+        <div class="field">
+          <p class="quiet-label">Note</p>
+          <textarea class="area">Put the receipt in the vault. Note what it was for.</textarea>
+        </div>
+        <div class="field">
+          <p class="quiet-label">Kind</p>
+          <select class="choice">
+            <option>Receipt</option>
+            <option>Letter</option>
+            <option>Invoice</option>
+          </select>
+        </div>
+        <div class="field">
+          <p class="quiet-label">Date</p>
+          <input class="line nums" type="text" value="1 September 2026" />
+        </div>
+        <div class="field">
+          <p class="quiet-label">Quantity</p>
+          <input class="line nums" type="text" value="2" />
+        </div>
+        <div class="field">
+          <p class="quiet-label">Amount</p>
+          <input class="line nums" type="text" value="$240.00" />
+          <p class="validation">Amount needs a number.</p>
+        </div>
+        <div class="field">
+          <p class="quiet-label">Filed</p>
+          <div class="toggle"><span>On</span><span class="box" aria-hidden="true"></span></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>List row, line item, filter chip, and table head</h2>
+      <p class="why">A collection on paper. A filter is a word you can dismiss. Columns are quiet labels. Not a list-view chrome.</p>
+      <div class="stage">
+        <div class="chips">
+          <span class="chip">Receipt <button type="button" aria-label="Clear">×</button></span>
+          <span class="chip">This week <button type="button" aria-label="Clear">×</button></span>
+        </div>
+        <div class="list-row">
+          <span>North Mill Paper</span>
+          <span class="meta">Waiting · $240.00</span>
+        </div>
+        <div class="list-row">
+          <span>Reply to a letter</span>
+          <span class="meta">Next · 30 min</span>
+        </div>
+        <hr class="rule" />
+        <div class="row head">
+          <span>Item</span>
+          <span class="qty">Qty</span>
+          <span class="amt">Amount</span>
+        </div>
+        <div class="row">
+          <span>Ream of cream stock</span>
+          <span class="qty">2</span>
+          <span class="amt">$180.00</span>
+        </div>
+        <div class="row">
+          <span>Board mailer</span>
+          <span class="qty">1</span>
+          <span class="amt">$60.00</span>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Related strip and attachment link</h2>
+      <p class="why">Connected notes as wiki links. A file name that opens a vault file. Not a related list. Not a Files tab.</p>
+      <div class="stage">
+        <p class="quiet-label">Related</p>
+        <div class="related">
+          <span class="person">the-receipt</span>
+          <span class="person">file-a-receipt</span>
+        </div>
+        <hr class="rule" />
+        <p class="quiet-label">Attachment</p>
+        <a class="attach" href="#">north-mill-receipt.pdf</a>
+      </div>
+    </section>
+
+    <section>
+      <h2>Confirm pair, quiet sheet, soft notice, validation, and progress</h2>
+      <p class="why">Two hairline buttons. A panel on the same paper, not a dimmed overlay. A quiet sentence. A count, not a bar.</p>
+      <div class="stage">
+        <p class="notice">Saved to the vault.</p>
+        <p class="progress">3 of 7 filed</p>
+        <div class="sheet">
+          <p>File the original with the note, or leave it on the desk?</p>
+          <div class="pair">
+            <button type="button" class="hairline-button">Accept</button>
+            <button type="button" class="hairline-button">Reject</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Hairline rule and duration mark</h2>
+      <p class="why">A one-pixel divide. How long, in faint numbers. Not a card shadow. Not a timesheet.</p>
+      <div class="stage">
+        <p class="quiet-label">Duration</p>
+        <p class="duration">45 min</p>
+        <hr class="rule" />
+        <p class="why" style="margin: 0;">The rule is the line above. It is not a new page shell.</p>
+      </div>
+    </section>
+  </div>
+</body>
+</html>

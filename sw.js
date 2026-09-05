@@ -1,5 +1,5 @@
 /* AidanOS shell cache — offline chrome; /api/* network-first */
-const CACHE = "aidanos-shell-v1";
+const CACHE = "aidanos-shell-v4";
 const SHELL = [
   "/",
   "/index.html",
@@ -37,6 +37,29 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  const shellFresh =
+    url.pathname === "/" ||
+    url.pathname === "/index.html" ||
+    url.pathname === "/app.js" ||
+    url.pathname === "/day.css" ||
+    url.pathname === "/styles.css" ||
+    url.pathname === "/sw.js";
+
+  if (shellFresh) {
+    event.respondWith(
+      fetch(req)
+        .then((res) => {
+          if (res && res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE).then((c) => c.put(req, copy));
+          }
+          return res;
+        })
+        .catch(() => caches.match(req))
+    );
+    return;
+  }
+
   event.respondWith(
     caches.match(req).then((hit) => {
       const net = fetch(req)
@@ -44,10 +67,7 @@ self.addEventListener("fetch", (event) => {
           if (
             res &&
             res.ok &&
-            (url.pathname === "/" ||
-              SHELL.includes(url.pathname) ||
-              url.pathname.endsWith(".css") ||
-              url.pathname.endsWith(".js") ||
+            (SHELL.includes(url.pathname) ||
               url.pathname.endsWith(".webmanifest") ||
               url.pathname.endsWith(".png"))
           ) {

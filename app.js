@@ -2468,6 +2468,12 @@ $("door-skip").addEventListener("click", () => {
   hideDoorProposals();
   goToday();
 });
+$("door-capture").addEventListener("click", () => {
+  const input = $("door-input");
+  if (input) input.value = "";
+  hideDoorProposals();
+  goToday();
+});
 $("door-accept").addEventListener("click", async () => {
   if (!doorProposed.length) return;
   const date = todayIso();

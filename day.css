@@ -59,7 +59,7 @@ body.view-door.day-page {
   align-items: center;
   gap: 0.7rem;
   border: 1px solid #a89f91;
-  border-radius: 6px;
+  border-radius: 0;
   background: transparent;
   padding: 0.85rem 1rem 0.85rem 1.05rem;
 }
@@ -92,17 +92,41 @@ body.view-door.day-page {
   line-height: 1;
   cursor: pointer;
 }
+.hairline-button {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border: 1px solid #a89f91;
+  border-radius: 0;
+  background: transparent;
+  color: #a89f91;
+  font: inherit;
+  font-family: var(--font);
+  font-size: 1.05rem;
+  cursor: pointer;
+}
+.hairline-button:hover {
+  color: #d4cbb8;
+  border-color: #d4cbb8;
+}
+.hairline-button:focus {
+  outline: 1px solid #d4cbb8;
+  outline-offset: 2px;
+}
 .door-skip {
-  background: none;
-  border: 0;
+  /* alias kept for older tests; same hairline */
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border: 1px solid #a89f91;
+  border-radius: 0;
+  background: transparent;
   color: #a89f91;
   font-family: var(--font);
   font-size: 1.05rem;
   cursor: pointer;
-  padding: 0;
 }
 .door-skip:hover,
 .door-return:hover { color: #d4cbb8; }
+.door-skip:hover { border-color: #d4cbb8; }
 .door-proposals {
   width: 100%;
   color: #a89f91;

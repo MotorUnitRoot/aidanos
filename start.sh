@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Honors PORT and AIDANOS_HOST (default 127.0.0.1). Phone/LAN: AIDANOS_HOST=0.0.0.0 ./start.sh — see PHONE.md
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p logs
@@ -7,7 +8,8 @@ if [ -z "${AIDANOS_VAULT:-}" ]; then
 fi
 PIDF=logs/aidanos.pid
 LOGF=logs/aidanos.log
-HEALTH=http://127.0.0.1:3847/api/health
+PORT_N="${PORT:-3847}"
+HEALTH=http://127.0.0.1:${PORT_N}/api/health
 SIT=32457
 alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 hcode() { curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "$HEALTH" 2>/dev/null || echo 000; }
@@ -29,7 +31,7 @@ fi
 if alive "$SIT"; then
   cmd=$(ps -p "$SIT" -o args= 2>/dev/null || true)
   on=0
-  ss -tlnp 2>/dev/null | grep ":3847" | grep -q "pid=$SIT" && on=1
+  ss -tlnp 2>/dev/null | grep ":${PORT_N}" | grep -q "pid=$SIT" && on=1
   case "$cmd" in
     *node\ server.mjs*)
       if [ "$on" = 1 ]; then
@@ -53,6 +55,6 @@ while [ "$n" -lt 40 ]; do
   n=$((n+1))
 done
 if [ "$ok" != 1 ]; then
-  echo "start.sh: http://127.0.0.1:3847/api/health not 200" >&2
+  echo "start.sh: http://127.0.0.1:${PORT_N}/api/health not 200" >&2
   exit 1
 fi

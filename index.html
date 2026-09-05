@@ -17,22 +17,24 @@
 </head>
 <body class="day-page view-door">
   <main id="view-door" class="view view-door-screen">
-    <form class="door-only" id="door-form" autocomplete="off">
-      <label class="sr-only" for="door-input">What do you want to do today?</label>
-      <div class="door-bar">
-        <input type="text" id="door-input" name="q" placeholder="What do you want to do today?" maxlength="240" autofocus />
-        <button type="submit" class="door-return" aria-label="Enter">&#8629;</button>
-      </div>
-      <div id="door-proposals" class="door-proposals" hidden></div>
-      <div id="door-decide" class="door-decide" hidden>
-        <button type="button" id="door-accept" class="hairline-button">Accept</button>
-        <button type="button" id="door-reject" class="hairline-button">Reject</button>
-      </div>
-      <div class="door-actions">
+    <div class="door-only">
+      <form id="door-form" autocomplete="off">
+        <label class="sr-only" for="door-input">What do you want to do today?</label>
+        <div class="door-bar">
+          <input type="text" id="door-input" name="q" placeholder="What do you want to do today?" maxlength="240" autofocus />
+          <button type="submit" class="door-return" aria-label="Enter">&#8629;</button>
+        </div>
+        <div id="door-proposals" class="door-proposals" hidden></div>
+        <div id="door-decide" class="door-decide" hidden>
+          <button type="button" id="door-accept" class="hairline-button">Accept</button>
+          <button type="button" id="door-reject" class="hairline-button">Reject</button>
+        </div>
+      </form>
+      <div class="door-actions" role="group" aria-label="Start">
         <button type="button" id="door-skip" class="hairline-button">Get to Work</button>
         <button type="button" id="door-capture" class="hairline-button">Capture thoughts</button>
       </div>
-    </form>
+    </div>
   </main>
 
   <main id="view-today" class="view view-today-screen" hidden>

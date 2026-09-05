@@ -20,7 +20,7 @@
       top: var(--space-3);
       left: var(--space-3);
       margin: 0;
-      max-width: 22rem;
+      max-width: 32rem;
       color: var(--faint);
       font-size: 0.8rem;
       line-height: 1.45;
@@ -34,16 +34,26 @@
       gap: var(--space-4);
       padding: var(--space-5);
     }
+    .door-actions {
+      display: flex;
+      flex-direction: row;
+      flex-wrap: nowrap;
+      align-items: center;
+      justify-content: center;
+      gap: var(--space-3);
+    }
   </style>
 </head>
 <body>
-  <p class="caption">Empty Door. The prompt bar and two hairline buttons. Get to Work and Capture thoughts are the same button. No thread. No nav mall.</p>
+  <p class="caption">Empty Door. One web app: desktop and phone show this same Door. There is not a phone-only Door. Get to Work and Capture thoughts sit side by side on one row. They are the same hairline outlined button. Capture thoughts opens a blank Capture note: no week cards, no agenda, no timeline rail, and not Today chrome. Get to Work opens Today with the week chrome. No thread. No nav mall.</p>
   <div class="door">
     <div class="prompt">
       <input type="text" placeholder="What do you want to do today?" />
     </div>
-    <button type="button" class="hairline-button">Get to Work</button>
-    <button type="button" class="hairline-button">Capture thoughts</button>
+    <div class="door-actions">
+      <button type="button" class="hairline-button">Get to Work</button>
+      <button type="button" class="hairline-button">Capture thoughts</button>
+    </div>
   </div>
 </body>
 </html>

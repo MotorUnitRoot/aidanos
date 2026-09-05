@@ -152,13 +152,17 @@
 
   <section>
     <h2>Hairline button</h2>
-    <p class="why">What it is: one button. Get to Work, Capture thoughts, Accept, and Reject are four uses of this class, not four components. Tokens: --quiet ink and border, --ink on hover, --line, --radius. Behavior: a hairline box, never underlined text. Hover brightens. Focus is a hairline, not a glow.</p>
+    <p class="why">What it is: one button. Get to Work, Capture thoughts, Accept, and Reject are four uses of this class, not four components. Tokens: --quiet ink and border, --ink on hover, --line, --radius. Behavior: a hairline box, never underlined text. Hover brightens. Focus is a hairline, not a glow. On the Door, Get to Work and Capture thoughts sit side by side on one row. Capture thoughts opens a blank Capture note: no week cards, no agenda, no timeline rail, and not Today chrome. Get to Work opens Today with the week chrome. Desktop and phone use this same Door. There is not a phone-only Door.</p>
     <div class="stage on-black">
       <div class="uses stack">
-        <button type="button" class="hairline-button">Get to Work</button>
-        <button type="button" class="hairline-button">Capture thoughts</button>
-        <button type="button" class="hairline-button">Accept</button>
-        <button type="button" class="hairline-button">Reject</button>
+        <div class="uses">
+          <button type="button" class="hairline-button">Get to Work</button>
+          <button type="button" class="hairline-button">Capture thoughts</button>
+        </div>
+        <div class="uses">
+          <button type="button" class="hairline-button">Accept</button>
+          <button type="button" class="hairline-button">Reject</button>
+        </div>
       </div>
     </div>
   </section>

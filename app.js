@@ -184,6 +184,9 @@ function formatOneLine(line, asSource, hidden) {
       cls += " h" + m[1].length;
       kind = "h";
       extra = ' data-level="' + m[1].length + '"';
+      return '<div draggable="true" class="' + cls + '" data-kind="' + kind + '" data-src="' + attr(line) + '"' + extra + ">" +
+        '<span class="md-hash" contenteditable="false">' + escapeHtml(m[1] + m[2]) + '</span>' +
+        '<span class="md-body">' + paintWiki(escapeHtml(m[3]), true) + "</span></div>";
     } else if ((m = line.match(/^(\s*)([-*+])\s+\[([ xX])\]\s*(.*)$/))) {
       cls += " task" + (/x/i.test(m[3]) ? " done" : "") + (m[1] ? " nest" : "");
       kind = "task";
@@ -246,9 +249,13 @@ function formatOneLine(line, asSource, hidden) {
 
 function frontmatterLineCount(md) {
   const lines = String(md ?? "").split("\n");
-  if (lines[0] !== "---") return 0;
+  if (!/^---\s*$/.test(lines[0] || "")) return 0;
   for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === "---") return i + 1;
+    if (/^---\s*$/.test(lines[i])) return i + 1;
+    // Recover scuffed closes like "subtitle: …---"
+    if (/\S---\s*$/.test(lines[i]) && !/^---/.test(lines[i])) {
+      return i + 1;
+    }
   }
   return 0;
 }
@@ -287,6 +294,18 @@ function joinBrokenHyphens(md) {
 function cleanPaperMarkdown(md) {
   return joinBrokenHyphens(String(md ?? "").split("\n").map(stripAccidentalBulletSpace).join("\n"));
 }
+
+function normalizeSeasonPlanMarkdown(md) {
+  let s = String(md ?? "").replace(/\r\n/g, "\n");
+  // Un-task headings accidentally saved as "- [ ] ## Why"
+  s = s.replace(/^(\s*)[-*+]\s+\[[ xX]\]\s+(#{1,6}\s+)/gm, "$1$2");
+  // Repair "text---" frontmatter close glued onto a YAML line
+  if (s.startsWith("---\n")) {
+    s = s.replace(/^(---\n[\s\S]*?\S)---(\n)/, "$1\n---$2");
+  }
+  return s;
+}
+
 
 function continueLinePrefix(line) {
   const s = String(line || "");
@@ -338,7 +357,10 @@ function lineBody(n) {
 }
 
 function serializeLine(n) {
-  if (n.classList && n.classList.contains("is-source")) return stripAccidentalBulletSpace(lineBody(n));
+  if (n.classList && n.classList.contains("is-source")) {
+    if (n.dataset && n.dataset.kind === "h") return lineMarkdown(n);
+    return stripAccidentalBulletSpace(lineBody(n));
+  }
   const kind = n.dataset.kind;
   const src = n.getAttribute("data-src");
   if (src != null && src !== "") {
@@ -443,6 +465,14 @@ function lineMarkdown(el) {
   const idx = paperLines().indexOf(el);
   const dumpLine = (dump && idx >= 0) ? dump.value.split("\n")[idx] : null;
   if (el.classList && el.classList.contains("is-source")) {
+    if (el.dataset && el.dataset.kind === "h") {
+      const level = Math.max(1, Math.min(6, Number(el.dataset.level) || 1));
+      const bodyEl = el.querySelector(".md-body");
+      const body = bodyEl
+        ? String(bodyEl.innerText != null ? bodyEl.innerText : (bodyEl.textContent || ""))
+        : String(el.innerText != null ? el.innerText : (el.textContent || "")).replace(/^#+\s*/, "");
+      return "#".repeat(level) + " " + stripAccidentalBulletSpace(body.replace(/\n/g, "").replace(/\u00a0/g, " "));
+    }
     const raw = (el.innerText != null ? el.innerText : (el.textContent || ""));
     return stripAccidentalBulletSpace(String(raw).replace(/\n/g, "").replace(/\u00a0/g, " "));
   }
@@ -491,7 +521,7 @@ function syncDumpFromPaper() {
   const lines = dump.value.split("\n");
   while (lines.length <= idx) lines.push("");
   if (el.classList && el.classList.contains("is-source")) {
-    lines[idx] = stripAccidentalBulletSpace((el.innerText || "").replace(/\n/g, "").replace(/\u00a0/g, " "));
+    lines[idx] = lineMarkdown(el);
   } else if (el.dataset && el.dataset.kind === "task" && /^\s*[-*+]\s+\[[ xX]\]/.test(lines[idx] || "")) {
     const on = el.classList.contains("done");
     const was = /\[[xX]\]/.test(lines[idx]);
@@ -697,6 +727,28 @@ function setCaptureHash() {
   }
 }
 
+function isPlanDoc() {
+  return isNoteDoc() && String(state.doc && state.doc.path || "").replace(/\\/g, "/") === "aidanos/active-horse.md";
+}
+
+function isPlanHash() {
+  return (location.hash || "").replace(/^#/, "") === "plan";
+}
+
+function setPlanHash() {
+  const next = location.pathname + location.search + "#plan";
+  if (location.hash !== "#plan") {
+    history.replaceState(null, "", next);
+  }
+}
+
+function syncTodayNav() {
+  document.querySelectorAll(".today-nav a.text-link").forEach((a) => {
+    const href = (a.getAttribute("href") || "").replace(/^#/, "");
+    const on = isPlanHash() || isPlanDoc() ? href === "plan" : href === "today";
+    a.classList.toggle("is-current", on);
+  });
+}
 
 function notePaperTitle(doc) {
   const rel = String((doc && doc.path) || "").replace(/\\/g, "/");
@@ -714,7 +766,7 @@ async function loadWeek(start) {
   state.weekStart = start;
   state.week = await api("/api/week?start=" + start);
   if (isNoteDoc()) {
-    if (isCaptureDoc()) {
+    if (isCaptureDoc() || isPlanDoc()) {
       const days = $("days");
       if (days) days.innerHTML = "";
     }
@@ -759,7 +811,7 @@ function putRawDay(date, markdown, mtime) {
 }
 
 async function openDay(date, { silent = false, force = false } = {}) {
-  if (!force && (isCaptureHash() || isCaptureDoc())) return;
+  if (!force && (isCaptureHash() || isCaptureDoc() || isPlanHash() || isPlanDoc())) return;
   const gen = ++state.openDayGen;
   flushActiveLineToDump();
   const dump = $("dump");
@@ -818,7 +870,7 @@ async function openDay(date, { silent = false, force = false } = {}) {
 function renderDay() {
   const d = state.day;
   if (!d) return;
-  document.body.classList.remove("doc-note", "doc-capture");
+  document.body.classList.remove("doc-note", "doc-capture", "doc-plan");
   $("paper-title").textContent = formatPaperTitle(d.date);
   $("rail-date").textContent = formatRailDate(d.date);
   const dump = $("dump");
@@ -1375,7 +1427,10 @@ function paperSaveSnapshot() {
   ensureDumpMatchesPaper();
   const dump = $("dump");
   if (isNoteDoc()) {
-    const markdown = cleanPaperMarkdown(dump ? dump.value : String(state.doc.markdown || ""));
+    let markdown = cleanPaperMarkdown(dump ? dump.value : String(state.doc.markdown || ""));
+    if (String(state.doc.path || "").replace(/\\/g, "/") === "aidanos/active-horse.md") {
+      markdown = normalizeSeasonPlanMarkdown(markdown);
+    }
     if (dump) dump.value = markdown;
     state.doc.markdown = markdown;
     return {
@@ -1518,29 +1573,38 @@ async function saveDay({ keepalive = false } = {}) {
 function currentView() {
   let h = (location.hash || "").replace(/^#/, "");
   if (h === "day") return "today";
-  if (h === "plan") return "plan";
-  if (h === "today" || h === "capture") return "today";
+  // Plan is editable paper in Today chrome (#plan hash), not #view-plan
+  if (h === "plan" || h === "today" || h === "capture") return "today";
   return "door";
 }
 
 function showView(view) {
   if (!PAGE_VIEWS.includes(view)) view = "door";
   if (isNoteDoc() && view !== "today") leaveCurrentPaper().catch(() => {});
-  document.body.className = "day-page view-" + view + (isNoteDoc() ? " doc-note" : "") + (isCaptureDoc() ? " doc-capture" : "");
+  const planOn = isPlanDoc() || isPlanHash();
+  const captureOn = isCaptureDoc() || isCaptureHash();
+  document.body.className = "day-page view-" + view
+    + (isNoteDoc() ? " doc-note" : "")
+    + (captureOn && isCaptureDoc() ? " doc-capture" : "")
+    + (planOn && isPlanDoc() ? " doc-plan" : "");
   PAGE_VIEWS.forEach((v) => {
     const el = $("view-" + v);
     if (!el) return;
+    // #view-plan stays in DOM but unused — always hidden
+    if (v === "plan") {
+      el.setAttribute("hidden", "");
+      return;
+    }
     if (v === view) el.removeAttribute("hidden");
     else el.setAttribute("hidden", "");
   });
-  document.title = view === "door" ? "AidanOS" : view === "today" ? "Today · AidanOS" : "Plan · AidanOS";
-  if (view === "plan") {
-    renderPlan();
-    setStatus("");
-  }
+  document.title = view === "door"
+    ? "AidanOS"
+    : (planOn ? "Plan · AidanOS" : "Today · AidanOS");
   if (view === "today") {
     startDayWatch();
-    if (!state.selectedDate && !isNoteDoc() && !isCaptureHash()) openDay(todayIso());
+    syncTodayNav();
+    if (!state.selectedDate && !isNoteDoc() && !isCaptureHash() && !isPlanHash()) openDay(todayIso());
   } else stopDayWatch();
   if (view === "door") {
     const input = $("door-input");
@@ -1553,6 +1617,8 @@ function route() {
   showView(view);
   if (isCaptureHash() && !isCaptureDoc()) {
     openCaptureNote().catch((e) => setStatus(String(e && e.message || e), "error"));
+  } else if (isPlanHash() && !isPlanDoc()) {
+    openPlanNote().catch((e) => setStatus(String(e && e.message || e), "error"));
   }
 }
 
@@ -1676,8 +1742,10 @@ function renderNote() {
   const doc = state.doc;
   if (!doc || doc.kind !== "note") return;
   document.body.classList.add("doc-note");
-  document.body.classList.toggle("doc-capture", /^Capture\.md$/i.test(String(doc.path || "")));
-  const title = notePaperTitle(doc);
+  const path = String(doc.path || "").replace(/\\/g, "/");
+  document.body.classList.toggle("doc-capture", /^Capture\.md$/i.test(path));
+  document.body.classList.toggle("doc-plan", path === "aidanos/active-horse.md");
+  const title = path === "aidanos/active-horse.md" ? "Plan" : notePaperTitle(doc);
   if ($("paper-title")) $("paper-title").textContent = title;
   if ($("rail-date")) $("rail-date").textContent = title;
   const dump = $("dump");
@@ -1685,6 +1753,7 @@ function renderNote() {
   if (dump) dump.value = md;
   paintPaper();
   renderRail();
+  syncTodayNav();
 }
 
 async function openVaultNote(rel) {
@@ -1704,25 +1773,33 @@ async function openVaultNote(rel) {
   const data = await api("/api/file?path=" + encodeURIComponent(path));
   if (noteGen !== state.openDayGen) return;
   state.day = null;
+  let noteMd = typeof data.markdown === "string" ? data.markdown : "";
+  if (String(data.path || path).replace(/\\/g, "/") === "aidanos/active-horse.md") {
+    noteMd = normalizeSeasonPlanMarkdown(noteMd);
+  }
   state.doc = {
     kind: "note",
     path: String(data.path || path).replace(/\\/g, "/"),
-    markdown: typeof data.markdown === "string" ? data.markdown : "",
+    markdown: noteMd,
     mtime: Number(data.mtime) || 0,
   };
   resetPaperHistory(paperHistory);
-  // Capture uses its own hash so Today loadWeek/openDay cannot steal it
+  // Capture / Plan use their own hashes so Today loadWeek/openDay cannot steal them
   if (isCaptureDoc()) {
     setCaptureHash();
+  } else if (isPlanDoc()) {
+    setPlanHash();
   } else if (location.hash !== "#today") {
     history.replaceState(null, "", location.pathname + location.search + "#today");
   }
   showView("today");
   renderNote();
-  if (isCaptureDoc()) {
+  if (isCaptureDoc() || isPlanDoc()) {
     const days = $("days");
     if (days) days.innerHTML = "";
-    document.body.classList.add("doc-note", "doc-capture");
+    document.body.classList.add("doc-note");
+    if (isCaptureDoc()) document.body.classList.add("doc-capture");
+    if (isPlanDoc()) document.body.classList.add("doc-plan");
   } else {
     renderWeek();
   }
@@ -1751,7 +1828,7 @@ function openVaultPath(rel) {
   }
   if (path === "aidanos/active-horse.md") {
     closeAsk();
-    location.hash = "plan";
+    openPlanNote().catch((e) => setStatus(String(e && e.message || e), "error"));
     return;
   }
   openVaultNote(path);
@@ -1780,7 +1857,10 @@ async function runAsk(q) {
     } else if (row.kind === "task") {
       a.addEventListener("click", () => openTaskHit(row.date, row.line));
     } else if (row.kind === "plan") {
-      a.addEventListener("click", () => { closeAsk(); location.hash = "plan"; });
+      a.addEventListener("click", () => {
+        closeAsk();
+        openPlanNote().catch((e) => setStatus(String(e && e.message || e), "error"));
+      });
     } else if (row.kind === "folder") {
       a.addEventListener("click", () => {
         state.folderDir = row.path;
@@ -2152,7 +2232,7 @@ async function openWiki(name) {
   }
   if (/^plan$/i.test(n)) {
     closeAsk();
-    location.hash = "plan";
+    openPlanNote().catch((e) => setStatus(String(e && e.message || e), "error"));
     return;
   }
   if (/^today$/i.test(n)) {
@@ -2647,9 +2727,97 @@ async function goToday() {
   await leaveCurrentPaper();
   state.doc = null;
   state.openDayGen++;
+  document.body.classList.remove("doc-note", "doc-capture", "doc-plan");
   if (location.hash !== "#today") location.hash = "today";
   else showView("today");
+  syncTodayNav();
   openDay(todayIso(), { force: true });
+}
+document.querySelectorAll("a[href='#today']").forEach((a) => {
+  a.addEventListener("click", (e) => {
+    e.preventDefault();
+    goToday();
+  });
+});
+document.querySelectorAll("a[href='#plan']").forEach((a) => {
+  a.addEventListener("click", (e) => {
+    e.preventDefault();
+    openPlanNote().catch((err) => setStatus(String(err && err.message || err), "error"));
+  });
+});
+$("door-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const input = $("door-input");
+  const raw = input ? input.value : "";
+  if (!String(raw || "").trim()) {
+    hideDoorProposals();
+    goToday();
+    return;
+  }
+  const landed = await landDoorQueryOnToday(raw);
+  if (landed) {
+    if (input) input.value = "";
+    hideDoorProposals();
+    goToday();
+    return;
+  }
+  const lines = proposeDoorLines(raw);
+  if (lines.length) {
+    paintDoorProposals(lines);
+    return;
+  }
+  if (input) input.value = "";
+  hideDoorProposals();
+  goToday();
+});
+
+async function openPlanNote() {
+  const path = "aidanos/active-horse.md";
+  // Already on Plan paper — keep edits, just ensure chrome + hash
+  if (isPlanDoc()) {
+    state.openDayGen++;
+    setPlanHash();
+    showView("today");
+    document.body.classList.add("doc-note", "doc-plan");
+    const days0 = $("days");
+    if (days0) days0.innerHTML = "";
+    syncTodayNav();
+    const paper = $("paper");
+    if (paper) paper.focus();
+    return;
+  }
+  try { await leaveCurrentPaper(); } catch (e) {}
+  // Paint Plan immediately so Today chrome cannot flash week/rail
+  state.openDayGen++;
+  state.day = null;
+  state.selectedDate = null;
+  state.doc = { kind: "note", path: path, markdown: "", mtime: 0 };
+  setPlanHash();
+  showView("today");
+  renderNote();
+  document.body.classList.add("doc-note", "doc-plan");
+  const days0 = $("days");
+  if (days0) days0.innerHTML = "";
+  syncTodayNav();
+  try {
+    await openVaultNote(path);
+  } catch (e) {
+    setStatus(String(e && e.message || e), "error");
+    return;
+  }
+  const paper = $("paper");
+  if (paper) {
+    syncPaperEmptyClass();
+    paper.focus();
+    const lines = paperLines();
+    const line = lines.find((n) => n && !n.classList.contains("md-front")) || lines[0];
+    if (line) {
+      // Prefer rendered paint on open (phone was flashing raw ## Why in source mode)
+      state.activeLine = -1;
+      const body = line.querySelector(".md-body") || line;
+      placeCaret(body, 0);
+    }
+  }
 }
 
 async function openCaptureNote() {
@@ -2710,37 +2878,6 @@ async function openCaptureNote() {
     syncPaperEmptyClass();
   }
 }
-document.querySelectorAll("a[href='#today']").forEach((a) => {
-  a.addEventListener("click", (e) => {
-    e.preventDefault();
-    goToday();
-  });
-});
-$("door-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const input = $("door-input");
-  const raw = input ? input.value : "";
-  if (!String(raw || "").trim()) {
-    hideDoorProposals();
-    goToday();
-    return;
-  }
-  const landed = await landDoorQueryOnToday(raw);
-  if (landed) {
-    if (input) input.value = "";
-    hideDoorProposals();
-    goToday();
-    return;
-  }
-  const lines = proposeDoorLines(raw);
-  if (lines.length) {
-    paintDoorProposals(lines);
-    return;
-  }
-  if (input) input.value = "";
-  hideDoorProposals();
-  goToday();
-});
 
 $("door-skip").addEventListener("click", () => {
   const input = $("door-input");
@@ -2875,15 +3012,224 @@ document.addEventListener("visibilitychange", () => {
   });
 })();
 
+function runPaperUndoAction() {
+  const dump = $("dump");
+  if (!dump) return;
+  const current = currentPaperSnap();
+  const snap = undoPaperHistory(paperHistory, current);
+  if (!snap) return;
+  applyPaperHistorySnap(snap);
+  restorePaperFocus(snap.line, snap.caret);
+}
+
+function fmtActiveLineIndex() {
+  let idx = state.activeLine >= 0 ? state.activeLine : lineIndexOfCaret();
+  if (idx < 0) idx = 0;
+  return idx;
+}
+
+function fmtToggleTaskLine() {
+  const paper = $("paper");
+  const dump = $("dump");
+  if (!paper || !dump) return;
+  paper.focus();
+  const idx = fmtActiveLineIndex();
+  const el = paperLines()[idx];
+  if (el) writeDumpLine(idx, lineMarkdown(el));
+  const lines = dump.value.split("\n");
+  while (lines.length <= idx) lines.push("");
+  const text = lines[idx] != null ? lines[idx] : "";
+  // Headings stay headings — task mark must not produce "- [ ] ## Why"
+  if (/^\s*#{1,6}\s/.test(text)) return;
+  const task = text.match(/^(\s*)([-*+])\s+\[([ xX])\]\s*(.*)$/);
+  let next;
+  if (task) {
+    next = task[1] + task[2] + " [" + (/x/i.test(task[3]) ? " " : "x") + "] " + task[4];
+  } else {
+    const ul = text.match(/^(\s*)([-*+])\s+(.*)$/);
+    const ol = text.match(/^(\s*)(\d+[.)])\s+(.*)$/);
+    const nest = text.match(/^(\s{2,})(\S.*)$/);
+    if (ul) next = ul[1] + "- [ ] " + ul[3];
+    else if (ol) next = ol[1] + "- [ ] " + ol[3];
+    else if (nest) next = nest[1] + "- [ ] " + nest[2];
+    else next = "- [ ] " + String(text || "").replace(/^\s+/, "");
+  }
+  pushPaperHistory(paperHistory, { markdown: dump.value, line: idx, caret: 0 }, { kind: "fmt-task" });
+  writeDumpLine(idx, next);
+  scheduleSave();
+  paintPaperAt(idx, next.length);
+}
+
+function fmtBoldSelectionOrLine() {
+  const paper = $("paper");
+  const dump = $("dump");
+  if (!paper || !dump) return;
+  paper.focus();
+  const idx = fmtActiveLineIndex();
+  const el = paperLines()[idx];
+  if (!el) return;
+  writeDumpLine(idx, lineMarkdown(el));
+  const lines = dump.value.split("\n");
+  while (lines.length <= idx) lines.push("");
+  let text = lines[idx] != null ? lines[idx] : "";
+  const sel = window.getSelection();
+  let start = -1;
+  let end = -1;
+  if (sel && sel.rangeCount && paper.contains(sel.anchorNode) && !sel.isCollapsed) {
+    try {
+      const off = caretOffset(el);
+      const selected = String(sel.toString() || "");
+      if (selected && text.includes(selected)) {
+        start = text.indexOf(selected);
+        end = start + selected.length;
+      } else {
+        // best-effort: wrap around caret using last selection length
+        const piece = state.lastPaperSelection || selected;
+        if (piece && text.includes(piece)) {
+          start = text.indexOf(piece);
+          end = start + piece.length;
+        }
+      }
+    } catch (err) {}
+  }
+  pushPaperHistory(paperHistory, {
+    markdown: dump.value,
+    line: idx,
+    caret: el ? (() => { try { return caretOffset(el); } catch (e) { return 0; } })() : 0,
+  }, { kind: "fmt-bold" });
+  let caret = text.length;
+  if (start >= 0 && end > start) {
+    const wrapped = text.slice(0, start) + "**" + text.slice(start, end) + "**" + text.slice(end);
+    text = wrapped;
+    caret = end + 4;
+  } else {
+    // wrap whole body after list/task prefix, or wrap empty as ****
+    const m = text.match(/^(\s*(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+|#{1,6}\s+)?)([\s\S]*)$/);
+    const prefix = m ? m[1] : "";
+    const body = m ? m[2] : text;
+    if (!body) {
+      text = prefix + "****";
+      caret = prefix.length + 2;
+    } else if (/^\*\*([\s\S]*)\*\*$/.test(body)) {
+      text = prefix + body.replace(/^\*\*([\s\S]*)\*\*$/, "$1");
+      caret = text.length;
+    } else {
+      text = prefix + "**" + body + "**";
+      caret = text.length;
+    }
+  }
+  writeDumpLine(idx, text);
+  scheduleSave();
+  paintPaperAt(idx, caret);
+}
+
+function fmtIndentLine() {
+  const paper = $("paper");
+  const dump = $("dump");
+  if (!paper || !dump) return;
+  paper.focus();
+  const idx = fmtActiveLineIndex();
+  const el = paperLines()[idx];
+  const off = el ? (() => { try { return caretOffset(el); } catch (e) { return 0; } })() : 0;
+  if (idx < 0 || !el) return;
+  writeDumpLine(idx, lineMarkdown(el));
+  const lines = dump.value.split("\n");
+  const text = lines[idx] != null ? lines[idx] : "";
+  const next = indentDumpLine(text);
+  if (next === text) return;
+  pushPaperHistory(paperHistory, { markdown: dump.value, line: idx, caret: off }, { kind: "indent" });
+  writeDumpLine(idx, next);
+  const caret = Math.max(0, off + (next.length - text.length));
+  scheduleSave();
+  paintPaperAt(idx, caret);
+}
+
+function setFmtBarVisible(on) {
+  const bar = $("fmt-bar");
+  if (!bar) return;
+  if (on) {
+    bar.classList.remove("hidden");
+    bar.removeAttribute("hidden");
+  } else {
+    bar.classList.add("hidden");
+    bar.setAttribute("hidden", "");
+  }
+}
+
+function syncFmtBarInset() {
+  const bar = $("fmt-bar");
+  if (!bar) return;
+  const vv = window.visualViewport;
+  if (!vv) {
+    bar.style.bottom = "calc(12px + env(safe-area-inset-bottom, 0px))";
+    return;
+  }
+  const inset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+  bar.style.bottom = (inset + 12) + "px";
+}
+
+(function wireFmtBar() {
+  const bar = $("fmt-bar");
+  const paper = $("paper");
+  if (!bar || !paper) return;
+  let ignoreBlur = false;
+
+  const holdFocus = (e) => {
+    // Keep paper focused so bar taps do not blur/hide the strip first
+    e.preventDefault();
+    ignoreBlur = true;
+  };
+  bar.addEventListener("mousedown", holdFocus);
+  bar.addEventListener("pointerdown", holdFocus);
+  bar.addEventListener("mouseup", () => { ignoreBlur = false; });
+  bar.addEventListener("pointerup", () => { ignoreBlur = false; });
+  bar.addEventListener("click", (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest("[data-fmt]") : null;
+    if (!btn) return;
+    e.preventDefault();
+    const act = btn.getAttribute("data-fmt");
+    if (act === "task") fmtToggleTaskLine();
+    else if (act === "style") fmtBoldSelectionOrLine();
+    else if (act === "undo") runPaperUndoAction();
+    else if (act === "indent") fmtIndentLine();
+    else if (act === "find" || act === "wand" || act === "command") openAsk();
+    syncFmtBarInset();
+  });
+
+  paper.addEventListener("focus", () => {
+    setFmtBarVisible(true);
+    syncFmtBarInset();
+  });
+  paper.addEventListener("blur", () => {
+    setTimeout(() => {
+      if (ignoreBlur) return;
+      if (document.activeElement === paper) return;
+      if (bar.contains(document.activeElement)) return;
+      setFmtBarVisible(false);
+    }, 0);
+  });
+
+  const onVV = () => syncFmtBarInset();
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", onVV);
+    window.visualViewport.addEventListener("scroll", onVV);
+  }
+  window.addEventListener("resize", onVV);
+  syncFmtBarInset();
+})();
+
 if (/^https?:$/.test(location.protocol) && "serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
 }
+
 
 route();
 state.weekStart = mondayOf(state.selectedDate ? parseDate(state.selectedDate) : new Date());
 loadPlan().catch(() => {});
 if (isCaptureHash()) {
   openCaptureNote().catch((e) => setStatus(String(e && e.message || e), "error"));
+} else if (isPlanHash()) {
+  openPlanNote().catch((e) => setStatus(String(e && e.message || e), "error"));
 } else if (currentView() === "today") {
   loadWeek(state.weekStart).catch((e) => setStatus(String(e.message), "error"));
 }

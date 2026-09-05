@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AidanOS — local-only. Binds 127.0.0.1 only.
+ * AidanOS — local by default (127.0.0.1). Set AIDANOS_HOST=0.0.0.0 for LAN/phone.
  * Vault: AIDANOS_VAULT, or sibling vault/ beside this server.
  * On the Mac the vault is the parent (~/Grok/motorunit).
  * Never copy this folder's vault/ over that one.
@@ -15,7 +15,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VAULT = path.resolve(process.env.AIDANOS_VAULT || path.join(__dirname, "vault"));
 const PUBLIC = __dirname;
 const PORT = Number(process.env.PORT) || 3847;
-const HOST = "127.0.0.1";
+const HOST = process.env.AIDANOS_HOST || "127.0.0.1";
 const DAY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.md$/;
 const MTIME_SKEW_MS = 1;
 const lastSelfWrites = new Map();
@@ -292,6 +292,19 @@ async function atomicWriteFile(filePath, markdown) {
 
 function atomicWriteDay(logPath, markdown) {
   return atomicWriteFile(logPath, markdown);
+}
+
+
+function normalizeSeasonPlanMarkdown(md) {
+  let s = String(md ?? "").replace(/\r\n/g, "\n");
+  s = s.replace(/^(\s*)[-*+]\s+\[[ xX]\]\s+(#{1,6}\s+)/gm, "$1$2");
+  s = s.replace(/^Sit:\s*stay on plan\.\s*$/gmi, "");
+  if (s.startsWith("---\n")) {
+    s = s.replace(/^(---\n[\s\S]*?\S)---(\n)/, "$1\n---$2");
+  }
+  // collapse extra blank lines from Sit: strip
+  s = s.replace(/\n{3,}/g, "\n\n");
+  return s;
 }
 
 function kernelRel(rel) {
@@ -593,7 +606,8 @@ const server = http.createServer(async (req, res) => {
       if (!String(relPath).endsWith(".md")) {
         return json(res, 400, { error: "markdown only" });
       }
-      if (kernelRel(relPath)) {
+      // Season Plan is editable paper; other aidanos/* stay kernel-locked
+      if (kernelRel(relPath) && relPath !== "aidanos/active-horse.md") {
         return json(res, 400, { error: "kernel path" });
       }
       const incoming = await readBody(req);
@@ -603,7 +617,10 @@ const server = http.createServer(async (req, res) => {
       } catch {
         body = incoming;
       }
-      const markdown = dayMarkdownFromBody(body);
+      let markdown = dayMarkdownFromBody(body);
+      if (relPath === "aidanos/active-horse.md") {
+        markdown = normalizeSeasonPlanMarkdown(markdown);
+      }
       const clientMtime = body && typeof body === "object" && body.mtime != null
         ? Number(body.mtime)
         : NaN;
@@ -766,6 +783,9 @@ const server = http.createServer(async (req, res) => {
       ".css": "text/css; charset=utf-8",
       ".svg": "image/svg+xml",
       ".json": "application/json",
+      ".webmanifest": "application/manifest+json",
+      ".png": "image/png",
+      ".ico": "image/x-icon",
     };
     return sendFile(res, full, types[ext] || "application/octet-stream");
   } catch (err) {
@@ -778,5 +798,6 @@ startLogWatch();
 server.listen(PORT, HOST, () => {
   console.log(`AidanOS`);
   console.log(`  vault: ${VAULT}`);
-  console.log(`  open:  http://${HOST}:${PORT}`);
+  console.log(`  host:  ${HOST}`);
+  console.log(`  open:  http://${HOST === "0.0.0.0" ? "127.0.0.1" : HOST}:${PORT}`);
 });

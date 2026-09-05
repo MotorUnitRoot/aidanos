@@ -689,6 +689,13 @@ function isCaptureHash() {
   return (location.hash || "").replace(/^#/, "") === "capture";
 }
 
+function setCaptureHash() {
+  const next = location.pathname + location.search + "#capture";
+  if (location.hash !== "#capture") {
+    history.replaceState(null, "", next);
+  }
+}
+
 function notePaperTitle(doc) {
   const rel = String((doc && doc.path) || "").replace(/\\/g, "/");
   return wikiNoteTitle(rel);
@@ -749,7 +756,8 @@ function putRawDay(date, markdown, mtime) {
   });
 }
 
-async function openDay(date, { silent = false } = {}) {
+async function openDay(date, { silent = false, force = false } = {}) {
+  if (!force && (isCaptureHash() || isCaptureDoc())) return;
   const gen = ++state.openDayGen;
   flushActiveLineToDump();
   const dump = $("dump");
@@ -1506,8 +1514,9 @@ async function saveDay({ keepalive = false } = {}) {
 
 function currentView() {
   let h = (location.hash || "").replace(/^#/, "");
-  if (h === "day" || h === "today" || h === "capture") return "today";
+  if (h === "day") return "today";
   if (h === "plan") return "plan";
+  if (h === "today" || h === "capture") return "today";
   return "door";
 }
 
@@ -1537,15 +1546,11 @@ function showView(view) {
 }
 
 function route() {
-  if (isCaptureHash()) {
-    if (!isCaptureDoc()) {
-      openCaptureNote().catch((err) => setStatus(String(err && err.message || err), "error"));
-      return;
-    }
-    showView("today");
-    return;
+  const view = currentView();
+  showView(view);
+  if (isCaptureHash() && !isCaptureDoc()) {
+    openCaptureNote().catch((e) => setStatus(String(e && e.message || e), "error"));
   }
-  showView(currentView());
 }
 
 function planScreenTitle(h) {
@@ -1703,14 +1708,16 @@ async function openVaultNote(rel) {
     mtime: Number(data.mtime) || 0,
   };
   resetPaperHistory(paperHistory);
-  // replaceState avoids hashchange→openDay racing past the note paint
-  const wantHash = isCaptureDoc() ? "#capture" : "#today";
-  if (location.hash !== wantHash) {
-    history.replaceState(null, "", location.pathname + location.search + wantHash);
+  // Capture uses its own hash so Today loadWeek/openDay cannot steal it
+  if (isCaptureDoc()) {
+    setCaptureHash();
+  } else if (location.hash !== "#today") {
+    history.replaceState(null, "", location.pathname + location.search + "#today");
   }
   showView("today");
   renderNote();
   if (isCaptureDoc()) {
+    document.body.classList.add("doc-note", "doc-capture");
     const days = $("days");
     if (days) days.innerHTML = "";
   } else {
@@ -2636,16 +2643,57 @@ async function goToday() {
   await landMapNextStepsOnToday();
   await leaveCurrentPaper();
   state.doc = null;
+  state.openDayGen++;
   if (location.hash !== "#today") location.hash = "today";
-  showView("today");
-  openDay(todayIso());
+  else showView("today");
+  openDay(todayIso(), { force: true });
 }
 
-async function openCaptureNote() {
-  if (!isCaptureHash()) {
-    history.replaceState(null, "", location.pathname + location.search + "#capture");
+document.querySelectorAll("a[href='#today']").forEach((a) => {
+  a.addEventListener("click", (e) => {
+    e.preventDefault();
+    goToday();
+  });
+});
+$("door-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const input = $("door-input");
+  const raw = input ? input.value : "";
+  if (!String(raw || "").trim()) {
+    hideDoorProposals();
+    goToday();
+    return;
   }
+  const landed = await landDoorQueryOnToday(raw);
+  if (landed) {
+    if (input) input.value = "";
+    hideDoorProposals();
+    goToday();
+    return;
+  }
+  const lines = proposeDoorLines(raw);
+  if (lines.length) {
+    paintDoorProposals(lines);
+    return;
+  }
+  if (input) input.value = "";
+  hideDoorProposals();
+  goToday();
+});
+
+async function openCaptureNote() {
   const path = "Capture.md";
+  // Paint Capture immediately so phone never flashes Today chrome
+  state.openDayGen++;
+  state.day = null;
+  state.doc = { kind: "note", path: path, markdown: "", mtime: 0 };
+  state.selectedDate = null;
+  setCaptureHash();
+  showView("today");
+  renderNote();
+  document.body.classList.add("doc-note", "doc-capture");
+  const days0 = $("days");
+  if (days0) days0.innerHTML = "";
   try {
     const got = await fetch("/api/file?path=" + encodeURIComponent(path));
     if (got.status === 404) {
@@ -2692,52 +2740,37 @@ async function openCaptureNote() {
   }
 }
 
-document.querySelectorAll("a[href='#today']").forEach((a) => {
-  a.addEventListener("click", (e) => {
-    e.preventDefault();
-    goToday();
-  });
-});
-$("door-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const input = $("door-input");
-  const raw = input ? input.value : "";
-  if (!String(raw || "").trim()) {
-    hideDoorProposals();
-    goToday();
-    return;
-  }
-  const landed = await landDoorQueryOnToday(raw);
-  if (landed) {
-    if (input) input.value = "";
-    hideDoorProposals();
-    goToday();
-    return;
-  }
-  const lines = proposeDoorLines(raw);
-  if (lines.length) {
-    paintDoorProposals(lines);
-    return;
-  }
-  if (input) input.value = "";
-  hideDoorProposals();
-  goToday();
-});
-
 $("door-skip").addEventListener("click", () => {
   const input = $("door-input");
   if (input) input.value = "";
   hideDoorProposals();
   goToday();
 });
-$("door-capture").addEventListener("click", (e) => {
-  e.preventDefault();
-  e.stopPropagation();
-  const input = $("door-input");
-  if (input) input.value = "";
-  hideDoorProposals();
-  openCaptureNote().catch((err) => setStatus(String(err && err.message || err), "error"));
-});
+(function wireDoorCapture() {
+  const cap = $("door-capture");
+  if (!cap) return;
+  let last = 0;
+  const run = (e) => {
+    const now = Date.now();
+    if (now - last < 450) {
+      if (e) { e.preventDefault(); e.stopPropagation(); }
+      return;
+    }
+    last = now;
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    const input = $("door-input");
+    if (input) input.value = "";
+    hideDoorProposals();
+    openCaptureNote().catch((err) => setStatus(String(err && err.message || err), "error"));
+  };
+  cap.addEventListener("click", run);
+  cap.addEventListener("pointerup", (e) => {
+    if (e.pointerType === "touch" || e.pointerType === "pen") run(e);
+  });
+})();
 $("door-accept").addEventListener("click", async () => {
   if (!doorProposed.length) return;
   const date = todayIso();
@@ -2847,6 +2880,8 @@ if (/^https?:$/.test(location.protocol) && "serviceWorker" in navigator) {
 route();
 state.weekStart = mondayOf(state.selectedDate ? parseDate(state.selectedDate) : new Date());
 loadPlan().catch(() => {});
-if (currentView() === "today") {
+if (isCaptureHash()) {
+  openCaptureNote().catch((e) => setStatus(String(e && e.message || e), "error"));
+} else if (currentView() === "today") {
   loadWeek(state.weekStart).catch((e) => setStatus(String(e.message), "error"));
 }

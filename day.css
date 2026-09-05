@@ -46,6 +46,12 @@ body.view-door.day-page {
   padding: 1.5rem;
   background: #000;
 }
+.door-only form {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
 .door-only {
   width: min(38rem, 92vw);
   display: flex;
@@ -848,6 +854,8 @@ body.view-plan.day-page {
     min-height: 44px;
     font-size: 0.95rem;
     padding: 0.5rem 0.55rem;
+    position: relative;
+    z-index: 2;
   }
   .door-decide {
     width: 100%;

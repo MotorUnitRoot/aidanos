@@ -365,11 +365,16 @@ body.view-today.day-page {
   padding: 0.15rem 0 3rem;
   -webkit-user-select: text;
   user-select: text;
+  position: relative;
 }
 .paper.is-empty:before {
   content: attr(data-placeholder);
   color: var(--faint);
   pointer-events: none;
+  position: absolute;
+  left: 0;
+  top: 0.15rem;
+  z-index: 1;
 }
 .md-line.md-front { display: none; }
 .md-line {
@@ -952,13 +957,21 @@ body.doc-capture .today-left {
     display: flex !important;
     flex-direction: column !important;
   }
-  body.doc-capture .today-rail {
+  body.doc-capture .week-row,
+  body.doc-capture .week-arrows,
+  body.doc-capture .day-shift,
+  body.doc-capture .rail-toggle,
+  body.doc-capture .today-rail,
+  body.doc-capture .month-grid,
+  body.doc-capture #timeline {
     display: none !important;
     flex: 0 !important;
     min-height: 0 !important;
     max-height: 0 !important;
+    height: 0 !important;
     overflow: hidden !important;
     padding: 0 !important;
+    margin: 0 !important;
     border: 0 !important;
   }
 }

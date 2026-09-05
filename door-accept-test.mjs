@@ -58,8 +58,39 @@ check("Capture thoughts calls openCaptureNote", () => {
   );
   assert(src.includes("async function openCaptureNote("), "openCaptureNote exists");
   assert(capture.includes("openCaptureNote()"), "Capture thoughts openCaptureNote");
+  assert(capture.includes("preventDefault()"), "Capture click preventDefault");
+  assert(capture.includes("stopPropagation()"), "Capture click stopPropagation");
   assert(!capture.includes("goToday()"), "Capture does not goToday");
   assert(capture.includes("hideDoorProposals()"), "Capture hides proposals");
+});
+
+check("Capture is not stolen back to Today", () => {
+  const open = src.slice(src.indexOf("async function openVaultNote("), src.indexOf("async function openVaultSearchHit("));
+  assert(open.includes("const noteGen = ++state.openDayGen"), "openVaultNote bumps openDayGen");
+  assert(open.includes("if (noteGen !== state.openDayGen) return"), "openVaultNote cancels stale fetch");
+  const day = src.slice(src.indexOf("async function openDay("), src.indexOf("function renderDay("));
+  assert(day.includes("if (isNoteDoc()) return;"), "openDay does not wipe a note");
+  const week = src.slice(src.indexOf("async function loadWeek("), src.indexOf("function renderWeek("));
+  assert(week.includes("if (isNoteDoc())"), "loadWeek returns when a note is open");
+  assert(!/if \(inWeek\) await openDay/.test(week.split("if (isNoteDoc())")[0] || ""), "loadWeek does not openDay before the note check");
+});
+
+check("Empty Write. cue and save snapshot stay on Capture", () => {
+  assert(src.includes("function paperHasVisibleText("), "paperHasVisibleText");
+  assert(src.includes("function syncPaperEmptyClass("), "syncPaperEmptyClass");
+  assert(src.includes("function ensureDumpMatchesPaper("), "ensureDumpMatchesPaper");
+  const save = src.slice(src.indexOf("async function saveDay("), src.indexOf("function currentView("));
+  assert(save.indexOf("const snap = paperSaveSnapshot()") > save.indexOf("const run = async ()"), "saveDay snapshots inside the chain");
+  assert(!src.includes('classList.remove("is-empty")'), "focus does not drop is-empty");
+  assert(/position:\s*relative/.test(css.slice(css.indexOf(".paper {"), css.indexOf(".paper {") + 280)), "paper is relative");
+  const cue = css.slice(css.indexOf(".paper.is-empty:before"), css.indexOf(".paper.is-empty:before") + 220);
+  assert(/position:\s*absolute/.test(cue), "Write. cue is absolute");
+  assert(/z-index:\s*1/.test(cue), "Write. cue sits over the seed line");
+  const phone = css.slice(css.lastIndexOf("@media (max-width: 720px)"));
+  assert(phone.includes("body.doc-capture .week-row"), "phone hides week-row on Capture");
+  assert(phone.includes("body.doc-capture .today-rail"), "phone hides today-rail on Capture");
+  assert(phone.includes("body.doc-capture .day-shift"), "phone hides day-shift on Capture");
+  assert(phone.includes("body.doc-capture #timeline"), "phone hides timeline on Capture");
 });
 
 check("Door actions row and Capture chrome locks", () => {

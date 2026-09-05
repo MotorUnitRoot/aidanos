@@ -504,13 +504,25 @@ function syncDumpFromPaper() {
   return dump;
 }
 
+function paperHasVisibleText() {
+  const dump = $("dump");
+  if (dump && String(dump.value || "").trim()) return true;
+  return paperLines().some((n) => String(lineMarkdown(n) || "").trim());
+}
+
+function syncPaperEmptyClass() {
+  const paper = $("paper");
+  if (!paper) return;
+  paper.classList.toggle("is-empty", !paperHasVisibleText());
+}
+
 function paintPaper() {
   const paper = $("paper");
   const dump = $("dump");
   if (!paper || !dump) return;
   painting = true;
   paper.innerHTML = formatPaper(dump.value);
-  paper.classList.toggle("is-empty", !String(dump.value || "").trim());
+  syncPaperEmptyClass();
   state.activeLine = -1;
   painting = false;
 }
@@ -523,7 +535,7 @@ function paintPaperAt(activeIndex, caretInLine) {
   const gen = ++keepPaperFocusGen;
   painting = true;
   paper.innerHTML = formatPaper(dump.value, activeIndex);
-  paper.classList.toggle("is-empty", !String(dump.value || "").trim());
+  syncPaperEmptyClass();
   state.activeLine = activeIndex;
   paper.focus();
   const el = paperLines()[activeIndex];
@@ -688,6 +700,13 @@ async function leaveCurrentPaper() {
 async function loadWeek(start) {
   state.weekStart = start;
   state.week = await api("/api/week?start=" + start);
+  if (isNoteDoc()) {
+    if (isCaptureDoc()) {
+      const days = $("days");
+      if (days) days.innerHTML = "";
+    }
+    return;
+  }
   const want = state.selectedDate || todayIso();
   const inWeek = state.week.days.some((d) => d.date === want);
   if (inWeek) await openDay(want, { silent: true });
@@ -742,6 +761,8 @@ async function openDay(date, { silent = false } = {}) {
   try {
     const day = await api("/api/day?date=" + date);
     if (gen !== state.openDayGen) return;
+    // Note (Capture) opened while we were fetching — do not steal
+    if (isNoteDoc()) return;
     state.doc = null;
     state.day = {
       date: day.date || date,
@@ -1213,6 +1234,31 @@ async function renderMonth() {
   });
 }
 
+function ensureDumpMatchesPaper() {
+  const dump = $("dump");
+  const paper = $("paper");
+  if (!dump || !paper) return dump;
+  flushActiveLineToDump();
+  const nodes = paperLines();
+  let rebuilt = "";
+  if (nodes.length) {
+    rebuilt = cleanPaperMarkdown(nodes.map(lineMarkdown).join("\n"));
+  } else {
+    rebuilt = cleanPaperMarkdown(String(paper.innerText || "").replace(/\u00a0/g, " "));
+  }
+  const dumpTrim = String(dump.value || "").trim();
+  const paperTrim = String(rebuilt || "").trim();
+  if (paperTrim && paperTrim !== dumpTrim && (!dumpTrim || paperTrim.length >= dumpTrim.length)) {
+    dump.value = rebuilt;
+  }
+  if (state.day) {
+    state.day.paper = dump.value;
+    state.day.markdown = dump.value;
+  }
+  if (isNoteDoc() && state.doc) state.doc.markdown = dump.value;
+  return dump;
+}
+
 function scheduleSave() {
   if (applyingDragSave) return;
   state.dirty = true;
@@ -1311,6 +1357,7 @@ function applyRemoteNote(body) {
 
 let saveChain = Promise.resolve();
 function paperSaveSnapshot() {
+  ensureDumpMatchesPaper();
   const dump = $("dump");
   if (isNoteDoc()) {
     const markdown = cleanPaperMarkdown(dump ? dump.value : String(state.doc.markdown || ""));
@@ -1337,8 +1384,8 @@ function paperSaveSnapshot() {
   return null;
 }
 async function saveDay({ keepalive = false } = {}) {
-  const snap = paperSaveSnapshot();
   const run = async () => {
+    const snap = paperSaveSnapshot();
     if (!snap) {
       setStatus("");
       return;
@@ -1631,9 +1678,12 @@ async function openVaultNote(rel) {
   }
   closeAsk();
   setStatus("Loading");
-  const same = isNoteDoc() && state.doc.path === path;
+  const same = isNoteDoc() && state.doc && state.doc.path === path;
   if (!same) await leaveCurrentPaper();
+  // Cancel any in-flight openDay/loadWeek so Capture is not stolen back to Today
+  const noteGen = ++state.openDayGen;
   const data = await api("/api/file?path=" + encodeURIComponent(path));
+  if (noteGen !== state.openDayGen) return;
   state.day = null;
   state.doc = {
     kind: "note",
@@ -1916,6 +1966,8 @@ function syncPaperFromEdit(e) {
     caret: paperCaret.caret,
   }, { kind: "type", coalesce: true });
   if (idx >= 0 && el) writeDumpLine(idx, lineMarkdown(el));
+  else ensureDumpMatchesPaper();
+  syncPaperEmptyClass();
   scheduleSave();
   renderRail();
   if (idx >= 0) paintPaperAt(idx, caret);
@@ -1926,12 +1978,13 @@ $("paper").addEventListener("focus", () => {
   if (!paperLines().length) {
     painting = true;
     $("paper").innerHTML = formatOneLine("", true);
-    $("paper").classList.remove("is-empty");
     state.activeLine = 0;
     placeCaret(paperLines()[0], 0);
     painting = false;
+    syncPaperEmptyClass();
     return;
   }
+  syncPaperEmptyClass();
   revealActiveLine();
 });
 $("paper").addEventListener("blur", () => {
@@ -2632,8 +2685,27 @@ async function openCaptureNote() {
     return;
   }
   await openVaultNote(path);
+  const dump = $("dump");
   const paper = $("paper");
-  if (paper) paper.focus();
+  if (dump && !String(dump.value || "").trim()) {
+    dump.value = "";
+    if (state.doc) state.doc.markdown = "";
+    paintPaper();
+  }
+  if (paper) {
+    // Seed a caret line without clearing the empty “Write.” cue
+    if (!paperLines().length) {
+      painting = true;
+      paper.innerHTML = formatOneLine("", true);
+      state.activeLine = 0;
+      painting = false;
+    }
+    syncPaperEmptyClass();
+    paper.focus();
+    const line = paperLines()[0];
+    if (line) placeCaret(line, 0);
+    syncPaperEmptyClass();
+  }
 }
 
 $("door-skip").addEventListener("click", () => {
@@ -2642,11 +2714,13 @@ $("door-skip").addEventListener("click", () => {
   hideDoorProposals();
   goToday();
 });
-$("door-capture").addEventListener("click", () => {
+$("door-capture").addEventListener("click", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
   const input = $("door-input");
   if (input) input.value = "";
   hideDoorProposals();
-  openCaptureNote();
+  openCaptureNote().catch((err) => setStatus(String(err && err.message || err), "error"));
 });
 $("door-accept").addEventListener("click", async () => {
   if (!doorProposed.length) return;

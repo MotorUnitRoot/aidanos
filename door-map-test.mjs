@@ -21,7 +21,9 @@ assert(!skip.includes("landDoorQueryOnToday"), "empty Get to Work does not land 
 assert(!skip.includes("proposeDoorLines"), "Get to Work does not invent tasks");
 assert(src.includes('$("door-capture").addEventListener("click"'), "Capture thoughts exists");
 const capture = src.slice(src.indexOf('$("door-capture")'), src.indexOf('$("door-accept")'));
-assert(capture.includes("goToday()"), "Capture thoughts opens today");
+assert(src.includes("async function openCaptureNote("), "openCaptureNote exists");
+assert(capture.includes("openCaptureNote()"), "Capture thoughts opens Capture.md");
+assert(!capture.includes("goToday()"), "Capture thoughts does not goToday");
 assert(!capture.includes("landDoorQueryOnToday"), "Capture thoughts does not land maps");
 console.log("pass  Door map path, empty Get to Work stays empty");
 

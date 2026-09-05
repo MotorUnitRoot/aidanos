@@ -51,13 +51,26 @@ check("Get to Work and Capture thoughts are hairline-button", () => {
   }
 });
 
-check("Capture thoughts calls goToday", () => {
+check("Capture thoughts calls openCaptureNote", () => {
   const capture = doorBlock(
     '$("door-capture").addEventListener("click"',
     '$("door-accept").addEventListener("click"'
   );
-  assert(capture.includes("goToday()"), "Capture thoughts goToday");
+  assert(src.includes("async function openCaptureNote("), "openCaptureNote exists");
+  assert(capture.includes("openCaptureNote()"), "Capture thoughts openCaptureNote");
+  assert(!capture.includes("goToday()"), "Capture does not goToday");
   assert(capture.includes("hideDoorProposals()"), "Capture hides proposals");
+});
+
+check("Door actions row and Capture chrome locks", () => {
+  assert(html.includes('class="door-actions"'), "index wraps buttons in door-actions");
+  assert(css.includes(".door-actions {"), "day.css has .door-actions");
+  assert(/flex-direction:\s*row/.test(css.slice(css.indexOf(".door-actions {"), css.indexOf(".door-actions {") + 220)), "door-actions is a row");
+  assert(css.includes("body.doc-capture"), "day.css has body.doc-capture");
+  const show = src.slice(src.indexOf("function showView("), src.indexOf("function route("));
+  assert(show.includes("!isNoteDoc()"), "showView must not openDay when isNoteDoc");
+  const open = src.slice(src.indexOf("async function openVaultNote("), src.indexOf("async function openVaultSearchHit("));
+  assert(open.includes("history.replaceState"), "openVaultNote uses replaceState for #today");
 });
 
 check("day.css hairline-button is a 1px solid square", () => {

@@ -162,16 +162,19 @@ check("Door UI paints proposals, no Mark / horse", () => {
   assert(!/\bhorse\b/i.test(doorCss) && !/\bMark\b/.test(doorCss), "Door CSS never says horse or Mark");
 });
 
-check("Capture thoughts mirrors empty Get to Work", () => {
+check("Capture thoughts opens a blank Capture note", () => {
   assert(html.includes('id="door-capture"'), "capture id");
   assert(html.includes(">Get to Work<"), "Get to Work label");
   assert(html.includes(">Capture thoughts<"), "Capture thoughts label");
   assert(html.includes('class="hairline-button"'), "hairline-button class");
+  assert(html.includes('class="door-actions"'), "side-by-side wrapper");
   const capture = doorBlock(
     '$("door-capture").addEventListener("click"',
     '$("door-accept").addEventListener("click"'
   );
-  assert(capture.includes("goToday()"), "Capture goToday");
+  assert(src.includes("async function openCaptureNote("), "openCaptureNote exists");
+  assert(capture.includes("openCaptureNote()"), "Capture openCaptureNote");
+  assert(!capture.includes("goToday()"), "Capture does not goToday");
   assert(capture.includes("hideDoorProposals()"), "Capture hides");
   assert(!/dump\.value\s*=/.test(capture), "Capture must not write dump");
 });

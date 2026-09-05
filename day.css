@@ -112,6 +112,26 @@ body.view-door.day-page {
   outline: 1px solid #d4cbb8;
   outline-offset: 2px;
 }
+.door-actions {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: stretch;
+  justify-content: center;
+  gap: 0.65rem;
+  width: 100%;
+  max-width: 28rem;
+  box-sizing: border-box;
+}
+.door-actions .hairline-button {
+  flex: 1 1 0;
+  width: auto !important;
+  max-width: none;
+  min-width: 0;
+  text-align: center;
+  white-space: nowrap;
+  box-sizing: border-box;
+}
 .door-skip {
   /* alias kept for older tests; same hairline */
   display: inline-block;
@@ -783,5 +803,62 @@ body.view-plan.day-page {
   .today-rail {
     border-top: 1px solid var(--border-strong);
     min-height: 22rem;
+  }
+}
+
+@media (max-width: 720px) {
+  .door-only .door-actions {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    justify-content: center;
+    gap: 0.5rem;
+    width: 100%;
+    max-width: 100%;
+  }
+  .door-only .door-actions .hairline-button,
+  .door-only .door-actions .door-skip {
+    width: auto !important;
+    max-width: none;
+    flex: 1 1 0;
+    min-height: 44px;
+    font-size: 0.95rem;
+    padding: 0.5rem 0.55rem;
+  }
+}
+
+/* Capture thoughts: blank note paper, no Today week/agenda chrome */
+body.doc-capture .week-row,
+body.doc-capture .week-arrows,
+body.doc-capture .day-shift,
+body.doc-capture .rail-toggle,
+body.doc-capture .today-rail,
+body.doc-capture .month-grid,
+body.doc-capture #timeline {
+  display: none !important;
+}
+body.doc-capture .today-room {
+  grid-template-columns: minmax(0, 1fr) !important;
+  display: block !important;
+}
+body.doc-capture .today-left {
+  border-right: 0;
+  height: 100%;
+  max-height: 100dvh;
+}
+@media (max-width: 720px) {
+  body.doc-capture .today-room {
+    display: flex !important;
+    flex-direction: column !important;
+  }
+  body.doc-capture .today-rail {
+    display: none !important;
+    flex: 0 !important;
+    min-height: 0 !important;
+    max-height: 0 !important;
+    overflow: hidden !important;
+    padding: 0 !important;
+    border: 0 !important;
   }
 }

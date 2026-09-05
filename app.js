@@ -619,6 +619,10 @@ function isNoteDoc() {
   return !!(state.doc && state.doc.kind === "note");
 }
 
+function isCaptureDoc() {
+  return isNoteDoc() && /^Capture\.md$/i.test(String(state.doc && state.doc.path || ""));
+}
+
 function notePaperTitle(doc) {
   const rel = String((doc && doc.path) || "").replace(/\\/g, "/");
   return wikiNoteTitle(rel);
@@ -725,7 +729,7 @@ async function openDay(date, { silent = false } = {}) {
 function renderDay() {
   const d = state.day;
   if (!d) return;
-  document.body.classList.remove("doc-note");
+  document.body.classList.remove("doc-note", "doc-capture");
   $("paper-title").textContent = formatPaperTitle(d.date);
   $("rail-date").textContent = formatRailDate(d.date);
   const dump = $("dump");
@@ -1383,7 +1387,8 @@ function currentView() {
 
 function showView(view) {
   if (!PAGE_VIEWS.includes(view)) view = "door";
-  document.body.className = "day-page view-" + view + (isNoteDoc() ? " doc-note" : "");
+  if (isNoteDoc() && view !== "today") leaveCurrentPaper().catch(() => {});
+  document.body.className = "day-page view-" + view + (isNoteDoc() ? " doc-note" : "") + (isCaptureDoc() ? " doc-capture" : "");
   PAGE_VIEWS.forEach((v) => {
     const el = $("view-" + v);
     if (!el) return;
@@ -1397,7 +1402,7 @@ function showView(view) {
   }
   if (view === "today") {
     startDayWatch();
-    if (!state.selectedDate) openDay(todayIso());
+    if (!state.selectedDate && !isNoteDoc()) openDay(todayIso());
   } else stopDayWatch();
   if (view === "door") {
     const input = $("door-input");
@@ -1529,6 +1534,7 @@ function renderNote() {
   const doc = state.doc;
   if (!doc || doc.kind !== "note") return;
   document.body.classList.add("doc-note");
+  document.body.classList.toggle("doc-capture", /^Capture\.md$/i.test(String(doc.path || "")));
   const title = notePaperTitle(doc);
   if ($("paper-title")) $("paper-title").textContent = title;
   if ($("rail-date")) $("rail-date").textContent = title;
@@ -1548,10 +1554,6 @@ async function openVaultNote(rel) {
     return;
   }
   closeAsk();
-  if (currentView() !== "today") {
-    if (location.hash !== "#today") location.hash = "today";
-    else showView("today");
-  }
   setStatus("Loading");
   const same = isNoteDoc() && state.doc.path === path;
   if (!same) await leaveCurrentPaper();
@@ -1564,8 +1566,18 @@ async function openVaultNote(rel) {
     mtime: Number(data.mtime) || 0,
   };
   resetPaperHistory(paperHistory);
+  // replaceState avoids hashchange→openDay racing past the note paint
+  if (location.hash !== "#today") {
+    history.replaceState(null, "", location.pathname + location.search + "#today");
+  }
+  showView("today");
   renderNote();
-  renderWeek();
+  if (isCaptureDoc()) {
+    const days = $("days");
+    if (days) days.innerHTML = "";
+  } else {
+    renderWeek();
+  }
   setStatus("");
 }
 
@@ -2462,6 +2474,35 @@ $("door-form").addEventListener("submit", (e) => {
   hideDoorProposals();
   goToday();
 });
+async function openCaptureNote() {
+  const path = "Capture.md";
+  try {
+    const got = await fetch("/api/file?path=" + encodeURIComponent(path));
+    if (got.status === 404) {
+      const put = await fetch("/api/file?path=" + encodeURIComponent(path), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ markdown: "", paper: "", mtime: 0 }),
+      });
+      if (!put.ok) {
+        const err = await put.json().catch(() => ({}));
+        setStatus(String(err.error || put.statusText), "error");
+        return;
+      }
+    } else if (!got.ok) {
+      const err = await got.json().catch(() => ({}));
+      setStatus(String(err.error || got.statusText), "error");
+      return;
+    }
+  } catch (e) {
+    setStatus(String(e.message || e), "error");
+    return;
+  }
+  await openVaultNote(path);
+  const paper = $("paper");
+  if (paper) paper.focus();
+}
+
 $("door-skip").addEventListener("click", () => {
   const input = $("door-input");
   if (input) input.value = "";
@@ -2472,7 +2513,7 @@ $("door-capture").addEventListener("click", () => {
   const input = $("door-input");
   if (input) input.value = "";
   hideDoorProposals();
-  goToday();
+  openCaptureNote();
 });
 $("door-accept").addEventListener("click", async () => {
   if (!doorProposed.length) return;

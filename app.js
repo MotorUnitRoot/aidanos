@@ -2628,37 +2628,6 @@ async function goToday() {
   showView("today");
   openDay(todayIso());
 }
-document.querySelectorAll("a[href='#today']").forEach((a) => {
-  a.addEventListener("click", (e) => {
-    e.preventDefault();
-    goToday();
-  });
-});
-$("door-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const input = $("door-input");
-  const raw = input ? input.value : "";
-  if (!String(raw || "").trim()) {
-    hideDoorProposals();
-    goToday();
-    return;
-  }
-  const landed = await landDoorQueryOnToday(raw);
-  if (landed) {
-    if (input) input.value = "";
-    hideDoorProposals();
-    goToday();
-    return;
-  }
-  const lines = proposeDoorLines(raw);
-  if (lines.length) {
-    paintDoorProposals(lines);
-    return;
-  }
-  if (input) input.value = "";
-  hideDoorProposals();
-  goToday();
-});
 
 async function openCaptureNote() {
   const path = "Capture.md";
@@ -2707,6 +2676,38 @@ async function openCaptureNote() {
     syncPaperEmptyClass();
   }
 }
+
+document.querySelectorAll("a[href='#today']").forEach((a) => {
+  a.addEventListener("click", (e) => {
+    e.preventDefault();
+    goToday();
+  });
+});
+$("door-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const input = $("door-input");
+  const raw = input ? input.value : "";
+  if (!String(raw || "").trim()) {
+    hideDoorProposals();
+    goToday();
+    return;
+  }
+  const landed = await landDoorQueryOnToday(raw);
+  if (landed) {
+    if (input) input.value = "";
+    hideDoorProposals();
+    goToday();
+    return;
+  }
+  const lines = proposeDoorLines(raw);
+  if (lines.length) {
+    paintDoorProposals(lines);
+    return;
+  }
+  if (input) input.value = "";
+  hideDoorProposals();
+  goToday();
+});
 
 $("door-skip").addEventListener("click", () => {
   const input = $("door-input");

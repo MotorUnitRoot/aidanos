@@ -82,7 +82,8 @@ check("Empty Write. cue and save snapshot stay on Capture", () => {
   const save = src.slice(src.indexOf("async function saveDay("), src.indexOf("function currentView("));
   assert(save.indexOf("const snap = paperSaveSnapshot()") > save.indexOf("const run = async ()"), "saveDay snapshots inside the chain");
   assert(!src.includes('classList.remove("is-empty")'), "focus does not drop is-empty");
-  assert(/position:\s*relative/.test(css.slice(css.indexOf(".paper {"), css.indexOf(".paper {") + 280)), "paper is relative");
+  const paperRule = css.slice(css.indexOf(".paper {"), css.indexOf("}", css.indexOf(".paper {")) + 1);
+  assert(/position:\s*relative/.test(paperRule), "paper is relative");
   const cue = css.slice(css.indexOf(".paper.is-empty:before"), css.indexOf(".paper.is-empty:before") + 220);
   assert(/position:\s*absolute/.test(cue), "Write. cue is absolute");
   assert(/z-index:\s*1/.test(cue), "Write. cue sits over the seed line");

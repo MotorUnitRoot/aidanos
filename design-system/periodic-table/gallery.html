@@ -97,8 +97,7 @@
     }
     .line,
     .area,
-    .choice,
-    .toggle {
+    .choice {
       width: 100%;
       max-width: 100%;
       padding: var(--space-2) 0;
@@ -122,23 +121,56 @@
     .nums {
       font-variant-numeric: tabular-nums;
     }
-    .toggle {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: var(--space-3);
-      color: var(--ink);
-      cursor: pointer;
+    .crumb {
+      color: var(--quiet);
+      line-height: 1.7;
     }
-    .toggle .box {
-      display: inline-flex;
-      width: 1.15em;
-      height: 1.15em;
-      border: var(--line) solid var(--quiet);
-      border-radius: var(--radius);
-      background: var(--ok);
-      border-color: var(--ok);
-      flex: 0 0 auto;
+    .crumb .person {
+      color: var(--ink);
+    }
+    .labels {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+    }
+    .stages {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2) var(--space-3);
+      color: var(--faint);
+    }
+    .stages .now {
+      color: var(--ink);
+    }
+    .child {
+      margin: var(--space-3) 0 0;
+    }
+    .hang {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--space-2);
+      margin: 0 0 var(--space-2);
+      font-size: 1.08rem;
+      line-height: 1.8;
+    }
+    .hang .mark {
+      flex: 0 0 1.25rem;
+      color: var(--faint);
+      text-align: center;
+    }
+    .activity {
+      padding: var(--space-2) 0;
+      border-top: var(--line) solid var(--hairline);
+      color: var(--quiet);
+      line-height: 1.6;
+    }
+    .activity:first-child {
+      border-top: 0;
+      padding-top: 0;
+    }
+    .activity .when {
+      color: var(--faint);
+      font-variant-numeric: tabular-nums;
     }
     .row {
       display: grid;
@@ -299,20 +331,31 @@
     </section>
 
     <section>
-      <h2>Person chip and status mark</h2>
-      <p class="why">A name, not an avatar stack. One word of status, not a colored pill.</p>
+      <h2>Person chip, status mark, place crumb, label chips, and stage steps</h2>
+      <p class="why">A name, not an avatar stack. One word of status, not a colored pill. A quiet parent path with middots. Hairline labels, not tag pills. Process words on paper, not a Path chevron bar.</p>
       <div class="stage">
+        <p class="crumb"><span class="person">maps</span> · <span class="person">file-a-receipt</span></p>
         <div class="who">
           <span class="person">Colby Ricker</span>
           <span class="status">Waiting</span>
           <span class="duration">45 min</span>
+        </div>
+        <div class="labels" style="margin-top: var(--space-3);">
+          <span class="chip">Receipt</span>
+          <span class="chip">Vault</span>
+        </div>
+        <div class="stages" style="margin-top: var(--space-3);">
+          <span>Find</span>
+          <span class="now">File</span>
+          <span>Note</span>
+          <span>Done</span>
         </div>
       </div>
     </section>
 
     <section>
       <h2>Fields</h2>
-      <p class="why">Labeled, text, multiline, choice, date, number, money, and toggle. Same serif. Hairline edges. No rich-text toolbar.</p>
+      <p class="why">Labeled, text, multiline, choice, date, number, money, and lookup. Same serif. Hairline edges. No rich-text toolbar. No standalone toggle. A binary fact uses the checkbox.</p>
       <div class="stage">
         <div class="field">
           <p class="quiet-label">Title</p>
@@ -344,15 +387,17 @@
           <p class="validation">Amount needs a number.</p>
         </div>
         <div class="field">
-          <p class="quiet-label">Filed</p>
-          <div class="toggle"><span>On</span><span class="box" aria-hidden="true"></span></div>
+          <p class="quiet-label">Lookup</p>
+          <input class="line" type="text" value="North Mill" />
+          <p class="why" style="margin: var(--space-2) 0 0;">Commit a wiki link. Not a Lightning popup.</p>
+          <span class="person">North Mill Paper</span>
         </div>
       </div>
     </section>
 
     <section>
-      <h2>List row, line item, filter chip, and table head</h2>
-      <p class="why">A collection on paper. A filter is a word you can dismiss. Columns are quiet labels. Not a list-view chrome.</p>
+      <h2>List row, line item, filter chip, table head, and child list</h2>
+      <p class="why">A collection on paper. A filter is a word you can dismiss. Columns are quiet labels. Sub-work is a hanging list. Not a list-view chrome.</p>
       <div class="stage">
         <div class="chips">
           <span class="chip">Receipt <button type="button" aria-label="Clear">×</button></span>
@@ -382,6 +427,11 @@
           <span class="qty">1</span>
           <span class="amt">$60.00</span>
         </div>
+        <div class="child">
+          <p class="quiet-label">Child list</p>
+          <div class="hang"><span class="mark">•</span><span>Find the receipt</span></div>
+          <div class="hang"><span class="mark">•</span><span>Put it in the vault</span></div>
+        </div>
       </div>
     </section>
 
@@ -401,11 +451,12 @@
     </section>
 
     <section>
-      <h2>Confirm pair, quiet sheet, soft notice, validation, and progress</h2>
-      <p class="why">Two hairline buttons. A panel on the same paper, not a dimmed overlay. A quiet sentence. A count, not a bar.</p>
+      <h2>Confirm pair, quiet sheet, soft notice, activity line, validation, and progress</h2>
+      <p class="why">Two hairline buttons. A panel on the same paper, not a dimmed overlay. A quiet sentence. One chronicle line, not a Chatter feed. A count, not a bar.</p>
       <div class="stage">
         <p class="notice">Saved to the vault.</p>
         <p class="progress">3 of 7 filed</p>
+        <div class="activity"><span class="when">1 Sep</span> · Filed the receipt in the vault.</div>
         <div class="sheet">
           <p>File the original with the note, or leave it on the desk?</p>
           <div class="pair">

@@ -44,7 +44,49 @@ ERP: approval or posting state on a transaction.
 
 Project: issue status.
 
-AidanOS: one word in quiet ink. Not a colored pill. Not a sales path.
+AidanOS: one word in quiet ink. Not a colored pill. Not a sales path. Not a traffic-light.
+
+Mark: Keep
+
+### Place crumb
+
+What it is: the quiet parent path of this work.
+
+CRM: a breadcrumb under the record title.
+
+ERP: a hierarchy above a transaction.
+
+Project: the project and parent above an issue.
+
+AidanOS: wiki links joined by middots on the paper. Not a chevron breadcrumb bar. Not a new page shell.
+
+Mark: Keep
+
+### Label chips
+
+What it is: a few quiet marks that classify the work.
+
+CRM: tags on a record.
+
+ERP: class or category marks.
+
+Project: labels on an issue.
+
+AidanOS: several hairline words. Not colorful tag pills. Not the saved chip. The saved chip stays the reserved Saved word in the nav.
+
+Mark: Keep
+
+### Stage steps
+
+What it is: the ordered words of a process.
+
+CRM: the Path on an opportunity.
+
+ERP: approval steps on a transaction.
+
+Project: a workflow.
+
+AidanOS: ordered process words on paper. The current word is ink. The others are quiet. Salesforce Path chevron bars are refused.
 
 Mark: Keep
 
@@ -148,19 +190,33 @@ AidanOS: an amount on paper. Not a ledger widget. Not a dashboard tile.
 
 Mark: Keep
 
+### Lookup field
+
+What it is: a search that commits a link to another record.
+
+CRM: a Lightning lookup popup.
+
+ERP: a name-field search on a form.
+
+Project: a parent or related-issue picker.
+
+AidanOS: type to find, then commit a wiki link on the paper. Not a Lightning lookup popup. Not a second store of objects.
+
+Mark: Keep
+
 ### Toggle
 
-What it is: on or off.
+What it is: a standalone on-or-off control.
 
-CRM: a checkbox that means a state, not a task.
+CRM: a checkbox or a switch on a record.
 
 ERP: a flag on a form.
 
 Project: a switch such as blocked or done.
 
-AidanOS: on or off as a word or a square. The task checkbox stays the tick on a line of work. This is not an iOS switch.
+AidanOS: do not invent a toggle. A binary fact on paper uses the existing checkbox. This is not its own control.
 
-Mark: Keep
+Mark: Refuse
 
 ### Checkbox
 
@@ -261,6 +317,20 @@ Project: a command or search row.
 AidanOS: the file name is quiet. The title is ink. Opening a hit uses the same paper. Already named in the library.
 
 Mark: Already
+
+### Child list
+
+What it is: sub-work under a parent.
+
+CRM: child records under an account.
+
+ERP: related documents under a master.
+
+Project: sub-tasks under an issue.
+
+AidanOS: a hanging list or list rows on the same paper. That is a composition of the existing library, not a new look. Not a console subtab. Not a related-list chrome.
+
+Mark: Keep
 
 ### Board lane
 
@@ -516,6 +586,20 @@ AidanOS: a quiet sentence on the paper. Not a toast stack. Not a notification be
 
 Mark: Keep
 
+### Activity line
+
+What it is: one chronicle entry.
+
+CRM: a row in Chatter or in an activity timeline.
+
+ERP: a system note on a transaction.
+
+Project: a comment or a change on an issue.
+
+AidanOS: one dated line on the paper. Chatter feed chrome and toast stacks are refused.
+
+Mark: Keep
+
 ### Progress count
 
 What it is: how much of a set is done.
@@ -630,7 +714,19 @@ These jobs are real. The form waits for a later mark. Generation may not invent 
 These never ship. They brand a vendor, force a second store, open a theme shop, or ask for a new page shell.
 
 - Page shell as a new look
-- Salesforce Lightning chrome: app launcher, utility bar, global header, path, highlights card
+- Toggle as its own control
+- Highlights panel chrome
+- Path chevron bar
+- Utility bar
+- Console subtabs
+- Avatar piles
+- Traffic-light status pills
+- App Builder card mosaics
+- Floating action buttons
+- Left icon nav rails
+- Monday rainbow board ornament
+- Lightning button brands
+- Salesforce Lightning chrome: app launcher, global header
 - Theme catalog and skin shop
 - Second store or second database
 - Second typeface for chrome
@@ -639,39 +735,43 @@ These never ship. They brand a vendor, force a second store, open a theme shop, 
 - Side nav of objects
 - Dashboard widgets and portlets
 - Toast stacks and notification bells
-- Avatar stacks and presence
 - Floating chat
 - Dimmed modal as a second room
 - Filter builder as a product
 - Rich-text toolbar as vendor chrome
-- Activity feed as Salesforce activity
+- Chatter feed chrome
 - Settings page of chrome
 
 ## Closed Keep additions
 
-These twenty-four names are the only new jobs generation may assemble. They do not replace the Door, Today, and Plan library.
+These twenty-nine names are the only new jobs generation may assemble. They do not replace the Door, Today, and Plan library. Compositions of that library are rules, not new atoms.
 
 1. Key facts
 2. Person chip
 3. Status mark
-4. Labeled field
-5. Text field
-6. Multiline field
-7. Choice field
-8. Date field
-9. Number field
-10. Money field
-11. Toggle
-12. List row
-13. Line item
-14. Filter chip
-15. Table head
-16. Related strip
-17. Attachment link
-18. Duration mark
-19. Confirm pair
-20. Quiet sheet
-21. Soft notice
-22. Progress count
-23. Validation line
-24. Hairline rule
+4. Place crumb
+5. Label chips
+6. Stage steps
+7. Labeled field
+8. Text field
+9. Multiline field
+10. Choice field
+11. Date field
+12. Number field
+13. Money field
+14. Lookup field
+15. List row
+16. Line item
+17. Filter chip
+18. Table head
+19. Child list
+20. Related strip
+21. Attachment link
+22. Duration mark
+23. Activity line
+24. Confirm pair
+25. Quiet sheet
+26. Soft notice
+27. Progress count
+28. Validation line
+29. Hairline rule

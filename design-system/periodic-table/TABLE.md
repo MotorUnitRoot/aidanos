@@ -342,7 +342,21 @@ ERP: a pipeline board.
 
 Project: a board in Jira, Linear, or Asana.
 
-AidanOS: the job is real. The form is not ready. A generated screen uses a list row and a status mark until a later mark.
+AidanOS: the job is real. The form is not ready. A generated screen uses a list row and a status mark until a later mark. This is an optional later pack, not a new atom now.
+
+Mark: Defer
+
+### Board card
+
+What it is: one card on a board lane.
+
+CRM: a Kanban card.
+
+ERP: a pipeline card.
+
+Project: a card on a Jira, Linear, or Asana board.
+
+AidanOS: the job waits with the board lane. A generated screen uses a list row until a later mark. Do not invent a card chrome.
 
 Mark: Defer
 
@@ -707,6 +721,7 @@ Mark: Refuse
 These jobs are real. The form waits for a later mark. Generation may not invent them.
 
 - Board lane
+- Board card
 - Timeline view
 
 ## Refused

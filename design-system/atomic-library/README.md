@@ -11,9 +11,9 @@ Four layers, and nothing else:
 1. **Foundations** — type roles, space, Stoic color roles, radius, line. Not an elevation catalog. Not a motion catalog.
 2. **Controls** — true atoms. Each row is Keep, Refuse, Already, or System.
 3. **Composition patterns** — named assemblies of atoms already on the list. Not new atoms.
-4. **States** — default, hover, focus, active, disabled, loading, empty, error, selected, dragging.
+4. **States** — default, hover, focus, active, disabled, loading, empty, error, success, selected, dragging, checked, expanded, collapsed.
 
-`TABLE.md` is the closed list. `gallery.html` renders each Keep and Already control as one live strip on Stoic paper. The gallery is atoms, not screens.
+`TABLE.md` is the closed list. Keep is thirty-four atoms. `gallery.html` renders each Keep and Already control as one live strip on Stoic paper. The gallery is atoms, not screens. `PRESSURE.md` marks thirteen ordinary surfaces against this list; all pass without a new Keep atom.
 
 ## How this differs from the snipped draft
 
@@ -36,5 +36,6 @@ The Door prompt bar is the same kernel field. The Door prompt bar with its hairl
 3. Load `../foundations/tokens.css` and `../components/primitives.css` for the kernel look. Match Keep atoms to the gallery strips. Do not invent a look.
 4. Prefer a checkbox to a switch. Prefer a word to a badge, a bar, a ring, or a pile of faces.
 5. Ordinary English names only. No ticket slang.
+6. Read `PRESSURE.md` before inventing a control. Mail, calendar, notes, chat, checkout, settings, admin tables, charts, media, auth, onboarding, file picker, and offline or error all pass. Compose or refuse.
 
 Open `gallery.html` in a browser to mark the atoms. Open `../components/library.html` for the kernel. Patterns in `../patterns/` assemble; they do not invent.

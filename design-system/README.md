@@ -6,7 +6,7 @@ This is the contract last-mile generation obeys, not a shop style guide. AidanOS
 
 Open `components/library.html` and `patterns/` in a browser to see the Door, Today, and Plan parts. Tokens live in `foundations/tokens.css`. The look of each kernel part lives in `components/primitives.css`. Patterns load that file. They do not invent a look.
 
-The atomic library is the closed set of last-mile atoms: foundations, controls, composition patterns, and states. Open `atomic-library/README.md`, `atomic-library/TABLE.md`, and `atomic-library/gallery.html`. A generator may assemble any third-level screen only from that closed set plus the kernel already named in `components/`. It may not invent a control mid-flight.
+The atomic library is the closed set of last-mile atoms: foundations, controls, composition patterns, and states. Open `atomic-library/README.md`, `atomic-library/TABLE.md`, and `atomic-library/gallery.html`. Keep is thirty-four atoms. `atomic-library/PRESSURE.md` marks thirteen ordinary surfaces; all pass without a new Keep atom. A generator may assemble any third-level screen only from that closed set plus the kernel already named in `components/`. It may not invent a control mid-flight.
 
 A closed draft once framed CRM, ERP, and project screen jobs as a table. That pull request (number 7) was snipped. This library is atoms, not jobs. Do not revive that framing.
 

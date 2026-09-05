@@ -116,22 +116,17 @@ True atoms. Each row has one mark.
 | Checkbox row | Keep | The kernel checkbox on a full row. Box is the hit. Words take the caret. |
 | Table head | Keep | Quiet labels over columns. No sort-arrow chrome. No resize handles. |
 | Table cell | Keep | One cell of words or tabular numbers. |
-| Attachment link | Keep | A file name that opens a vault file. Not a Files tab. |
-| Duration mark | Keep | How long, in faint tabular numbers, such as 45 min. |
-| Place crumb | Keep | Parent path as wiki links joined by middots. Not chevron breadcrumbs. |
-| Lookup field | Keep | Type to find, then commit a wiki link. Not a branded popup. |
-| Stage steps | Keep | Ordered process words on paper. Current is ink. Not path chevrons. |
-| Activity line | Keep | One dated line. Not a feed chrome. Not a toast. |
-| Filter chip | Keep | A word that narrows a list. The word is the control. Not a filter builder. |
-| Quiet sheet | Keep | A hairline panel on the same paper. No scrim. Not a second room. |
 | Save state | Already | Use the saved chip. Saving, Saved, or quiet empty. Does not shove the paper. |
 | Switch / toggle | Refuse | A binary fact uses the checkbox. |
-| Slider | Refuse | Use number, money, or duration words. |
+| Slider | Refuse | Use number, money, time, and skip or jump hairline buttons. Not a scrub bar. |
+| Stepper | Refuse | Use number. |
 | Icon-only button | Refuse | Chevrons excepted. Actions have words. |
+| Badge count | Refuse | Use a quiet number or progress fraction. |
 | Progress bar or ring | Refuse | Use progress fraction. |
 | Skeleton shimmer | Refuse | Use empty state or spinner/loading. |
 | Toast stack | Refuse | Use soft notice or page message. |
 | Avatar pile | Refuse | Use person chip. |
+| Presence dot | Refuse | Never. |
 | Traffic-light badge | Refuse | Use status word. |
 | Floating action button | Refuse | Use hairline button. |
 | Left icon nav rail | Refuse | Generated work stays on paper. |
@@ -147,11 +142,15 @@ True atoms. Each row has one mark.
 | Resize handle | Refuse | Never. |
 | Board lane | Defer | Optional later pack. Not closed v1. Use list row and status word. |
 | Board card | Defer | Optional later pack. Not closed v1. Use list row. |
-| Timeline view | Defer | Optional later pack. Not closed v1. Use date, duration, and month day. |
+| Board column | Defer | Same later pack as board lane. |
+| Board slip | Defer | Same later pack as board card. |
+| Timeline view | Defer | Optional later pack. Not closed v1. Use date, duration mark, and month day. |
 
 ### System (not widgets)
 
-Empty Door. Vault as disk. One serif. 42rem centered paper. Stoic tokens. No second store. No theme catalog.
+Empty Door. Vault as disk. One serif. 42rem centered paper. Stoic tokens. No second store. No theme catalog. The operating system file dialog is System. Do not skin it.
+
+Keep is closed at thirty-four atoms. Do not add a Keep atom to cover a surface. Compose, or refuse.
 
 ## Composition patterns
 
@@ -159,12 +158,31 @@ Named assemblies. Not new atoms. Generation may use the name; it must emit only 
 
 | Pattern | Assembles | What it is |
 | --- | --- | --- |
-| Key facts | Quiet label + ink values (title or body) | A short stack of named facts at the top of paper. Not a highlights panel. |
-| Child list | Quiet label + hanging list or list rows | Sub-lines under a parent, on the same paper. |
+| Labeled field | Quiet label + a Keep field | A name over a field. Not its own atom. |
+| Key facts | Quiet label + ink values | A short stack of named facts. Not a highlights panel. |
+| Place crumb | Wiki links + middots | Parent path on paper. Not chevron breadcrumbs. |
+| Related strip | Wiki links in a row | Other notes this one needs. |
+| Association line | Person chip or wiki link + a quiet fact | Who or what this line belongs with. |
+| Activity line | Faint date + body | One dated line. Not a feed chrome. |
+| Log activity | Several activity lines | A short chronicle on the same paper. |
+| Stage steps | Body words; current is ink | Ordered process words. Not path chevrons. |
+| Week cards | Week card + week chevron | The week strip. Already in the kernel. |
+| Prompt bar / actions row | Door prompt bar + hairline buttons | The Door question and its two actions. |
+| Save state | Saved chip | Saving, Saved, or quiet empty. Does not shove the paper. |
+| Lookup field | Search field + search hit + wiki link | Type to find, then commit a wiki link. |
+| Line-item sheet | Quiet sheet + table head + table cell | Header facts and lines on one paper panel. |
+| Data table | Table head + list row or table cell | A register on paper. Not a grid chrome. |
+| Bulk bar | Progress fraction or quiet count + hairline buttons | Work on several rows. Words, not a toolbar island. |
+| Child list | Quiet label + hanging list or list rows | Sub-lines under a parent. |
+| Dependency line | Wiki link + quiet words | This needs that. On the same paper. |
 | Confirm pair | Two hairline buttons | Accept and Reject, or any two uses of the same button. |
-| Prompt bar / actions row | Door prompt bar + hairline buttons | The Door: the question and Get to Work / Capture thoughts on one row of actions. |
-| Labeled field | Quiet label + text input, multiline, number, money, date, time, select, or lookup | A name over a field. Not its own atom. |
-| Checkbox row | Already listed as Keep | Checkbox plus words on one row. Named once so generation does not invent a task chrome. |
+| Confirm destroy | Dialog/confirm panel + confirm pair | A question before a delete. |
+| Settings group | Section head or quiet label + labeled fields | A cluster of settings on paper. |
+| Filter chips row | Chip/tag | One or more hairline words that narrow a list. |
+| Pagination strip | Text link + progress fraction | Previous, Next, and page n of m. For long tables. Not a new atom. |
+| Attachment line | Text link + quiet meta + text link | A vault file name, optional size, and remove. |
+| Quiet sheet | Sheet/drawer on the paper, no scrim | A hairline panel on the same paper. Not a second room. |
+| Duration mark | Faint tabular body | How long, such as 45 min. Not a timesheet widget. |
 
 ## States
 
@@ -180,7 +198,11 @@ One set for the whole product. Not a motion catalog.
 | Loading | Spinner/loading: the word Working. Not a ring. Not shimmer. |
 | Empty | Empty state: Write. Quiet, not an error. |
 | Error | Validation line or page message in `--danger`. One line. Not a toast stack. |
+| Success | Soft notice or saved chip in `--ok`. Not a toast stack. |
 | Selected | `--ink` and `--hairline-strong`. Week card and month day already do this. |
 | Dragging | Drag preview: faded block, dashed strong hairline. |
+| Checked | Checkbox uses `--ok`. |
+| Expanded | A sheet, menu, or popover is open. Same hairline. No new chrome. |
+| Collapsed | The same control is shut. The trigger word remains. |
 
 A checked box uses `--ok`. Saving uses the saved chip and does not shove the paper.

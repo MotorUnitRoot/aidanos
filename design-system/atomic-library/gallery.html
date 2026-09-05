@@ -1065,16 +1065,18 @@
   </section>
 
   <section>
-    <p class="kind">Keep</p>
-    <h2>Attachment link</h2>
-    <p class="why">A file name that opens a vault file.</p>
+    <p class="kind">Composition</p>
+    <h2>Attachment line</h2>
+    <p class="why">A vault file name, optional size, and remove. Text links. Not a new atom.</p>
     <div class="stage">
       <a class="atom-attach" href="#">leave-letter.md</a>
+      <span class="atom-duration"> 24 KB </span>
+      <button type="button" class="text-link">remove</button>
     </div>
   </section>
 
   <section>
-    <p class="kind">Keep</p>
+    <p class="kind">Composition</p>
     <h2>Duration mark</h2>
     <p class="why">How long, in faint tabular numbers.</p>
     <div class="stage">
@@ -1083,7 +1085,7 @@
   </section>
 
   <section>
-    <p class="kind">Keep</p>
+    <p class="kind">Composition</p>
     <h2>Place crumb</h2>
     <p class="why">Parent path as wiki links joined by middots. Not chevron breadcrumbs.</p>
     <div class="stage">
@@ -1092,7 +1094,7 @@
   </section>
 
   <section>
-    <p class="kind">Keep</p>
+    <p class="kind">Composition</p>
     <h2>Lookup field</h2>
     <p class="why">Type to find, then commit a wiki link. Not a branded popup.</p>
     <div class="stage">
@@ -1101,7 +1103,7 @@
   </section>
 
   <section>
-    <p class="kind">Keep</p>
+    <p class="kind">Composition</p>
     <h2>Stage steps</h2>
     <p class="why">Ordered process words on paper. Current is ink. Not path chevrons.</p>
     <div class="stage">
@@ -1114,7 +1116,7 @@
   </section>
 
   <section>
-    <p class="kind">Keep</p>
+    <p class="kind">Composition</p>
     <h2>Activity line</h2>
     <p class="why">One dated line. Not a feed. Not a toast.</p>
     <div class="stage">
@@ -1123,16 +1125,16 @@
   </section>
 
   <section>
-    <p class="kind">Keep</p>
-    <h2>Filter chip</h2>
-    <p class="why">A word that narrows a list. The word is the control.</p>
+    <p class="kind">Composition</p>
+    <h2>Filter chips row</h2>
+    <p class="why">Chip/tag used to narrow a list. Not a new atom.</p>
     <div class="stage">
       <button type="button" class="atom-filter">This week</button>
     </div>
   </section>
 
   <section>
-    <p class="kind">Keep</p>
+    <p class="kind">Composition</p>
     <h2>Quiet sheet</h2>
     <p class="why">A hairline panel on the same paper. No scrim.</p>
     <div class="stage">
@@ -1194,6 +1196,136 @@
       <div class="door-actions" style="margin-top: var(--space-4);">
         <button type="button" class="hairline-button">Get to Work</button>
         <button type="button" class="hairline-button">Capture thoughts</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Labeled field</h2>
+    <p class="why">A quiet label over a Keep field. Not a new atom.</p>
+    <div class="stage">
+      <p class="quiet-label">Hours</p>
+      <input class="atom-line atom-nums" type="text" value="7.5" />
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Related strip</h2>
+    <p class="why">Wiki links in a row. Other notes this one needs.</p>
+    <div class="stage">
+      <a class="wiki" href="#"><span class="brack">[[</span>the-reply<span class="brack">]]</span></a>
+      <span class="atom-status"> · </span>
+      <a class="wiki" href="#"><span class="brack">[[</span>the-receipt<span class="brack">]]</span></a>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Association line</h2>
+    <p class="why">A person chip or wiki link and one quiet fact.</p>
+    <div class="stage">
+      <span class="atom-person">Claire Moss</span>
+      <span class="atom-status"> · Friday</span>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Log activity</h2>
+    <p class="why">Several activity lines. A short chronicle, not a feed.</p>
+    <div class="stage">
+      <div class="atom-activity"><span class="when">5 Sep</span> · Wrote the reply.</div>
+      <div class="atom-activity"><span class="when">4 Sep</span> · Opened the letter.</div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Data table</h2>
+    <p class="why">Table head and a row. Not a grid chrome.</p>
+    <div class="stage">
+      <div class="atom-list-row">
+        <span class="atom-th">Item</span>
+        <span class="atom-th">Hours</span>
+      </div>
+      <div class="atom-list-row">
+        <span>Front desk</span>
+        <span class="meta">4</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Pagination strip</h2>
+    <p class="why">Previous, Next, and page n of m. Text links and a progress fraction. Not a new atom.</p>
+    <div class="stage">
+      <div class="uses">
+        <button type="button" class="text-link">Previous</button>
+        <span class="atom-fraction">page 2 of 6</span>
+        <button type="button" class="text-link">Next</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Bulk bar</h2>
+    <p class="why">A quiet count and hairline buttons. Not a toolbar island.</p>
+    <div class="stage">
+      <div class="uses">
+        <span class="atom-fraction">3 selected</span>
+        <button type="button" class="hairline-button">Move</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Dependency line</h2>
+    <p class="why">This needs that. A wiki link and quiet words.</p>
+    <div class="stage">
+      <span class="atom-status">Needs </span>
+      <a class="wiki" href="#"><span class="brack">[[</span>the-reply<span class="brack">]]</span></a>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Confirm destroy</h2>
+    <p class="why">A dialog and a confirm pair. Not a new atom.</p>
+    <div class="stage">
+      <div class="atom-dialog">
+        <p>Delete this note from the vault?</p>
+        <div class="uses" style="margin-top: var(--space-3);">
+          <button type="button" class="hairline-button">Accept</button>
+          <button type="button" class="hairline-button">Reject</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Settings group</h2>
+    <p class="why">A section head and labeled fields. Not a settings chrome.</p>
+    <div class="stage">
+      <h3 class="atom-section">Hours</h3>
+      <p class="quiet-label">Week starts</p>
+      <input class="atom-line" type="text" value="Monday" />
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Line-item sheet</h2>
+    <p class="why">A quiet sheet with a table head and a cell. Not a sublist chrome.</p>
+    <div class="stage">
+      <div class="atom-quiet-sheet">
+        <span class="atom-th">Item</span>
+        <p class="atom-td">Cream stock</p>
       </div>
     </div>
   </section>

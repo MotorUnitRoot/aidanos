@@ -4,7 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#161513" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="AidanOS" />
   <title>AidanOS</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <link rel="stylesheet" href="/styles.css" />
   <link rel="stylesheet" href="/day.css" />
   <link rel="stylesheet" href="/api/skin.css" />
@@ -33,6 +39,7 @@
         <header class="today-nav">
           <a href="#today" class="text-link is-current">Today</a>
           <a href="#plan" class="text-link">Plan</a>
+          <button type="button" id="toggle-rail" class="text-link rail-toggle" aria-expanded="false">Timeline</button>
           <p id="status" class="status" aria-live="polite"></p>
         </header>
         <section class="week-row" aria-label="Week">
@@ -94,6 +101,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=hairline1" type="module"></script>
+  <script src="/app.js?v=phone1" type="module"></script>
 </body>
 </html>

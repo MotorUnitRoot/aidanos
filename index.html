@@ -1,1 +1,99 @@
-PLACEHOLDER
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark light" />
+  <title>AidanOS</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/day.css" />
+  <link rel="stylesheet" href="/api/skin.css" />
+</head>
+<body class="day-page view-door">
+  <main id="view-door" class="view view-door-screen">
+    <form class="door-only" id="door-form" autocomplete="off">
+      <label class="sr-only" for="door-input">What do you want to do today?</label>
+      <div class="door-bar">
+        <input type="text" id="door-input" name="q" placeholder="What do you want to do today?" maxlength="240" autofocus />
+        <button type="submit" class="door-return" aria-label="Enter">&#8629;</button>
+      </div>
+      <div id="door-proposals" class="door-proposals" hidden></div>
+      <div id="door-decide" class="door-decide" hidden>
+        <button type="button" id="door-accept" class="hairline-button">Accept</button>
+        <button type="button" id="door-reject" class="hairline-button">Reject</button>
+      </div>
+      <button type="button" id="door-skip" class="hairline-button">Get to Work</button>
+      <button type="button" id="door-capture" class="hairline-button">Capture thoughts</button>
+    </form>
+  </main>
+
+  <main id="view-today" class="view view-today-screen" hidden>
+    <div class="today-room">
+      <section class="today-left">
+        <header class="today-nav">
+          <a href="#today" class="text-link is-current">Today</a>
+          <a href="#plan" class="text-link">Plan</a>
+          <p id="status" class="status" aria-live="polite"></p>
+        </header>
+        <section class="week-row" aria-label="Week">
+          <div id="days" class="days" role="list"></div>
+          <div class="week-arrows">
+            <button type="button" id="prev-week" class="icon-btn" aria-label="Previous week">&#8249;</button>
+            <button type="button" id="next-week" class="icon-btn" aria-label="Next week">&#8250;</button>
+          </div>
+        </section>
+        <div id="dump-wrap" class="paper-wrap">
+          <div class="paper-head">
+            <h1 id="paper-title" class="paper-title"></h1>
+            <p class="day-shift">
+              <button type="button" id="prev-day" class="text-link" aria-label="Previous day">&#8249;</button>
+              <button type="button" id="next-day" class="text-link" aria-label="Next day">&#8250;</button>
+            </p>
+          </div>
+          <label class="sr-only" for="dump">Today note</label>
+          <textarea id="dump" class="dump-src sr-only" rows="16" placeholder="Write."></textarea>
+          <div id="paper" class="paper" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Today note" data-placeholder="Write."></div>
+        </div>
+        <button type="button" id="ask-open" class="ask-line">
+          <span>Ask or find</span>
+          <span class="ask-x" aria-hidden="true">x</span>
+        </button>
+      </section>
+      <aside class="today-rail" aria-label="Day timeline">
+        <header class="rail-head">
+          <p id="rail-date" class="rail-date"></p>
+          <button type="button" id="toggle-month" class="text-link month-link">Month</button>
+        </header>
+        <div id="month-grid" class="month-grid hidden" hidden></div>
+        <div id="timeline" class="timeline" tabindex="-1"></div>
+      </aside>
+    </div>
+  </main>
+
+  <section id="view-plan" class="view view-plan" hidden>
+    <p class="back"><a href="#today" class="text-link">Today</a></p>
+    <h1 id="plan-title">Plan</h1>
+    <p id="plan-why" class="form-lead"></p>
+    <p class="kicker">Next steps</p>
+    <ol id="plan-steps" class="steps"></ol>
+    <p class="kicker parked-k">Waiting</p>
+    <ul id="plan-parked" class="parked"></ul>
+  </section>
+
+  <div id="ask-modal" class="ask-modal hidden" hidden>
+    <div class="ask-sheet" role="dialog" aria-modal="true" aria-labelledby="ask-heading">
+      <header class="ask-head">
+        <h2 id="ask-heading">Ask or find</h2>
+        <button type="button" id="ask-close" class="text-link" aria-label="Close">x</button>
+      </header>
+      <form id="ask-form" class="ask-form" autocomplete="off">
+        <label class="sr-only" for="ask-q">Ask or find</label>
+        <input type="text" id="ask-q" placeholder="Ask or find" />
+      </form>
+      <ul id="ask-hits" class="ask-hits"></ul>
+    </div>
+  </div>
+
+  <script src="/app.js?v=hairline1" type="module"></script>
+</body>
+</html>

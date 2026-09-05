@@ -2782,8 +2782,8 @@ async function openPlanNote() {
     const days0 = $("days");
     if (days0) days0.innerHTML = "";
     syncTodayNav();
-    const paper = $("paper");
-    if (paper) paper.focus();
+    // Do not auto-focus — format capsule stays hidden until the user taps to type
+    setFmtBarVisible(false);
     return;
   }
   try { await leaveCurrentPaper(); } catch (e) {}
@@ -2808,16 +2808,11 @@ async function openPlanNote() {
   const paper = $("paper");
   if (paper) {
     syncPaperEmptyClass();
-    paper.focus();
-    const lines = paperLines();
-    const line = lines.find((n) => n && !n.classList.contains("md-front")) || lines[0];
-    if (line) {
-      // Prefer rendered paint on open (phone was flashing raw ## Why in source mode)
-      state.activeLine = -1;
-      const body = line.querySelector(".md-body") || line;
-      placeCaret(body, 0);
-    }
+    // Prefer rendered paint on open (phone was flashing raw ## Why in source mode)
+    state.activeLine = -1;
   }
+  // Do not auto-focus — format capsule stays hidden until the user taps to type
+  setFmtBarVisible(false);
 }
 
 async function openCaptureNote() {
@@ -2872,11 +2867,9 @@ async function openCaptureNote() {
       painting = false;
     }
     syncPaperEmptyClass();
-    paper.focus();
-    const line = paperLines()[0];
-    if (line) placeCaret(line, 0);
-    syncPaperEmptyClass();
+    // Do not auto-focus — format capsule stays hidden until the user taps to type
   }
+  setFmtBarVisible(false);
 }
 
 $("door-skip").addEventListener("click", () => {
@@ -3156,6 +3149,23 @@ function setFmtBarVisible(on) {
   }
 }
 
+function fmtKeyboardInset() {
+  const vv = window.visualViewport;
+  if (!vv) return 0;
+  return Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+}
+
+function fmtPhoneLike() {
+  return window.matchMedia("(max-width: 640px)").matches
+    || window.matchMedia("(pointer: coarse)").matches;
+}
+
+function paperEditorFocused() {
+  const paper = $("paper");
+  const a = document.activeElement;
+  return !!(paper && a && (a === paper || (paper.contains && paper.contains(a))));
+}
+
 function syncFmtBarInset() {
   const bar = $("fmt-bar");
   if (!bar) return;
@@ -3164,8 +3174,31 @@ function syncFmtBarInset() {
     bar.style.bottom = "calc(12px + env(safe-area-inset-bottom, 0px))";
     return;
   }
-  const inset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-  bar.style.bottom = (inset + 12) + "px";
+  bar.style.bottom = (fmtKeyboardInset() + 12) + "px";
+}
+
+let softKeyboardSeen = false;
+
+function syncFmtBarForKeyboard() {
+  if (!paperEditorFocused()) {
+    setFmtBarVisible(false);
+    return;
+  }
+  const phone = fmtPhoneLike();
+  const inset = fmtKeyboardInset();
+  if (phone) {
+    if (inset > 80) softKeyboardSeen = true;
+    if (softKeyboardSeen && inset <= 80) {
+      setFmtBarVisible(false);
+      return;
+    }
+    // Phone: show while focused even before the keyboard lifts
+    setFmtBarVisible(true);
+    syncFmtBarInset();
+    return;
+  }
+  setFmtBarVisible(true);
+  syncFmtBarInset();
 }
 
 (function wireFmtBar() {
@@ -3197,25 +3230,29 @@ function syncFmtBarInset() {
   });
 
   paper.addEventListener("focus", () => {
-    setFmtBarVisible(true);
-    syncFmtBarInset();
+    syncFmtBarForKeyboard();
   });
   paper.addEventListener("blur", () => {
     setTimeout(() => {
       if (ignoreBlur) return;
-      if (document.activeElement === paper) return;
+      if (paperEditorFocused()) {
+        syncFmtBarForKeyboard();
+        return;
+      }
       if (bar.contains(document.activeElement)) return;
+      softKeyboardSeen = false;
       setFmtBarVisible(false);
     }, 0);
   });
 
-  const onVV = () => syncFmtBarInset();
+  const onVV = () => syncFmtBarForKeyboard();
   if (window.visualViewport) {
     window.visualViewport.addEventListener("resize", onVV);
     window.visualViewport.addEventListener("scroll", onVV);
   }
   window.addEventListener("resize", onVV);
-  syncFmtBarInset();
+  setFmtBarVisible(false);
+  syncFmtBarForKeyboard();
 })();
 
 if (/^https?:$/.test(location.protocol) && "serviceWorker" in navigator) {

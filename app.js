@@ -12,6 +12,7 @@ const state = {
   monthView: null,
   paintTimer: null,
   askTimer: null,
+  askCtrl: null,
   askGen: 0,
   openDayGen: 0,
   lastPaperSelection: "",
@@ -264,6 +265,29 @@ function stripAccidentalBulletSpace(line) {
   return String(line ?? "").replace(/^ ([-*+])/, "$1");
 }
 
+function joinBrokenHyphens(md) {
+  const lines = String(md ?? "").split("\n");
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+    while (i + 1 < lines.length) {
+      const next = lines[i + 1];
+      if (line && /^-\S/.test(next)) {
+        line += next;
+        i += 1;
+        continue;
+      }
+      break;
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+function cleanPaperMarkdown(md) {
+  return joinBrokenHyphens(String(md ?? "").split("\n").map(stripAccidentalBulletSpace).join("\n"));
+}
+
 function continueLinePrefix(line) {
   const s = String(line || "");
   const task = s.match(/^(\s*)([-*+])\s+\[[ xX]\]\s*/);
@@ -443,7 +467,7 @@ function writeDumpLine(idx, text) {
   if (!dump || idx == null || idx < 0) return dump;
   const lines = dump.value.split("\n");
   while (lines.length <= idx) lines.push("");
-  lines[idx] = stripAccidentalBulletSpace(text);
+  lines[idx] = stripAccidentalBulletSpace(String(text ?? "").replace(/\r\n/g, "\n").replace(/\n/g, ""));
   dump.value = lines.join("\n");
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
   return dump;
@@ -475,7 +499,7 @@ function syncDumpFromPaper() {
       lines[idx] = on ? lines[idx].replace(/\[ \]/, "[x]") : lines[idx].replace(/\[[xX]\]/, "[ ]");
     }
   }
-  dump.value = lines.join("\n");
+  dump.value = cleanPaperMarkdown(lines.join("\n"));
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
   return dump;
 }
@@ -594,17 +618,43 @@ function setStatus(msg, kind = "") {
 
 async function api(path, opts = {}) {
   const rest = { ...opts };
+  const timeoutMs = rest.timeoutMs;
   delete rest.timeoutMs;
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    cache: "no-store",
-    ...rest,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || res.statusText);
+  const parent = rest.signal;
+  delete rest.signal;
+  const ctrl = new AbortController();
+  const onParent = () => { try { ctrl.abort(); } catch (e) {} };
+  if (parent) {
+    if (parent.aborted) onParent();
+    else parent.addEventListener("abort", onParent, { once: true });
   }
-  return res.json();
+  const timer = Number(timeoutMs) > 0 ? setTimeout(() => {
+    try { ctrl.abort(); } catch (e) {}
+  }, timeoutMs) : null;
+  try {
+    const res = await fetch(path, {
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      ...rest,
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || res.statusText);
+    }
+    return res.json();
+  } catch (e) {
+    const aborted = e && (e.name === "AbortError" || /aborted/i.test(String(e.message || "")));
+    if (aborted) {
+      const err = new Error("timed out");
+      err.name = "AbortError";
+      throw err;
+    }
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (parent && parent.removeEventListener) parent.removeEventListener("abort", onParent);
+  }
 }
 
 function dayMarkdown(day) {
@@ -684,7 +734,11 @@ async function openDay(date, { silent = false } = {}) {
   const oldMd = dump ? dump.value : (state.day ? dayMarkdown(state.day) : "");
   const oldMtime = state.day ? state.day.mtime : 0;
   const leavingDay = !isNoteDoc() && oldDate && oldDate !== date;
-  if (isNoteDoc()) leaveCurrentPaper().catch(() => {});
+  if (isNoteDoc()) {
+    if (date === todayIso()) await landMapNextStepsOnToday();
+    await leaveCurrentPaper();
+    if (gen !== state.openDayGen) return;
+  }
   try {
     const day = await api("/api/day?date=" + date);
     if (gen !== state.openDayGen) return;
@@ -733,7 +787,7 @@ function renderDay() {
   $("paper-title").textContent = formatPaperTitle(d.date);
   $("rail-date").textContent = formatRailDate(d.date);
   const dump = $("dump");
-  dump.value = dayMarkdown(d).split("\n").map(stripAccidentalBulletSpace).join("\n");
+  dump.value = cleanPaperMarkdown(dayMarkdown(d));
   paintPaper();
   renderRail();
 }
@@ -1174,7 +1228,7 @@ function applyRemoteDay(day) {
   if (state.selectedDate && date && date !== state.selectedDate) return;
   const markdown = typeof day.markdown === "string" ? day.markdown : dayMarkdown(day);
   const dump = $("dump");
-  const cleaned = String(markdown || "").split("\n").map(stripAccidentalBulletSpace).join("\n");
+  const cleaned = cleanPaperMarkdown(markdown || "");
   if (dump) dump.value = cleaned;
   if (state.day && (!date || state.day.date === date)) {
     state.day.markdown = cleaned;
@@ -1244,7 +1298,7 @@ function applyRemoteNote(body) {
   const path = body && body.path ? String(body.path).replace(/\\/g, "/") : state.doc.path;
   if (path && state.doc.path && path !== state.doc.path) return;
   const markdown = typeof (body && body.markdown) === "string" ? body.markdown : "";
-  const cleaned = String(markdown || "").split("\n").map(stripAccidentalBulletSpace).join("\n");
+  const cleaned = cleanPaperMarkdown(markdown || "");
   const dump = $("dump");
   if (dump) dump.value = cleaned;
   state.doc.markdown = cleaned;
@@ -1256,39 +1310,67 @@ function applyRemoteNote(body) {
 }
 
 let saveChain = Promise.resolve();
+function paperSaveSnapshot() {
+  const dump = $("dump");
+  if (isNoteDoc()) {
+    const markdown = cleanPaperMarkdown(dump ? dump.value : String(state.doc.markdown || ""));
+    if (dump) dump.value = markdown;
+    state.doc.markdown = markdown;
+    return {
+      kind: "note",
+      path: state.doc.path,
+      markdown,
+      mtime: Number(state.doc.mtime) || 0,
+    };
+  }
+  if (state.day) {
+    const markdown = cleanPaperMarkdown(dump ? dump.value : dayMarkdown(state.day));
+    if (dump) dump.value = markdown;
+    state.day.markdown = markdown;
+    return {
+      kind: "day",
+      date: state.day.date,
+      markdown,
+      mtime: Number(state.day.mtime) || 0,
+    };
+  }
+  return null;
+}
 async function saveDay({ keepalive = false } = {}) {
+  const snap = paperSaveSnapshot();
   const run = async () => {
-    if (isNoteDoc()) {
-      const doc = state.doc;
-      if (!doc) {
-        setStatus("");
-        return;
-      }
-      const path = doc.path;
-      const dump = $("dump");
-      const markdown = dump ? dump.value : String(doc.markdown || "");
-      doc.markdown = markdown;
-      const mtime = Number(doc.mtime) || 0;
+    if (!snap) {
+      setStatus("");
+      return;
+    }
+    if (snap.kind === "note") {
+      const path = snap.path;
+      const markdown = snap.markdown;
       try {
-        const res = await fetch("/api/file?path=" + encodeURIComponent(path), {
+        const putNote = (mt) => fetch("/api/file?path=" + encodeURIComponent(path), {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path, paper: markdown, markdown, mtime }),
+          body: JSON.stringify({ path, paper: markdown, markdown, mtime: mt }),
           keepalive: !!keepalive,
         });
+        let res = await putNote(snap.mtime);
         if (res.status === 409) {
           const body = await res.json().catch(() => ({}));
-          applyRemoteNote(body);
-          setStatus("");
-          return;
+          res = await putNote(Number(body.mtime) || 0);
+          if (!res.ok) {
+            if (isNoteDoc() && state.doc && state.doc.path === path) applyRemoteNote(body);
+            setStatus("");
+            return;
+          }
         }
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
           throw new Error(err.error || res.statusText);
         }
         const out = await res.json().catch(() => ({}));
-        if (isNoteDoc() && state.doc.path === path) {
+        if (isNoteDoc() && state.doc && state.doc.path === path) {
           if (out && out.mtime != null) state.doc.mtime = Number(out.mtime) || 0;
+          const dump = $("dump");
           if (dump && dump.value === markdown) state.dirty = false;
         }
         if (keepalive) return;
@@ -1299,16 +1381,10 @@ async function saveDay({ keepalive = false } = {}) {
       }
       return;
     }
-    if (!state.day && !isNoteDoc()) { setStatus(""); return; }
-    if (!state.day) {
-      setStatus("");
-      return;
-    }
-    const date = state.day.date;
-    const dump = $("dump");
-    const markdown = dump ? dump.value : dayMarkdown(state.day);
-    state.day.markdown = markdown;
-    const mtime = Number(state.day.mtime) || 0;
+    if (snap.kind !== "day") { setStatus(""); return; }
+    const date = snap.date;
+    const markdown = snap.markdown;
+    const mtime = snap.mtime;
     try {
       let res = await fetch("/api/day?date=" + date, {
         method: "PUT",
@@ -1324,8 +1400,8 @@ async function saveDay({ keepalive = false } = {}) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               date,
-              paper: dump ? dump.value : markdown,
-              markdown: dump ? dump.value : markdown,
+              paper: markdown,
+              markdown: markdown,
               mtime: Number(body.mtime) || 0,
             }),
             keepalive: !!keepalive,
@@ -1539,7 +1615,7 @@ function renderNote() {
   if ($("paper-title")) $("paper-title").textContent = title;
   if ($("rail-date")) $("rail-date").textContent = title;
   const dump = $("dump");
-  const md = String(doc.markdown || "").split("\n").map(stripAccidentalBulletSpace).join("\n");
+  const md = cleanPaperMarkdown(doc.markdown || "");
   if (dump) dump.value = md;
   paintPaper();
   renderRail();
@@ -1607,73 +1683,6 @@ function openVaultPath(rel) {
     return;
   }
   openVaultNote(path);
-}
-
-function applyLandedDay(date, markdown, mtime) {
-  if (!state.day || state.day.date !== date || isNoteDoc()) return;
-  const dump = $("dump");
-  if (dump) dump.value = markdown;
-  state.day.paper = markdown;
-  state.day.markdown = markdown;
-  if (mtime != null) state.day.mtime = Number(mtime) || 0;
-  state.dirty = false;
-  paintPaper();
-  renderRail();
-}
-
-async function landMapNextSteps(paths) {
-  const maps = workMapPathsFromHits((paths || []).map((p) => ({ path: p })));
-  if (!maps.length) return false;
-  const mapMarkdowns = [];
-  for (const rel of maps) {
-    try {
-      const data = await api("/api/file?path=" + encodeURIComponent(rel));
-      mapMarkdowns.push(typeof data.markdown === "string" ? data.markdown : "");
-    } catch (e) {}
-  }
-  if (!mapMarkdowns.length) return false;
-  const date = todayIso();
-  const viewing = !!(state.day && state.day.date === date && !isNoteDoc());
-  let existing = "";
-  let mtime = 0;
-  if (viewing) {
-    flushActiveLineToDump();
-    const dump = $("dump");
-    existing = dump ? dump.value : dayMarkdown(state.day);
-    mtime = Number(state.day.mtime) || 0;
-  } else {
-    const body = await api("/api/day?date=" + date);
-    existing = typeof body.markdown === "string" ? body.markdown : "";
-    mtime = Number(body.mtime) || 0;
-  }
-  const next = landedDayMarkdown(existing, mapMarkdowns);
-  if (next === existing) return false;
-  let res = await fetch("/api/day?date=" + date, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    cache: "no-store",
-    body: JSON.stringify({ date, paper: next, markdown: next, mtime }),
-  });
-  let written = next;
-  if (res.status === 409) {
-    const body = await res.json().catch(() => ({}));
-    written = landedDayMarkdown(typeof body.markdown === "string" ? body.markdown : "", mapMarkdowns);
-    res = await fetch("/api/day?date=" + date, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      cache: "no-store",
-      body: JSON.stringify({
-        date,
-        paper: written,
-        markdown: written,
-        mtime: Number(body.mtime) || 0,
-      }),
-    });
-  }
-  if (!res.ok) return false;
-  const out = await res.json().catch(() => ({}));
-  if (viewing) applyLandedDay(date, written, out && out.mtime);
-  return true;
 }
 
 async function runAsk(q) {
@@ -1773,8 +1782,25 @@ async function runAsk(q) {
     if (planTitle.toLowerCase().includes(needle) || needle === "plan") {
       add({ kind: "plan", text: "Plan · " + planTitle });
     }
+    const finding = document.createElement("li");
+    finding.className = "ask-finding";
+    finding.textContent = "Finding\u2026";
+    hits.appendChild(finding);
     try {
-      const data = await api("/api/search?q=" + encodeURIComponent(String(q || "").trim()));
+      if (state.askCtrl) {
+        try { state.askCtrl.abort(); } catch (err) {}
+      }
+      state.askCtrl = new AbortController();
+      const askSignal = state.askCtrl.signal;
+      let data;
+      try {
+        data = await api("/api/search?q=" + encodeURIComponent(String(q || "").trim()), { timeoutMs: 12000, signal: askSignal });
+      } catch (err) {
+        const aborted = err && (err.name === "AbortError" || /timed out|aborted/i.test(String(err.message || "")));
+        if (!aborted || gen !== state.askGen) throw err;
+        data = await api("/api/search?q=" + encodeURIComponent(String(q || "").trim()), { timeoutMs: 12000 });
+      }
+      if (finding.parentNode) finding.remove();
       if (gen !== state.askGen) return;
       const vaultHits = data.hits || [];
       const openPath = isNoteDoc()
@@ -1792,20 +1818,23 @@ async function runAsk(q) {
         visible.forEach((h) => {
           add({ kind: "vault", text: vaultHitLabel(h), path: h.path, line: h.line });
         });
-      }
-      const mapPaths = workMapPathsFromHits(vaultHits);
-      if (mapPaths.length) {
-        try {
-          await landMapNextSteps(mapPaths);
-        } catch (e) {}
-        if (gen !== state.askGen) return;
+        const maps = [];
+        const seenMap = {};
+        visible.forEach((h) => {
+          const p = String(h.path || "").replace(/\\/g, "/");
+          if (!/^maps\/.+\.md$/i.test(p) || seenMap[p]) return;
+          seenMap[p] = true;
+          maps.push(p);
+        });
+        maps.forEach((p) => { landMapFileOnToday(p); });
       }
     } catch (e) {
+      if (finding.parentNode) finding.remove();
       if (gen !== state.askGen) return;
+      const aborted = e && (e.name === "AbortError" || /timed out|aborted/i.test(String(e.message || "")));
       const li = document.createElement("li");
       li.className = "ask-miss";
-      const msg = e && e.message ? String(e.message).slice(0, 80) : "";
-      li.textContent = msg ? "Couldn't search. " + msg : "Couldn't search.";
+      li.textContent = aborted ? "Couldn't search. Trying again." : ("Couldn't search." + (e && e.message ? " " + String(e.message).slice(0, 60) : ""));
       hits.appendChild(li);
       console.error(e);
     }
@@ -1919,6 +1948,10 @@ $("paper").addEventListener("blur", () => {
 $("paper").addEventListener("beforeinput", (e) => {
   if (painting || slotDrag.active) return;
   if (e.isComposing) return;
+  if (e.inputType === "insertParagraph" || e.inputType === "insertLineBreak") {
+    e.preventDefault();
+    return;
+  }
   const idx = state.activeLine >= 0 ? state.activeLine : lineIndexOfCaret();
   const el = paperLines()[idx];
   if (idx >= 0 && el) {
@@ -2045,6 +2078,12 @@ async function openWiki(name) {
   if (/^plan$/i.test(n)) {
     closeAsk();
     location.hash = "plan";
+    return;
+  }
+  if (/^today$/i.test(n)) {
+    closeAsk();
+    await landMapNextStepsOnToday();
+    await openDay(todayIso());
     return;
   }
   try {
@@ -2340,53 +2379,11 @@ function proposeDoorLines(sentence) {
   return lines;
 }
 
-function taskKey(line) {
-  const item = parseTaskLine(line);
-  if (!item) return "";
-  return stripWhen(item.text).toLowerCase();
-}
-
-function appendDoorTasks(markdown, lines) {
-  const seen = new Set();
-  const tasks = [];
-  for (const line of (Array.isArray(lines) ? lines : [])) {
-    const s = String(line);
-    if (!/^- \[ \] /.test(s)) continue;
-    const key = taskKey(s);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    tasks.push(s);
-  }
-  const existing = markdown == null ? "" : String(markdown);
-  if (!tasks.length) return existing;
-  const have = new Set();
-  for (const line of existing.split("\n")) {
-    const key = taskKey(line);
-    if (key) have.add(key);
-  }
-  const fresh = tasks.filter((line) => !have.has(taskKey(line)));
-  if (!fresh.length) return existing;
-  const block = fresh.join("\n") + "\n";
-  if (!existing.trim()) return block;
-  if (existing.endsWith("\n\n")) return existing + block;
-  if (existing.endsWith("\n")) return existing + "\n" + block;
-  return existing + "\n\n" + block;
-}
-
-function isWorkMapPath(rel) {
-  const p = String(rel || "").replace(/\\/g, "/");
-  if (!p.startsWith("maps/") || !/\.md$/i.test(p)) return false;
-  const rest = p.slice(5);
-  if (!rest || rest.includes("/")) return false;
-  if (/^the-/i.test(rest)) return false;
-  return true;
-}
-
-function nextStepTaskLines(markdown) {
-  const lines = String(markdown || "").split("\n");
+function mapNextStepLines(md) {
+  const lines = String(md ?? "").split("\n");
   let start = -1;
   for (let i = 0; i < lines.length; i++) {
-    if (/^##\s+Next steps\s*$/i.test(lines[i])) {
+    if (/^## Next steps\s*$/i.test(lines[i].trimEnd())) {
       start = i;
       break;
     }
@@ -2394,31 +2391,151 @@ function nextStepTaskLines(markdown) {
   if (start < 0) return [];
   const out = [];
   for (let i = start + 1; i < lines.length; i++) {
-    if (/^##\s+/.test(lines[i])) break;
-    const line = lines[i].replace(/\r$/, "");
-    if (/^- \[ \] /.test(line)) out.push(line);
+    if (/^## /.test(lines[i])) break;
+    const m = String(lines[i]).match(/^\s*[-*+]\s+\[ \]\s+(.*)$/);
+    if (m && String(m[1]).trim()) out.push("- [ ] " + String(m[1]).trim());
   }
   return out;
 }
 
-function workMapPathsFromHits(hits) {
-  const out = [];
-  const seen = new Set();
-  for (const h of hits || []) {
-    const p = String((h && h.path) || "").replace(/\\/g, "/");
-    if (!isWorkMapPath(p) || seen.has(p)) continue;
-    seen.add(p);
-    out.push(p);
-  }
-  return out;
+function taskLineKey(line) {
+  const m = String(line || "").match(/^\s*[-*+]\s+\[[ xX]\]\s*(.*)$/);
+  return m ? String(m[1]).trim().toLowerCase() : "";
 }
 
-function landedDayMarkdown(existing, mapMarkdowns) {
+function appendMapTasks(markdown, lines) {
+  const existing = markdown == null ? "" : String(markdown);
+  const have = new Set(existing.split("\n").map(taskLineKey).filter(Boolean));
   const tasks = [];
-  for (const md of mapMarkdowns || []) {
-    for (const line of nextStepTaskLines(md)) tasks.push(line);
+  for (const line of Array.isArray(lines) ? lines : []) {
+    if (!/^- \[ \] /.test(String(line))) continue;
+    const k = taskLineKey(line);
+    if (!k || have.has(k)) continue;
+    have.add(k);
+    tasks.push(String(line));
   }
   return appendDoorTasks(existing, tasks);
+}
+
+async function applyStepsToToday(steps, date) {
+  const list = Array.isArray(steps) ? steps : [];
+  if (!list.length) return;
+  const day = date || state.selectedDate || todayIso();
+  const onThis = !isNoteDoc() && state.day && state.day.date === day;
+  if (onThis) {
+    flushActiveLineToDump();
+    const dump = $("dump");
+    const current = dump ? dump.value : String(state.day.markdown || "");
+    const next = appendMapTasks(current, list);
+    if (next === current) return;
+    if (dump) dump.value = next;
+    state.day.markdown = next;
+    state.day.paper = next;
+    paintPaper();
+    renderRail();
+    await saveDay();
+    return;
+  }
+  try {
+    const got = await fetch("/api/day?date=" + day);
+    const body = await got.json().catch(() => ({}));
+    if (!got.ok) return;
+    const next = appendMapTasks(body.markdown || "", list);
+    if (next === (body.markdown || "")) return;
+    let res = await fetch("/api/day?date=" + day, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ date: day, paper: next, markdown: next, mtime: body.mtime || 0 }),
+    });
+    if (res.status === 409) {
+      const again = await res.json().catch(() => ({}));
+      const merged = appendMapTasks(again.markdown || "", list);
+      await fetch("/api/day?date=" + day, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date: day, paper: merged, markdown: merged, mtime: Number(again.mtime) || 0 }),
+      });
+    }
+  } catch (e) {}
+}
+
+async function landMapNextStepsOnToday() {
+  flushActiveLineToDump();
+  const dump = $("dump");
+  const md = dump ? dump.value : (isNoteDoc() ? String(state.doc.markdown || "") : "");
+  await applyStepsToToday(mapNextStepLines(md), todayIso());
+}
+
+async function landMapFileOnToday(rel) {
+  const path = String(rel || "").replace(/\\/g, "/");
+  if (!/^maps\/.+\.md$/i.test(path)) return;
+  const day = state.selectedDate || todayIso();
+  const key = day + ":" + path;
+  state.landedMaps = state.landedMaps || new Set();
+  if (state.landedMaps.has(key)) return;
+  try {
+    const data = await api("/api/file?path=" + encodeURIComponent(path));
+    const steps = mapNextStepLines(typeof data.markdown === "string" ? data.markdown : "");
+    if (!steps.length) {
+      state.landedMaps.add(key);
+      return;
+    }
+    await applyStepsToToday(steps, day);
+    state.landedMaps.add(key);
+  } catch (e) {}
+}
+
+async function findMapPathsForQuery(q) {
+  const needle = String(q || "").trim();
+  if (!needle) return [];
+  try {
+    const data = await api("/api/search?q=" + encodeURIComponent(needle), { timeoutMs: 12000 });
+    const seen = {};
+    const maps = [];
+    for (const h of data.hits || []) {
+      const path = String(h.path || "").replace(/\\/g, "/");
+      if (!/^maps\/.+\.md$/i.test(path) || seen[path]) continue;
+      if (/^maps\/the-/i.test(path)) continue;
+      seen[path] = true;
+      maps.push(path);
+    }
+    return maps;
+  } catch (e) {
+    return [];
+  }
+}
+
+async function landDoorQueryOnToday(q) {
+  const maps = await findMapPathsForQuery(q);
+  if (!maps.length) return false;
+  const day = todayIso();
+  for (const path of maps) {
+    const key = day + ":" + path;
+    state.landedMaps = state.landedMaps || new Set();
+    if (state.landedMaps.has(key)) continue;
+    try {
+      const data = await api("/api/file?path=" + encodeURIComponent(path));
+      const steps = mapNextStepLines(typeof data.markdown === "string" ? data.markdown : "");
+      if (!steps.length) {
+        state.landedMaps.add(key);
+        continue;
+      }
+      await applyStepsToToday(steps, day);
+      state.landedMaps.add(key);
+    } catch (err) {}
+  }
+  return true;
+}
+
+function appendDoorTasks(markdown, lines) {
+  const tasks = (Array.isArray(lines) ? lines : []).filter((line) => /^- \[ \] /.test(String(line)));
+  const existing = markdown == null ? "" : String(markdown);
+  if (!tasks.length) return existing;
+  const block = tasks.join("\n") + "\n";
+  if (!existing.trim()) return block;
+  if (existing.endsWith("\n\n")) return existing + block;
+  if (existing.endsWith("\n")) return existing + "\n" + block;
+  return existing + "\n\n" + block;
 }
 
 let doorProposed = [];
@@ -2450,7 +2567,9 @@ function paintDoorProposals(lines) {
   }
 }
 
-function goToday() {
+async function goToday() {
+  await landMapNextStepsOnToday();
+  await leaveCurrentPaper();
   state.doc = null;
   if (location.hash !== "#today") location.hash = "today";
   showView("today");
@@ -2462,10 +2581,23 @@ document.querySelectorAll("a[href='#today']").forEach((a) => {
     goToday();
   });
 });
-$("door-form").addEventListener("submit", (e) => {
+$("door-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const input = $("door-input");
-  const lines = proposeDoorLines(input ? input.value : "");
+  const raw = input ? input.value : "";
+  if (!String(raw || "").trim()) {
+    hideDoorProposals();
+    goToday();
+    return;
+  }
+  const landed = await landDoorQueryOnToday(raw);
+  if (landed) {
+    if (input) input.value = "";
+    hideDoorProposals();
+    goToday();
+    return;
+  }
+  const lines = proposeDoorLines(raw);
   if (lines.length) {
     paintDoorProposals(lines);
     return;
@@ -2474,6 +2606,7 @@ $("door-form").addEventListener("submit", (e) => {
   hideDoorProposals();
   goToday();
 });
+
 async function openCaptureNote() {
   const path = "Capture.md";
   try {
@@ -2601,6 +2734,25 @@ window.addEventListener("beforeunload", flushOnLeave);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") flushOnLeave();
 });
+
+(function wireRailToggle() {
+  const btn = $("toggle-rail");
+  const room = document.querySelector(".today-room");
+  if (!btn || !room) return;
+  function sync(collapsed) {
+    room.classList.toggle("rail-collapsed", collapsed);
+    btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    btn.textContent = collapsed ? "Timeline" : "Hide timeline";
+  }
+  if (window.matchMedia("(max-width: 720px)").matches) sync(true);
+  btn.addEventListener("click", () => {
+    sync(!room.classList.contains("rail-collapsed"));
+  });
+})();
+
+if (/^https?:$/.test(location.protocol) && "serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch(() => {});
+}
 
 route();
 state.weekStart = mondayOf(state.selectedDate ? parseDate(state.selectedDate) : new Date());

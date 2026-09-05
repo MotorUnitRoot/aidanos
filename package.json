@@ -7,6 +7,6 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node paper-smoke.mjs && node paper-undo-test.mjs && node list-keys-test.mjs && node day-save-test.mjs && node note-paper-test.mjs && node search-test.mjs && node month-cal-test.mjs && node door-propose-test.mjs && node door-accept-test.mjs && node stranger-today-test.mjs && node today-frontmatter-test.mjs && node slot-snap-test.mjs && node drop-save-test.mjs && node ask-label-test.mjs && node stay-up-test.mjs && node saved-shove-test.mjs && node checkbox-hit-test.mjs && node paper-width-test.mjs && node day-switch-test.mjs && node plan-copy-test.mjs && node library-primitives-test.mjs"
+    "test": "node paper-smoke.mjs && node paper-undo-test.mjs && node list-keys-test.mjs && node day-save-test.mjs && node note-paper-test.mjs && node search-test.mjs && node month-cal-test.mjs && node door-propose-test.mjs && node door-accept-test.mjs && node stranger-today-test.mjs && node today-frontmatter-test.mjs && node slot-snap-test.mjs && node drop-save-test.mjs && node ask-label-test.mjs && node stay-up-test.mjs && node saved-shove-test.mjs && node checkbox-hit-test.mjs && node paper-width-test.mjs && node day-switch-test.mjs && node plan-copy-test.mjs && node library-primitives-test.mjs && node atomic-library-test.mjs"
   }
 }

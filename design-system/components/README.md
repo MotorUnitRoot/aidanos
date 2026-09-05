@@ -24,3 +24,5 @@ Get to Work and Capture thoughts are two uses of the hairline button. They are n
 - Saved chip (reserved space, does not shove the paper)
 
 Each part names the tokens it uses and how it behaves. Open `library.html` to see them. The look lives in `primitives.css`. Patterns load that file. They do not invent a look.
+
+Last-mile screens that need more than this kernel use the atomic library. Open `../atomic-library/`. Do not invent a control that is not on either list.

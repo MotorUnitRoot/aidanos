@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Atomic library — AidanOS</title>
+  <link rel="stylesheet" href="../foundations/tokens.css" />
+  <link rel="stylesheet" href="../components/primitives.css" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+    }
+    button, input, select, textarea {
+      font: inherit;
+    }
+    body {
+      padding: var(--space-6) var(--space-4);
+    }
+    .page {
+      width: var(--paper);
+      max-width: 100%;
+      margin: 0 auto var(--space-5);
+    }
+    h1 {
+      margin: 0 0 var(--space-3);
+      font-size: clamp(1.7rem, 3.2vw, 2.25rem);
+      font-weight: 500;
+      letter-spacing: -0.025em;
+      line-height: 1.12;
+    }
+    .lead {
+      margin: 0;
+      color: var(--quiet);
+      font-size: 1.08rem;
+      line-height: 1.8;
+    }
+    section {
+      width: var(--paper);
+      max-width: 100%;
+      margin: 0 auto var(--space-6);
+    }
+    h2 {
+      margin: 0 0 var(--space-2);
+      font-size: 1.15rem;
+      font-weight: 500;
+    }
+    .why {
+      margin: 0 0 var(--space-3);
+      color: var(--quiet);
+      line-height: 1.55;
+    }
+    .kind {
+      color: var(--faint);
+      font-size: 0.75rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .stage {
+      background: var(--surface);
+      border: var(--line) solid var(--hairline);
+      border-radius: var(--radius);
+      padding: var(--space-4);
+    }
+    .stage.on-black {
+      background: #000;
+      border-color: #000;
+    }
+    .stage.paper-room {
+      padding: var(--space-5) var(--space-3);
+    }
+    .uses {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: var(--space-3);
+    }
+    .uses.stack {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+    .weeks {
+      display: grid;
+      grid-template-columns: repeat(3, 5.5rem);
+      gap: var(--space-2);
+    }
+    .week-row {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+    }
+    .week-arrows {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-1);
+    }
+    .paper-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: var(--space-3);
+    }
+    .paper-head h3 {
+      margin: 0;
+      font-size: 1.15rem;
+      font-weight: 500;
+    }
+    .day-shift {
+      display: flex;
+      gap: var(--space-2);
+    }
+    .ask-demo {
+      position: relative;
+      min-height: 8rem;
+      padding: 0 0 3.2rem;
+    }
+    .ask-demo .scroll {
+      color: var(--quiet);
+      line-height: 1.7;
+    }
+    .ask-demo .ask-strip {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+    }
+    .agenda {
+      display: flex;
+      flex-direction: column;
+    }
+    .month-row {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 0.15rem;
+    }
+    .nav-row {
+      display: flex;
+      align-items: center;
+      gap: var(--space-4);
+    }
+    .nav-row .saved {
+      margin-left: auto;
+    }
+
+    .atom-line,
+    .atom-area,
+    .atom-select {
+      width: 100%;
+      max-width: 100%;
+      padding: var(--space-2) 0;
+      border: 0;
+      border-bottom: var(--line) solid var(--hairline);
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--ink);
+      outline: none;
+    }
+    .atom-line:focus,
+    .atom-area:focus,
+    .atom-select:focus {
+      border-bottom-color: var(--ink);
+    }
+    .atom-line:disabled,
+    .atom-area:disabled,
+    .atom-select:disabled {
+      color: var(--faint);
+    }
+    .atom-line::placeholder,
+    .atom-area::placeholder {
+      color: var(--quiet);
+    }
+    .atom-area {
+      display: block;
+      min-height: 5.5rem;
+      resize: none;
+      line-height: 1.7;
+    }
+    .atom-select {
+      appearance: none;
+      padding-right: 1.2rem;
+    }
+    .atom-nums {
+      font-variant-numeric: tabular-nums;
+    }
+    .atom-money {
+      display: flex;
+      align-items: baseline;
+      gap: var(--space-2);
+      border-bottom: var(--line) solid var(--hairline);
+    }
+    .atom-money .sign {
+      color: var(--quiet);
+    }
+    .atom-money .atom-line {
+      border-bottom: 0;
+    }
+    .atom-choice {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-2);
+    }
+    .atom-choice label {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.55em;
+      font-size: 1.08rem;
+      line-height: 1.8;
+      cursor: pointer;
+    }
+    .atom-choice input {
+      appearance: none;
+      width: 1.15em;
+      height: 1.15em;
+      margin: 0.32em 0 0;
+      border: var(--line) solid var(--quiet);
+      border-radius: var(--radius);
+      background: transparent;
+    }
+    .atom-choice input:checked {
+      background: var(--ok);
+      border-color: var(--ok);
+    }
+    .atom-choice input:focus {
+      outline: var(--line) solid var(--quiet);
+      outline-offset: 2px;
+    }
+    .atom-handle {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.4rem;
+      color: var(--faint);
+      letter-spacing: 0.04em;
+      cursor: grab;
+      user-select: none;
+    }
+    .atom-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-4);
+    }
+    .atom-tab {
+      color: var(--quiet);
+      text-decoration: none;
+    }
+    .atom-tab:hover {
+      color: var(--ink);
+    }
+    .atom-tab.is-on {
+      color: var(--ink);
+      font-weight: 700;
+    }
+    .atom-seg {
+      display: inline-flex;
+    }
+    .atom-seg button {
+      padding: var(--space-2) var(--space-3);
+      border: var(--line) solid var(--hairline);
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--quiet);
+      cursor: pointer;
+    }
+    .atom-seg button + button {
+      border-left: 0;
+    }
+    .atom-seg button:hover {
+      color: var(--ink);
+    }
+    .atom-seg button.is-on {
+      color: var(--ink);
+      border-color: var(--hairline-strong);
+    }
+    .atom-seg button:focus {
+      outline: var(--line) solid var(--quiet);
+      outline-offset: 2px;
+    }
+    .atom-chip,
+    .atom-filter {
+      display: inline-block;
+      padding: var(--space-1) var(--space-2);
+      border: var(--line) solid var(--hairline);
+      border-radius: var(--radius);
+      color: var(--quiet);
+      font-size: 0.95rem;
+      background: transparent;
+      cursor: pointer;
+    }
+    .atom-chip:hover,
+    .atom-filter:hover {
+      color: var(--ink);
+      border-color: var(--ink);
+    }
+    .atom-person {
+      display: inline;
+      padding: 0 0.12em;
+      background: color-mix(in srgb, var(--ink) 10%, transparent);
+      color: var(--ink);
+    }
+    .atom-status {
+      color: var(--quiet);
+    }
+    .atom-fraction,
+    .atom-duration {
+      margin: 0;
+      color: var(--quiet);
+      font-variant-numeric: tabular-nums;
+    }
+    .atom-duration {
+      color: var(--faint);
+    }
+    .atom-spin {
+      margin: 0;
+      color: var(--faint);
+    }
+    .atom-help {
+      margin: var(--space-1) 0 0;
+      color: var(--faint);
+      font-size: 0.95rem;
+      line-height: 1.5;
+    }
+    .atom-valid {
+      margin: var(--space-1) 0 0;
+      color: var(--danger);
+      font-size: 0.95rem;
+      line-height: 1.5;
+    }
+    .atom-notice {
+      margin: 0;
+      color: var(--quiet);
+      line-height: 1.7;
+    }
+    .atom-page-msg {
+      margin: 0;
+      padding-bottom: var(--space-2);
+      border-bottom: var(--line) solid var(--hairline);
+      color: var(--danger);
+      line-height: 1.7;
+    }
+    .atom-menu {
+      display: inline-flex;
+      flex-direction: column;
+      min-width: 12rem;
+      padding: var(--space-2) 0;
+      border: var(--line) solid var(--hairline);
+      background: var(--surface);
+    }
+    .atom-menu-item {
+      display: block;
+      width: 100%;
+      padding: var(--space-2) var(--space-3);
+      border: 0;
+      background: none;
+      color: var(--ink);
+      text-align: left;
+      cursor: pointer;
+    }
+    .atom-menu-item:hover {
+      color: var(--ink);
+      background: color-mix(in srgb, var(--ink) 6%, transparent);
+    }
+    .atom-menu-item:focus {
+      outline: var(--line) solid var(--quiet);
+      outline-offset: -2px;
+    }
+    .atom-pop {
+      display: inline-block;
+      max-width: 16rem;
+      padding: var(--space-3);
+      border: var(--line) solid var(--hairline);
+      background: var(--surface);
+      color: var(--quiet);
+      line-height: 1.6;
+    }
+    .atom-dialog,
+    .atom-quiet-sheet {
+      padding: var(--space-4);
+      border: var(--line) solid var(--hairline);
+      background: var(--surface);
+    }
+    .atom-dialog p,
+    .atom-quiet-sheet p,
+    .atom-sheet p {
+      margin: 0;
+      line-height: 1.7;
+    }
+    .atom-sheet {
+      padding: var(--space-4);
+      border: var(--line) solid var(--hairline);
+      border-right: 0;
+      background: var(--surface);
+      margin-left: 30%;
+    }
+    .atom-scrim {
+      min-height: 6rem;
+      background: color-mix(in srgb, #000 45%, var(--bg));
+    }
+    .atom-title {
+      margin: 0;
+      font-size: clamp(1.7rem, 3.2vw, 2.25rem);
+      font-weight: 500;
+      letter-spacing: -0.025em;
+      line-height: 1.12;
+    }
+    .atom-section {
+      margin: 0;
+      font-size: 1.15rem;
+      font-weight: 500;
+    }
+    .atom-rule {
+      height: 0;
+      margin: 0;
+      border: 0;
+      border-top: var(--line) solid var(--hairline);
+    }
+    .atom-list-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: var(--space-3);
+      font-size: 1.08rem;
+      line-height: 1.6;
+    }
+    .atom-list-row .meta {
+      color: var(--quiet);
+      white-space: nowrap;
+    }
+    .atom-check-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.55em;
+      font-size: 1.08rem;
+      line-height: 1.8;
+    }
+    .atom-th {
+      font-size: 0.75rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--faint);
+    }
+    .atom-td {
+      font-size: 1.08rem;
+      line-height: 1.6;
+    }
+    .atom-td.nums {
+      font-variant-numeric: tabular-nums;
+    }
+    .atom-attach {
+      color: var(--quiet);
+      text-decoration: none;
+    }
+    .atom-attach:hover {
+      color: var(--ink);
+    }
+    .atom-crumb {
+      color: var(--quiet);
+      line-height: 1.7;
+    }
+    .atom-stages {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2) var(--space-3);
+      color: var(--faint);
+    }
+    .atom-stages .now {
+      color: var(--ink);
+    }
+    .atom-activity {
+      color: var(--quiet);
+      line-height: 1.6;
+    }
+    .atom-activity .when {
+      color: var(--faint);
+      font-variant-numeric: tabular-nums;
+    }
+    .atom-facts {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-3);
+    }
+    .atom-facts .value {
+      margin: 0;
+      font-size: 1.08rem;
+      line-height: 1.5;
+    }
+    .door-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-3);
+    }
+    .is-faint {
+      color: var(--faint);
+    }
+    .is-disabled {
+      color: var(--faint);
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Atomic library</h1>
+    <p class="lead">Closed atoms on Stoic paper. One control per strip. Not application screens. Generation may compose only from these Keep and Already parts, plus the named assemblies in TABLE.md.</p>
+  </div>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Hairline button</h2>
+    <p class="why">One button. Get to Work, Capture thoughts, Accept, and Reject are four uses.</p>
+    <div class="stage on-black">
+      <div class="uses stack">
+        <button type="button" class="hairline-button">Get to Work</button>
+        <button type="button" class="hairline-button">Capture thoughts</button>
+        <button type="button" class="hairline-button">Accept</button>
+        <button type="button" class="hairline-button">Reject</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Text link</h2>
+    <p class="why">Today, Plan, Month, and close. No box. No underline.</p>
+    <div class="stage">
+      <div class="uses">
+        <a href="#today" class="text-link is-current">Today</a>
+        <a href="#plan" class="text-link">Plan</a>
+        <button type="button" class="text-link">Month</button>
+        <button type="button" class="text-link">close</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Week card</h2>
+    <p class="why">One day in the week strip. Not a sport chip.</p>
+    <div class="stage">
+      <div class="weeks">
+        <div class="week today"><span class="dow">MON</span><span class="dom">31</span></div>
+        <div class="week selected"><span class="dow">TUE</span><span class="dom">1</span></div>
+        <div class="week"><span class="dow">WED</span><span class="dom">2</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Week chevron</h2>
+    <p class="why">Steps the week strip. Chevron exception to icon-only.</p>
+    <div class="stage">
+      <div class="week-row">
+        <div class="week"><span class="dow">MON</span><span class="dom">31</span></div>
+        <div class="week-arrows">
+          <button type="button" class="week-chevron" aria-label="Previous week">‹</button>
+          <button type="button" class="week-chevron" aria-label="Next week">›</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Day chevron</h2>
+    <p class="why">Steps one day on the paper.</p>
+    <div class="stage">
+      <div class="paper-head">
+        <h3>Tuesday September 1</h3>
+        <p class="day-shift">
+          <button type="button" class="day-chevron" aria-label="Previous day">‹</button>
+          <button type="button" class="day-chevron" aria-label="Next day">›</button>
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>42rem paper</h2>
+    <p class="why">The writing column. Centered. One serif. Ordinary markdown on disk.</p>
+    <div class="stage paper-room">
+      <div class="paper">
+        <h3>Tuesday September 1</h3>
+        <p>The day’s writing is a real note. It should feel quiet, with enough space to breathe.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Checkbox</h2>
+    <p class="why">A tick on the paper. Prefer this to a switch.</p>
+    <div class="stage">
+      <div class="task">
+        <span class="box" aria-hidden="true"></span>
+        <span class="words">Read the letter</span>
+      </div>
+      <div class="task">
+        <span class="box checked" aria-hidden="true"></span>
+        <span class="words">Write the reply in the vault</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Hanging list</h2>
+    <p class="why">The mark sits in the gutter. The words hang to the right.</p>
+    <div class="stage">
+      <div class="hang"><span class="mark">•</span><span class="words">Read the letter</span></div>
+      <div class="hang"><span class="mark">•</span><span class="words">Write the reply in the vault</span></div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Wiki link</h2>
+    <p class="why">A painted note name. Brackets stay hidden while idle.</p>
+    <div class="stage">
+      <p>Open <a class="wiki" href="#"><span class="brack">[[</span>the-reply<span class="brack">]]</span></a> beside the map.</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Quiet label</h2>
+    <p class="why">A section heading on paper. Same serif. Faint ink.</p>
+    <div class="stage">
+      <p class="quiet-label">Next steps</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Empty state</h2>
+    <p class="why">An empty day or an empty generated page. It says Write.</p>
+    <div class="stage">
+      <p class="empty">Write.</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Ask strip</h2>
+    <p class="why">Ask or find at the bottom of the room. The paper scrolls. The strip stays.</p>
+    <div class="stage ask-demo">
+      <p class="scroll">The paper scrolls above this strip.</p>
+      <div class="ask-strip">
+        <input type="text" placeholder="Ask or find" />
+        <button type="button" class="text-link">close</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Search hit</h2>
+    <p class="why">One result. Quiet file name. Ink title. Same paper, not a preview.</p>
+    <div class="stage">
+      <div class="hit"><span class="file">reply-to-a-letter</span> · Reply to a letter</div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Half-hour agenda slot</h2>
+    <p class="why">One row of the day. Two rem. Hours in the gutter.</p>
+    <div class="stage">
+      <div class="agenda">
+        <div class="slot"><span class="hour">14:00</span><span></span></div>
+        <div class="slot"><span class="hour">14:30</span><span></span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Drag preview</h2>
+    <p class="why">The faded block on the slot you are over.</p>
+    <div class="stage">
+      <div class="agenda">
+        <div class="slot"><span class="hour">14:30</span><span class="ghost">Read the letter</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Month day</h2>
+    <p class="why">One day in the month grid. A hairline mark if a note exists.</p>
+    <div class="stage">
+      <div class="month-row">
+        <span class="month-day"></span>
+        <span class="month-day has-note selected">1</span>
+        <span class="month-day">2</span>
+        <span class="month-day has-note">3</span>
+        <span class="month-day">4</span>
+        <span class="month-day">5</span>
+        <span class="month-day">6</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Saved chip</h2>
+    <p class="why">Reserved space. Saved does not shove the paper. Save state uses this.</p>
+    <div class="stage">
+      <div class="nav-row">
+        <a href="#today" class="text-link is-current">Today</a>
+        <a href="#plan" class="text-link">Plan</a>
+        <p class="saved is-saved">Saved</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Already</p>
+    <h2>Door prompt bar</h2>
+    <p class="why">The Door question as a search-like field. Not a floating line of type. Not a chat thread.</p>
+    <div class="stage on-black">
+      <div class="prompt">
+        <input type="text" placeholder="What do you want to do today?" />
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Text input</h2>
+    <p class="why">One line. Hairline edge. Same serif.</p>
+    <div class="stage">
+      <input class="atom-line" type="text" value="Subject of the note" />
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Multiline</h2>
+    <p class="why">Several lines. No toolbar. Ordinary words.</p>
+    <div class="stage">
+      <textarea class="atom-area">Claire takes Friday. Cover the front desk in the morning.</textarea>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Search field</h2>
+    <p class="why">A field for find. Not the Ask strip. Not the Door prompt.</p>
+    <div class="stage">
+      <input class="atom-line" type="search" placeholder="Find a note" />
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Number</h2>
+    <p class="why">A count. Tabular numbers. Not a slider.</p>
+    <div class="stage">
+      <input class="atom-line atom-nums" type="text" inputmode="numeric" value="12" />
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Money</h2>
+    <p class="why">An amount with a currency mark. Not a ledger widget.</p>
+    <div class="stage">
+      <div class="atom-money">
+        <span class="sign">$</span>
+        <input class="atom-line atom-nums" type="text" inputmode="decimal" value="24.00" />
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Date</h2>
+    <p class="why">A day in ordinary words. Not a month-day cell.</p>
+    <div class="stage">
+      <input class="atom-line" type="text" value="5 September 2026" />
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Time</h2>
+    <p class="why">A clock time. Tabular. Not an agenda slot.</p>
+    <div class="stage">
+      <input class="atom-line atom-nums" type="text" value="14:30" />
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Radio/choice</h2>
+    <p class="why">One value from a short closed list. Square mark, like the checkbox.</p>
+    <div class="stage">
+      <div class="atom-choice">
+        <label><input type="radio" name="when" checked /> Morning</label>
+        <label><input type="radio" name="when" /> Afternoon</label>
+        <label><input type="radio" name="when" /> Evening</label>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Select</h2>
+    <p class="why">One value from a longer closed list. Hairline. Same serif.</p>
+    <div class="stage">
+      <select class="atom-select">
+        <option>Open</option>
+        <option>Waiting</option>
+        <option>Done</option>
+      </select>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Drag handle</h2>
+    <p class="why">The grabber for a row. Not a resize handle.</p>
+    <div class="stage">
+      <span class="atom-handle" aria-label="Move">::</span>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Tabs</h2>
+    <p class="why">Words in a row. Current is ink. Not a product shell.</p>
+    <div class="stage">
+      <div class="atom-tabs">
+        <a href="#hours" class="atom-tab is-on">Hours</a>
+        <a href="#notes" class="atom-tab">Notes</a>
+        <a href="#letters" class="atom-tab">Letters</a>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Segmented control</h2>
+    <p class="why">Two or three hairline choices. Selected uses the strong line.</p>
+    <div class="stage">
+      <div class="atom-seg">
+        <button type="button" class="is-on">Week</button>
+        <button type="button">Month</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Chip/tag</h2>
+    <p class="why">A hairline word that classifies. Not a colorful pill.</p>
+    <div class="stage">
+      <span class="atom-chip">Hours</span>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Person chip</h2>
+    <p class="why">A name. No avatar. No pile of faces.</p>
+    <div class="stage">
+      <span class="atom-person">Claire Moss</span>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Status word</h2>
+    <p class="why">One word in quiet ink. Not a traffic-light badge.</p>
+    <div class="stage">
+      <span class="atom-status">Open</span>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Progress fraction</h2>
+    <p class="why">A count in words. Not a bar. Not a ring.</p>
+    <div class="stage">
+      <p class="atom-fraction">3 of 8</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Spinner/loading</h2>
+    <p class="why">The word Working. Not a ring. Not shimmer.</p>
+    <div class="stage">
+      <p class="atom-spin">Working.</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Tooltip/field help</h2>
+    <p class="why">Quiet help under a field. Not a dark balloon.</p>
+    <div class="stage">
+      <p class="atom-help">Hours are written as numbers, such as 7.5.</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Validation line</h2>
+    <p class="why">Why this field cannot be saved. One line. Muted danger.</p>
+    <div class="stage">
+      <p class="atom-valid">Hours need a number.</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Soft notice</h2>
+    <p class="why">A quiet sentence. Not a toast stack.</p>
+    <div class="stage">
+      <p class="atom-notice">Saved to the vault.</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Page message</h2>
+    <p class="why">A sentence at the top of the paper. Still paper.</p>
+    <div class="stage">
+      <p class="atom-page-msg">This note could not be saved.</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Menu</h2>
+    <p class="why">A hairline list of actions. Not a waffle. Not a utility bar.</p>
+    <div class="stage">
+      <div class="atom-menu">
+        <button type="button" class="atom-menu-item">Open</button>
+        <button type="button" class="atom-menu-item">Move</button>
+        <button type="button" class="atom-menu-item">Delete</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Menu item</h2>
+    <p class="why">One row in a menu. Words, not an icon-only button.</p>
+    <div class="stage">
+      <button type="button" class="atom-menu-item">Move</button>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Popover</h2>
+    <p class="why">A small hairline panel near a control. Not a second room.</p>
+    <div class="stage">
+      <div class="atom-pop">Friday is already covered.</div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Dialog/confirm panel</h2>
+    <p class="why">A centered hairline panel with a question. Buttons are the confirm pair.</p>
+    <div class="stage">
+      <div class="atom-dialog">
+        <p>Delete this note from the vault?</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Sheet/drawer</h2>
+    <p class="why">A hairline panel from an edge. Not a utility bar.</p>
+    <div class="stage">
+      <div class="atom-sheet">
+        <p>More fields sit here, still on paper.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Modal scrim</h2>
+    <p class="why">The wash behind a dialog. The paper stays the product.</p>
+    <div class="stage">
+      <div class="atom-scrim" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Title</h2>
+    <p class="why">The page name on paper. Same serif.</p>
+    <div class="stage">
+      <h3 class="atom-title">Hours this week</h3>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Section head</h2>
+    <p class="why">A group name on paper. Not the quiet label. Not a tab.</p>
+    <div class="stage">
+      <h3 class="atom-section">Morning cover</h3>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Separator</h2>
+    <p class="why">One pixel of hairline. Not a card shadow.</p>
+    <div class="stage">
+      <hr class="atom-rule" />
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>List row</h2>
+    <p class="why">One line in a collection. A name and one quiet fact.</p>
+    <div class="stage">
+      <div class="atom-list-row">
+        <span>Front desk cover</span>
+        <span class="meta">Friday</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Checkbox row</h2>
+    <p class="why">The kernel checkbox on a full row. Box is the hit. Words take the caret.</p>
+    <div class="stage">
+      <div class="atom-check-row">
+        <span class="box" aria-hidden="true"></span>
+        <span>Cover the front desk</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Table head</h2>
+    <p class="why">Quiet labels over columns. No sort arrows. No resize handles.</p>
+    <div class="stage">
+      <span class="atom-th">Item</span>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Table cell</h2>
+    <p class="why">One cell of words or tabular numbers.</p>
+    <div class="stage">
+      <span class="atom-td nums">24.00</span>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Attachment link</h2>
+    <p class="why">A file name that opens a vault file.</p>
+    <div class="stage">
+      <a class="atom-attach" href="#">leave-letter.md</a>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Duration mark</h2>
+    <p class="why">How long, in faint tabular numbers.</p>
+    <div class="stage">
+      <p class="atom-duration">45 min</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Place crumb</h2>
+    <p class="why">Parent path as wiki links joined by middots. Not chevron breadcrumbs.</p>
+    <div class="stage">
+      <p class="atom-crumb"><span class="atom-person">notes</span> · <span class="atom-person">hours</span></p>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Lookup field</h2>
+    <p class="why">Type to find, then commit a wiki link. Not a branded popup.</p>
+    <div class="stage">
+      <input class="atom-line" type="text" value="Claire" />
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Stage steps</h2>
+    <p class="why">Ordered process words on paper. Current is ink. Not path chevrons.</p>
+    <div class="stage">
+      <div class="atom-stages">
+        <span>Ask</span>
+        <span class="now">Write</span>
+        <span>Send</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Activity line</h2>
+    <p class="why">One dated line. Not a feed. Not a toast.</p>
+    <div class="stage">
+      <div class="atom-activity"><span class="when">5 Sep</span> · Wrote the reply.</div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Filter chip</h2>
+    <p class="why">A word that narrows a list. The word is the control.</p>
+    <div class="stage">
+      <button type="button" class="atom-filter">This week</button>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Keep</p>
+    <h2>Quiet sheet</h2>
+    <p class="why">A hairline panel on the same paper. No scrim.</p>
+    <div class="stage">
+      <div class="atom-quiet-sheet">
+        <p>File the letter next to the map.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Key facts</h2>
+    <p class="why">Quiet labels and ink values. Not a highlights panel. Not a new atom.</p>
+    <div class="stage">
+      <div class="atom-facts">
+        <div>
+          <p class="quiet-label">Who</p>
+          <p class="value">Claire Moss</p>
+        </div>
+        <div>
+          <p class="quiet-label">When</p>
+          <p class="value">Friday</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Child list</h2>
+    <p class="why">A quiet label and a hanging list. Not a new atom.</p>
+    <div class="stage">
+      <p class="quiet-label">Cover</p>
+      <div class="hang"><span class="mark">•</span><span class="words">Morning desk</span></div>
+      <div class="hang"><span class="mark">•</span><span class="words">Afternoon phone</span></div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Confirm pair</h2>
+    <p class="why">Two hairline buttons. Not a new atom.</p>
+    <div class="stage on-black">
+      <div class="uses">
+        <button type="button" class="hairline-button">Accept</button>
+        <button type="button" class="hairline-button">Reject</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kind">Composition</p>
+    <h2>Prompt bar / actions row</h2>
+    <p class="why">Door prompt bar and two hairline buttons. Not a new atom.</p>
+    <div class="stage on-black">
+      <div class="prompt">
+        <input type="text" placeholder="What do you want to do today?" />
+      </div>
+      <div class="door-actions" style="margin-top: var(--space-4);">
+        <button type="button" class="hairline-button">Get to Work</button>
+        <button type="button" class="hairline-button">Capture thoughts</button>
+      </div>
+    </div>
+  </section>
+</body>
+</html>

@@ -5,14 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Generated — AidanOS pattern</title>
   <link rel="stylesheet" href="../foundations/tokens.css" />
+  <link rel="stylesheet" href="../components/primitives.css" />
   <style>
     * { box-sizing: border-box; }
     html, body {
       margin: 0;
       padding: 0;
-    }
-    a, button {
-      font: inherit;
     }
     a {
       color: inherit;
@@ -34,112 +32,37 @@
       margin: 0 auto;
       padding: var(--space-6) var(--space-4) var(--space-6);
     }
-    h1 {
-      margin: 0 0 var(--space-3);
-      font-size: 1.7rem;
-      font-weight: 500;
-      letter-spacing: -0.02em;
-    }
-    .why {
-      margin: 0 0 var(--space-5);
-      color: var(--quiet);
-      line-height: 1.7;
-    }
-    .quiet-label {
-      margin: var(--space-4) 0 var(--space-2);
-      font-size: 0.75rem;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--faint);
-    }
-    .task {
-      display: flex;
-      align-items: flex-start;
-      gap: 0.55em;
-      margin: 0 0 var(--space-2);
-      font-size: 1.08rem;
-      line-height: 1.8;
-    }
-    .box {
-      display: inline-flex;
-      width: 1.15em;
-      height: 1.15em;
-      margin-top: 0.32em;
-      border: var(--line) solid var(--quiet);
-      border-radius: var(--radius);
-      flex: 0 0 auto;
-    }
-    .empty {
-      margin: 0 0 var(--space-5);
-      color: var(--faint);
-      font-size: 1.08rem;
-      line-height: 1.8;
-    }
-    .wiki {
-      display: inline;
-      padding: 0 0.12em;
-      background: color-mix(in srgb, var(--ink) 10%, transparent);
-      color: var(--ink);
-    }
-    .wiki .brack {
-      display: none;
-    }
-    .back {
-      margin: 0 0 var(--space-5);
-      line-height: 1.7;
-    }
     .actions {
       display: flex;
       flex-direction: column;
       align-items: flex-start;
       gap: var(--space-3);
-    }
-    .work {
-      padding: var(--space-2) var(--space-3);
-      border: var(--line) solid var(--quiet);
-      border-radius: var(--radius);
-      background: transparent;
-      color: var(--quiet);
-      cursor: pointer;
-    }
-    .work:hover {
-      color: var(--ink);
-      border-color: var(--ink);
-    }
-    .capture {
-      padding: 0;
-      border: 0;
-      background: none;
-      color: var(--quiet);
-      text-decoration: underline;
-      text-underline-offset: 0.2em;
-      cursor: pointer;
-    }
-    .capture:hover {
-      color: var(--ink);
+      margin-top: var(--space-5);
     }
   </style>
 </head>
 <body>
-  <p class="caption">A generated application. Only library parts. No new look.</p>
+  <p class="caption">A generated application. Only library parts. Get to Work and Capture thoughts are the same hairline button. No new look.</p>
   <div class="sheet">
-    <h1>Write the reply</h1>
-    <p class="why">A letter is work. This screen is the reply, built only from the library.</p>
-    <p class="quiet-label">Next steps</p>
-    <div class="task">
-      <span class="box" aria-hidden="true"></span>
-      <span>Read the letter</span>
+    <div class="paper">
+      <h1>Write the reply</h1>
+      <p>A letter is work. This screen is the reply, built only from the library.</p>
+      <p class="quiet-label">Next steps</p>
+      <div class="task">
+        <span class="box" aria-hidden="true"></span>
+        <span class="words">Read the letter</span>
+      </div>
+      <div class="task">
+        <span class="box" aria-hidden="true"></span>
+        <span class="words">Write the reply in the vault</span>
+      </div>
+      <p class="quiet-label">The reply</p>
+      <p class="empty">Write.</p>
+      <p>Back to <a class="wiki" href="#"><span class="brack">[[</span>reply-to-a-letter<span class="brack">]]</span></a>.</p>
     </div>
-    <div class="task">
-      <span class="box" aria-hidden="true"></span>
-      <span>Write the reply in the vault</span>
-    </div>
-    <p class="quiet-label">The reply</p>
-    <p class="empty">Write.</p>
-    <p class="back">Back to <a class="wiki" href="#"><span class="brack">[[</span>reply-to-a-letter<span class="brack">]]</span></a>.</p>
     <div class="actions">
-      <button type="button" class="work">Get to Work</button>
-      <button type="button" class="capture">Capture thoughts</button>
+      <button type="button" class="hairline-button">Get to Work</button>
+      <button type="button" class="hairline-button">Capture thoughts</button>
     </div>
   </div>
 </body>

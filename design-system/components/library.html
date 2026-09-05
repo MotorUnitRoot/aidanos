@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AidanOS component library</title>
   <link rel="stylesheet" href="../foundations/tokens.css" />
+  <link rel="stylesheet" href="primitives.css" />
   <style>
     * { box-sizing: border-box; }
     html, body {
@@ -13,9 +14,6 @@
     }
     body {
       padding: var(--space-6) var(--space-4);
-    }
-    button, input {
-      font: inherit;
     }
     .page {
       max-width: 48rem;
@@ -59,185 +57,49 @@
     .stage.paper-room {
       padding: var(--space-5) var(--space-3);
     }
-
-    .prompt {
+    .uses {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      width: min(38rem, 100%);
-      margin: 0 auto;
-      padding: 0.85rem 1rem;
-      border: var(--line) solid var(--quiet);
-      border-radius: var(--radius);
-      background: transparent;
+      gap: var(--space-3);
     }
-    .prompt input {
-      flex: 1;
-      min-width: 0;
-      border: 0;
-      background: transparent;
-      color: var(--quiet);
-      font-size: 1.15rem;
-      outline: none;
+    .uses.stack {
+      flex-direction: column;
+      align-items: flex-start;
     }
-    .prompt input::placeholder {
-      color: var(--quiet);
-      opacity: 1;
-    }
-    .prompt input:focus {
-      color: var(--ink);
-    }
-
-    .work {
-      display: block;
-      margin: 0 auto;
-      padding: var(--space-2) var(--space-3);
-      border: var(--line) solid var(--quiet);
-      border-radius: var(--radius);
-      background: transparent;
-      color: var(--quiet);
-      cursor: pointer;
-    }
-    .work:hover {
-      color: var(--ink);
-      border-color: var(--ink);
-    }
-    .work:focus {
-      outline: var(--line) solid var(--ink);
-      outline-offset: 2px;
-    }
-
-    .capture {
-      display: block;
-      margin: 0 auto;
-      padding: 0;
-      border: 0;
-      background: none;
-      color: var(--quiet);
-      text-decoration: underline;
-      text-underline-offset: 0.2em;
-      cursor: pointer;
-    }
-    .capture:hover {
-      color: var(--ink);
-    }
-    .capture:focus {
-      outline: var(--line) solid var(--quiet);
-      outline-offset: 3px;
-    }
-
     .weeks {
       display: grid;
       grid-template-columns: repeat(3, 5.5rem);
       gap: var(--space-2);
     }
-    .week {
+    .week-row {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+    }
+    .week-arrows {
       display: flex;
       flex-direction: column;
-      align-items: center;
       gap: var(--space-1);
-      min-height: 5rem;
-      padding: var(--space-2) var(--space-1);
-      border: var(--line) solid var(--hairline);
-      border-radius: var(--radius);
-      background: var(--surface);
-      color: var(--ink);
     }
-    .week .dow {
-      font-size: 0.62rem;
-      letter-spacing: 0.08em;
-      color: var(--quiet);
-    }
-    .week .dom {
-      font-size: 1.15rem;
-      font-weight: 600;
-      line-height: 1.1;
-    }
-    .week.selected {
-      border-color: var(--hairline-strong);
-      background: transparent;
-    }
-    .week.today {
-      box-shadow: inset 0 -1px 0 var(--hairline-strong);
-    }
-
-    .paper {
+    .paper-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: var(--space-3);
       width: var(--paper);
       max-width: 100%;
       margin: 0 auto;
     }
-    .paper h3 {
-      margin: 0 0 var(--space-3);
-      font-size: clamp(1.7rem, 3.2vw, 2.25rem);
-      font-weight: 500;
-      letter-spacing: -0.025em;
-      line-height: 1.12;
-    }
-    .paper p {
+    .paper-head h3 {
       margin: 0;
-      font-size: 1.08rem;
-      line-height: 1.8;
+      font-size: 1.15rem;
+      font-weight: 500;
     }
-
-    .task {
+    .day-shift {
       display: flex;
-      align-items: flex-start;
-      gap: 0.55em;
-      margin: 0 0 var(--space-2);
-      font-size: 1.08rem;
-      line-height: 1.8;
-    }
-    .box {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      flex: 0 0 auto;
-      width: 1.15em;
-      height: 1.15em;
-      margin-top: 0.32em;
-      border: var(--line) solid var(--quiet);
-      border-radius: var(--radius);
-      background: transparent;
-      cursor: pointer;
-    }
-    .box.checked {
-      background: var(--ok);
-      border-color: var(--ok);
-    }
-    .task .words {
-      flex: 1;
-      min-width: 0;
-    }
-
-    .hang {
-      display: flex;
-      align-items: flex-start;
       gap: var(--space-2);
-      margin: 0 0 var(--space-2);
-      font-size: 1.08rem;
-      line-height: 1.8;
     }
-    .hang .mark {
-      flex: 0 0 1.25rem;
-      width: 1.25rem;
-      color: var(--faint);
-      text-align: center;
-    }
-    .hang .words {
-      flex: 1;
-      min-width: 0;
-    }
-
-    .wiki {
-      display: inline;
-      padding: 0 0.12em;
-      background: color-mix(in srgb, var(--ink) 10%, transparent);
-      color: var(--ink);
-      text-decoration: none;
-    }
-    .wiki .brack {
-      display: none;
-    }
-
     .ask-demo {
       position: relative;
       min-height: 8rem;
@@ -247,109 +109,40 @@
       color: var(--quiet);
       line-height: 1.7;
     }
-    .ask-strip {
+    .ask-demo .ask-strip {
       position: absolute;
       left: 0;
       right: 0;
       bottom: 0;
-      display: flex;
-      align-items: center;
-      gap: var(--space-3);
-      padding: 0.7rem var(--space-3);
-      border-top: var(--line) solid var(--hairline);
-      background: var(--bg);
     }
-    .ask-strip input {
-      flex: 1;
-      min-width: 0;
-      border: 0;
-      background: transparent;
-      color: var(--ink);
-      outline: none;
-    }
-    .ask-strip input::placeholder {
-      color: var(--quiet);
-    }
-    .ask-strip .close {
-      border: 0;
-      background: none;
-      color: var(--faint);
-      cursor: pointer;
-      padding: 0;
-    }
-    .ask-strip .close:hover {
-      color: var(--ink);
-    }
-
-    .hit {
-      padding: var(--space-2) 0;
-      border-top: var(--line) solid var(--hairline);
-      font-size: 0.95rem;
-      line-height: 1.5;
-    }
-    .hit:first-child {
-      border-top: 0;
-      padding-top: 0;
-    }
-    .hit .file {
-      color: var(--quiet);
-    }
-
     .agenda {
       display: flex;
       flex-direction: column;
     }
-    .slot {
+    .month-row {
       display: grid;
-      grid-template-columns: 3.15rem minmax(0, 1fr);
-      gap: var(--space-2);
-      min-height: var(--slot);
-      border-top: var(--line) solid var(--hairline);
-      padding: var(--space-1) 0;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 0.15rem;
     }
-    .slot:last-child {
-      border-bottom: var(--line) solid var(--hairline);
+    .nav-row {
+      display: flex;
+      align-items: center;
+      gap: var(--space-4);
     }
-    .slot .hour {
-      font-size: 0.7rem;
-      color: var(--faint);
-      font-variant-numeric: tabular-nums;
-    }
-    .ghost {
-      margin: 0.08rem 0;
-      padding: 0.22rem 0.4rem;
-      border: var(--line) dashed var(--hairline-strong);
-      border-radius: var(--radius);
-      color: var(--quiet);
-      font-size: 0.8rem;
-      line-height: 1.3;
-      opacity: 0.78;
-    }
-
-    .quiet-label {
-      margin: 0;
-      font-size: 0.75rem;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--faint);
-    }
-    .empty {
-      margin: 0;
-      color: var(--faint);
-      font-size: 1.08rem;
-      line-height: 1.8;
+    .nav-row .saved {
+      margin-left: auto;
     }
   </style>
 </head>
 <body>
   <div class="page">
     <h1>Component library</h1>
-    <p class="lead">Closed library. Generated screens may use only these parts. If a last-mile file would need a new look, the system is wrong.</p>
+    <p class="lead">Closed library. Get to Work and Capture thoughts are the same hairline button. Last-mile generation may use only this list. A screen that would need a new look is wrong.</p>
   </div>
 
   <section>
     <h2>Door prompt bar</h2>
-    <p class="why">A search-like field on black. The placeholder is quiet ink. Empty Enter opens Today. It is not a chat thread.</p>
+    <p class="why">What it is: the Door question as a search-like field, not a floating line of type. Tokens: --quiet for the border and the placeholder, --ink when you type, --line, --radius. Behavior: empty Enter opens Today. It is not a chat thread.</p>
     <div class="stage on-black">
       <div class="prompt">
         <input type="text" placeholder="What do you want to do today?" />
@@ -358,24 +151,34 @@
   </section>
 
   <section>
-    <h2>Get to Work</h2>
-    <p class="why">A hairline button on black. It opens Today with nothing typed. Hover brightens --quiet to --ink.</p>
+    <h2>Hairline button</h2>
+    <p class="why">What it is: one button. Get to Work, Capture thoughts, Accept, and Reject are four uses of this class, not four components. Tokens: --quiet ink and border, --ink on hover, --line, --radius. Behavior: a hairline box, never underlined text. Hover brightens. Focus is a hairline, not a glow.</p>
     <div class="stage on-black">
-      <button type="button" class="work">Get to Work</button>
+      <div class="uses stack">
+        <button type="button" class="hairline-button">Get to Work</button>
+        <button type="button" class="hairline-button">Capture thoughts</button>
+        <button type="button" class="hairline-button">Accept</button>
+        <button type="button" class="hairline-button">Reject</button>
+      </div>
     </div>
   </section>
 
   <section>
-    <h2>Capture thoughts</h2>
-    <p class="why">Quiet underlined text on black. It opens blank paper. It is not a ritual screen.</p>
-    <div class="stage on-black">
-      <button type="button" class="capture">Capture thoughts</button>
+    <h2>Text link</h2>
+    <p class="why">What it is: Today, Plan, Month, and close. Tokens: --quiet, --ink when current or on hover. Behavior: no box and no underline. The current place is ink. It is not a tab and not a hairline button.</p>
+    <div class="stage">
+      <div class="uses">
+        <a href="#today" class="text-link is-current">Today</a>
+        <a href="#plan" class="text-link">Plan</a>
+        <button type="button" class="text-link">Month</button>
+        <button type="button" class="text-link">close</button>
+      </div>
     </div>
   </section>
 
   <section>
     <h2>Week card</h2>
-    <p class="why">Hairline cards, not sport chips. The selected day uses --hairline-strong. The current day has a stronger edge.</p>
+    <p class="why">What it is: one day in the week strip. Tokens: --hairline, --surface, --quiet for the weekday, --ink for the date, --hairline-strong when selected or today. Behavior: opening a card opens that day’s note, plan, and intention. Not a sport chip.</p>
     <div class="stage">
       <div class="weeks">
         <div class="week today">
@@ -395,8 +198,36 @@
   </section>
 
   <section>
+    <h2>Week chevron</h2>
+    <p class="why">What it is: the control that steps the week strip. Tokens: --quiet, --ink on hover. Behavior: it sits beside the week cards. It is not a day chevron and not a hairline button.</p>
+    <div class="stage">
+      <div class="week-row">
+        <div class="week"><span class="dow">MON</span><span class="dom">31</span></div>
+        <div class="week-arrows">
+          <button type="button" class="week-chevron" aria-label="Previous week">‹</button>
+          <button type="button" class="week-chevron" aria-label="Next week">›</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Day chevron</h2>
+    <p class="why">What it is: the control that steps one day on the paper. Tokens: --faint, --ink on hover. Behavior: it sits by the paper title. It is not a week chevron and not a text link.</p>
+    <div class="stage">
+      <div class="paper-head">
+        <h3>Tuesday September 1</h3>
+        <p class="day-shift">
+          <button type="button" class="day-chevron" aria-label="Previous day">‹</button>
+          <button type="button" class="day-chevron" aria-label="Next day">›</button>
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section>
     <h2>42rem paper</h2>
-    <p class="why">The writing column is --paper, 42rem, and centered. One serif. A heading and a sentence of prose.</p>
+    <p class="why">What it is: the writing column. Tokens: --paper (42rem), --ink, one serif. Behavior: the column is centered. Headings and prose live here. What is saved is ordinary markdown.</p>
     <div class="stage paper-room">
       <div class="paper">
         <h3>Tuesday September 1</h3>
@@ -407,7 +238,7 @@
 
   <section>
     <h2>Checkbox</h2>
-    <p class="why">The box is the hit target. The words take the caret. A checked box uses --ok.</p>
+    <p class="why">What it is: a tick on the paper. Tokens: --quiet for the empty box, --ok when checked. Behavior: the box is the hit target. The words take the caret.</p>
     <div class="stage">
       <div class="task">
         <span class="box" aria-hidden="true"></span>
@@ -422,7 +253,7 @@
 
   <section>
     <h2>Hanging list</h2>
-    <p class="why">The mark sits in the gutter. The words hang to the right of it. The mark uses --faint.</p>
+    <p class="why">What it is: a list that hangs. Tokens: --faint for the mark, --ink for the words. Behavior: the mark sits in the gutter. The words hang to the right of it.</p>
     <div class="stage">
       <div class="hang">
         <span class="mark">•</span>
@@ -437,27 +268,43 @@
 
   <section>
     <h2>Wiki link</h2>
-    <p class="why">The painted word is the-reply. Brackets stay hidden while idle. The disk is still [[the-reply]].</p>
+    <p class="why">What it is: a painted note name. Tokens: --ink wash. Behavior: the word is the-reply. Brackets stay hidden while idle. The disk is still [[the-reply]].</p>
     <div class="stage">
       <p>Open <a class="wiki" href="#"><span class="brack">[[</span>the-reply<span class="brack">]]</span></a> beside the map.</p>
     </div>
   </section>
 
   <section>
+    <h2>Quiet label</h2>
+    <p class="why">What it is: a section heading on paper. Tokens: --faint, the same serif, letter spacing. Behavior: Plan uses it for next steps and waiting. Generated screens may use it. It is not a second typeface and not a tab.</p>
+    <div class="stage">
+      <p class="quiet-label">Next steps</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Empty state</h2>
+    <p class="why">What it is: an empty day or an empty generated page. Tokens: --faint. Behavior: it says Write. This is not a tutorial and not an error banner.</p>
+    <div class="stage">
+      <p class="empty">Write.</p>
+    </div>
+  </section>
+
+  <section>
     <h2>Ask strip</h2>
-    <p class="why">The placeholder is Ask or find. The paper scrolls. The strip stays. It can be closed. It is not a mail feed.</p>
+    <p class="why">What it is: Ask or find at the bottom of the room. Tokens: --hairline on top, --bg, --quiet placeholder, --ink for type. Behavior: the paper scrolls. The strip stays. Close is a text link. It is not a mail feed.</p>
     <div class="stage ask-demo">
       <p class="scroll">The paper scrolls above this strip. The strip stays at the bottom of the room.</p>
       <div class="ask-strip">
         <input type="text" placeholder="Ask or find" />
-        <button type="button" class="close" aria-label="Close">x</button>
+        <button type="button" class="text-link">close</button>
       </div>
     </div>
   </section>
 
   <section>
     <h2>Search hit</h2>
-    <p class="why">The file name is --quiet. The title is ink. This is not TODAY.md and not a raw heading mark.</p>
+    <p class="why">What it is: one result. Tokens: --quiet for the file name, --ink for the title, --hairline between rows. Behavior: opening a hit uses the same paper, not a separate preview. This is not TODAY.md and not a raw heading mark.</p>
     <div class="stage">
       <div class="hit"><span class="file">reply-to-a-letter</span> · Reply to a letter</div>
       <div class="hit"><span class="file">2026-08-31</span> · Read the letter</div>
@@ -466,7 +313,7 @@
 
   <section>
     <h2>Half-hour agenda slot</h2>
-    <p class="why">Each row is --slot tall, a half hour. Hours sit faint in the gutter. Hairlines divide the day.</p>
+    <p class="why">What it is: one row of the day. Tokens: --slot (two rem, a half hour), --faint for the hour, --hairline between rows. Behavior: hours sit in the gutter. A line from the note can land here.</p>
     <div class="stage">
       <div class="agenda">
         <div class="slot"><span class="hour">14:00</span><span></span></div>
@@ -478,7 +325,7 @@
 
   <section>
     <h2>Drag preview</h2>
-    <p class="why">Dragging shows a faded block on the slot you are over. The ghost uses --quiet ink and a dashed --hairline-strong.</p>
+    <p class="why">What it is: the faded block on the slot you are over. Tokens: --quiet ink, dashed --hairline-strong. Behavior: dragging a line from the note shows this ghost. Dropping places the line in time.</p>
     <div class="stage">
       <div class="agenda">
         <div class="slot"><span class="hour">14:00</span><span></span></div>
@@ -489,20 +336,31 @@
   </section>
 
   <section>
-    <h2>Quiet label</h2>
-    <p class="why">A section heading on paper. It uses --faint, the same serif, and letter spacing. Plan uses it for next steps and waiting. Generated screens may use it. It is not a second typeface and not a tab.</p>
+    <h2>Month day</h2>
+    <p class="why">What it is: one day in the month grid. Tokens: --ink, --hairline-strong for the mark. Behavior: if a note exists, a hairline mark. It is not a badge and not a Salesforce cell.</p>
     <div class="stage">
-      <p class="quiet-label">Next steps</p>
+      <div class="month-row">
+        <span class="month-day"></span>
+        <span class="month-day has-note selected">1</span>
+        <span class="month-day">2</span>
+        <span class="month-day has-note">3</span>
+        <span class="month-day">4</span>
+        <span class="month-day">5</span>
+        <span class="month-day">6</span>
+      </div>
     </div>
   </section>
 
   <section>
-    <h2>Empty state</h2>
-    <p class="why">An empty day or an empty generated page says Write. The words use --faint. This is not an Architecture line, not a tutorial, and not an error banner.</p>
+    <h2>Saved chip</h2>
+    <p class="why">What it is: reserved space in the nav. Tokens: --quiet, --ok when saved. Behavior: min-width and nowrap keep the word Saved from shoving the paper. Empty still holds the line box.</p>
     <div class="stage">
-      <p class="empty">Write.</p>
+      <div class="nav-row">
+        <a href="#today" class="text-link is-current">Today</a>
+        <a href="#plan" class="text-link">Plan</a>
+        <p class="saved is-saved">Saved</p>
+      </div>
     </div>
   </section>
 </body>
 </html>
-

@@ -1,1 +1,1 @@
-FILE_CONTENT_FROM_DISK:/workspace/cdpprove/push_files/app.js
+RESTORE_FROM_COMMIT:a0dbae9ac674fb9d962706a7e2f634c5db91bb2c

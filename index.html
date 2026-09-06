@@ -12,7 +12,7 @@
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <link rel="stylesheet" href="/styles.css" />
-  <link rel="stylesheet" href="/day.css?v=map1" />
+  <link rel="stylesheet" href="/day.css?v=ios1" />
   <link rel="stylesheet" href="/api/skin.css" />
 </head>
 <body class="day-page view-door">
@@ -21,7 +21,7 @@
       <form id="door-form" autocomplete="off">
         <label class="sr-only" for="door-input">What do you want to do today?</label>
         <div class="door-bar">
-          <input type="text" id="door-input" name="q" placeholder="What do you want to do today?" maxlength="240" autofocus />
+          <input type="text" id="door-input" name="door-intent" placeholder="What do you want to do today?" maxlength="240" autofocus autocomplete="off" autocorrect="off" autocapitalize="sentences" spellcheck="false" inputmode="search" enterkeyhint="search" data-lpignore="true" data-1p-ignore="true" />
           <button type="submit" class="door-return" aria-label="Enter">&#8629;</button>
         </div>
         <div id="door-proposals" class="door-proposals" hidden></div>
@@ -131,7 +131,7 @@
       </header>
       <form id="ask-form" class="ask-form" autocomplete="off">
         <label class="sr-only" for="ask-q">Ask or find</label>
-        <input type="text" id="ask-q" placeholder="Ask or find" />
+        <input type="text" id="ask-q" name="ask-find" placeholder="Ask or find" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" inputmode="search" enterkeyhint="search" data-lpignore="true" data-1p-ignore="true" />
       </form>
       <ul id="ask-hits" class="ask-hits"></ul>
     </div>
@@ -159,6 +159,6 @@
     </button>
   </div>
 
-  <script src="/app.js?v=map1" type="module"></script>
+  <script src="/app.js?v=ios1" type="module"></script>
 </body>
 </html>

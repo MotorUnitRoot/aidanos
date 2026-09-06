@@ -19,6 +19,7 @@ const state = {
   activeLine: -1,
   folderDir: "",
   plan: { title: "", why: "", steps: [], parked: [] },
+  mapStageId: "",
 };
 
 const PAGE_VIEWS = ["door", "today", "plan"];
@@ -731,6 +732,15 @@ function isPlanDoc() {
   return isNoteDoc() && String(state.doc && state.doc.path || "").replace(/\\/g, "/") === "aidanos/active-horse.md";
 }
 
+function isWorkMapPath(rel) {
+  const p = String(rel || "").replace(/\\/g, "/");
+  return /^maps\/.+\.md$/i.test(p) && !/^maps\/the-/i.test(p);
+}
+
+function isMapDoc() {
+  return isNoteDoc() && isWorkMapPath(state.doc && state.doc.path);
+}
+
 function isPlanHash() {
   return (location.hash || "").replace(/^#/, "") === "plan";
 }
@@ -870,7 +880,9 @@ async function openDay(date, { silent = false, force = false } = {}) {
 function renderDay() {
   const d = state.day;
   if (!d) return;
-  document.body.classList.remove("doc-note", "doc-capture", "doc-plan");
+  state.mapStageId = "";
+  hideMapRoom();
+  document.body.classList.remove("doc-note", "doc-capture", "doc-plan", "doc-map", "doc-stage");
   $("paper-title").textContent = formatPaperTitle(d.date);
   $("rail-date").textContent = formatRailDate(d.date);
   const dump = $("dump");
@@ -1305,6 +1317,10 @@ function ensureDumpMatchesPaper() {
   const dump = $("dump");
   const paper = $("paper");
   if (!dump || !paper) return dump;
+  if (isMapDoc()) {
+    if (state.doc) state.doc.markdown = dump.value;
+    return dump;
+  }
   flushActiveLineToDump();
   const nodes = paperLines();
   let rebuilt = "";
@@ -1419,7 +1435,8 @@ function applyRemoteNote(body) {
   state.doc.mtime = Number(body && body.mtime) || 0;
   state.dirty = false;
   resetPaperHistory(paperHistory);
-  paintPaper();
+  if (isMapDoc()) renderMap();
+  else paintPaper();
 }
 
 let saveChain = Promise.resolve();
@@ -1583,10 +1600,14 @@ function showView(view) {
   if (isNoteDoc() && view !== "today") leaveCurrentPaper().catch(() => {});
   const planOn = isPlanDoc() || isPlanHash();
   const captureOn = isCaptureDoc() || isCaptureHash();
+  const mapOn = isMapDoc();
+  const stageOn = mapOn && !!state.mapStageId;
   document.body.className = "day-page view-" + view
     + (isNoteDoc() ? " doc-note" : "")
     + (captureOn && isCaptureDoc() ? " doc-capture" : "")
-    + (planOn && isPlanDoc() ? " doc-plan" : "");
+    + (planOn && isPlanDoc() ? " doc-plan" : "")
+    + (mapOn ? " doc-map" : "")
+    + (stageOn ? " doc-stage" : "");
   PAGE_VIEWS.forEach((v) => {
     const el = $("view-" + v);
     if (!el) return;
@@ -1600,7 +1621,7 @@ function showView(view) {
   });
   document.title = view === "door"
     ? "AidanOS"
-    : (planOn ? "Plan · AidanOS" : "Today · AidanOS");
+    : (planOn ? "Plan · AidanOS" : (mapOn ? ((state.doc && notePaperTitle(state.doc)) || "Map") + " · AidanOS" : "Today · AidanOS"));
   if (view === "today") {
     startDayWatch();
     syncTodayNav();
@@ -1745,12 +1766,22 @@ function renderNote() {
   const path = String(doc.path || "").replace(/\\/g, "/");
   document.body.classList.toggle("doc-capture", /^Capture\.md$/i.test(path));
   document.body.classList.toggle("doc-plan", path === "aidanos/active-horse.md");
+  document.body.classList.toggle("doc-map", isWorkMapPath(path));
+  document.body.classList.toggle("doc-stage", isWorkMapPath(path) && !!state.mapStageId);
   const title = path === "aidanos/active-horse.md" ? "Plan" : notePaperTitle(doc);
   if ($("paper-title")) $("paper-title").textContent = title;
   if ($("rail-date")) $("rail-date").textContent = title;
   const dump = $("dump");
   const md = cleanPaperMarkdown(doc.markdown || "");
   if (dump) dump.value = md;
+  if (isWorkMapPath(path)) {
+    renderMap();
+    renderRail();
+    syncTodayNav();
+    return;
+  }
+  hideMapRoom();
+  state.mapStageId = "";
   paintPaper();
   renderRail();
   syncTodayNav();
@@ -1767,7 +1798,10 @@ async function openVaultNote(rel) {
   closeAsk();
   setStatus("Loading");
   const same = isNoteDoc() && state.doc && state.doc.path === path;
-  if (!same) await leaveCurrentPaper();
+  if (!same) {
+    await leaveCurrentPaper();
+    state.mapStageId = "";
+  }
   // Cancel any in-flight openDay/loadWeek so Capture is not stolen back to Today
   const noteGen = ++state.openDayGen;
   const data = await api("/api/file?path=" + encodeURIComponent(path));
@@ -1816,6 +1850,211 @@ async function openVaultSearchHit(rel, line) {
   closeAsk();
   await openVaultNote(path);
   flashPaperLine(line);
+}
+
+function hideMapRoom() {
+  const room = $("map-room");
+  if (room) room.setAttribute("hidden", "");
+  const canvas = $("map-canvas");
+  if (canvas) canvas.removeAttribute("hidden");
+  const sheet = $("stage-sheet");
+  if (sheet) sheet.setAttribute("hidden", "");
+}
+
+function matchStageName(stage, name) {
+  const want = String(name || "").trim().toLowerCase();
+  if (!want || !stage) return false;
+  const title = String(stage.title || "").trim().toLowerCase();
+  const numbered = String(stage.number || "") + ". " + title;
+  return title === want || numbered.toLowerCase() === want || title.startsWith(want);
+}
+
+function renderMap() {
+  const room = $("map-room");
+  const canvas = $("map-canvas");
+  const sheet = $("stage-sheet");
+  const board = $("map-board");
+  const dump = $("dump");
+  if (!room || !canvas || !sheet || !board) return;
+  const md = dump ? dump.value : String(state.doc && state.doc.markdown || "");
+  const parsed = parseProcessMap(md);
+  const lints = processMapLints(parsed);
+  room.removeAttribute("hidden");
+  document.body.classList.add("doc-note", "doc-map");
+  document.body.classList.toggle("doc-stage", !!state.mapStageId);
+  if (typeof setFmtBarVisible === "function") setFmtBarVisible(false);
+  const title = parsed.title || notePaperTitle(state.doc);
+  if ($("map-title")) $("map-title").textContent = title;
+  if ($("paper-title")) $("paper-title").textContent = title;
+  const lint = $("map-lint");
+  if (lint) {
+    if (lints.length) {
+      lint.textContent = lints.join(" ");
+      lint.removeAttribute("hidden");
+    } else {
+      lint.textContent = "";
+      lint.setAttribute("hidden", "");
+    }
+  }
+  const stage = (parsed.stages || []).find((s) => s.id === state.mapStageId);
+  if (state.mapStageId && stage) {
+    canvas.setAttribute("hidden", "");
+    sheet.removeAttribute("hidden");
+    paintStagePaper(stage, parsed);
+    return;
+  }
+  state.mapStageId = "";
+  document.body.classList.remove("doc-stage");
+  canvas.removeAttribute("hidden");
+  sheet.setAttribute("hidden", "");
+  board.innerHTML = "";
+  const flow = document.createElement("div");
+  flow.className = "map-flow";
+  const nodes = [];
+  for (const s of parsed.stages || []) nodes.push({ type: "stage", stage: s });
+  const fork = (parsed.forks || [])[0];
+  if (fork) {
+    let at = nodes.findIndex((n) => n.type === "stage" && matchStageName(n.stage, (fork.branches[0] && fork.branches[0].target) || ""));
+    if (at < 0) at = Math.min(2, nodes.length);
+    nodes.splice(at, 0, { type: "fork", fork });
+  }
+  nodes.forEach((node, i) => {
+    if (i) {
+      const join = document.createElement("span");
+      join.className = "map-join";
+      join.setAttribute("aria-hidden", "true");
+      flow.appendChild(join);
+    }
+    if (node.type === "fork") {
+      const col = document.createElement("div");
+      col.className = "map-fork-col";
+      const diamond = document.createElement("div");
+      diamond.className = "map-fork";
+      const label = document.createElement("span");
+      label.textContent = node.fork.title || "Fork";
+      diamond.appendChild(label);
+      col.appendChild(diamond);
+      const kind = document.createElement("p");
+      kind.className = "map-fork-kind";
+      kind.textContent = node.fork.forkKind === "all-together" ? "All together" : (node.fork.forkKind === "only-one" ? "Only one" : "");
+      if (kind.textContent) col.appendChild(kind);
+      const no = (node.fork.branches || []).find((b) => /^no$/i.test(b.label));
+      if (no && no.target) {
+        const bye = document.createElement("p");
+        bye.className = "map-fork-no";
+        bye.textContent = "No → " + no.target;
+        col.appendChild(bye);
+      }
+      flow.appendChild(col);
+      return;
+    }
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "map-stage";
+    btn.setAttribute("data-stage", node.stage.id);
+    const name = document.createElement("span");
+    name.className = "map-stage-name";
+    name.textContent = (node.stage.number ? node.stage.number + ". " : "") + node.stage.title;
+    btn.appendChild(name);
+    const enter = stageGateText(node.stage, "enter");
+    const exit = stageGateText(node.stage, "exit");
+    if (enter) {
+      const line = document.createElement("span");
+      line.className = "map-stage-gate";
+      line.textContent = "Enter: " + enter;
+      btn.appendChild(line);
+    }
+    if (exit) {
+      const line = document.createElement("span");
+      line.className = "map-stage-gate";
+      line.textContent = "Exit: " + exit;
+      btn.appendChild(line);
+    }
+    btn.addEventListener("click", () => openMapStage(node.stage.id));
+    flow.appendChild(btn);
+  });
+  board.appendChild(flow);
+}
+
+function paintStagePaper(stage) {
+  const title = $("stage-title");
+  const body = $("stage-body");
+  if (title) title.textContent = stage.title || "Stage";
+  if (!body) return;
+  body.innerHTML = "";
+  const addBlock = (kicker, inner) => {
+    const block = document.createElement("section");
+    block.className = "stage-block";
+    const h = document.createElement("h2");
+    h.className = "stage-kicker";
+    h.textContent = kicker;
+    block.appendChild(h);
+    inner(block);
+    body.appendChild(block);
+  };
+  if (String(stage.why || "").trim()) {
+    addBlock("Why", (block) => {
+      const p = document.createElement("p");
+      p.className = "stage-why";
+      p.textContent = stage.why;
+      block.appendChild(p);
+    });
+  }
+  const addChecks = (kicker, items, fallback) => {
+    addBlock(kicker, (block) => {
+      if (items && items.length) {
+        items.forEach((item) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "stage-check" + (item.done ? " is-done" : "");
+          btn.setAttribute("data-line", String(item.line));
+          const box = document.createElement("span");
+          box.className = "box";
+          box.setAttribute("aria-hidden", "true");
+          const words = document.createElement("span");
+          words.className = "words";
+          words.textContent = item.text;
+          btn.appendChild(box);
+          btn.appendChild(words);
+          btn.addEventListener("click", () => toggleMapLine(item.line));
+          block.appendChild(btn);
+        });
+        return;
+      }
+      const p = document.createElement("p");
+      p.className = "stage-why";
+      p.textContent = fallback || "";
+      if (p.textContent) block.appendChild(p);
+    });
+  };
+  addChecks("Enter", stage.enterItems, stage.enter);
+  addChecks("Exit", stage.exitItems, stage.exit);
+  if ((stage.nextItems || []).length) addChecks("Next steps", stage.nextItems, "");
+}
+
+function openMapStage(id) {
+  state.mapStageId = String(id || "");
+  renderMap();
+}
+
+function closeMapStage() {
+  state.mapStageId = "";
+  renderMap();
+}
+
+function toggleMapLine(idx) {
+  const dump = $("dump");
+  if (!dump || !isMapDoc()) return;
+  const lines = dump.value.split("\n");
+  const n = Number(idx);
+  if (!lines[n] || !/^\s*[-*+]\s+\[[ xX]\]/.test(lines[n])) return;
+  lines[n] = /\[[xX]\]/.test(lines[n])
+    ? lines[n].replace(/\[[xX]\]/, "[ ]")
+    : lines[n].replace(/\[ \]/, "[x]");
+  dump.value = lines.join("\n");
+  if (state.doc) state.doc.markdown = dump.value;
+  scheduleSave();
+  renderMap();
 }
 
 function openVaultPath(rel) {
@@ -1974,7 +2213,7 @@ async function runAsk(q) {
         const seenMap = {};
         visible.forEach((h) => {
           const p = String(h.path || "").replace(/\\/g, "/");
-          if (!/^maps\/.+\.md$/i.test(p) || seenMap[p]) return;
+          if (!isWorkMapPath(p) || seenMap[p]) return;
           seenMap[p] = true;
           maps.push(p);
         });
@@ -2534,6 +2773,183 @@ function proposeDoorLines(sentence) {
   return lines;
 }
 
+function stageGateText(stage, which) {
+  if (!stage) return "";
+  const inline = which === "exit" ? stage.exit : stage.enter;
+  if (String(inline || "").trim()) return String(inline).trim();
+  const items = which === "exit" ? stage.exitItems : stage.enterItems;
+  if (items && items[0] && items[0].text) return String(items[0].text);
+  return "";
+}
+
+function stageNextStepLines(stage) {
+  const out = [];
+  for (const item of (stage && stage.nextItems) || []) {
+    if (!item || item.done || !String(item.text || "").trim()) continue;
+    out.push("- [ ] " + String(item.text).trim());
+  }
+  return out;
+}
+
+function parseProcessMap(md) {
+  const text = String(md ?? "").replace(/\r\n/g, "\n");
+  const lines = text.split("\n");
+  const title = ((text.match(/^#\s+(.+)$/m) || [])[1] || "").trim();
+  let why = "";
+  const whyStart = lines.findIndex((line) => /^##\s+Why\s*$/i.test(line.trimEnd()));
+  if (whyStart >= 0) {
+    const bits = [];
+    for (let i = whyStart + 1; i < lines.length; i++) {
+      if (/^##\s+/.test(lines[i])) break;
+      bits.push(lines[i]);
+    }
+    why = bits.join("\n").trim();
+  }
+  const stages = [];
+  const forks = [];
+  let inStages = false;
+  let current = null;
+  const finish = () => {
+    if (!current) return;
+    if (current.kind === "fork") forks.push(current);
+    else stages.push(current);
+    current = null;
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^##\s+Stages\s*$/i.test(line.trimEnd())) {
+      finish();
+      inStages = true;
+      continue;
+    }
+    if (inStages && /^##\s+/.test(line)) {
+      finish();
+      inStages = false;
+      continue;
+    }
+    if (!inStages) continue;
+    const forkHead = line.match(/^###\s+Fork:\s*(.*)$/i) || line.match(/^###\s+Fork\s*$/i);
+    if (forkHead) {
+      finish();
+      current = {
+        kind: "fork",
+        id: "fork-" + (forks.length + 1),
+        title: String(forkHead[1] || "").trim(),
+        forkKind: "",
+        branches: [],
+        line: i,
+      };
+      continue;
+    }
+    const stageHead = line.match(/^###\s+(?:(\d+)\.\s*)?(.+)$/);
+    if (stageHead) {
+      finish();
+      const num = stageHead[1] ? Number(stageHead[1]) : stages.length + 1;
+      current = {
+        kind: "stage",
+        id: "stage-" + num,
+        number: num,
+        title: String(stageHead[2] || "").trim(),
+        why: "",
+        enter: "",
+        exit: "",
+        enterItems: [],
+        exitItems: [],
+        nextItems: [],
+        field: "",
+        line: i,
+      };
+      continue;
+    }
+    if (!current) continue;
+    const trimmed = line.trim();
+    if (current.kind === "fork") {
+      const kindLine = trimmed.match(/^(?:Kind:\s*)?(only one|all together)\s*$/i);
+      if (kindLine) {
+        current.forkKind = /all together/i.test(kindLine[1]) ? "all-together" : "only-one";
+        continue;
+      }
+      const branch = trimmed.match(/^[-*+]\s+(.+?)\s*(?:→|->)\s+(.+)$/);
+      if (branch) {
+        current.branches.push({
+          label: String(branch[1] || "").trim(),
+          target: String(branch[2] || "").trim(),
+        });
+      }
+      continue;
+    }
+    const whyLine = line.match(/^Why:\s*(.*)$/i);
+    if (whyLine) {
+      current.why = String(whyLine[1] || "").trim();
+      current.field = "why";
+      continue;
+    }
+    if (/^Why\s*$/i.test(trimmed)) {
+      current.field = "why";
+      continue;
+    }
+    const enterLine = line.match(/^Enter:\s*(.*)$/i);
+    if (enterLine) {
+      if (String(enterLine[1] || "").trim()) current.enter = String(enterLine[1]).trim();
+      current.field = "enter";
+      continue;
+    }
+    if (/^Enter\s*$/i.test(trimmed)) {
+      current.field = "enter";
+      continue;
+    }
+    const exitLine = line.match(/^Exit:\s*(.*)$/i);
+    if (exitLine) {
+      if (String(exitLine[1] || "").trim()) current.exit = String(exitLine[1]).trim();
+      current.field = "exit";
+      continue;
+    }
+    if (/^Exit\s*$/i.test(trimmed)) {
+      current.field = "exit";
+      continue;
+    }
+    if (/^Next steps:\s*$/i.test(trimmed) || /^Next steps\s*$/i.test(trimmed)) {
+      current.field = "next";
+      continue;
+    }
+    const task = parseTaskLine(line);
+    if (task) {
+      const item = { done: task.done, text: task.text, line: i };
+      if (current.field === "exit") current.exitItems.push(item);
+      else if (current.field === "next") current.nextItems.push(item);
+      else current.enterItems.push(item);
+      continue;
+    }
+    if (!trimmed) continue;
+    if (current.field === "why" && !current.why) current.why = trimmed;
+    else if (current.field === "enter" && !current.enter) current.enter = trimmed;
+    else if (current.field === "exit" && !current.exit) current.exit = trimmed;
+  }
+  finish();
+  return { title, why, stages, forks };
+}
+
+function processMapLints(map) {
+  const out = [];
+  const parsed = map || {};
+  if (!Array.isArray(parsed.stages) || !parsed.stages.length) {
+    out.push("This map has no stages yet.");
+  }
+  for (const stage of parsed.stages || []) {
+    const name = String(stage.title || "A stage").trim() || "A stage";
+    if (!stageGateText(stage, "enter")) out.push(name + " is missing an Enter.");
+    if (!stageGateText(stage, "exit")) out.push(name + " is missing an Exit.");
+  }
+  for (const fork of parsed.forks || []) {
+    if (!String(fork.title || "").trim()) out.push("This fork has no name.");
+    if (!fork.forkKind) {
+      const who = String(fork.title || "").trim() || "This fork";
+      out.push(who + " does not say only one or all together.");
+    }
+  }
+  return out;
+}
+
 function mapNextStepLines(md) {
   const lines = String(md ?? "").split("\n");
   let start = -1;
@@ -2615,15 +3031,23 @@ async function applyStepsToToday(steps, date) {
 }
 
 async function landMapNextStepsOnToday() {
-  flushActiveLineToDump();
+  if (!isMapDoc()) flushActiveLineToDump();
   const dump = $("dump");
   const md = dump ? dump.value : (isNoteDoc() ? String(state.doc.markdown || "") : "");
-  await applyStepsToToday(mapNextStepLines(md), todayIso());
+  const steps = mapNextStepLines(md);
+  if (state.mapStageId) {
+    const parsed = parseProcessMap(md);
+    const stage = (parsed.stages || []).find((s) => s.id === state.mapStageId);
+    for (const line of stageNextStepLines(stage)) {
+      if (!steps.includes(line)) steps.push(line);
+    }
+  }
+  await applyStepsToToday(steps, todayIso());
 }
 
 async function landMapFileOnToday(rel) {
   const path = String(rel || "").replace(/\\/g, "/");
-  if (!/^maps\/.+\.md$/i.test(path)) return;
+  if (!isWorkMapPath(path)) return;
   const day = state.selectedDate || todayIso();
   const key = day + ":" + path;
   state.landedMaps = state.landedMaps || new Set();
@@ -2649,7 +3073,7 @@ async function findMapPathsForQuery(q) {
     const maps = [];
     for (const h of data.hits || []) {
       const path = String(h.path || "").replace(/\\/g, "/");
-      if (!/^maps\/.+\.md$/i.test(path) || seen[path]) continue;
+      if (!isWorkMapPath(path) || seen[path]) continue;
       if (/^maps\/the-/i.test(path)) continue;
       seen[path] = true;
       maps.push(path);
@@ -2724,6 +3148,7 @@ function paintDoorProposals(lines) {
 
 async function goToday() {
   await landMapNextStepsOnToday();
+  state.mapStageId = "";
   await leaveCurrentPaper();
   state.doc = null;
   state.openDayGen++;
@@ -2950,6 +3375,12 @@ $("toggle-month").addEventListener("click", () => {
 
 $("ask-open").addEventListener("click", openAsk);
 $("ask-close").addEventListener("click", closeAsk);
+if ($("stage-ask")) $("stage-ask").addEventListener("click", openAsk);
+if ($("stage-sheet")) {
+  $("stage-sheet").addEventListener("click", (e) => {
+    if (e.target && e.target.closest && e.target.closest(".stage-rule")) closeMapStage();
+  });
+}
 $("ask-modal").addEventListener("click", (e) => {
   if (e.target === $("ask-modal")) closeAsk();
 });
@@ -2970,7 +3401,12 @@ function askOpen() {
 
 document.addEventListener("keydown", handlePaperUndoKey, true);
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") closeAsk();
+  if (e.key === "Escape") {
+    if (askOpen()) closeAsk();
+    else if (isMapDoc() && state.mapStageId) closeMapStage();
+    else closeAsk();
+    return;
+  }
   if (askOpen()) return;
   if (handlePaperUndoKey(e)) return;
   const tag = document.activeElement && document.activeElement.tagName;

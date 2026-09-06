@@ -12,7 +12,7 @@
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <link rel="stylesheet" href="/styles.css" />
-  <link rel="stylesheet" href="/day.css?v=fmt-kb3" />
+  <link rel="stylesheet" href="/day.css?v=map1" />
   <link rel="stylesheet" href="/api/skin.css" />
 </head>
 <body class="day-page view-door">
@@ -64,6 +64,19 @@
           <label class="sr-only" for="dump">Today note</label>
           <textarea id="dump" class="dump-src sr-only" rows="16" placeholder="Write."></textarea>
           <div id="paper" class="paper" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Today note" data-placeholder="Write."></div>
+          <div id="map-room" class="map-room" hidden>
+            <div id="map-canvas" class="map-canvas">
+              <h1 id="map-title" class="map-title"></h1>
+              <p id="map-lint" class="map-lint" hidden></p>
+              <div id="map-board" class="map-board"></div>
+            </div>
+            <div id="stage-sheet" class="stage-sheet" hidden>
+              <h1 id="stage-title" class="stage-title"></h1>
+              <p class="stage-rule" title="Back to the map"><span>&#10087;</span></p>
+              <div id="stage-body" class="stage-body"></div>
+              <button type="button" id="stage-ask" class="ask-quiet">Ask quietly&hellip;</button>
+            </div>
+          </div>
         </div>
         <button type="button" id="ask-open" class="ask-line">
           <span>Ask or find</span>
@@ -127,6 +140,6 @@
     </button>
   </div>
 
-  <script src="/app.js?v=fmt-kb3" type="module"></script>
+  <script src="/app.js?v=map1" type="module"></script>
 </body>
 </html>

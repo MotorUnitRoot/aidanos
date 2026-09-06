@@ -26,6 +26,8 @@ A process map is an ordinary markdown file in the vault. Copying the file is how
 
 This repository ships two maps: reply to a letter, and file a receipt. Ask for that work, or name it at the door, and the next steps land on today’s note as ordinary tasks. You do not have to open the map first.
 
+Ask for the map, or open a wiki link to it, and the file draws as a canvas: stages, one named fork, and Enter and Exit. A stage opens as paper with Why, Enter, Exit, and next steps. Those next steps are ordinary `- [ ]` lines on today. Copy the markdown file to take the map. Delete it to drop it. The first screen stays empty of this.
+
 ## Last-mile
 
 When the work needs a place to write the letter or note the receipt, that place is another markdown file next to the map. It opens in the same note as the day. Those files are assembled from the design system already used for AidanOS. They are not a new look and not a CRM screen. Change the file, or delete it.

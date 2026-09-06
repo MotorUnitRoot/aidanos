@@ -1,5 +1,10 @@
 node_modules
 logs
 .git
+.github
 *.tmp
 **/*.tmp
+*-test.mjs
+*.md
+!vault/**/*.md
+!README.md

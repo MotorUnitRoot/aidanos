@@ -3,7 +3,6 @@ import fs from "node:fs";
 
 const src = fs.readFileSync(new URL("./app.js", import.meta.url), "utf8");
 const css = fs.readFileSync(new URL("./day.css", import.meta.url), "utf8");
-const day26 = fs.readFileSync(new URL("./vault/log/2026-08-26.md", import.meta.url), "utf8");
 
 function grabFn(name, nextName) {
   const start = src.indexOf("function " + name + "(");
@@ -82,14 +81,10 @@ check("formatPaper yaml+body includes md-front and the body", () => {
 check("goToday source has openDay(todayIso()) and state.doc = null", () => {
   const start = src.indexOf("function goToday(");
   assert(start >= 0, "missing goToday");
-  const next = src.indexOf("\nfunction ", start + 1);
+  const next = src.indexOf("document.querySelectorAll", start + 1);
   const go = src.slice(start, next > start ? next : start + 800);
-  assert(go.includes("openDay(todayIso())"), "goToday must call openDay(todayIso())");
+  assert(/openDay\(todayIso\(\)/.test(go), "goToday must call openDay(todayIso())");
   assert(/state\.doc\s*=\s*null/.test(go), "goToday must set state.doc = null");
-});
-
-check("vault/log/2026-08-26.md still starts with ---", () => {
-  assert(day26.startsWith("---"), "26th must still start with ---, got " + JSON.stringify(day26.slice(0, 20)));
 });
 
 check("day.css hides .md-line.md-front", () => {

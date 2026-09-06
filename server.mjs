@@ -14,10 +14,24 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VAULT = path.resolve(process.env.AIDANOS_VAULT || path.join(__dirname, "vault"));
 const PUBLIC = __dirname;
-const PORT = Number(process.env.PORT) || 3847;
+const PORT_RAW = Number(process.env.PORT);
+const PORT = Number.isInteger(PORT_RAW) && PORT_RAW > 0 && PORT_RAW < 65536 ? PORT_RAW : 3847;
 const HOST = process.env.AIDANOS_HOST || "127.0.0.1";
 const DAY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.md$/;
 const MTIME_SKEW_MS = 1;
+const MAX_BODY = 1_000_000;
+const MAX_SSE = 32;
+const PUBLIC_FILES = new Set([
+  "index.html",
+  "app.js",
+  "day.css",
+  "styles.css",
+  "manifest.webmanifest",
+  "sw.js",
+  "icon-180.png",
+  "icon-192.png",
+  "apple-touch-icon.png",
+]);
 const lastSelfWrites = new Map();
 const pendingSelfWrites = new Set();
 const sseClients = new Set();
@@ -197,6 +211,12 @@ function parsePlan(raw) {
   };
 }
 
+function contained(abs, root) {
+  const resolved = path.resolve(abs);
+  const rootResolved = path.resolve(root);
+  return resolved === rootResolved || resolved.startsWith(rootResolved + path.sep);
+}
+
 function safeJoin(root, rel) {
   let decoded;
   try {
@@ -209,18 +229,60 @@ function safeJoin(root, rel) {
     throw new Error("bad path");
   }
   const parts = cleaned.split("/").filter((p) => p && p !== ".");
-  if (parts.some((p) => p === "..")) {
+  if (parts.some((p) => p === ".." || p.startsWith("."))) {
     throw new Error("path escapes vault");
   }
   const resolved = path.resolve(root, ...parts);
-  const rootResolved = path.resolve(root);
-  if (
-    resolved !== rootResolved &&
-    !resolved.startsWith(rootResolved + path.sep)
-  ) {
+  if (!contained(resolved, root)) {
     throw new Error("path escapes vault");
   }
   return resolved;
+}
+
+async function resolveInside(root, abs) {
+  const rootReal = await fs.realpath(root);
+  let cursor = path.resolve(abs);
+  for (;;) {
+    try {
+      const real = await fs.realpath(cursor);
+      if (!contained(real, rootReal)) {
+        throw new Error("path escapes vault");
+      }
+      return abs;
+    } catch (e) {
+      if (e.code !== "ENOENT") throw e;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) throw new Error("bad path");
+      cursor = parent;
+    }
+  }
+}
+
+function applySafeHeaders(res) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+  );
+}
+
+function sameOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  const host = req.headers.host;
+  if (!host) return false;
+  try {
+    return new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+}
+
+function isMutating(method) {
+  return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
 }
 
 async function listMdTree(dir, vaultRoot) {
@@ -229,11 +291,14 @@ async function listMdTree(dir, vaultRoot) {
   for (const e of entries) {
     if (e.name.startsWith(".")) continue;
     if (e.name.endsWith(".tmp")) continue;
+    if (e.isSymbolicLink()) continue;
     const p = path.join(dir, e.name);
+    const rel = path.relative(vaultRoot, p);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) continue;
     if (e.isDirectory()) {
       out.push(...(await listMdTree(p, vaultRoot)));
     } else if (e.isFile() && e.name.endsWith(".md")) {
-      out.push(path.relative(vaultRoot, p).split(path.sep).join("/"));
+      out.push(rel.split(path.sep).join("/"));
     }
   }
   return out.sort((a, b) => a.localeCompare(b));
@@ -248,7 +313,16 @@ function dayMarkdownFromBody(body) {
 
 async function readBody(req) {
   const chunks = [];
-  for await (const c of req) chunks.push(c);
+  let n = 0;
+  for await (const c of req) {
+    n += c.length;
+    if (n > MAX_BODY) {
+      const err = new Error("too large");
+      err.code = "BODY_TOO_LARGE";
+      throw err;
+    }
+    chunks.push(c);
+  }
   return Buffer.concat(chunks).toString("utf8");
 }
 
@@ -280,9 +354,9 @@ function isSelfWrite(date, diskMtime) {
 
 async function atomicWriteFile(filePath, markdown) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.tmp`;
+  const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
   try {
-    await fs.writeFile(tmpPath, markdown, "utf8");
+    await fs.writeFile(tmpPath, markdown, { encoding: "utf8", flag: "wx" });
     await fs.rename(tmpPath, filePath);
   } catch (e) {
     try { await fs.unlink(tmpPath); } catch {}
@@ -375,11 +449,15 @@ function sendFile(res, filePath, contentType) {
 
 const server = http.createServer(async (req, res) => {
   try {
+    applySafeHeaders(res);
+    if (isMutating(req.method) && !sameOrigin(req)) {
+      return json(res, 403, { error: "forbidden" });
+    }
     const url = new URL(req.url || "/", `http://${HOST}:${PORT}`);
     const { pathname } = url;
 
     if (pathname === "/api/health") {
-      return json(res, 200, { ok: true, vault: VAULT });
+      return json(res, 200, { ok: true });
     }
 
     if (pathname === "/api/week" && req.method === "GET") {
@@ -580,6 +658,7 @@ const server = http.createServer(async (req, res) => {
       let abs;
       try {
         abs = safeJoin(VAULT, rel);
+        await resolveInside(VAULT, abs);
       } catch (e) {
         return json(res, 400, { error: e.message || "bad path" });
       }
@@ -599,6 +678,7 @@ const server = http.createServer(async (req, res) => {
       let abs;
       try {
         abs = safeJoin(VAULT, rel);
+        await resolveInside(VAULT, abs);
       } catch (e) {
         return json(res, 400, { error: e.message || "bad path" });
       }
@@ -665,6 +745,7 @@ const server = http.createServer(async (req, res) => {
       let abs;
       try {
         abs = dirParam === "." || dirParam === "" ? VAULT : safeJoin(VAULT, dirParam);
+        await resolveInside(VAULT, abs);
       } catch (e) {
         return json(res, 400, { error: e.message || "bad path" });
       }
@@ -702,6 +783,7 @@ const server = http.createServer(async (req, res) => {
         let abs;
         try {
           abs = safeJoin(VAULT, rel);
+          await resolveInside(VAULT, abs);
         } catch {
           continue;
         }
@@ -730,6 +812,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/day-watch" && req.method === "GET") {
+      if (sseClients.size >= MAX_SSE) {
+        return json(res, 503, { error: "too many listeners" });
+      }
       req.setTimeout(0);
       res.setTimeout(0);
       res.writeHead(200, {
@@ -760,19 +845,13 @@ const server = http.createServer(async (req, res) => {
     let full;
     try {
       full = safeJoin(PUBLIC, file);
+      await resolveInside(PUBLIC, full);
     } catch {
       res.writeHead(400);
       return res.end("Bad path");
     }
     const rel = path.relative(path.resolve(PUBLIC), full).split(path.sep).join("/");
-    const base = path.basename(full);
-    if (
-      rel === "vault" ||
-      rel.startsWith("vault/") ||
-      /^old-/i.test(base) ||
-      rel === "launchd" ||
-      rel.startsWith("launchd/")
-    ) {
+    if (!PUBLIC_FILES.has(rel)) {
       res.writeHead(404);
       return res.end("Not found");
     }
@@ -789,8 +868,12 @@ const server = http.createServer(async (req, res) => {
     };
     return sendFile(res, full, types[ext] || "application/octet-stream");
   } catch (err) {
+    if (err && err.code === "BODY_TOO_LARGE") {
+      if (!res.headersSent) return json(res, 413, { error: "too large" });
+      return;
+    }
     console.error(err);
-    json(res, 500, { error: String(err.message || err) });
+    if (!res.headersSent) json(res, 500, { error: "internal error" });
   }
 });
 

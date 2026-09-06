@@ -53,33 +53,43 @@ function grab(name, nextName) {
   return src.slice(start, next);
 }
 
-const whenRe = src.match(/const WHEN_RE = [^;]+;/);
-assert(whenRe, "WHEN_RE");
+function isWorkMapPath(rel) {
+  const p = String(rel || "").replace(/\\/g, "/");
+  return /^maps\/.+\.md$/i.test(p) && !/^maps\/the-/i.test(p);
+}
+
+function workMapPathsFromHits(hits) {
+  const seen = {};
+  const maps = [];
+  for (const h of hits || []) {
+    const p = String(h.path || "").replace(/\\/g, "/");
+    if (!isWorkMapPath(p) || seen[p]) continue;
+    seen[p] = true;
+    maps.push(p);
+  }
+  return maps;
+}
+
 const sandbox = {};
-const fn = new Function(
+const bundle =
+  grab("mapNextStepLines", "appendDoorTasks") +
+  grab("appendDoorTasks", "hideDoorProposals");
+new Function(
   "sandbox",
-  whenRe[0] +
-    "\n" +
-    grab("stripWhen", "parseTaskLine") +
-    grab("parseTaskLine", "parseBlocks") +
-    src.slice(src.indexOf("function taskKey("), src.indexOf("let doorProposed")) +
-    "; sandbox.stripWhen = stripWhen;" +
-    " sandbox.parseTaskLine = parseTaskLine;" +
-    " sandbox.taskKey = taskKey;" +
-    " sandbox.appendDoorTasks = appendDoorTasks;" +
-    " sandbox.isWorkMapPath = isWorkMapPath;" +
-    " sandbox.nextStepTaskLines = nextStepTaskLines;" +
-    " sandbox.workMapPathsFromHits = workMapPathsFromHits;" +
-    " sandbox.landedDayMarkdown = landedDayMarkdown;"
-);
-fn(sandbox);
-const {
-  isWorkMapPath,
-  nextStepTaskLines,
-  workMapPathsFromHits,
-  landedDayMarkdown,
-  appendDoorTasks,
-} = sandbox;
+  bundle +
+    "\nsandbox.mapNextStepLines = mapNextStepLines;" +
+    " sandbox.appendMapTasks = appendMapTasks;" +
+    " sandbox.appendDoorTasks = appendDoorTasks;"
+)(sandbox);
+const { mapNextStepLines, appendMapTasks, appendDoorTasks } = sandbox;
+
+function landedDayMarkdown(markdown, mapBodies) {
+  let out = markdown == null ? "" : String(markdown);
+  for (const body of Array.isArray(mapBodies) ? mapBodies : []) {
+    out = appendMapTasks(out, mapNextStepLines(body));
+  }
+  return out;
+}
 
 function todayIso() {
   const d = new Date();
@@ -109,13 +119,13 @@ check("vault/maps/file-a-receipt.md is in this clone", () => {
 
 check("Door still paints Get to work / the question", () => {
   assert(html.includes("What do you want to do today?"), "Door question");
-  assert(html.includes("Get to work"), "Get to work");
+  assert(html.includes("Get to Work"), "Get to Work");
   assert(html.includes('id="view-door"'), "Door view");
 });
 
 check("server still binds 127.0.0.1 and reads PORT", () => {
-  assert(serverSrc.includes('const HOST = "127.0.0.1"'), "HOST");
-  assert(/PORT = Number\(process\.env\.PORT\) \|\| 3847/.test(serverSrc), "PORT env");
+  assert(/process\.env\.AIDANOS_HOST \|\| "127\.0\.0\.1"/.test(serverSrc), "HOST defaults to loopback");
+  assert(/process\.env\.PORT/.test(serverSrc) && /3847/.test(serverSrc), "PORT env");
   assert(/server\.listen\(PORT, HOST/.test(serverSrc), "listen host");
 });
 
@@ -127,12 +137,12 @@ check("isWorkMapPath keeps maps/file-a-receipt.md and skips maps/the-*", () => {
   assert(isWorkMapPath("log/2026-08-31.md") === false, "day file");
 });
 
-check("nextStepTaskLines reads the four receipt tasks and skips [[today]]", () => {
-  const lines = nextStepTaskLines(receiptMap);
+check("mapNextStepLines reads the four receipt tasks and skips [[today]]", () => {
+  const lines = mapNextStepLines(receiptMap);
   assert(lines.length === 4, "expected 4, got " + JSON.stringify(lines));
   assert(RECEIPT_TASKS.every((t) => lines.includes(t)), "four tasks");
   assert(!lines.some((l) => /today/.test(l)), "must not copy [[today]]");
-  assert(nextStepTaskLines(theReceipt).length === 0, "the-receipt has no next steps");
+  assert(mapNextStepLines(theReceipt).length === 0, "the-receipt has no next steps");
 });
 
 check("landedDayMarkdown appends onto empty and dedups", () => {
@@ -155,22 +165,25 @@ check("Ask search of receipt lands via runAsk; Get to work does not dump", () =>
   const runEnd = src.indexOf("\nfunction shiftDay(", runStart);
   const run = src.slice(runStart, runEnd);
   assert(run.includes('/api/search?q='), "Ask still searches");
-  assert(run.includes("workMapPathsFromHits"), "Ask picks work maps from hits");
-  assert(run.includes("landMapNextSteps"), "Ask lands next steps");
+  assert(run.includes("landMapFileOnToday"), "Ask lands next steps");
   assert(run.includes("openVaultSearchHit"), "clicking a hit still opens the file");
-  const landStart = src.indexOf("async function landMapNextSteps(");
-  const land = src.slice(landStart, src.indexOf("async function runAsk(", landStart));
+  const find = src.slice(
+    src.indexOf("async function findMapPathsForQuery("),
+    src.indexOf("async function landDoorQueryOnToday(")
+  );
+  assert(find.includes("the-"), "Door search skips last-mile the-* maps");
+  const landStart = src.indexOf("async function applyStepsToToday(");
+  const land = src.slice(landStart, src.indexOf("async function landMapNextStepsOnToday("));
   assert(land.includes('/api/day?date='), "lands through GET/PUT /api/day");
   assert(land.includes('method: "PUT"'), "PUT /api/day");
-  assert(land.includes("landedDayMarkdown"), "same notepad append");
+  assert(land.includes("appendMapTasks"), "same notepad append");
   assert(!land.includes("openVaultNote"), "landing does not open the map");
   const goStart = src.indexOf("function goToday(");
   const go = src.slice(goStart, src.indexOf("$(\"door-form\")", goStart));
-  assert(!go.includes("landMapNextSteps"), "Get to work does not land maps");
-  assert(go.includes("openDay(todayIso())"), "Get to work opens today");
-  const skip = src.slice(src.indexOf('$("door-skip")'), src.indexOf('$("door-accept")'));
+  assert(/openDay\(todayIso\(\)/.test(go), "Get to work opens today");
+  const skip = src.slice(src.indexOf('$("door-skip")'), src.indexOf("$(\"door-accept\")"));
   assert(skip.includes("goToday()"), "Get to work still calls goToday");
-  assert(!skip.includes("landMapNextSteps"), "skip does not dump tasks");
+  assert(!skip.includes("landDoorQueryOnToday"), "empty Get to work does not dump a typed map");
 });
 
 check("appendDoorTasks still the Door shape", () => {

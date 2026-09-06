@@ -33,19 +33,22 @@ Open `http://<mac-lan-ip>:3847` in Safari → Add to Home Screen.
 
 ## Cloud Run (ready when Colby says go)
 
-`Dockerfile` already sets `PORT=8080` and `AIDANOS_HOST=0.0.0.0`. Vault remains a markdown folder mounted or synced in (Drive/GCS as a dumb file replica — not a second store). No CRM.
+`Dockerfile` already sets `PORT=8080` and `AIDANOS_HOST=0.0.0.0`, and installs `git` so Cloud Run can clone a private vault. The vault is a private git repo of markdown (target `MotorUnitRoot/aidanos-vault`). Not Drive, not a second database. The Mac keeps a working tree of that same repo; Cloud Run clones, serves, and commits on write.
 
 When a GCP project is authorized:
 
 ```bash
 # from the aidanos repo root (after live Door files are on main)
+# Also set AIDANOS_VAULT_GIT_URL and a token secret (AIDANOS_VAULT_GIT_TOKEN or GITHUB_TOKEN).
 gcloud run deploy aidanos \
   --source . \
   --region us-west1 \
   --allow-unauthenticated \
-  --set-env-vars "AIDANOS_HOST=0.0.0.0" \
+  --set-env-vars "AIDANOS_HOST=0.0.0.0,AIDANOS_VAULT_GIT_URL=https://github.com/MotorUnitRoot/aidanos-vault.git" \
   --port 8080
 ```
+
+If the vault remote is not created yet, the service still boots. Local writes succeed; push failures show on `/api/health` as `git.error`. Do not put the token in the command line if you can bind it as a secret.
 
 Then point Safari / Add to Home Screen at the Cloud Run HTTPS URL. Until then: keep the tunnel or use LAN.
 

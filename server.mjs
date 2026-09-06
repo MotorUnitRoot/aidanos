@@ -2,6 +2,7 @@
 /**
  * AidanOS — local by default (127.0.0.1). Set AIDANOS_HOST=0.0.0.0 for LAN/phone.
  * Vault: AIDANOS_VAULT, or sibling vault/ beside this server.
+ * Optional git: AIDANOS_VAULT_GIT_URL (+ AIDANOS_VAULT_GIT_TOKEN or GITHUB_TOKEN).
  * On the Mac the vault is the parent (~/Grok/motorunit).
  * Never copy this folder's vault/ over that one.
  */
@@ -9,10 +10,26 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
+import os from "node:os";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VAULT = path.resolve(process.env.AIDANOS_VAULT || path.join(__dirname, "vault"));
+const GIT_URL = String(process.env.AIDANOS_VAULT_GIT_URL || "").trim();
+const GIT_TOKEN = String(process.env.AIDANOS_VAULT_GIT_TOKEN || process.env.GITHUB_TOKEN || "").trim();
+const GIT_DEBOUNCE_MS = (() => {
+  const n = Number(process.env.AIDANOS_VAULT_GIT_DEBOUNCE_MS);
+  return Number.isFinite(n) && n >= 50 ? Math.min(n, 10_000) : 1500;
+})();
+function resolveVaultPath() {
+  if (process.env.AIDANOS_VAULT) return path.resolve(process.env.AIDANOS_VAULT);
+  if (GIT_URL) {
+    const clone = String(process.env.AIDANOS_VAULT_CLONE || "").trim();
+    return path.resolve(clone || path.join(os.tmpdir(), "aidanos-vault"));
+  }
+  return path.join(__dirname, "vault");
+}
+let VAULT = resolveVaultPath();
 const PUBLIC = __dirname;
 const PORT_RAW = Number(process.env.PORT);
 const PORT = Number.isInteger(PORT_RAW) && PORT_RAW > 0 && PORT_RAW < 65536 ? PORT_RAW : 3847;
@@ -35,6 +52,202 @@ const PUBLIC_FILES = new Set([
 const lastSelfWrites = new Map();
 const pendingSelfWrites = new Set();
 const sseClients = new Set();
+const vaultGit = {
+  enabled: Boolean(GIT_URL),
+  ready: false,
+  error: "",
+  lastPushAt: 0,
+  pending: new Set(),
+  timer: null,
+  busy: false,
+};
+
+function sanitizeGitError(msg) {
+  let s = String(msg || "git failed").replace(/\s+/g, " ").trim();
+  if (GIT_TOKEN) s = s.split(GIT_TOKEN).join("***");
+  if (VAULT) s = s.split(VAULT).join("[vault]");
+  if (GIT_URL) s = s.split(GIT_URL).join("[url]");
+  s = s.replace(/https?:\/\/[^\s]+/gi, "[url]");
+  s = s.replace(/file:\/\/[^\s]+/gi, "[url]");
+  return s.slice(0, 180);
+}
+
+function gitHint() {
+  if (!vaultGit.enabled) return { enabled: false };
+  const hint = { enabled: true, ok: !vaultGit.error };
+  if (vaultGit.error) hint.error = vaultGit.error;
+  if (vaultGit.lastPushAt) hint.pushed = true;
+  return hint;
+}
+
+function gitEnv() {
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  delete env.GIT_ASKPASS;
+  if (GIT_TOKEN) {
+    env.GIT_CONFIG_COUNT = "1";
+    env.GIT_CONFIG_KEY_0 = "http.extraHeader";
+    env.GIT_CONFIG_VALUE_0 = "Authorization: Bearer " + GIT_TOKEN;
+  }
+  return env;
+}
+
+function runGit(args, { cwd, timeoutMs = 20000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", args, {
+      cwd: cwd || undefined,
+      env: gitEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (buf) => { out += String(buf); });
+    child.stderr.on("data", (buf) => { err += String(buf); });
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      reject(new Error("git timeout"));
+    }, timeoutMs);
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve({ out, err });
+      else reject(new Error((err || out || ("git " + args[0] + " failed")).trim()));
+    });
+  });
+}
+
+async function ensureGitIdentity(cwd) {
+  const name = process.env.AIDANOS_VAULT_GIT_NAME || "AidanOS";
+  const email = process.env.AIDANOS_VAULT_GIT_EMAIL || "aidanos@local";
+  await runGit(["-C", cwd, "config", "user.name", name], { timeoutMs: 4000 });
+  await runGit(["-C", cwd, "config", "user.email", email], { timeoutMs: 4000 });
+}
+
+async function ensureOrigin(cwd) {
+  try {
+    await runGit(["-C", cwd, "remote", "set-url", "origin", GIT_URL], { timeoutMs: 4000 });
+  } catch {
+    await runGit(["-C", cwd, "remote", "add", "origin", GIT_URL], { timeoutMs: 4000 });
+  }
+}
+
+async function isGitRepo(dir) {
+  try {
+    const st = await fs.stat(path.join(dir, ".git"));
+    return st.isDirectory() || st.isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function initVaultGit() {
+  if (!GIT_URL) return;
+  try {
+    await runGit(["--version"], { timeoutMs: 4000 });
+  } catch {
+    vaultGit.error = "git not available";
+    console.error("vault git:", vaultGit.error);
+    return;
+  }
+  try {
+    await fs.mkdir(VAULT, { recursive: true });
+    if (await isGitRepo(VAULT)) {
+      await ensureGitIdentity(VAULT);
+      await ensureOrigin(VAULT);
+      try {
+        await runGit(["-C", VAULT, "pull", "--ff-only", "--no-rebase"], { timeoutMs: 25000 });
+        vaultGit.error = "";
+      } catch (e) {
+        vaultGit.error = sanitizeGitError(e && e.message || "pull failed");
+        console.error("vault git pull:", vaultGit.error);
+      }
+      vaultGit.ready = true;
+      return;
+    }
+    const names = await fs.readdir(VAULT);
+    const nonempty = names.filter((n) => n !== "." && n !== "..");
+    if (nonempty.length === 0) {
+      try {
+        await runGit(["clone", "--depth", "1", GIT_URL, VAULT], { timeoutMs: 25000 });
+        vaultGit.error = "";
+      } catch (e) {
+        vaultGit.error = sanitizeGitError(e && e.message || "clone failed");
+        console.error("vault git clone:", vaultGit.error);
+        try {
+          await runGit(["-C", VAULT, "init", "-b", "main"], { timeoutMs: 8000 });
+          await ensureOrigin(VAULT);
+        } catch (initErr) {
+          console.error("vault git init:", sanitizeGitError(initErr && initErr.message));
+        }
+      }
+      await ensureGitIdentity(VAULT);
+      vaultGit.ready = await isGitRepo(VAULT);
+      return;
+    }
+    vaultGit.error = "vault path is not a git checkout";
+    console.error("vault git:", vaultGit.error);
+  } catch (e) {
+    vaultGit.error = sanitizeGitError(e && e.message || "vault git failed");
+    console.error("vault git:", vaultGit.error);
+  }
+}
+
+function scheduleVaultSync(relPath) {
+  if (!vaultGit.enabled || !vaultGit.ready) return;
+  const rel = String(relPath || "").replace(/\\/g, "/");
+  if (!rel || rel.startsWith("/") || rel.includes("..")) return;
+  vaultGit.pending.add(rel);
+  if (vaultGit.timer) clearTimeout(vaultGit.timer);
+  vaultGit.timer = setTimeout(() => {
+    vaultGit.timer = null;
+    flushVaultSync().catch((e) => {
+      vaultGit.error = sanitizeGitError(e && e.message);
+      console.error("vault git:", vaultGit.error);
+    });
+  }, GIT_DEBOUNCE_MS);
+}
+
+async function flushVaultSync() {
+  if (!vaultGit.enabled || !vaultGit.ready) return;
+  if (vaultGit.busy) {
+    if (vaultGit.pending.size && !vaultGit.timer) {
+      vaultGit.timer = setTimeout(() => {
+        vaultGit.timer = null;
+        flushVaultSync().catch((e) => {
+          vaultGit.error = sanitizeGitError(e && e.message);
+          console.error("vault git:", vaultGit.error);
+        });
+      }, GIT_DEBOUNCE_MS);
+    }
+    return;
+  }
+  const paths = [...vaultGit.pending];
+  if (!paths.length) return;
+  vaultGit.pending.clear();
+  vaultGit.busy = true;
+  try {
+    for (const p of paths) {
+      await runGit(["-C", VAULT, "add", "--", p], { timeoutMs: 8000 });
+    }
+    const status = await runGit(["-C", VAULT, "status", "--porcelain"], { timeoutMs: 8000 });
+    if (!String(status.out || "").trim()) return;
+    const msg = "vault: " + paths.join(", ");
+    await runGit(["-C", VAULT, "commit", "-m", msg], { timeoutMs: 8000 });
+    try {
+      await runGit(["-C", VAULT, "push", "-u", "origin", "HEAD"], { timeoutMs: 25000 });
+      vaultGit.error = "";
+      vaultGit.lastPushAt = Date.now();
+    } catch (e) {
+      vaultGit.error = sanitizeGitError(e && e.message || "push failed");
+      console.error("vault git push:", vaultGit.error);
+    }
+  } finally {
+    vaultGit.busy = false;
+    if (vaultGit.pending.size) scheduleVaultSync([...vaultGit.pending][0]);
+  }
+}
 
 function mondayOf(d) {
   const x = new Date(d + "T12:00:00");
@@ -457,7 +670,7 @@ const server = http.createServer(async (req, res) => {
     const { pathname } = url;
 
     if (pathname === "/api/health") {
-      return json(res, 200, { ok: true });
+      return json(res, 200, { ok: true, git: gitHint() });
     }
 
     if (pathname === "/api/week" && req.method === "GET") {
@@ -601,7 +814,8 @@ const server = http.createServer(async (req, res) => {
         await atomicWriteDay(logPath, markdown);
         const mtime = await fileMtimeMs(logPath);
         lastSelfWrites.set(date, mtime);
-        return json(res, 200, { ok: true, date, mtime });
+        scheduleVaultSync(`log/${date}.md`);
+        return json(res, 200, { ok: true, date, mtime, git: gitHint() });
       } finally {
         pendingSelfWrites.delete(date);
       }
@@ -734,7 +948,8 @@ const server = http.createServer(async (req, res) => {
         await atomicWriteFile(abs, markdown);
         const mtime = await fileMtimeMs(abs);
         lastSelfWrites.set(writeKey, mtime);
-        return json(res, 200, { ok: true, path: relPath, mtime });
+        scheduleVaultSync(relPath);
+        return json(res, 200, { ok: true, path: relPath, mtime, git: gitHint() });
       } finally {
         pendingSelfWrites.delete(writeKey);
       }
@@ -877,10 +1092,20 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-startLogWatch();
-server.listen(PORT, HOST, () => {
-  console.log(`AidanOS`);
-  console.log(`  vault: ${VAULT}`);
-  console.log(`  host:  ${HOST}`);
-  console.log(`  open:  http://${HOST === "0.0.0.0" ? "127.0.0.1" : HOST}:${PORT}`);
+async function boot() {
+  await initVaultGit();
+  startLogWatch();
+  server.listen(PORT, HOST, () => {
+    console.log(`AidanOS`);
+    console.log(`  vault: ${VAULT}`);
+    if (vaultGit.enabled) {
+      console.log(`  git:   ${vaultGit.error ? "error" : "on"}`);
+    }
+    console.log(`  host:  ${HOST}`);
+    console.log(`  open:  http://${HOST === "0.0.0.0" ? "127.0.0.1" : HOST}:${PORT}`);
+  });
+}
+boot().catch((err) => {
+  console.error(err);
+  process.exit(1);
 });

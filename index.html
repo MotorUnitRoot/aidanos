@@ -64,6 +64,25 @@
           <label class="sr-only" for="dump">Today note</label>
           <textarea id="dump" class="dump-src sr-only" rows="16" placeholder="Write."></textarea>
           <div id="paper" class="paper" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Today note" data-placeholder="Write."></div>
+          <div id="conflict-sheet" class="conflict-sheet" hidden>
+            <p class="conflict-kicker">This page changed on disk.</p>
+            <p id="conflict-path" class="conflict-path"></p>
+            <div class="conflict-cols">
+              <div id="conflict-mine-col" class="conflict-col">
+                <p class="kicker">Yours</p>
+                <pre id="conflict-mine"></pre>
+              </div>
+              <div id="conflict-theirs-col" class="conflict-col">
+                <p class="kicker">Theirs</p>
+                <pre id="conflict-theirs"></pre>
+              </div>
+            </div>
+            <div class="conflict-actions">
+              <button type="button" id="conflict-keep" class="hairline-button">Keep mine</button>
+              <button type="button" id="conflict-take" class="hairline-button">Take theirs</button>
+              <button type="button" id="conflict-edit" class="hairline-button">Edit</button>
+            </div>
+          </div>
           <div id="map-room" class="map-room" hidden>
             <div id="map-canvas" class="map-canvas">
               <h1 id="map-title" class="map-title"></h1>

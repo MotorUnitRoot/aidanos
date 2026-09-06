@@ -14,6 +14,23 @@ Open http://127.0.0.1:3847/. The first screen asks, “What do you want to do to
 
 The vault is the `vault/` folder next to the app, or the folder named in `AIDANOS_VAULT`.
 
+## Private vault (git)
+
+The durable disk is a private git repo of markdown. The intended remote is `MotorUnitRoot/aidanos-vault`. This app repo does not create that remote.
+
+On a Mac, keep a working tree of that same repo on disk and point `AIDANOS_VAULT` at it. The phone uses the hosted app; the server reads and writes the files.
+
+Cloud Run (and any host) can clone that repo when these are set:
+
+- `AIDANOS_VAULT_GIT_URL` — HTTPS git URL of the private vault
+- `AIDANOS_VAULT_GIT_TOKEN` or `GITHUB_TOKEN` — token that can clone and push
+- `AIDANOS_VAULT` — working tree path (optional; if unset with a git URL, the server clones into a dedicated directory and uses that as the vault)
+- `AIDANOS_VAULT_CLONE` — override that dedicated clone path
+
+If the git env is unset, today’s local `vault/` behavior is unchanged. A missing remote must not stop the app: writes stay on local disk, and push failures are logged plus a `git` hint on `/api/health` and successful PUT bodies.
+
+Two people (or the Mac and the phone) writing the same file at once is a conflict. The server refuses a silent overwrite (409 with the disk markdown and mtime). The paper then asks Keep mine, Take theirs, or Edit.
+
 ## The daily
 
 The first screen is almost empty. Today is the day’s note. Plan is this season’s file: a title, why it matters, what comes next, and what is waiting. Ask finds across the vault. A result opens in the same note, not a preview.

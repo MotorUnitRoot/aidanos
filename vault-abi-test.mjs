@@ -50,6 +50,15 @@ check("Dockerfile does not run as root and still binds 0.0.0.0 for Cloud Run", (
   assert(/AIDANOS_HOST=0\.0\.0\.0/.test(docker), "Cloud Run host");
   assert(/ENV PORT=8080/.test(docker), "Cloud Run port");
   assert(!/COPY \. \./.test(docker), "no broad COPY");
+  assert(/apt-get install[^\n]*git/.test(docker), "git in image for vault clone");
+});
+
+check("git vault sync is env-gated and does not invent a second write ABI", () => {
+  assert(/AIDANOS_VAULT_GIT_URL/.test(serverSrc), "git url env");
+  assert(/AIDANOS_VAULT_GIT_TOKEN/.test(serverSrc), "git token env");
+  assert(/GITHUB_TOKEN/.test(serverSrc), "GITHUB_TOKEN fallback");
+  assert(/scheduleVaultSync/.test(serverSrc), "commit after write");
+  assert(/error:\s*"disk newer"/.test(serverSrc), "409 still disk newer");
 });
 
 check("dockerignore keeps tests and git out of a future broad COPY", () => {
@@ -102,6 +111,8 @@ async function liveVaultAbi() {
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,
+      AIDANOS_VAULT_GIT_URL: "",
+      AIDANOS_VAULT_GIT_TOKEN: "",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -122,6 +133,7 @@ async function liveVaultAbi() {
     assert(health.ok === true, "health ok");
     assert(!Object.prototype.hasOwnProperty.call(health, "vault"), "health must not name the vault path");
     assert(!JSON.stringify(health).includes(vault), "health body must not leak the vault path");
+    assert(health.git && health.git.enabled === false, "git off when env unset");
     assert(healthRes.headers.get("x-content-type-options") === "nosniff", "nosniff");
     assert(healthRes.headers.get("x-frame-options") === "DENY", "frame deny");
 
@@ -188,6 +200,61 @@ async function liveVaultAbi() {
     });
     assert(sameOrigin.ok, "same-origin write " + sameOrigin.status);
     assert(fs.readFileSync(path.join(vault, "maps", "safe.md"), "utf8") === "still inside\n", "same-origin saved");
+
+    const dayDate = "2026-09-06";
+    const firstDay = await fetch(base + "/api/day?date=" + dayDate, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ date: dayDate, markdown: "one\n", paper: "one\n" }),
+    });
+    assert(firstDay.ok, "create day " + firstDay.status);
+    const firstDayBody = await firstDay.json();
+    assert(typeof firstDayBody.mtime === "number", "day put mtime");
+    const logPath = path.join(vault, "log", dayDate + ".md");
+    fs.writeFileSync(logPath, "two\n", "utf8");
+    const daySt = fs.statSync(logPath);
+    fs.utimesSync(logPath, daySt.atime, new Date(daySt.mtimeMs + 25));
+    const dayConflict = await fetch(base + "/api/day?date=" + dayDate, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        date: dayDate,
+        markdown: "three\n",
+        paper: "three\n",
+        mtime: firstDayBody.mtime,
+      }),
+    });
+    assert(dayConflict.status === 409, "stale day put got " + dayConflict.status);
+    const dayConflictBody = await dayConflict.json();
+    assert(dayConflictBody.error === "disk newer", "day 409 error");
+    assert(dayConflictBody.date === dayDate, "day 409 date");
+    assert(dayConflictBody.markdown === "two\n", "day 409 returns disk markdown");
+    assert(typeof dayConflictBody.mtime === "number" && dayConflictBody.mtime > firstDayBody.mtime, "day 409 mtime");
+    assert(fs.readFileSync(logPath, "utf8") === "two\n", "409 must not overwrite the day");
+
+    const fileRel = "maps/safe.md";
+    const firstFile = await fetch(base + "/api/file?path=" + encodeURIComponent(fileRel));
+    const firstFileBody = await firstFile.json();
+    fs.writeFileSync(path.join(vault, "maps", "safe.md"), "theirs on disk\n", "utf8");
+    const fileSt = fs.statSync(path.join(vault, "maps", "safe.md"));
+    fs.utimesSync(path.join(vault, "maps", "safe.md"), fileSt.atime, new Date(fileSt.mtimeMs + 25));
+    const fileConflict = await fetch(base + "/api/file?path=" + encodeURIComponent(fileRel), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: fileRel,
+        markdown: "mine\n",
+        paper: "mine\n",
+        mtime: firstFileBody.mtime,
+      }),
+    });
+    assert(fileConflict.status === 409, "stale file put got " + fileConflict.status);
+    const fileConflictBody = await fileConflict.json();
+    assert(fileConflictBody.error === "disk newer", "file 409 error");
+    assert(fileConflictBody.path === fileRel, "file 409 path");
+    assert(fileConflictBody.markdown === "theirs on disk\n", "file 409 returns disk markdown");
+    assert(typeof fileConflictBody.mtime === "number", "file 409 mtime");
+    assert(fs.readFileSync(path.join(vault, "maps", "safe.md"), "utf8") === "theirs on disk\n", "409 must not overwrite the file");
 
     const huge = await fetch(base + "/api/day?date=2026-09-06", {
       method: "PUT",

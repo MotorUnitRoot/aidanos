@@ -769,6 +769,10 @@ async function leaveCurrentPaper() {
   flushActiveLineToDump();
   clearTimeout(state.saveTimer);
   state.saveTimer = null;
+  if (paperConflict) {
+    closePaperConflict();
+    return;
+  }
   await saveDay();
 }
 
@@ -1344,6 +1348,7 @@ function ensureDumpMatchesPaper() {
 
 function scheduleSave() {
   if (applyingDragSave) return;
+  if (paperConflict) return;
   state.dirty = true;
   setStatus("Saving");
   clearTimeout(state.saveTimer);
@@ -1470,8 +1475,182 @@ function paperSaveSnapshot() {
   }
   return null;
 }
+
+let paperConflict = null;
+
+function conflictStillHere(info) {
+  if (!info) return false;
+  if (info.kind === "note") {
+    return isNoteDoc() && state.doc && state.doc.path === info.path;
+  }
+  return !isNoteDoc() && state.day && state.day.date === info.date;
+}
+
+function openPaperConflict(info) {
+  paperConflict = {
+    kind: info.kind,
+    path: info.path || "",
+    date: info.date || "",
+    mine: String(info.mine || ""),
+    theirs: String(info.theirs || ""),
+    mtime: Number(info.mtime) || 0,
+  };
+  const sheet = $("conflict-sheet");
+  const pathEl = $("conflict-path");
+  const mineEl = $("conflict-mine");
+  const theirsEl = $("conflict-theirs");
+  if (pathEl) pathEl.textContent = paperConflict.kind === "note"
+    ? (paperConflict.path || "note")
+    : (paperConflict.date || "today");
+  if (mineEl) mineEl.textContent = paperConflict.mine;
+  if (theirsEl) theirsEl.textContent = paperConflict.theirs;
+  if (sheet) {
+    sheet.hidden = false;
+    sheet.classList.remove("is-edit");
+  }
+  document.body.classList.add("has-conflict");
+  document.body.classList.remove("conflict-edit");
+  setStatus("This page changed on disk.");
+}
+
+function closePaperConflict() {
+  paperConflict = null;
+  const sheet = $("conflict-sheet");
+  if (sheet) {
+    sheet.hidden = true;
+    sheet.classList.remove("is-edit");
+  }
+  document.body.classList.remove("has-conflict");
+  document.body.classList.remove("conflict-edit");
+}
+
+function handleSaveConflict(snap, body, { keepalive = false } = {}) {
+  if (keepalive) return;
+  if (!conflictStillHere(snap)) return;
+  openPaperConflict({
+    kind: snap.kind,
+    path: snap.path || (body && body.path) || "",
+    date: snap.date || (body && body.date) || "",
+    mine: snap.markdown,
+    theirs: typeof (body && body.markdown) === "string" ? body.markdown : "",
+    mtime: Number(body && body.mtime) || 0,
+  });
+}
+
+function conflictMineNow() {
+  if (!paperConflict) return "";
+  if (document.body.classList.contains("conflict-edit")) {
+    ensureDumpMatchesPaper();
+    const dump = $("dump");
+    if (dump) return cleanPaperMarkdown(dump.value);
+  }
+  return paperConflict.mine;
+}
+
+async function resolveConflictKeep() {
+  if (!paperConflict) return;
+  const info = paperConflict;
+  const mine = conflictMineNow();
+  try {
+    let res;
+    if (info.kind === "note") {
+      res = await fetch("/api/file?path=" + encodeURIComponent(info.path), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          path: info.path,
+          paper: mine,
+          markdown: mine,
+          mtime: info.mtime,
+        }),
+      });
+    } else {
+      res = await fetch("/api/day?date=" + info.date, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          date: info.date,
+          paper: mine,
+          markdown: mine,
+          mtime: info.mtime,
+        }),
+      });
+    }
+    if (res.status === 409) {
+      const body = await res.json().catch(() => ({}));
+      info.theirs = typeof body.markdown === "string" ? body.markdown : "";
+      info.mtime = Number(body.mtime) || 0;
+      info.mine = mine;
+      const mineEl = $("conflict-mine");
+      const theirsEl = $("conflict-theirs");
+      if (mineEl) mineEl.textContent = info.mine;
+      if (theirsEl) theirsEl.textContent = info.theirs;
+      setStatus("This page changed on disk.");
+      return;
+    }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || res.statusText);
+    }
+    const out = await res.json().catch(() => ({}));
+    if (info.kind === "note") {
+      if (isNoteDoc() && state.doc && state.doc.path === info.path) {
+        if (out && out.mtime != null) state.doc.mtime = Number(out.mtime) || 0;
+        state.doc.markdown = mine;
+        const dump = $("dump");
+        if (dump) dump.value = mine;
+        state.dirty = false;
+        paintPaper();
+      }
+    } else if (state.day && state.day.date === info.date) {
+      if (out && out.mtime != null) state.day.mtime = Number(out.mtime) || 0;
+      state.day.markdown = mine;
+      const dump = $("dump");
+      if (dump) dump.value = mine;
+      state.dirty = false;
+      paintPaper();
+    }
+    closePaperConflict();
+    setStatus("Saved", "saved");
+    setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
+  } catch (e) {
+    setStatus(String(e.message), "error");
+  }
+}
+
+function resolveConflictTheirs() {
+  if (!paperConflict) return;
+  const info = paperConflict;
+  if (info.kind === "note") {
+    applyRemoteNote({ path: info.path, markdown: info.theirs, mtime: info.mtime });
+  } else {
+    applyRemoteDay({ date: info.date, markdown: info.theirs, mtime: info.mtime });
+  }
+  closePaperConflict();
+  setStatus("");
+}
+
+function resolveConflictEdit() {
+  if (!paperConflict) return;
+  const mine = paperConflict.mine;
+  const dump = $("dump");
+  if (dump) dump.value = mine;
+  if (paperConflict.kind === "note" && state.doc) state.doc.markdown = mine;
+  else if (state.day) state.day.markdown = mine;
+  state.dirty = true;
+  paintPaper();
+  const sheet = $("conflict-sheet");
+  if (sheet) sheet.classList.add("is-edit");
+  document.body.classList.add("conflict-edit");
+  setStatus("They wrote this too.");
+}
+
 async function saveDay({ keepalive = false } = {}) {
   const run = async () => {
+    if (paperConflict && !keepalive) {
+      setStatus("This page changed on disk.");
+      return;
+    }
     const snap = paperSaveSnapshot();
     if (!snap) {
       setStatus("");
@@ -1481,21 +1660,16 @@ async function saveDay({ keepalive = false } = {}) {
       const path = snap.path;
       const markdown = snap.markdown;
       try {
-        const putNote = (mt) => fetch("/api/file?path=" + encodeURIComponent(path), {
+        const res = await fetch("/api/file?path=" + encodeURIComponent(path), {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path, paper: markdown, markdown, mtime: mt }),
+          body: JSON.stringify({ path, paper: markdown, markdown, mtime: snap.mtime }),
           keepalive: !!keepalive,
         });
-        let res = await putNote(snap.mtime);
         if (res.status === 409) {
           const body = await res.json().catch(() => ({}));
-          res = await putNote(Number(body.mtime) || 0);
-          if (!res.ok) {
-            if (isNoteDoc() && state.doc && state.doc.path === path) applyRemoteNote(body);
-            setStatus("");
-            return;
-          }
+          handleSaveConflict(snap, body, { keepalive });
+          return;
         }
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
@@ -1520,7 +1694,7 @@ async function saveDay({ keepalive = false } = {}) {
     const markdown = snap.markdown;
     const mtime = snap.mtime;
     try {
-      let res = await fetch("/api/day?date=" + date, {
+      const res = await fetch("/api/day?date=" + date, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ date, paper: markdown, markdown, mtime }),
@@ -1528,38 +1702,8 @@ async function saveDay({ keepalive = false } = {}) {
       });
       if (res.status === 409) {
         const body = await res.json().catch(() => ({}));
-        if (applyingDragSave) {
-          const retry = await fetch("/api/day?date=" + date, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              date,
-              paper: markdown,
-              markdown: markdown,
-              mtime: Number(body.mtime) || 0,
-            }),
-            keepalive: !!keepalive,
-          });
-          if (retry.ok) {
-            res = retry;
-          } else {
-            applyRemoteDay({
-              date: body.date || date,
-              markdown: typeof body.markdown === "string" ? body.markdown : "",
-              mtime: Number(body.mtime) || 0,
-            });
-            setStatus("");
-            return;
-          }
-        } else {
-          applyRemoteDay({
-            date: body.date || date,
-            markdown: typeof body.markdown === "string" ? body.markdown : "",
-            mtime: Number(body.mtime) || 0,
-          });
-          setStatus("");
-          return;
-        }
+        handleSaveConflict(snap, body, { keepalive });
+        return;
       }
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -3018,6 +3162,8 @@ async function applyStepsToToday(steps, date) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ date: day, paper: next, markdown: next, mtime: body.mtime || 0 }),
     });
+    // Quiet merge: map-task append is not the interactive paper save.
+    // Re-read theirs and append the same tasks again. Do not open conflict UI.
     if (res.status === 409) {
       const again = await res.json().catch(() => ({}));
       const merged = appendMapTasks(again.markdown || "", list);
@@ -3689,6 +3835,15 @@ function syncFmtBarForKeyboard() {
   window.addEventListener("resize", onVV);
   setFmtBarVisible(false);
   syncFmtBarForKeyboard();
+})();
+
+(function bindConflict() {
+  const keep = $("conflict-keep");
+  const take = $("conflict-take");
+  const edit = $("conflict-edit");
+  if (keep) keep.addEventListener("click", () => { resolveConflictKeep().catch(() => {}); });
+  if (take) take.addEventListener("click", () => resolveConflictTheirs());
+  if (edit) edit.addEventListener("click", () => resolveConflictEdit());
 })();
 
 if (/^https?:$/.test(location.protocol) && "serviceWorker" in navigator) {

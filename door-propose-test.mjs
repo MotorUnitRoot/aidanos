@@ -99,7 +99,7 @@ check("helper never says horse or Mark", () => {
 check("submit-with-text proposes and does not write", () => {
   const submit = doorBlock(
     '$("door-form").addEventListener("submit"',
-    '$("door-skip").addEventListener("click"'
+    "async function openPlanNote("
   );
   assert(submit.includes("e.preventDefault()"), "preventDefault");
   assert(submit.includes("proposeDoorLines("), "submit proposes");
@@ -141,7 +141,7 @@ check("applyDoorPending stays dead", () => {
   assert(!/dump\.value\s*=/.test(propose), "proposeDoorLines must not write dump");
   const submit = doorBlock(
     '$("door-form").addEventListener("submit"',
-    '$("door-skip").addEventListener("click"'
+    "async function openPlanNote("
   );
   assert(!/dump\.value\s*=/.test(submit), "Door submit must not write dump.value");
   const skip = doorBlock(

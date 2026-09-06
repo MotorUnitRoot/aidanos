@@ -105,9 +105,19 @@ async function liveVaultAbi() {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  let errOut = "";
+  child.stderr.on("data", (buf) => { errOut += String(buf); });
+  child.stdout.on("data", (buf) => { errOut += String(buf); });
   const base = "http://127.0.0.1:" + port;
+  const step = async (name, fn) => {
+    try {
+      return await fn();
+    } catch (e) {
+      throw new Error(name + ": " + (e && e.message || e) + (errOut ? " :: " + errOut.slice(-400) : ""));
+    }
+  };
   try {
-    const healthRes = await waitHealth(base, child);
+    const healthRes = await step("health", () => waitHealth(base, child));
     const health = await healthRes.json();
     assert(health.ok === true, "health ok");
     assert(!Object.prototype.hasOwnProperty.call(health, "vault"), "health must not name the vault path");

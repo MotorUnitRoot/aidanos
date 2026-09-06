@@ -314,25 +314,14 @@ function dayMarkdownFromBody(body) {
 async function readBody(req) {
   const chunks = [];
   let n = 0;
-  try {
-    for await (const c of req) {
-      n += c.length;
-      if (n > MAX_BODY) {
-        req.destroy();
-        const err = new Error("too large");
-        err.code = "BODY_TOO_LARGE";
-        throw err;
-      }
-      chunks.push(c);
-    }
-  } catch (e) {
-    if (e && e.code === "BODY_TOO_LARGE") throw e;
-    if (req.destroyed) {
+  for await (const c of req) {
+    n += c.length;
+    if (n > MAX_BODY) {
       const err = new Error("too large");
       err.code = "BODY_TOO_LARGE";
       throw err;
     }
-    throw e;
+    chunks.push(c);
   }
   return Buffer.concat(chunks).toString("utf8");
 }

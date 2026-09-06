@@ -6,4 +6,4 @@ Generation may only emit the named primitives in `components/README.md`. Get to 
 
 A last-mile screen assembles those primitives. It does not invent a look. A person can open those files, change them, and delete them. They are not frames in Figma, not a component library dump, and not a Salesforce form.
 
-The letter map is the example. Open `generated.html` to see a generated application assembled only from those parts. `maps/reply-to-a-letter.md` names `[[the-reply]]`. The reply is a markdown file beside the map. Ask may put next steps on today. Nothing about that work lives in a second database.
+The letter map is the example. Open `generated.html` to see a generated application assembled only from those parts. `maps/reply-to-a-letter.md` names `[[the-reply]]`. The reply is a markdown file beside the map. Opening the map draws stages and one fork. A stage opens as paper. Ask may put next steps on today. Nothing about that work lives in a second database.

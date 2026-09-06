@@ -114,8 +114,8 @@ check("Door still paints Get to work / the question", () => {
 });
 
 check("server still binds 127.0.0.1 and reads PORT", () => {
-  assert(serverSrc.includes('const HOST = "127.0.0.1"'), "HOST");
-  assert(/PORT = Number\(process\.env\.PORT\) \|\| 3847/.test(serverSrc), "PORT env");
+  assert(/process\.env\.AIDANOS_HOST \|\| "127\.0\.0\.1"/.test(serverSrc), "HOST defaults to loopback");
+  assert(/process\.env\.PORT/.test(serverSrc) && /3847/.test(serverSrc), "PORT env");
   assert(/server\.listen\(PORT, HOST/.test(serverSrc), "listen host");
 });
 

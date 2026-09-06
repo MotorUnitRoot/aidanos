@@ -16,5 +16,8 @@ assert(sh.indexOf("/Users/colby") < 0, "do not bake Mac path");
 assert(sh.includes("AIDANOS_VAULT"), "honor vault env");
 assert(/unset\s+AIDANOS_VAULT/.test(sh), "empty vault env must be unset");
 assert(pkg.scripts.start === "node server.mjs", "package start is server");
-assert(server.includes('const HOST = "127.0.0.1"'), "HOST must be 127.0.0.1");
+assert(
+  /const HOST = process\.env\.AIDANOS_HOST \|\| "127\.0\.0\.1"/.test(server),
+  "HOST defaults to 127.0.0.1"
+);
 console.log("stay-up-test ok");

@@ -33,3 +33,18 @@ When the work needs a place to write the letter or note the receipt, that place 
 ## What this is not
 
 This is not Salesforce. It is not a second notes app. It is not the Tome. The phone can stay NotePlan, pulling into the same vault.
+
+## Licensing
+
+AidanOS is source-available under the Functional Source License, Version 1.1,
+ALv2 Future License (`FSL-1.1-ALv2`). You may read, modify, and self-host it for
+your own use. You may not offer AidanOS (or a substitute with substantially
+similar functionality) as a competing commercial hosted product or service for
+two years from each version’s release date. On the second anniversary of a
+version’s release, that version becomes available under Apache License 2.0.
+
+See [`LICENSE`](./LICENSE) for the full terms. Trademark rights in MotorUnit and
+AidanOS are not granted by this license.
+
+Prior releases under MIT remain available under MIT for those tagged versions
+only. New commits and releases after this change are FSL-1.1-ALv2.

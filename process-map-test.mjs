@@ -95,7 +95,7 @@ check("Today holds canvas and stage paper; paper stays 42rem", () => {
   assert(css.includes("width: 42rem"), "42rem paper");
   assert(css.includes("body.doc-map"), "map chrome hide");
   assert(css.includes(".stage-sheet"), "stage sheet");
-  assert(src.includes("aidanos-shell-v19") || fs.readFileSync(path.join(root, "sw.js"), "utf8").includes("aidanos-shell-v19"), "shell bump");
+  assert(src.includes("aidanos-shell-v20") || fs.readFileSync(path.join(root, "sw.js"), "utf8").includes("aidanos-shell-v20"), "shell bump");
 });
 
 check("isWorkMapPath keeps work maps and skips last-mile the-*", () => {

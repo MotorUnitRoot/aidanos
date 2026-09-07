@@ -12,7 +12,7 @@ import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GIT_URL = String(process.env.AIDANOS_VAULT_GIT_URL || "").trim();
@@ -62,11 +62,41 @@ const vaultGit = {
   busy: false,
 };
 
-function sanitizeGitError(msg) {
+export function authenticatedGitUrl(url, token) {
+  const rawUrl = String(url || "").trim();
+  const rawToken = String(token || "").trim();
+  if (!rawUrl || !rawToken) return rawUrl;
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return rawUrl;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return rawUrl;
+  parsed.username = "x-access-token";
+  parsed.password = rawToken;
+  return parsed.href;
+}
+
+function gitRemoteUrl() {
+  return authenticatedGitUrl(GIT_URL, GIT_TOKEN);
+}
+
+export function sanitizeGitError(msg, secrets) {
+  const token = secrets && secrets.token != null ? String(secrets.token) : GIT_TOKEN;
+  const vault = secrets && secrets.vault != null ? String(secrets.vault) : VAULT;
+  const url = secrets && secrets.url != null ? String(secrets.url) : GIT_URL;
   let s = String(msg || "git failed").replace(/\s+/g, " ").trim();
-  if (GIT_TOKEN) s = s.split(GIT_TOKEN).join("***");
-  if (VAULT) s = s.split(VAULT).join("[vault]");
-  if (GIT_URL) s = s.split(GIT_URL).join("[url]");
+  if (token) {
+    s = s.split(token).join("***");
+    const encoded = encodeURIComponent(token);
+    if (encoded !== token) s = s.split(encoded).join("***");
+  }
+  if (vault) s = s.split(vault).join("[vault]");
+  if (url) s = s.split(url).join("[url]");
+  const auth = token ? authenticatedGitUrl(url, token) : "";
+  if (auth && auth !== url) s = s.split(auth).join("[url]");
+  s = s.replace(/x-access-token:[^@\s]+/gi, "x-access-token:***");
   s = s.replace(/https?:\/\/[^\s]+/gi, "[url]");
   s = s.replace(/file:\/\/[^\s]+/gi, "[url]");
   return s.slice(0, 180);
@@ -83,11 +113,6 @@ function gitHint() {
 function gitEnv() {
   const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
   delete env.GIT_ASKPASS;
-  if (GIT_TOKEN) {
-    env.GIT_CONFIG_COUNT = "1";
-    env.GIT_CONFIG_KEY_0 = "http.extraHeader";
-    env.GIT_CONFIG_VALUE_0 = "Authorization: Bearer " + GIT_TOKEN;
-  }
   return env;
 }
 
@@ -126,10 +151,11 @@ async function ensureGitIdentity(cwd) {
 }
 
 async function ensureOrigin(cwd) {
+  const remote = gitRemoteUrl();
   try {
-    await runGit(["-C", cwd, "remote", "set-url", "origin", GIT_URL], { timeoutMs: 4000 });
+    await runGit(["-C", cwd, "remote", "set-url", "origin", remote], { timeoutMs: 4000 });
   } catch {
-    await runGit(["-C", cwd, "remote", "add", "origin", GIT_URL], { timeoutMs: 4000 });
+    await runGit(["-C", cwd, "remote", "add", "origin", remote], { timeoutMs: 4000 });
   }
 }
 
@@ -170,7 +196,7 @@ async function initVaultGit() {
     const nonempty = names.filter((n) => n !== "." && n !== "..");
     if (nonempty.length === 0) {
       try {
-        await runGit(["clone", "--depth", "1", GIT_URL, VAULT], { timeoutMs: 25000 });
+        await runGit(["clone", "--depth", "1", gitRemoteUrl(), VAULT], { timeoutMs: 25000 });
         vaultGit.error = "";
       } catch (e) {
         vaultGit.error = sanitizeGitError(e && e.message || "clone failed");
@@ -1105,7 +1131,19 @@ async function boot() {
     console.log(`  open:  http://${HOST === "0.0.0.0" ? "127.0.0.1" : HOST}:${PORT}`);
   });
 }
-boot().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+function isMainModule() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(path.resolve(entry)).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  boot().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

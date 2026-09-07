@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { authenticatedGitUrl, sanitizeGitError } from "./server.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
@@ -181,8 +182,69 @@ async function liveGitSync() {
   }
 }
 
+function authUrlShaping() {
+  const token = "ghp_unit_test_token_9f3a2c1b";
+  const url = "https://github.com/MotorUnitRoot/aidanos-vault.git";
+  const want = "https://x-access-token:" + token + "@github.com/MotorUnitRoot/aidanos-vault.git";
+  const auth = authenticatedGitUrl(url, token);
+  assert(auth === want, "https token userinfo");
+  assert(authenticatedGitUrl(url, "") === url, "no token keeps public url");
+  assert(authenticatedGitUrl(url, "   ") === url, "whitespace token keeps public url");
+  assert(authenticatedGitUrl("/tmp/local.git", token) === "/tmp/local.git", "local path unchanged");
+  assert(authenticatedGitUrl("file:///tmp/local.git", token) === "file:///tmp/local.git", "file url unchanged");
+  const replaced = authenticatedGitUrl("https://old:creds@github.com/MotorUnitRoot/aidanos-vault.git", token);
+  assert(replaced === want, "replaces existing userinfo");
+
+  const leaked = "fatal: could not read Username for '" + auth + "' terminal prompts disabled";
+  const clean = sanitizeGitError(leaked, { token, url, vault: "/tmp/vault" });
+  assert(!clean.includes(token), "token redacted from git error");
+  assert(!clean.includes(url), "public url redacted");
+  assert(!clean.includes("x-access-token:" + token), "auth userinfo redacted");
+  assert(clean.includes("[url]") || clean.includes("***"), "sanitized placeholder");
+}
+
+async function authOriginIsEmbedded() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-git-auth-"));
+  const vault = path.join(tmp, "vault");
+  fs.mkdirSync(vault, { recursive: true });
+  const token = "ghp_shape_test_" + String(Date.now());
+  const publicUrl = "https://127.0.0.1:1/MotorUnitRoot/aidanos-vault.git";
+  const port = 23000 + Math.floor(Math.random() * 2000);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: publicUrl,
+    AIDANOS_VAULT_GIT_TOKEN: token,
+    GITHUB_TOKEN: "",
+    AIDANOS_VAULT_GIT_DEBOUNCE_MS: "80",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    const healthRes = await waitHealth(base, child);
+    const health = await healthRes.json();
+    assert(health.ok === true, "health ok with token");
+    assert(health.git && health.git.enabled === true, "git enabled with token");
+    const origin = git(["-C", vault, "remote", "get-url", "origin"]).trim();
+    assert(origin.includes("x-access-token:"), "origin uses token userinfo");
+    assert(origin.includes(token), "origin embeds token");
+    assert(origin.includes("127.0.0.1:1/MotorUnitRoot/aidanos-vault.git"), "origin keeps host and path");
+    const hint = JSON.stringify(health);
+    assert(!hint.includes(token), "health must not leak token");
+    assert(!hint.includes(publicUrl), "health must not leak url");
+    const log = child._log();
+    assert(!log.includes(token), "logs must not leak token");
+    assert(!log.includes("x-access-token:" + token), "logs must not leak auth url");
+  } finally {
+    await stop(child);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 try {
+  authUrlShaping();
   await liveGitSync();
+  await authOriginIsEmbedded();
   console.log("vault-git-test ok");
 } catch (err) {
   console.error("FAIL  vault-git-test  " + err.message);

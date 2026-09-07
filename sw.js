@@ -1,5 +1,5 @@
 /* AidanOS shell cache — offline chrome; /api/* network-first */
-const CACHE = "aidanos-shell-v20";
+const CACHE = "aidanos-shell-v21";
 const SHELL = [
   "/",
   "/index.html",

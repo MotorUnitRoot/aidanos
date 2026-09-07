@@ -95,7 +95,27 @@ check("Today holds canvas and stage paper; paper stays 42rem", () => {
   assert(css.includes("width: 42rem"), "42rem paper");
   assert(css.includes("body.doc-map"), "map chrome hide");
   assert(css.includes(".stage-sheet"), "stage sheet");
-  assert(src.includes("aidanos-shell-v20") || fs.readFileSync(path.join(root, "sw.js"), "utf8").includes("aidanos-shell-v20"), "shell bump");
+  assert(src.includes("aidanos-shell-v21") || fs.readFileSync(path.join(root, "sw.js"), "utf8").includes("aidanos-shell-v21"), "shell bump");
+});
+
+check("Paper and dump refuse iOS autofill accessories", () => {
+  const dumpTag = (html.match(/<textarea[^>]*id="dump"[^>]*>/) || [])[0] || "";
+  const paperTag = (html.match(/<div[^>]*id="paper"[^>]*>/) || [])[0] || "";
+  assert(dumpTag, "dump tag");
+  assert(paperTag, "paper tag");
+  assert(dumpTag.includes('name="day-write"'), "dump name is not password/email/cc");
+  assert(!/name="(password|email|username|q|cc|card|address)"/i.test(dumpTag), "dump avoids autofill names");
+  for (const tag of [dumpTag, paperTag]) {
+    assert(/autocomplete="off"/.test(tag), "autocomplete off");
+    assert(/autocorrect="on"/.test(tag), "autocorrect on for prose");
+    assert(/autocapitalize="sentences"/.test(tag), "sentences for prose");
+    assert(/data-lpignore="true"/.test(tag), "LastPass ignore");
+    assert(/data-1p-ignore="true"/.test(tag), "1Password ignore");
+    assert(!/type="password"/.test(tag), "no password-input trick");
+    assert(!/autocomplete="(new-password|current-password|username|email|cc-|street-address|one-time-code)"/.test(tag), "no password/cc/address token");
+  }
+  assert(paperTag.includes('contenteditable="true"'), "paper stays a writing surface");
+  assert(html.includes('?v=ios2'), "asset query bump");
 });
 
 check("isWorkMapPath keeps work maps and skips last-mile the-*", () => {

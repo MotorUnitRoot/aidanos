@@ -12,7 +12,7 @@
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <link rel="stylesheet" href="/styles.css" />
-  <link rel="stylesheet" href="/day.css?v=ios1" />
+  <link rel="stylesheet" href="/day.css?v=ios2" />
   <link rel="stylesheet" href="/api/skin.css" />
 </head>
 <body class="day-page view-door">
@@ -62,8 +62,8 @@
             </p>
           </div>
           <label class="sr-only" for="dump">Today note</label>
-          <textarea id="dump" class="dump-src sr-only" rows="16" placeholder="Write."></textarea>
-          <div id="paper" class="paper" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Today note" data-placeholder="Write."></div>
+          <textarea id="dump" class="dump-src sr-only" name="day-write" rows="16" placeholder="Write." autocomplete="off" autocorrect="on" autocapitalize="sentences" spellcheck="true" data-lpignore="true" data-1p-ignore="true"></textarea>
+          <div id="paper" class="paper" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Today note" data-placeholder="Write." autocomplete="off" autocorrect="on" autocapitalize="sentences" spellcheck="true" data-lpignore="true" data-1p-ignore="true"></div>
           <div id="conflict-sheet" class="conflict-sheet" hidden>
             <p class="conflict-kicker">This page changed on disk.</p>
             <p id="conflict-path" class="conflict-path"></p>
@@ -159,6 +159,6 @@
     </button>
   </div>
 
-  <script src="/app.js?v=ios1" type="module"></script>
+  <script src="/app.js?v=ios2" type="module"></script>
 </body>
 </html>

@@ -1131,6 +1131,7 @@ async function boot() {
     console.log(`  open:  http://${HOST === "0.0.0.0" ? "127.0.0.1" : HOST}:${PORT}`);
   });
 }
+
 function isMainModule() {
   const entry = process.argv[1];
   if (!entry) return false;

@@ -57,6 +57,10 @@ check("git vault sync is env-gated and does not invent a second write ABI", () =
   assert(/AIDANOS_VAULT_GIT_URL/.test(serverSrc), "git url env");
   assert(/AIDANOS_VAULT_GIT_TOKEN/.test(serverSrc), "git token env");
   assert(/GITHUB_TOKEN/.test(serverSrc), "GITHUB_TOKEN fallback");
+  assert(/authenticatedGitUrl/.test(serverSrc), "https token url shaping");
+  assert(/x-access-token/.test(serverSrc), "github userinfo username");
+  assert(!/http\.extraHeader/.test(serverSrc), "do not use extraHeader bearer");
+  assert(!/Authorization: Bearer/.test(serverSrc), "do not send bearer extraHeader");
   assert(/scheduleVaultSync/.test(serverSrc), "commit after write");
   assert(/error:\s*"disk newer"/.test(serverSrc), "409 still disk newer");
 });

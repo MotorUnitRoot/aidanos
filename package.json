@@ -8,6 +8,6 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node search-test.mjs && node door-propose-test.mjs && node door-accept-test.mjs && node today-frontmatter-test.mjs && node slot-snap-test.mjs && node stay-up-test.mjs && node saved-shove-test.mjs && node checkbox-hit-test.mjs && node paper-width-test.mjs && node day-switch-test.mjs && node plan-copy-test.mjs && node library-primitives-test.mjs && node vault-abi-test.mjs && node process-map-test.mjs && node conflict-ui-test.mjs && node vault-git-test.mjs"
+    "test": "node search-test.mjs && node door-propose-test.mjs && node door-accept-test.mjs && node today-frontmatter-test.mjs && node slot-snap-test.mjs && node stay-up-test.mjs && node saved-shove-test.mjs && node checkbox-hit-test.mjs && node paper-task-source-test.mjs && node paper-width-test.mjs && node day-switch-test.mjs && node plan-copy-test.mjs && node library-primitives-test.mjs && node vault-abi-test.mjs && node process-map-test.mjs && node conflict-ui-test.mjs && node vault-git-test.mjs"
   }
 }

@@ -174,6 +174,14 @@ function indentPad(spaces) {
   return n ? "padding-left:" + (n * 0.55) + "em;" : "";
 }
 
+function matchPaperTask(line) {
+  return String(line ?? "").match(/^(\s*)([-*+])\s+\[([ xX]?)\]\s*(.*)$/);
+}
+
+function paperTaskSrc(indent, mark, on, body) {
+  return String(indent || "") + (mark || "-") + " [" + (on ? "x" : " ") + "] " + String(body ?? "");
+}
+
 function formatOneLine(line, asSource, hidden) {
   if (asSource) {
     let cls = "md-line is-source";
@@ -188,10 +196,17 @@ function formatOneLine(line, asSource, hidden) {
       return '<div draggable="true" class="' + cls + '" data-kind="' + kind + '" data-src="' + attr(line) + '"' + extra + ">" +
         '<span class="md-hash" contenteditable="false">' + escapeHtml(m[1] + m[2]) + '</span>' +
         '<span class="md-body">' + paintWiki(escapeHtml(m[3]), true) + "</span></div>";
-    } else if ((m = line.match(/^(\s*)([-*+])\s+\[([ xX])\]\s*(.*)$/))) {
-      cls += " task" + (/x/i.test(m[3]) ? " done" : "") + (m[1] ? " nest" : "");
+    } else if ((m = matchPaperTask(line))) {
+      const on = /x/i.test(m[3]);
+      const nest = m[1] ? " nest" : "";
+      const src = paperTaskSrc(m[1], m[2], on, m[4]);
+      cls += " task" + (on ? " done" : "") + nest;
       kind = "task";
       extra = ' data-indent="' + attr(m[1]) + '" data-mark="' + attr(m[2]) + '"';
+      return '<div draggable="true" class="' + cls + '" data-kind="' + kind + '" data-src="' + attr(src) + '"' + extra +
+        ' style="' + indentPad(m[1]) + '"><span class="md-box" contenteditable="false" role="checkbox" aria-checked="' +
+        (on ? "true" : "false") + '"></span><span class="md-body">' +
+        paintWiki(escapeHtml(m[4]), true) + "</span></div>";
     } else if ((m = line.match(/^(\s*)([-*+])\s+(.*)$/))) {
       cls += " ul" + (m[1] ? " nest" : "");
       kind = "ul";
@@ -217,11 +232,12 @@ function formatOneLine(line, asSource, hidden) {
     return '<div draggable="true" class="md-line' + front + ' h' + m[1].length + '" data-kind="h" data-src="' + attr(line) + '" data-level="' +
       m[1].length + '"><span class="md-body">' + paintInline(m[3]) + "</span></div>";
   }
-  if ((m = line.match(/^(\s*)([-*+])\s+\[([ xX])\]\s*(.*)$/))) {
+  if ((m = matchPaperTask(line))) {
     const on = /x/i.test(m[3]);
     const nest = m[1] ? " nest" : "";
+    const src = paperTaskSrc(m[1], m[2], on, m[4]);
     return '<div draggable="true" class="md-line' + front + ' task' + (on ? " done" : "") + nest +
-      '" data-kind="task" data-src="' + attr(line) + '" data-indent="' + attr(m[1]) + '" data-mark="' + attr(m[2]) +
+      '" data-kind="task" data-src="' + attr(src) + '" data-indent="' + attr(m[1]) + '" data-mark="' + attr(m[2]) +
       '" style="' + indentPad(m[1]) + '"><span class="md-box" contenteditable="false" role="checkbox" aria-checked="' +
       (on ? "true" : "false") + '"></span><span class="md-body">' +
       paintInline(m[4]) + "</span></div>";
@@ -292,8 +308,12 @@ function joinBrokenHyphens(md) {
   return out.join("\n");
 }
 
+function normalizeCheckboxStub(line) {
+  return String(line ?? "").replace(/^(\s*[-*+]\s+)\[\]/, "$1[ ]");
+}
+
 function cleanPaperMarkdown(md) {
-  return joinBrokenHyphens(String(md ?? "").split("\n").map(stripAccidentalBulletSpace).join("\n"));
+  return joinBrokenHyphens(String(md ?? "").split("\n").map((line) => normalizeCheckboxStub(stripAccidentalBulletSpace(line))).join("\n"));
 }
 
 function normalizeSeasonPlanMarkdown(md) {
@@ -310,7 +330,7 @@ function normalizeSeasonPlanMarkdown(md) {
 
 function continueLinePrefix(line) {
   const s = String(line || "");
-  const task = s.match(/^(\s*)([-*+])\s+\[[ xX]\]\s*/);
+  const task = s.match(/^(\s*)([-*+])\s+\[[ xX]?\]\s*/);
   if (task) return task[1] + task[2] + " [ ] ";
   const ul = s.match(/^(\s*)([-*+])\s+/);
   if (ul) return ul[1] + ul[2] + " ";
@@ -341,7 +361,7 @@ function outdentDumpLine(line) {
 
 function emptyListPrefix(line) {
   const s = String(line ?? "");
-  const task = s.match(/^(\s*[-*+]\s+\[[ xX]\]\s*)$/);
+  const task = s.match(/^(\s*[-*+]\s+\[[ xX]?\]\s*)$/);
   if (task) return task[1];
   const ul = s.match(/^(\s*[-*+]\s+)$/);
   if (ul) return ul[1];
@@ -357,9 +377,23 @@ function lineBody(n) {
   return stripAccidentalBulletSpace(String(raw).replace(/\n/g, "").replace(/\u00a0/g, " "));
 }
 
+function sourceTaskMarkdown(el) {
+  const bodyEl = el && el.querySelector ? el.querySelector(".md-body") : null;
+  let body = bodyEl
+    ? String(bodyEl.innerText != null ? bodyEl.innerText : (bodyEl.textContent || ""))
+    : String(el && (el.innerText != null ? el.innerText : (el.textContent || "")) || "")
+      .replace(/^\s*[-*+]\s+\[[ xX]?\]\s*/, "");
+  body = stripAccidentalBulletSpace(String(body).replace(/\n/g, "").replace(/\u00a0/g, " "));
+  const done = !!(el && el.classList && el.classList.contains("done"));
+  const mark = (el && el.dataset && el.dataset.mark) || "-";
+  const indent = (el && el.dataset && el.dataset.indent) || "";
+  return paperTaskSrc(indent, mark, done, body);
+}
+
 function serializeLine(n) {
   if (n.classList && n.classList.contains("is-source")) {
     if (n.dataset && n.dataset.kind === "h") return lineMarkdown(n);
+    if (n.dataset && n.dataset.kind === "task") return sourceTaskMarkdown(n);
     return stripAccidentalBulletSpace(lineBody(n));
   }
   const kind = n.dataset.kind;
@@ -367,8 +401,8 @@ function serializeLine(n) {
   if (src != null && src !== "") {
     if (kind === "task") {
       const on = n.classList.contains("done");
-      const was = /\[[xX]\]/.test(src);
-      if (on === was) return src;
+      const hit = matchPaperTask(src);
+      if (hit) return paperTaskSrc(hit[1], hit[2], on, hit[4]);
       return on ? src.replace(/\[ \]/, "[x]") : src.replace(/\[[xX]\]/, "[ ]");
     }
     return src;
@@ -381,10 +415,11 @@ function serializeLine(n) {
     return "#".repeat(Math.max(1, Math.min(6, level))) + " " + body;
   }
   if (kind === "task") {
-    if (/^\s*[-*+]\s+\[[ xX]\]/.test(body)) return body;
+    const hit = matchPaperTask(body);
+    if (hit) return paperTaskSrc(hit[1], hit[2], n.classList.contains("done") || /x/i.test(hit[3]), hit[4]);
     const done = n.classList.contains("done");
     const mark = n.dataset.mark || "-";
-    return (n.dataset.indent || "") + mark + " [" + (done ? "x" : " ") + "] " + body;
+    return paperTaskSrc(n.dataset.indent || "", mark, done, body);
   }
   if (kind === "ul") {
     if (/^\s*[-*+]\s+/.test(body)) return body;
@@ -414,6 +449,25 @@ function caretOffset(root) {
   pre.selectNodeContents(root);
   pre.setEnd(r.startContainer, r.startOffset);
   return pre.toString().length;
+}
+
+function isSourceTask(el) {
+  return !!(el && el.classList && el.classList.contains("is-source") && el.dataset && el.dataset.kind === "task");
+}
+
+function clampPaperCaret(el, caretInLine) {
+  if (isSourceTask(el)) {
+    const body = lineBody(el);
+    let pos = caretInLine == null ? body.length : caretInLine;
+    if (pos > body.length) {
+      const md = serializeLine(el);
+      pos = Math.max(0, pos - Math.max(0, md.length - body.length));
+    }
+    return Math.max(0, Math.min(body.length, pos));
+  }
+  const md = serializeLine(el);
+  const pos = caretInLine == null ? md.length : caretInLine;
+  return Math.max(0, Math.min(md.length, pos));
 }
 
 function placeCaret(root, offset) {
@@ -474,16 +528,16 @@ function lineMarkdown(el) {
         : String(el.innerText != null ? el.innerText : (el.textContent || "")).replace(/^#+\s*/, "");
       return "#".repeat(level) + " " + stripAccidentalBulletSpace(body.replace(/\n/g, "").replace(/\u00a0/g, " "));
     }
+    if (el.dataset && el.dataset.kind === "task") return sourceTaskMarkdown(el);
     const raw = (el.innerText != null ? el.innerText : (el.textContent || ""));
     return stripAccidentalBulletSpace(String(raw).replace(/\n/g, "").replace(/\u00a0/g, " "));
   }
   if (dumpLine != null) {
-    if (el.dataset && el.dataset.kind === "task" && /^\s*[-*+]\s+\[[ xX]\]/.test(dumpLine)) {
+    if (el.dataset && el.dataset.kind === "task" && matchPaperTask(dumpLine)) {
+      const hit = matchPaperTask(dumpLine);
       const on = el.classList.contains("done");
-      const was = /\[[xX]\]/.test(dumpLine);
-      if (on !== was) {
-        return on ? dumpLine.replace(/\[ \]/, "[x]") : dumpLine.replace(/\[[xX]\]/, "[ ]");
-      }
+      const was = /x/i.test(hit[3]);
+      if (on !== was) return paperTaskSrc(hit[1], hit[2], on, hit[4]);
     }
     return dumpLine;
   }
@@ -523,12 +577,11 @@ function syncDumpFromPaper() {
   while (lines.length <= idx) lines.push("");
   if (el.classList && el.classList.contains("is-source")) {
     lines[idx] = lineMarkdown(el);
-  } else if (el.dataset && el.dataset.kind === "task" && /^\s*[-*+]\s+\[[ xX]\]/.test(lines[idx] || "")) {
+  } else if (el.dataset && el.dataset.kind === "task" && matchPaperTask(lines[idx] || "")) {
+    const hit = matchPaperTask(lines[idx]);
     const on = el.classList.contains("done");
-    const was = /\[[xX]\]/.test(lines[idx]);
-    if (on !== was) {
-      lines[idx] = on ? lines[idx].replace(/\[ \]/, "[x]") : lines[idx].replace(/\[[xX]\]/, "[ ]");
-    }
+    const was = /x/i.test(hit[3]);
+    if (on !== was) lines[idx] = paperTaskSrc(hit[1], hit[2], on, hit[4]);
   }
   dump.value = cleanPaperMarkdown(lines.join("\n"));
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
@@ -572,8 +625,7 @@ function paintPaperAt(activeIndex, caretInLine) {
   paper.focus();
   const el = paperLines()[activeIndex];
   if (el) {
-    const md = serializeLine(el);
-    const pos = caretInLine == null ? md.length : Math.max(0, Math.min(md.length, caretInLine));
+    const pos = clampPaperCaret(el, caretInLine);
     placeCaret(el, pos);
     rememberPaperCaret(activeIndex, pos);
   }
@@ -612,8 +664,10 @@ function activateLine(idx, caretInVisible) {
       const next = tmp.firstElementChild;
       if (next) {
         el.replaceWith(next);
-        const pos = caretInVisible == null ? md.length : Math.max(0, Math.min(md.length, prefix + caretInVisible));
-        placeCaret(next, pos);
+        const pos = isSourceTask(next)
+          ? (caretInVisible == null ? lineBody(next).length : Math.max(0, caretInVisible))
+          : (caretInVisible == null ? md.length : Math.max(0, Math.min(md.length, prefix + caretInVisible)));
+        placeCaret(next, clampPaperCaret(next, pos));
       }
     }
     state.activeLine = idx;
@@ -1162,8 +1216,7 @@ function restorePaperFocus(line, caret) {
       : line;
     const el = paperLines()[idx];
     if (el) {
-      const md = serializeLine(el);
-      const pos = caret == null ? md.length : Math.max(0, Math.min(md.length, caret));
+      const pos = clampPaperCaret(el, caret);
       placeCaret(el, pos);
       rememberPaperCaret(idx, pos);
     }
@@ -2519,7 +2572,7 @@ $("paper").addEventListener("keydown", (e) => {
     if (next === text) return;
     pushPaperHistory(paperHistory, { markdown: dump.value, line: idx, caret: off }, { kind: e.shiftKey ? "outdent" : "indent" });
     writeDumpLine(idx, next);
-    const caret = Math.max(0, off + (next.length - text.length));
+    const caret = isSourceTask(el) ? off : Math.max(0, off + (next.length - text.length));
     scheduleSave();
     paintPaperAt(idx, caret);
     return;
@@ -2553,12 +2606,18 @@ $("paper").addEventListener("keydown", (e) => {
       renderRail();
       return;
     }
-    const split = splitDumpLine(text, off);
+    let mdOff = off;
+    if (isSourceTask(el)) {
+      const pre = String(text || "").match(/^(\s*[-*+]\s+\[[ xX]?\]\s*)/);
+      if (pre) mdOff = pre[1].length + off;
+    }
+    const split = splitDumpLine(text, mdOff);
     lines.splice(idx, 1, split.left, split.right);
     dump.value = lines.join("\n");
     if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
     scheduleSave();
-    paintPaperAt(idx + 1, split.caret);
+    const newTask = matchPaperTask(split.right);
+    paintPaperAt(idx + 1, newTask ? 0 : split.caret);
     renderRail();
     return;
   }
@@ -2702,11 +2761,10 @@ $("paper").addEventListener("click", (e) => {
   const idx = paperLines().indexOf(lineEl);
   const dump = $("dump");
   const lines = dump.value.split("\n");
-  if (!lines[idx] || !/^\s*[-*+]\s+\[[ xX]\]/.test(lines[idx])) return;
+  if (!lines[idx] || !matchPaperTask(lines[idx])) return;
   pushPaperHistory(paperHistory, { markdown: dump.value, line: idx < 0 ? 0 : idx, caret: 0 }, { kind: "box" });
-  lines[idx] = /\[[xX]\]/.test(lines[idx])
-    ? lines[idx].replace(/\[[xX]\]/, "[ ]")
-    : lines[idx].replace(/\[ \]/, "[x]");
+  const hit = matchPaperTask(lines[idx]);
+  lines[idx] = paperTaskSrc(hit[1], hit[2], !/x/i.test(hit[3]), hit[4]);
   dump.value = lines.join("\n");
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
   scheduleSave();
@@ -3616,10 +3674,10 @@ function fmtToggleTaskLine() {
   const text = lines[idx] != null ? lines[idx] : "";
   // Headings stay headings — task mark must not produce "- [ ] ## Why"
   if (/^\s*#{1,6}\s/.test(text)) return;
-  const task = text.match(/^(\s*)([-*+])\s+\[([ xX])\]\s*(.*)$/);
+  const task = matchPaperTask(text);
   let next;
   if (task) {
-    next = task[1] + task[2] + " [" + (/x/i.test(task[3]) ? " " : "x") + "] " + task[4];
+    next = paperTaskSrc(task[1], task[2], !/x/i.test(task[3]), task[4]);
   } else {
     const ul = text.match(/^(\s*)([-*+])\s+(.*)$/);
     const ol = text.match(/^(\s*)(\d+[.)])\s+(.*)$/);
@@ -3714,7 +3772,7 @@ function fmtIndentLine() {
   if (next === text) return;
   pushPaperHistory(paperHistory, { markdown: dump.value, line: idx, caret: off }, { kind: "indent" });
   writeDumpLine(idx, next);
-  const caret = Math.max(0, off + (next.length - text.length));
+  const caret = isSourceTask(el) ? off : Math.max(0, off + (next.length - text.length));
   scheduleSave();
   paintPaperAt(idx, caret);
 }

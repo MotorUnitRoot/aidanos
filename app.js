@@ -182,6 +182,12 @@ function paperTaskSrc(indent, mark, on, body) {
   return String(indent || "") + (mark || "-") + " [" + (on ? "x" : " ") + "] " + String(body ?? "");
 }
 
+function paintTaskBodyHtml(body, asSource) {
+  const text = String(body ?? "");
+  const html = asSource ? paintWiki(escapeHtml(text), true) : paintInline(text);
+  return html || "<br>";
+}
+
 function formatOneLine(line, asSource, hidden) {
   if (asSource) {
     let cls = "md-line is-source";
@@ -206,7 +212,7 @@ function formatOneLine(line, asSource, hidden) {
       return '<div draggable="true" class="' + cls + '" data-kind="' + kind + '" data-src="' + attr(src) + '"' + extra +
         ' style="' + indentPad(m[1]) + '"><span class="md-box" contenteditable="false" role="checkbox" aria-checked="' +
         (on ? "true" : "false") + '"></span><span class="md-body">' +
-        paintWiki(escapeHtml(m[4]), true) + "</span></div>";
+        paintTaskBodyHtml(m[4], true) + "</span></div>";
     } else if ((m = line.match(/^(\s*)([-*+])\s+(.*)$/))) {
       cls += " ul" + (m[1] ? " nest" : "");
       kind = "ul";
@@ -240,7 +246,7 @@ function formatOneLine(line, asSource, hidden) {
       '" data-kind="task" data-src="' + attr(src) + '" data-indent="' + attr(m[1]) + '" data-mark="' + attr(m[2]) +
       '" style="' + indentPad(m[1]) + '"><span class="md-box" contenteditable="false" role="checkbox" aria-checked="' +
       (on ? "true" : "false") + '"></span><span class="md-body">' +
-      paintInline(m[4]) + "</span></div>";
+      paintTaskBodyHtml(m[4], false) + "</span></div>";
   }
   if ((m = line.match(/^(\s*)([-*+])\s+(.*)$/))) {
     const nest = m[1] ? " nest" : "";
@@ -374,7 +380,7 @@ function lineBody(n) {
   const body = n.querySelector(".md-body");
   const src = body || n;
   const raw = (src.innerText != null && String(src.innerText) !== "" ? src.innerText : (src.textContent || ""));
-  return stripAccidentalBulletSpace(String(raw).replace(/\n/g, "").replace(/\u00a0/g, " "));
+  return stripAccidentalBulletSpace(String(raw).replace(/\n/g, "").replace(/\u00a0/g, " ").replace(/\u200b/g, ""));
 }
 
 function sourceTaskMarkdown(el) {
@@ -383,7 +389,7 @@ function sourceTaskMarkdown(el) {
     ? String(bodyEl.innerText != null ? bodyEl.innerText : (bodyEl.textContent || ""))
     : String(el && (el.innerText != null ? el.innerText : (el.textContent || "")) || "")
       .replace(/^\s*[-*+]\s+\[[ xX]?\]\s*/, "");
-  body = stripAccidentalBulletSpace(String(body).replace(/\n/g, "").replace(/\u00a0/g, " "));
+  body = stripAccidentalBulletSpace(String(body).replace(/\n/g, "").replace(/\u00a0/g, " ").replace(/\u200b/g, ""));
   const done = !!(el && el.classList && el.classList.contains("done"));
   const mark = (el && el.dataset && el.dataset.mark) || "-";
   const indent = (el && el.dataset && el.dataset.indent) || "";
@@ -470,8 +476,37 @@ function clampPaperCaret(el, caretInLine) {
   return Math.max(0, Math.min(md.length, pos));
 }
 
+function paperCaretHost(root) {
+  if (!root) return root;
+  if (root.classList && root.classList.contains("md-body")) return root;
+  if (root.querySelector && root.dataset && root.dataset.kind === "task") {
+    return root.querySelector(".md-body") || root;
+  }
+  return root;
+}
+
+function ensurePaperBodyCaret(host) {
+  if (!host) return host;
+  if (typeof document === "undefined" || !document.createTreeWalker) return host;
+  const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
+  let n;
+  while ((n = walker.nextNode())) {
+    if (n.nodeValue) return host;
+  }
+  if (host.querySelector && host.querySelector("br")) return host;
+  if (host.appendChild) {
+    if (typeof document.createTextNode === "function") {
+      host.appendChild(document.createTextNode("\u200b"));
+    } else if (typeof document.createElement === "function") {
+      host.appendChild(document.createElement("br"));
+    }
+  }
+  return host;
+}
+
 function placeCaret(root, offset) {
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const host = ensurePaperBodyCaret(paperCaretHost(root));
+  const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
   let n, count = 0;
   const sel = window.getSelection();
   while ((n = walker.nextNode())) {
@@ -487,8 +522,13 @@ function placeCaret(root, offset) {
     count += len;
   }
   const range = document.createRange();
-  range.selectNodeContents(root);
-  range.collapse(false);
+  if (offset <= 0 && host.childNodes && host.childNodes.length) {
+    range.setStart(host, 0);
+    range.collapse(true);
+  } else {
+    range.selectNodeContents(host);
+    range.collapse(false);
+  }
   sel.removeAllRanges();
   sel.addRange(range);
 }

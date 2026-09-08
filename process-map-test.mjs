@@ -95,7 +95,7 @@ check("Today holds canvas and stage paper; paper stays 42rem", () => {
   assert(css.includes("width: 42rem"), "42rem paper");
   assert(css.includes("body.doc-map"), "map chrome hide");
   assert(css.includes(".stage-sheet"), "stage sheet");
-  assert(src.includes("aidanos-shell-v22") || fs.readFileSync(path.join(root, "sw.js"), "utf8").includes("aidanos-shell-v22"), "shell bump");
+  assert(src.includes("aidanos-shell-v23") || fs.readFileSync(path.join(root, "sw.js"), "utf8").includes("aidanos-shell-v23"), "shell bump");
 });
 
 check("Paper and dump refuse iOS autofill accessories", () => {
@@ -115,7 +115,7 @@ check("Paper and dump refuse iOS autofill accessories", () => {
     assert(!/autocomplete="(new-password|current-password|username|email|cc-|street-address|one-time-code)"/.test(tag), "no password/cc/address token");
   }
   assert(paperTag.includes('contenteditable="true"'), "paper stays a writing surface");
-  assert(html.includes('?v=task1'), "asset query bump");
+  assert(html.includes('?v=task2'), "asset query bump");
 });
 
 check("isWorkMapPath keeps work maps and skips last-mile the-*", () => {

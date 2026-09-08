@@ -25,9 +25,15 @@ const bundle = [
   grabFn("joinBrokenHyphens", "normalizeCheckboxStub"),
   grabFn("normalizeCheckboxStub", "cleanPaperMarkdown"),
   grabFn("cleanPaperMarkdown", "normalizeSeasonPlanMarkdown"),
+  grabFn("continueLinePrefix", "splitDumpLine"),
+  grabFn("splitDumpLine", "indentDumpLine"),
   grabFn("lineBody", "sourceTaskMarkdown"),
   grabFn("sourceTaskMarkdown", "serializeLine"),
   grabFn("serializeLine", "readPaper"),
+  grabFn("isSourceTask", "clampPaperCaret"),
+  grabFn("clampPaperCaret", "paperCaretHost"),
+  grabFn("paperCaretHost", "ensurePaperBodyCaret"),
+  grabFn("ensurePaperBodyCaret", "placeCaret"),
 ].join("\n");
 
 const sandbox = {};
@@ -40,7 +46,12 @@ const fn = new Function(
     " sandbox.sourceTaskMarkdown = sourceTaskMarkdown;" +
     " sandbox.serializeLine = serializeLine;" +
     " sandbox.matchPaperTask = matchPaperTask;" +
-    " sandbox.paperTaskSrc = paperTaskSrc;"
+    " sandbox.paperTaskSrc = paperTaskSrc;" +
+    " sandbox.continueLinePrefix = continueLinePrefix;" +
+    " sandbox.splitDumpLine = splitDumpLine;" +
+    " sandbox.paperCaretHost = paperCaretHost;" +
+    " sandbox.ensurePaperBodyCaret = ensurePaperBodyCaret;" +
+    " sandbox.paintTaskBodyHtml = paintTaskBodyHtml;"
 );
 fn(sandbox);
 const {
@@ -49,6 +60,11 @@ const {
   cleanPaperMarkdown,
   sourceTaskMarkdown,
   serializeLine,
+  continueLinePrefix,
+  splitDumpLine,
+  paperCaretHost,
+  ensurePaperBodyCaret,
+  paintTaskBodyHtml,
 } = sandbox;
 
 function assert(cond, msg) {
@@ -150,11 +166,56 @@ check("serializeLine / sourceTaskMarkdown rebuild - [ ] body", () => {
   assert(sourceTaskMarkdown(done) === "- [x] buy milk", sourceTaskMarkdown(done));
   const nest = fakeTask("nested", { indent: "  ", mark: "-" });
   assert(sourceTaskMarkdown(nest) === "  - [ ] nested", sourceTaskMarkdown(nest));
+  const empty = fakeTask("");
+  assert(sourceTaskMarkdown(empty) === "- [ ] ", sourceTaskMarkdown(empty));
+  assert(serializeLine(empty) === "- [ ] ", serializeLine(empty));
+  const zwsp = fakeTask("\u200b");
+  assert(sourceTaskMarkdown(zwsp) === "- [ ] ", "zwsp body serializes empty: " + sourceTaskMarkdown(zwsp));
 });
 
-check("cache bust task1 / shell v22", () => {
-  assert(html.includes("/app.js?v=task1"), "index.html app.js ?v=task1");
-  assert(/aidanos-shell-v22/.test(sw), "sw.js CACHE v22");
+check("empty source task keeps md-box and a caret host in md-body", () => {
+  for (const line of ["- [ ]", "- [ ] ", "- []"]) {
+    const html = formatOneLine(line, true);
+    assert(html.includes("is-source"), "is-source for " + JSON.stringify(line));
+    assert(html.includes("md-box"), "md-box for empty task " + JSON.stringify(line));
+    assert(html.includes('contenteditable="false"'), "box stays non-editable");
+    assert(/<span class="md-body">(<br>|​|\u200b)<\/span>/.test(html), "empty md-body has br or zwsp: " + html);
+    assert(!/>\s*- \[\]/.test(html) && !/>\s*- \[ \]/.test(html), "must not dump raw checkbox: " + html);
+    assert(/data-src="- \[ \] ?/.test(html), "data-src normalized: " + html);
+  }
+  assert(paintTaskBodyHtml("", true) === "<br>", paintTaskBodyHtml("", true));
+  assert(paintTaskBodyHtml("x", true) === "x", paintTaskBodyHtml("x", true));
+});
+
+check("Enter continueLinePrefix + split lands on empty task markdown", () => {
+  assert(continueLinePrefix("- [ ] buy milk") === "- [ ] ", continueLinePrefix("- [ ] buy milk"));
+  assert(continueLinePrefix("  * [x] done") === "  * [ ] ", continueLinePrefix("  * [x] done"));
+  const split = splitDumpLine("- [ ] buy milk", "- [ ] buy milk".length);
+  assert(split.right === "- [ ] ", "new line is empty task: " + JSON.stringify(split));
+  const html = formatOneLine(split.right, true);
+  assert(html.includes("md-box"), "continued line keeps pretty box");
+  assert(/<span class="md-body">(<br>|​|\u200b)<\/span>/.test(html), "continued empty body has caret host: " + html);
+});
+
+check("paperCaretHost prefers .md-body on task lines", () => {
+  const body = { classList: { contains: (c) => c === "md-body" } };
+  const line = {
+    dataset: { kind: "task" },
+    querySelector: (sel) => sel === ".md-body" ? body : null,
+    classList: { contains: () => false },
+  };
+  assert(paperCaretHost(line) === body, "task line host is md-body");
+  assert(paperCaretHost(body) === body, "md-body is already the host");
+  const plain = { dataset: { kind: "p" }, querySelector: () => body, classList: { contains: () => false } };
+  assert(paperCaretHost(plain) === plain, "plain line stays the line");
+  const emptyBody = { childNodes: [], querySelector: () => null, appendChild(n) { this.child = n; } };
+  assert(ensurePaperBodyCaret(emptyBody) === emptyBody, "ensure returns host without document");
+});
+
+check("cache bust task2 / shell v23", () => {
+  assert(html.includes("/app.js?v=task2"), "index.html app.js ?v=task2");
+  assert(html.includes("/day.css?v=task2"), "index.html day.css ?v=task2");
+  assert(/aidanos-shell-v23/.test(sw), "sw.js CACHE v23");
 });
 
 const failed = results.filter((r) => r.ok === false);

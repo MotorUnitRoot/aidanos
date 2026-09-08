@@ -3,6 +3,8 @@
  * AidanOS — local by default (127.0.0.1). Set AIDANOS_HOST=0.0.0.0 for LAN/phone.
  * Vault: AIDANOS_VAULT, or sibling vault/ beside this server.
  * Optional git: AIDANOS_VAULT_GIT_URL (+ AIDANOS_VAULT_GIT_TOKEN or GITHUB_TOKEN).
+ * If clone/pull cannot populate the checkout, seed the bundled sample vault/
+ * (Plan + maps) so the demo still serves. Keep retrying git when possible.
  * On the Mac the vault is the parent (~/Grok/motorunit).
  * Never copy this folder's vault/ over that one.
  */
@@ -30,6 +32,12 @@ function resolveVaultPath() {
   return path.join(__dirname, "vault");
 }
 let VAULT = resolveVaultPath();
+const BUNDLED_VAULT = path.join(__dirname, "vault");
+const GIT_RETRY_MS = (() => {
+  const n = Number(process.env.AIDANOS_VAULT_GIT_RETRY_MS);
+  if (process.env.AIDANOS_VAULT_GIT_RETRY_MS === "0") return 0;
+  return Number.isFinite(n) && n >= 200 ? Math.min(n, 300_000) : 45_000;
+})();
 const PUBLIC = __dirname;
 const PORT_RAW = Number(process.env.PORT);
 const PORT = Number.isInteger(PORT_RAW) && PORT_RAW > 0 && PORT_RAW < 65536 ? PORT_RAW : 3847;
@@ -168,6 +176,110 @@ async function isGitRepo(dir) {
   }
 }
 
+async function pathExists(p) {
+  try {
+    await fs.stat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function bundledVaultDir() {
+  return BUNDLED_VAULT;
+}
+
+async function vaultHasDemo(dir) {
+  const plan = path.join(dir, "aidanos", "active-horse.md");
+  const map = path.join(dir, "maps", "reply-to-a-letter.md");
+  return (await pathExists(plan)) && (await pathExists(map));
+}
+
+async function copyBundledTree(src, dest) {
+  await fs.mkdir(dest, { recursive: true });
+  let entries = [];
+  try {
+    entries = await fs.readdir(src, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const ent of entries) {
+    if (ent.name === ".git") continue;
+    const from = path.join(src, ent.name);
+    const to = path.join(dest, ent.name);
+    if (ent.isDirectory()) {
+      await copyBundledTree(from, to);
+      continue;
+    }
+    if (!ent.isFile()) continue;
+    if (await pathExists(to)) continue;
+    await fs.copyFile(from, to);
+  }
+}
+
+export async function seedBundledVault(dest, src) {
+  const from = src || bundledVaultDir();
+  const to = dest || VAULT;
+  if (!from || !to) return false;
+  if (path.resolve(from) === path.resolve(to)) return false;
+  if (!(await pathExists(from))) return false;
+  if (await vaultHasDemo(to)) return false;
+  await copyBundledTree(from, to);
+  return true;
+}
+
+async function seedBundledVaultIfNeeded(reason) {
+  try {
+    const seeded = await seedBundledVault(VAULT, bundledVaultDir());
+    if (seeded) console.error("vault seed: bundled sample after " + String(reason || "git miss"));
+    return seeded;
+  } catch (e) {
+    console.error("vault seed:", sanitizeGitError(e && e.message || "seed failed"));
+    return false;
+  }
+}
+
+function scheduleVaultGitRetry() {
+  if (!GIT_URL || !GIT_RETRY_MS) return;
+  setTimeout(() => {
+    retryVaultGit().catch((e) => {
+      vaultGit.error = sanitizeGitError(e && e.message || "retry failed");
+      console.error("vault git retry:", vaultGit.error);
+    });
+  }, GIT_RETRY_MS).unref();
+}
+
+async function retryVaultGit() {
+  if (!GIT_URL) return;
+  try {
+    await runGit(["--version"], { timeoutMs: 4000 });
+  } catch {
+    return;
+  }
+  try {
+    if (await isGitRepo(VAULT)) {
+      await ensureGitIdentity(VAULT);
+      await ensureOrigin(VAULT);
+      await runGit(["-C", VAULT, "pull", "--ff-only", "--no-rebase"], { timeoutMs: 25000 });
+      vaultGit.error = "";
+      vaultGit.ready = true;
+      return;
+    }
+    await fs.mkdir(VAULT, { recursive: true });
+    const names = await fs.readdir(VAULT);
+    const nonempty = names.filter((n) => n !== "." && n !== "..");
+    if (nonempty.length === 0) {
+      await runGit(["clone", "--depth", "1", gitRemoteUrl(), VAULT], { timeoutMs: 25000 });
+      vaultGit.error = "";
+      await ensureGitIdentity(VAULT);
+      vaultGit.ready = await isGitRepo(VAULT);
+    }
+  } catch (e) {
+    vaultGit.error = sanitizeGitError(e && e.message || "retry failed");
+    await seedBundledVaultIfNeeded("git retry");
+  }
+}
+
 async function initVaultGit() {
   if (!GIT_URL) return;
   try {
@@ -175,6 +287,7 @@ async function initVaultGit() {
   } catch {
     vaultGit.error = "git not available";
     console.error("vault git:", vaultGit.error);
+    await seedBundledVaultIfNeeded("git missing");
     return;
   }
   try {
@@ -188,6 +301,8 @@ async function initVaultGit() {
       } catch (e) {
         vaultGit.error = sanitizeGitError(e && e.message || "pull failed");
         console.error("vault git pull:", vaultGit.error);
+        await seedBundledVaultIfNeeded("pull failed");
+        scheduleVaultGitRetry();
       }
       vaultGit.ready = true;
       return;
@@ -201,12 +316,14 @@ async function initVaultGit() {
       } catch (e) {
         vaultGit.error = sanitizeGitError(e && e.message || "clone failed");
         console.error("vault git clone:", vaultGit.error);
+        await seedBundledVaultIfNeeded("clone failed");
         try {
           await runGit(["-C", VAULT, "init", "-b", "main"], { timeoutMs: 8000 });
           await ensureOrigin(VAULT);
         } catch (initErr) {
           console.error("vault git init:", sanitizeGitError(initErr && initErr.message));
         }
+        scheduleVaultGitRetry();
       }
       await ensureGitIdentity(VAULT);
       vaultGit.ready = await isGitRepo(VAULT);
@@ -217,6 +334,8 @@ async function initVaultGit() {
   } catch (e) {
     vaultGit.error = sanitizeGitError(e && e.message || "vault git failed");
     console.error("vault git:", vaultGit.error);
+    await seedBundledVaultIfNeeded("vault git failed");
+    scheduleVaultGitRetry();
   }
 }
 

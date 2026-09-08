@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { authenticatedGitUrl, sanitizeGitError } from "./server.mjs";
+import { authenticatedGitUrl, sanitizeGitError, seedBundledVault } from "./server.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
@@ -41,7 +41,7 @@ async function waitHealth(base, child) {
 function spawnServer(env) {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
-    env: { ...process.env, ...env },
+    env: { ...process.env, AIDANOS_VAULT_GIT_RETRY_MS: "0", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let log = "";
@@ -172,6 +172,14 @@ async function liveGitSync() {
       fs.readFileSync(path.join(missingVault, "log", "2026-09-07.md"), "utf8") === "kept\n",
       "missing remote must not corrupt the write"
     );
+    assert(
+      fs.existsSync(path.join(missingVault, "aidanos", "active-horse.md")),
+      "failed clone still seeds Plan"
+    );
+    assert(
+      fs.existsSync(path.join(missingVault, "maps", "reply-to-a-letter.md")),
+      "failed clone still seeds reply-to-a-letter map"
+    );
     await new Promise((r) => setTimeout(r, 250));
     const later = await (await fetch(base2 + "/api/health")).json();
     assert(later.ok === true, "still healthy after failed push");
@@ -241,10 +249,84 @@ async function authOriginIsEmbedded() {
   }
 }
 
+function seedDoesNotOverwrite() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-seed-"));
+  const dest = path.join(tmp, "dest");
+  fs.mkdirSync(path.join(dest, "aidanos"), { recursive: true });
+  fs.writeFileSync(path.join(dest, "aidanos", "active-horse.md"), "KEEP MINE\n", "utf8");
+  return seedBundledVault(dest, path.join(root, "vault")).then((seeded) => {
+    assert(seeded === true, "seed copies missing map when plan exists");
+    assert(
+      fs.readFileSync(path.join(dest, "aidanos", "active-horse.md"), "utf8") === "KEEP MINE\n",
+      "seed must not overwrite existing Plan"
+    );
+    assert(
+      fs.existsSync(path.join(dest, "maps", "reply-to-a-letter.md")),
+      "seed fills the missing letter map"
+    );
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+}
+
+async function bundledSeedWhenCloneFails() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-seed-live-"));
+  const vault = path.join(tmp, "vault");
+  fs.mkdirSync(vault, { recursive: true });
+  const port = 24000 + Math.floor(Math.random() * 2000);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "https://127.0.0.1:1/MotorUnitRoot/aidanos-vault.git",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+    AIDANOS_VAULT_GIT_DEBOUNCE_MS: "80",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    const healthRes = await waitHealth(base, child);
+    const health = await healthRes.json();
+    assert(health.ok === true, "health ok after 403 clone");
+    assert(health.git && health.git.enabled === true, "git still enabled without PAT");
+    assert(health.git.ok === false, "git error is visible");
+    const planRes = await fetch(base + "/api/plan");
+    assert(planRes.ok, "plan endpoint " + planRes.status);
+    const plan = await planRes.json();
+    assert(plan.exists === true, "Plan exists without PAT");
+    assert(/plan/i.test(String(plan.plan && plan.plan.title || "")), "Plan has a title");
+    const mapRes = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/reply-to-a-letter.md"));
+    assert(mapRes.ok, "letter map " + mapRes.status);
+    const map = await mapRes.json();
+    assert(/Reply to a letter/.test(String(map.markdown || "")), "letter map body");
+    const searchRes = await fetch(base + "/api/search?q=" + encodeURIComponent("letter"));
+    assert(searchRes.ok, "search " + searchRes.status);
+    const search = await searchRes.json();
+    const paths = (search.hits || []).map((h) => String(h.path || ""));
+    assert(paths.some((p) => p.includes("maps/reply-to-a-letter.md")), "Ask finds the letter map");
+    const put = await fetch(base + "/api/day?date=2026-09-08", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ date: "2026-09-08", markdown: "demo write\n", paper: "demo write\n" }),
+    });
+    assert(put.ok, "local write after seed " + put.status);
+    assert(
+      fs.readFileSync(path.join(vault, "log", "2026-09-08.md"), "utf8") === "demo write\n",
+      "seeded vault still accepts writes"
+    );
+    const hint = JSON.stringify(health);
+    assert(!hint.includes(vault), "health must not leak vault path");
+  } finally {
+    await stop(child);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 try {
   authUrlShaping();
+  await seedDoesNotOverwrite();
   await liveGitSync();
   await authOriginIsEmbedded();
+  await bundledSeedWhenCloneFails();
   console.log("vault-git-test ok");
 } catch (err) {
   console.error("FAIL  vault-git-test  " + err.message);

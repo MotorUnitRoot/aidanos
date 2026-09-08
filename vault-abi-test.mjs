@@ -51,6 +51,7 @@ check("Dockerfile does not run as root and still binds 0.0.0.0 for Cloud Run", (
   assert(/ENV PORT=8080/.test(docker), "Cloud Run port");
   assert(!/COPY \. \./.test(docker), "no broad COPY");
   assert(/apt-get install[^\n]*git/.test(docker), "git in image for vault clone");
+  assert(/COPY vault \.\/vault/.test(docker), "image ships bundled sample vault");
 });
 
 check("git vault sync is env-gated and does not invent a second write ABI", () => {
@@ -63,6 +64,8 @@ check("git vault sync is env-gated and does not invent a second write ABI", () =
   assert(!/Authorization: Bearer/.test(serverSrc), "do not send bearer extraHeader");
   assert(/scheduleVaultSync/.test(serverSrc), "commit after write");
   assert(/error:\s*"disk newer"/.test(serverSrc), "409 still disk newer");
+  assert(/seedBundledVault/.test(serverSrc), "seed bundled sample when clone/pull cannot populate");
+  assert(/BUNDLED_VAULT/.test(serverSrc) || /path\.join\(__dirname,\s*"vault"\)/.test(serverSrc), "bundled vault beside server");
 });
 
 check("dockerignore keeps tests and git out of a future broad COPY", () => {

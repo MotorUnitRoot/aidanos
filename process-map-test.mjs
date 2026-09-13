@@ -95,7 +95,7 @@ check("Today holds canvas and stage paper; paper stays 42rem", () => {
   assert(css.includes("width: 42rem"), "42rem paper");
   assert(css.includes("body.doc-map"), "map chrome hide");
   assert(css.includes(".stage-sheet"), "stage sheet");
-  assert(src.includes("aidanos-shell-v23") || fs.readFileSync(path.join(root, "sw.js"), "utf8").includes("aidanos-shell-v23"), "shell bump");
+  assert(/const CACHE = "aidanos-shell-v\d+"/.test(fs.readFileSync(path.join(root, "sw.js"), "utf8")), "sw.js names a shell cache");
 });
 
 check("Paper and dump refuse iOS autofill accessories", () => {
@@ -219,7 +219,15 @@ async function liveCopyDeleteAndOpen() {
   const port = 18100 + Math.floor(Math.random() * 2000);
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
-    env: { ...process.env, PORT: String(port), AIDANOS_HOST: "127.0.0.1", AIDANOS_VAULT: vault },
+    env: {
+      ...process.env,
+      PORT: String(port),
+      AIDANOS_HOST: "127.0.0.1",
+      AIDANOS_VAULT: vault,
+      AIDANOS_VAULT_GIT_URL: "",
+      AIDANOS_VAULT_GIT_TOKEN: "",
+      GITHUB_TOKEN: "",
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   const base = "http://127.0.0.1:" + port;

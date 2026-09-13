@@ -200,6 +200,11 @@ function authUrlShaping() {
   assert(authenticatedGitUrl(url, "   ") === url, "whitespace token keeps public url");
   assert(authenticatedGitUrl("/tmp/local.git", token) === "/tmp/local.git", "local path unchanged");
   assert(authenticatedGitUrl("file:///tmp/local.git", token) === "file:///tmp/local.git", "file url unchanged");
+  assert(
+    authenticatedGitUrl("http://github.com/MotorUnitRoot/aidanos-vault.git", token) ===
+      "http://github.com/MotorUnitRoot/aidanos-vault.git",
+    "http does not embed token"
+  );
   const replaced = authenticatedGitUrl("https://old:creds@github.com/MotorUnitRoot/aidanos-vault.git", token);
   assert(replaced === want, "replaces existing userinfo");
 
@@ -209,6 +214,17 @@ function authUrlShaping() {
   assert(!clean.includes(url), "public url redacted");
   assert(!clean.includes("x-access-token:" + token), "auth userinfo redacted");
   assert(clean.includes("[url]") || clean.includes("***"), "sanitized placeholder");
+
+  const prevGithub = process.env.GITHUB_TOKEN;
+  const other = "ghp_other_env_token_7c1d";
+  process.env.GITHUB_TOKEN = other;
+  try {
+    const both = sanitizeGitError("clone failed with " + other, { token, url, vault: "/tmp/vault" });
+    assert(!both.includes(other), "GITHUB_TOKEN redacted even when secrets.token differs");
+  } finally {
+    if (prevGithub == null) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = prevGithub;
+  }
 }
 
 async function authOriginIsEmbedded() {

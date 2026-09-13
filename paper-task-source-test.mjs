@@ -212,10 +212,10 @@ check("paperCaretHost prefers .md-body on task lines", () => {
   assert(ensurePaperBodyCaret(emptyBody) === emptyBody, "ensure returns host without document");
 });
 
-check("cache bust task2 / shell v23", () => {
+check("cache bust task2 / shell cache", () => {
   assert(html.includes("/app.js?v=task2"), "index.html app.js ?v=task2");
   assert(html.includes("/day.css?v=task2"), "index.html day.css ?v=task2");
-  assert(/aidanos-shell-v23/.test(sw), "sw.js CACHE v23");
+  assert(/const CACHE = "aidanos-shell-v\d+"/.test(sw), "sw.js names a shell cache");
 });
 
 const failed = results.filter((r) => r.ok === false);

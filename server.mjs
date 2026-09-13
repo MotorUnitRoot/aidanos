@@ -80,7 +80,8 @@ export function authenticatedGitUrl(url, token) {
   } catch {
     return rawUrl;
   }
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return rawUrl;
+  // Never put a token on http:// or any non-https remote.
+  if (parsed.protocol !== "https:") return rawUrl;
   parsed.username = "x-access-token";
   parsed.password = rawToken;
   return parsed.href;
@@ -90,24 +91,41 @@ function gitRemoteUrl() {
   return authenticatedGitUrl(GIT_URL, GIT_TOKEN);
 }
 
-export function sanitizeGitError(msg, secrets) {
+function redactSecretValue(s, secret) {
+  const raw = String(secret || "");
+  if (!raw) return s;
+  let out = s.split(raw).join("***");
+  const encoded = encodeURIComponent(raw);
+  if (encoded !== raw) out = out.split(encoded).join("***");
+  return out;
+}
+
+function redactKnownSecrets(s, secrets) {
   const token = secrets && secrets.token != null ? String(secrets.token) : GIT_TOKEN;
   const vault = secrets && secrets.vault != null ? String(secrets.vault) : VAULT;
   const url = secrets && secrets.url != null ? String(secrets.url) : GIT_URL;
-  let s = String(msg || "git failed").replace(/\s+/g, " ").trim();
-  if (token) {
-    s = s.split(token).join("***");
-    const encoded = encodeURIComponent(token);
-    if (encoded !== token) s = s.split(encoded).join("***");
-  }
-  if (vault) s = s.split(vault).join("[vault]");
-  if (url) s = s.split(url).join("[url]");
+  let out = String(s || "");
+  out = redactSecretValue(out, token);
+  out = redactSecretValue(out, process.env.AIDANOS_VAULT_GIT_TOKEN);
+  out = redactSecretValue(out, process.env.GITHUB_TOKEN);
+  if (vault) out = out.split(vault).join("[vault]");
+  if (url) out = out.split(url).join("[url]");
   const auth = token ? authenticatedGitUrl(url, token) : "";
-  if (auth && auth !== url) s = s.split(auth).join("[url]");
-  s = s.replace(/x-access-token:[^@\s]+/gi, "x-access-token:***");
+  if (auth && auth !== url) out = out.split(auth).join("[url]");
+  return out.replace(/x-access-token:[^@\s]+/gi, "x-access-token:***");
+}
+
+export function sanitizeGitError(msg, secrets) {
+  let s = String(msg || "git failed").replace(/\s+/g, " ").trim();
+  s = redactKnownSecrets(s, secrets);
   s = s.replace(/https?:\/\/[^\s]+/gi, "[url]");
   s = s.replace(/file:\/\/[^\s]+/gi, "[url]");
   return s.slice(0, 180);
+}
+
+function logSafe(err) {
+  const text = err instanceof Error ? (err.stack || err.message || String(err)) : String(err);
+  console.error(redactKnownSecrets(text));
 }
 
 function gitHint() {
@@ -772,10 +790,10 @@ function startLogWatch() {
       });
     });
     watcher.on("error", (err) => {
-      console.error("log watch", err);
+      logSafe(err);
     });
   } catch (err) {
-    console.error("log watch", err);
+    logSafe(err);
   }
 }
 
@@ -1021,12 +1039,12 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         return json(res, 400, { error: e.message || "bad path" });
       }
-      if (!String(rel).replace(/\\/g, "/").endsWith(".md")) {
+      const relPath = path.relative(VAULT, abs).split(path.sep).join("/");
+      if (!String(relPath).endsWith(".md")) {
         return json(res, 400, { error: "markdown only" });
       }
       const raw = await readFileSafe(abs);
-      if (raw == null) return json(res, 404, { error: "not found", path: rel });
-      const relPath = path.relative(VAULT, abs).split(path.sep).join("/");
+      if (raw == null) return json(res, 404, { error: "not found", path: relPath });
       const mtime = await fileMtimeMs(abs);
       return json(res, 200, { path: relPath, markdown: raw, mtime });
     }
@@ -1232,7 +1250,7 @@ const server = http.createServer(async (req, res) => {
       if (!res.headersSent) return json(res, 413, { error: "too large" });
       return;
     }
-    console.error(err);
+    logSafe(err);
     if (!res.headersSent) json(res, 500, { error: "internal error" });
   }
 });
@@ -1263,7 +1281,7 @@ function isMainModule() {
 
 if (isMainModule()) {
   boot().catch((err) => {
-    console.error(err);
+    logSafe(err);
     process.exit(1);
   });
 }

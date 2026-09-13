@@ -59,7 +59,10 @@ check("git vault sync is env-gated and does not invent a second write ABI", () =
   assert(/AIDANOS_VAULT_GIT_TOKEN/.test(serverSrc), "git token env");
   assert(/GITHUB_TOKEN/.test(serverSrc), "GITHUB_TOKEN fallback");
   assert(/authenticatedGitUrl/.test(serverSrc), "https token url shaping");
+  assert(/parsed\.protocol !== "https:"/.test(serverSrc), "token only on https remotes");
+  assert(!/parsed\.protocol !== "https:" && parsed\.protocol !== "http:"/.test(serverSrc), "http remotes must not take a token");
   assert(/x-access-token/.test(serverSrc), "github userinfo username");
+  assert(/redactKnownSecrets/.test(serverSrc) && /logSafe/.test(serverSrc), "secret redaction on unexpected logs");
   assert(!/http\.extraHeader/.test(serverSrc), "do not use extraHeader bearer");
   assert(!/Authorization: Bearer/.test(serverSrc), "do not send bearer extraHeader");
   assert(/scheduleVaultSync/.test(serverSrc), "commit after write");
@@ -148,6 +151,13 @@ async function liveVaultAbi() {
     assert(okFile.ok, "read a vault markdown file");
     const okBody = await okFile.json();
     assert(okBody.markdown.includes("inside the vault"), "vault read");
+    assert(okBody.path === "maps/safe.md", "read returns resolved vault path");
+
+    fs.writeFileSync(path.join(vault, "maps", "notes.txt"), "not markdown\n", "utf8");
+    const notMd = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/notes.txt"));
+    assert(notMd.status === 400, "non-markdown read got " + notMd.status);
+    const notMdBody = await notMd.text();
+    assert(!notMdBody.includes("not markdown"), "non-markdown must not leak");
 
     const escapes = [
       "../../etc/passwd",

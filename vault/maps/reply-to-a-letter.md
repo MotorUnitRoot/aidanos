@@ -13,7 +13,8 @@ Exit: Letter logged
 Enter: Letter logged
 Exit: Decision made
 
-### Fork: Should I reply?
+### Decide — Should I reply?
+Fork:
 Only one
 - Yes → Write
 - No → Waiting

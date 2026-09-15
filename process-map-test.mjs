@@ -115,7 +115,7 @@ check("Paper and dump refuse iOS autofill accessories", () => {
     assert(!/autocomplete="(new-password|current-password|username|email|cc-|street-address|one-time-code)"/.test(tag), "no password/cc/address token");
   }
   assert(paperTag.includes('contenteditable="true"'), "paper stays a writing surface");
-  assert(html.includes('?v=task2'), "asset query bump");
+  assert(html.includes('?v=task3'), "asset query bump");
 });
 
 check("isWorkMapPath keeps work maps and skips last-mile the-*", () => {
@@ -133,6 +133,8 @@ check("letter map parses stages, one named fork, Enter/Exit", () => {
   assert(map.stages.map((s) => s.title).join(",") === "Receive,Decide,Write,Send,Waiting", "names");
   assert(stageGateText(map.stages[0], "enter") === "Letter arrives", "receive enter");
   assert(stageGateText(map.stages[0], "exit") === "Letter logged", "receive exit");
+  assert(stageGateText(map.stages[1], "enter") === "Letter logged", "decide enter");
+  assert(stageGateText(map.stages[1], "exit") === "Decision made", "decide exit");
   assert(map.forks.length === 1, "one fork");
   assert(map.forks[0].title === "Should I reply?", map.forks[0].title);
   assert(map.forks[0].forkKind === "only-one", map.forks[0].forkKind);
@@ -147,6 +149,59 @@ check("letter map parses stages, one named fork, Enter/Exit", () => {
   const mapSteps = mapNextStepLines(letter);
   assert(mapSteps.length === 4, "map still has four today tasks");
   assert(mapSteps.includes("- [ ] Read the letter"), "read the letter");
+});
+
+check("Designer Decide heading is a fork; stages keep Enter/Exit; lint stays quiet", () => {
+  const dreamforce = [
+    "# Reply to a letter",
+    "",
+    "Work map for Dreamforce demo.",
+    "",
+    "## Stages",
+    "",
+    "### Read",
+    "Enter: letter in hand",
+    "Exit: you know what they asked",
+    "Next steps:",
+    "- [ ] Skim the letter once",
+    "",
+    "### Decide — Should I reply?",
+    "Fork:",
+    "- Yes → Write",
+    "- No → File",
+    "",
+    "### Write",
+    "Enter: decided to reply",
+    "Exit: reply drafted",
+    "Next steps:",
+    "- [ ] Draft the reply",
+    "- [ ] Send or queue",
+    "",
+    "### File",
+    "Enter: no reply needed",
+    "Exit: letter filed",
+    "Next steps:",
+    "- [ ] File the letter",
+  ].join("\n");
+  const map = parseProcessMap(dreamforce);
+  assert(map.stages.map((s) => s.title).join(",") === "Read,Write,File", "stages: " + map.stages.map((s) => s.title).join(","));
+  assert(!map.stages.some((s) => /decide/i.test(s.title)), "Decide is not a stage");
+  assert(stageGateText(map.stages[0], "enter") === "letter in hand", "read enter");
+  assert(stageGateText(map.stages[0], "exit") === "you know what they asked", "read exit");
+  assert(stageGateText(map.stages[1], "enter") === "decided to reply", "write enter");
+  assert(stageGateText(map.stages[1], "exit") === "reply drafted", "write exit");
+  assert(stageGateText(map.stages[2], "enter") === "no reply needed", "file enter");
+  assert(stageGateText(map.stages[2], "exit") === "letter filed", "file exit");
+  assert(map.forks.length === 1, "one fork");
+  assert(map.forks[0].title === "Should I reply?", map.forks[0].title);
+  assert(map.forks[0].forkKind === "only-one", "yes/no is only one");
+  assert(map.forks[0].branches.some((b) => b.label === "Yes" && /Write/i.test(b.target)), "yes → write");
+  assert(map.forks[0].branches.some((b) => b.label === "No" && /File/i.test(b.target)), "no → file");
+  const lints = processMapLints(map);
+  assert(lints.length === 0, "Designer map is quiet: " + lints.join(" "));
+  assert(src.includes("startFork("), "parser promotes inline Fork:");
+  const paint = grab("paintStagePaper", "openMapStage");
+  assert(paint.includes("if (!hasItems && !text) return;"), "empty Enter/Exit are not drawn as missing");
 });
 
 check("soft lint speaks plain English", () => {

@@ -2238,8 +2238,11 @@ function paintStagePaper(stage) {
     });
   }
   const addChecks = (kicker, items, fallback) => {
+    const hasItems = items && items.length;
+    const text = String(fallback || "").trim();
+    if (!hasItems && !text) return;
     addBlock(kicker, (block) => {
-      if (items && items.length) {
+      if (hasItems) {
         items.forEach((item) => {
           const btn = document.createElement("button");
           btn.type = "button";
@@ -2260,8 +2263,8 @@ function paintStagePaper(stage) {
       }
       const p = document.createElement("p");
       p.className = "stage-why";
-      p.textContent = fallback || "";
-      if (p.textContent) block.appendChild(p);
+      p.textContent = text;
+      block.appendChild(p);
     });
   };
   addChecks("Enter", stage.enterItems, stage.enter);
@@ -3033,6 +3036,44 @@ function stageNextStepLines(stage) {
   return out;
 }
 
+function forkTitleFromHeading(heading, named) {
+  const given = String(named || "").trim();
+  if (given) return given;
+  const title = String(heading || "").trim();
+  const cut = title.match(/^(?:decide|decision)\s*[-—–:]\s*(.+)$/i);
+  if (cut && String(cut[1] || "").trim()) return String(cut[1]).trim();
+  return title;
+}
+
+function stageHasGates(stage) {
+  if (!stage || stage.kind === "fork") return false;
+  return !!(
+    String(stage.enter || "").trim() ||
+    String(stage.exit || "").trim() ||
+    String(stage.why || "").trim() ||
+    (stage.enterItems && stage.enterItems.length) ||
+    (stage.exitItems && stage.exitItems.length) ||
+    (stage.nextItems && stage.nextItems.length)
+  );
+}
+
+function inferExclusiveForkKind(fork) {
+  if (!fork || fork.forkKind) return;
+  const labels = (fork.branches || []).map((b) => String(b.label || "").trim().toLowerCase());
+  if (labels.length === 2 && labels.includes("yes") && labels.includes("no")) {
+    fork.forkKind = "only-one";
+  }
+}
+
+function parseGatewayBranch(trimmed) {
+  const branch = String(trimmed || "").match(/^[-*+]\s+(.+?)\s*(?:→|->)\s+(.+)$/);
+  if (!branch) return null;
+  return {
+    label: String(branch[1] || "").trim(),
+    target: String(branch[2] || "").trim(),
+  };
+}
+
 function parseProcessMap(md) {
   const text = String(md ?? "").replace(/\r\n/g, "\n");
   const lines = text.split("\n");
@@ -3053,9 +3094,23 @@ function parseProcessMap(md) {
   let current = null;
   const finish = () => {
     if (!current) return;
-    if (current.kind === "fork") forks.push(current);
-    else stages.push(current);
+    if (current.kind === "fork") {
+      inferExclusiveForkKind(current);
+      forks.push(current);
+    } else stages.push(current);
     current = null;
+  };
+  const startFork = (heading, named, lineNo) => {
+    if (current && current.kind === "stage" && !stageHasGates(current)) current = null;
+    else finish();
+    current = {
+      kind: "fork",
+      id: "fork-" + (forks.length + 1),
+      title: forkTitleFromHeading(heading, named),
+      forkKind: "",
+      branches: [],
+      line: lineNo,
+    };
   };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -3072,15 +3127,7 @@ function parseProcessMap(md) {
     if (!inStages) continue;
     const forkHead = line.match(/^###\s+Fork:\s*(.*)$/i) || line.match(/^###\s+Fork\s*$/i);
     if (forkHead) {
-      finish();
-      current = {
-        kind: "fork",
-        id: "fork-" + (forks.length + 1),
-        title: String(forkHead[1] || "").trim(),
-        forkKind: "",
-        branches: [],
-        line: i,
-      };
+      startFork("", String(forkHead[1] || "").trim(), i);
       continue;
     }
     const stageHead = line.match(/^###\s+(?:(\d+)\.\s*)?(.+)$/);
@@ -3105,19 +3152,31 @@ function parseProcessMap(md) {
     }
     if (!current) continue;
     const trimmed = line.trim();
+    if (current.kind !== "fork") {
+      const inlineFork = trimmed.match(/^Fork:\s*(.*)$/i);
+      if (inlineFork) {
+        const rest = String(inlineFork[1] || "").trim();
+        const kindFromRest = rest.match(/^(only one|all together)$/i);
+        const heading = current.title;
+        startFork(heading, kindFromRest ? "" : rest, i);
+        if (kindFromRest) current.forkKind = /all together/i.test(kindFromRest[1]) ? "all-together" : "only-one";
+        continue;
+      }
+      const earlyBranch = parseGatewayBranch(trimmed);
+      if (earlyBranch && !stageHasGates(current)) {
+        startFork(current.title, "", i);
+        current.branches.push(earlyBranch);
+        continue;
+      }
+    }
     if (current.kind === "fork") {
       const kindLine = trimmed.match(/^(?:Kind:\s*)?(only one|all together)\s*$/i);
       if (kindLine) {
         current.forkKind = /all together/i.test(kindLine[1]) ? "all-together" : "only-one";
         continue;
       }
-      const branch = trimmed.match(/^[-*+]\s+(.+?)\s*(?:→|->)\s+(.+)$/);
-      if (branch) {
-        current.branches.push({
-          label: String(branch[1] || "").trim(),
-          target: String(branch[2] || "").trim(),
-        });
-      }
+      const branch = parseGatewayBranch(trimmed);
+      if (branch) current.branches.push(branch);
       continue;
     }
     const whyLine = line.match(/^Why:\s*(.*)$/i);

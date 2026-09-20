@@ -28,7 +28,7 @@ assert(!capture.includes("landDoorQueryOnToday"), "Capture thoughts does not lan
 console.log("pass  Door map path, empty Get to Work stays empty");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = 3855;
+const PORT = 18500 + Math.floor(Math.random() * 2000);
 const origin = `http://127.0.0.1:${PORT}`;
 const vault = await fs.promises.mkdtemp(path.join(os.tmpdir(), "aidanos-door-"));
 await fs.promises.mkdir(path.join(vault, "log"), { recursive: true });
@@ -40,7 +40,15 @@ await fs.promises.writeFile(path.join(vault, "log", DATE + ".md"), "", "utf8");
 
 const child = spawn(process.execPath, [path.join(__dirname, "server.mjs")], {
   cwd: __dirname,
-  env: { ...process.env, PORT: String(PORT), AIDANOS_VAULT: vault },
+  env: {
+    ...process.env,
+    PORT: String(PORT),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+  },
   stdio: ["ignore", "pipe", "pipe"],
 });
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }

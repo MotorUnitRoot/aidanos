@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { authenticatedGitUrl, sanitizeGitError, seedBundledVault } from "./server.mjs";
+import { authenticatedGitUrl, redactSecrets, sanitizeGitError, seedBundledVault } from "./server.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
@@ -200,6 +200,8 @@ function authUrlShaping() {
   assert(authenticatedGitUrl(url, "   ") === url, "whitespace token keeps public url");
   assert(authenticatedGitUrl("/tmp/local.git", token) === "/tmp/local.git", "local path unchanged");
   assert(authenticatedGitUrl("file:///tmp/local.git", token) === "file:///tmp/local.git", "file url unchanged");
+  const httpUrl = "http://github.com/MotorUnitRoot/aidanos-vault.git";
+  assert(authenticatedGitUrl(httpUrl, token) === httpUrl, "http remotes never get token userinfo");
   const replaced = authenticatedGitUrl("https://old:creds@github.com/MotorUnitRoot/aidanos-vault.git", token);
   assert(replaced === want, "replaces existing userinfo");
 
@@ -209,6 +211,25 @@ function authUrlShaping() {
   assert(!clean.includes(url), "public url redacted");
   assert(!clean.includes("x-access-token:" + token), "auth userinfo redacted");
   assert(clean.includes("[url]") || clean.includes("***"), "sanitized placeholder");
+
+  const other = "gho_other_env_token_not_used_7c1d";
+  const prevGithub = process.env.GITHUB_TOKEN;
+  const prevAidanos = process.env.AIDANOS_VAULT_GIT_TOKEN;
+  process.env.GITHUB_TOKEN = other;
+  process.env.AIDANOS_VAULT_GIT_TOKEN = token;
+  try {
+    const long = "boom " + token + " and " + other + " at " + url + " " + "x".repeat(200);
+    const both = redactSecrets(long, { token, url, vault: "/tmp/vault" });
+    assert(!both.includes(token), "AIDANOS token redacted");
+    assert(!both.includes(other), "GITHUB_TOKEN redacted even when it differs");
+    assert(both.length > 180, "log redaction is not capped at the client hint length");
+    assert(sanitizeGitError(long, { token, url, vault: "/tmp/vault" }).length <= 180, "client git hint stays compact");
+  } finally {
+    if (prevGithub == null) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = prevGithub;
+    if (prevAidanos == null) delete process.env.AIDANOS_VAULT_GIT_TOKEN;
+    else process.env.AIDANOS_VAULT_GIT_TOKEN = prevAidanos;
+  }
 }
 
 async function authOriginIsEmbedded() {

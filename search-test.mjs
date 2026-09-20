@@ -219,7 +219,15 @@ async function liveSearchAndLand() {
   const port = 18000 + Math.floor(Math.random() * 2000);
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
-    env: { ...process.env, PORT: String(port), AIDANOS_VAULT: vault },
+    env: {
+      ...process.env,
+      PORT: String(port),
+      AIDANOS_HOST: "127.0.0.1",
+      AIDANOS_VAULT: vault,
+      AIDANOS_VAULT_GIT_URL: "",
+      AIDANOS_VAULT_GIT_TOKEN: "",
+      GITHUB_TOKEN: "",
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let errOut = "";

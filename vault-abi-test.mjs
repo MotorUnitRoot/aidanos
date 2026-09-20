@@ -43,6 +43,7 @@ check("source still defaults to loopback and honors Cloud Run host/port", () => 
   assert(/MAX_BODY/.test(serverSrc), "body cap");
   assert(/PUBLIC_FILES/.test(serverSrc), "static allowlist");
   assert(/X-Content-Type-Options/.test(serverSrc), "nosniff");
+  assert(!/String\(rel\)\.replace\([^)]*\)\.endsWith\("\.md"\)/.test(serverSrc), "GET markdown check must not use the raw query");
 });
 
 check("Dockerfile does not run as root and still binds 0.0.0.0 for Cloud Run", () => {
@@ -59,7 +60,11 @@ check("git vault sync is env-gated and does not invent a second write ABI", () =
   assert(/AIDANOS_VAULT_GIT_TOKEN/.test(serverSrc), "git token env");
   assert(/GITHUB_TOKEN/.test(serverSrc), "GITHUB_TOKEN fallback");
   assert(/authenticatedGitUrl/.test(serverSrc), "https token url shaping");
+  assert(/parsed\.protocol !== "https:"/.test(serverSrc), "token userinfo is https-only");
+  assert(!/parsed\.protocol !== "https:" && parsed\.protocol !== "http:"/.test(serverSrc), "do not mint token userinfo on http");
   assert(/x-access-token/.test(serverSrc), "github userinfo username");
+  assert(/function logSafe/.test(serverSrc), "unexpected errors go through logSafe");
+  assert(!/console\.error\(err\)/.test(serverSrc), "do not dump raw Error objects");
   assert(!/http\.extraHeader/.test(serverSrc), "do not use extraHeader bearer");
   assert(!/Authorization: Bearer/.test(serverSrc), "do not send bearer extraHeader");
   assert(/scheduleVaultSync/.test(serverSrc), "commit after write");
@@ -120,6 +125,7 @@ async function liveVaultAbi() {
       AIDANOS_VAULT: vault,
       AIDANOS_VAULT_GIT_URL: "",
       AIDANOS_VAULT_GIT_TOKEN: "",
+      GITHUB_TOKEN: "",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -148,6 +154,23 @@ async function liveVaultAbi() {
     assert(okFile.ok, "read a vault markdown file");
     const okBody = await okFile.json();
     assert(okBody.markdown.includes("inside the vault"), "vault read");
+
+    fs.writeFileSync(path.join(vault, "maps", "secret.txt"), "SECRET_TXT\n", "utf8");
+    const notMd = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/secret.txt"));
+    assert(notMd.status === 400, "plain text GET got " + notMd.status);
+    const notMdBody = await notMd.text();
+    assert(!notMdBody.includes("SECRET_TXT"), "non-markdown GET must not return the file");
+    const mdSuffix = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/secret.txt?dummy=.md"));
+    assert(mdSuffix.status === 400, "query-suffix .md GET got " + mdSuffix.status);
+    const mdSuffixBody = await mdSuffix.text();
+    assert(!mdSuffixBody.includes("SECRET_TXT"), "GET markdown check must use the resolved path");
+    const putTxt = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/secret.txt?dummy=.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "overwrite\n", mtime: 0 }),
+    });
+    assert(putTxt.status === 400, "query-suffix .md PUT got " + putTxt.status);
+    assert(fs.readFileSync(path.join(vault, "maps", "secret.txt"), "utf8") === "SECRET_TXT\n", "non-markdown left alone");
 
     const escapes = [
       "../../etc/passwd",

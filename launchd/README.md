@@ -34,7 +34,7 @@ launchctl unload ~/Library/LaunchAgents/com.aidanos.plist
 
 ## Without launchd
 
-On the Linux sit machine, ./start.sh is the keep-alive (setsid npm start).
+On the Linux sit machine, ./start.sh is the keep-alive (setsid or nohup npm start).
 
 Same process, foreground:
 

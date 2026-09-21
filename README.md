@@ -4,13 +4,13 @@ AidanOS is a daily notebook that runs on your computer. The disk is a folder of 
 
 ## Run
 
-You need Node 18 or newer.
+You need Node 18 or newer. There is no `npm install`.
 
 ```
 git clone https://github.com/MotorUnitRoot/aidanos.git && cd aidanos && ./start.sh
 ```
 
-Open http://127.0.0.1:3847/. The first screen asks, “What do you want to do today?”
+That starts the server in the background and prints the URL. Open http://127.0.0.1:3847/. The first screen asks, “What do you want to do today?” Foreground instead: `npm start`.
 
 The vault is the `vault/` folder next to the app, or the folder named in `AIDANOS_VAULT`.
 

@@ -15,7 +15,10 @@ alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 hcode() { curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "$HEALTH" 2>/dev/null || echo 000; }
 if [ "$(hcode)" = 200 ] && [ -f "$PIDF" ]; then
   old=$(cat "$PIDF" || true)
-  if alive "$old"; then exit 0; fi
+  if alive "$old"; then
+    echo "open http://127.0.0.1:${PORT_N}/"
+    exit 0
+  fi
 fi
 if [ -f "$PIDF" ]; then
   old=$(cat "$PIDF" || true)
@@ -45,7 +48,12 @@ if alive "$SIT"; then
 fi
 n=0
 while [ "$n" -lt 20 ] && [ "$(hcode)" = 200 ]; do sleep 0.1; n=$((n+1)); done
-setsid npm start </dev/null >>"$LOGF" 2>&1 &
+# setsid is Linux-only; Mac (and other Unix) strangers get nohup
+if command -v setsid >/dev/null 2>&1; then
+  setsid npm start </dev/null >>"$LOGF" 2>&1 &
+else
+  nohup npm start </dev/null >>"$LOGF" 2>&1 &
+fi
 echo $! > "$PIDF"
 n=0
 ok=0
@@ -58,3 +66,4 @@ if [ "$ok" != 1 ]; then
   echo "start.sh: http://127.0.0.1:${PORT_N}/api/health not 200" >&2
   exit 1
 fi
+echo "open http://127.0.0.1:${PORT_N}/"

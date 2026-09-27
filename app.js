@@ -902,7 +902,7 @@ function renderWeek() {
     btn.setAttribute("aria-pressed", d.date === state.selectedDate ? "true" : "false");
     btn.innerHTML =
       "<span class=\"dow\">" + DOW_FULL[i] + "</span>" +
-      "<span class=\"dom\">" + d.date.slice(8) + "</span>" +
+      "<span class=\"dom\">" + escapeHtml(String(d.date || "").slice(8)) + "</span>" +
       "<span class=\"moy\">" + escapeHtml(formatCardMonth(d.date)) + "</span>";
     btn.addEventListener("click", () => openDay(d.date));
     daysEl.appendChild(btn);

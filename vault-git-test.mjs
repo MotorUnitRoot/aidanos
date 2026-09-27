@@ -270,6 +270,29 @@ async function authOriginIsEmbedded() {
   }
 }
 
+async function seedSkipsSymlinkDest() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-seed-link-"));
+  const dest = path.join(tmp, "dest");
+  const outside = path.join(tmp, "outside");
+  fs.mkdirSync(dest);
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(dest, "maps"));
+  try {
+    const seeded = await seedBundledVault(dest, path.join(root, "vault"));
+    assert(seeded === true, "seed still attempts when the letter map is a symlink");
+    assert(
+      !fs.existsSync(path.join(outside, "reply-to-a-letter.md")),
+      "seed must not write through a maps symlink"
+    );
+    assert(
+      fs.existsSync(path.join(dest, "aidanos", "active-horse.md")),
+      "seed still copies Plan into a real directory"
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 function seedDoesNotOverwrite() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-seed-"));
   const dest = path.join(tmp, "dest");
@@ -344,6 +367,7 @@ async function bundledSeedWhenCloneFails() {
 
 try {
   authUrlShaping();
+  await seedSkipsSymlinkDest();
   await seedDoesNotOverwrite();
   await liveGitSync();
   await authOriginIsEmbedded();

@@ -40,10 +40,13 @@ check("source still defaults to loopback and honors Cloud Run host/port", () => 
   assert(/process\.env\.AIDANOS_HOST \|\| "127\.0\.0\.1"/.test(serverSrc), "HOST default");
   assert(/process\.env\.PORT/.test(serverSrc) && /3847/.test(serverSrc), "PORT default");
   assert(/safeJoin/.test(serverSrc) && /realpath/.test(serverSrc), "vault realpath");
+  assert(/lstat/.test(serverSrc) && /isSymbolicLink/.test(serverSrc), "symlink rejection");
   assert(/MAX_BODY/.test(serverSrc), "body cap");
   assert(/PUBLIC_FILES/.test(serverSrc), "static allowlist");
   assert(/X-Content-Type-Options/.test(serverSrc), "nosniff");
   assert(!/String\(rel\)\.replace\([^)]*\)\.endsWith\("\.md"\)/.test(serverSrc), "GET markdown check must not use the raw query");
+  const appSrc = fs.readFileSync(path.join(root, "app.js"), "utf8");
+  assert(/escapeHtml\(String\(d\.date \|\| ""\)\.slice\(8\)\)/.test(appSrc), "week day number escaped");
 });
 
 check("Dockerfile does not run as root and still binds 0.0.0.0 for Cloud Run", () => {
@@ -53,6 +56,8 @@ check("Dockerfile does not run as root and still binds 0.0.0.0 for Cloud Run", (
   assert(!/COPY \. \./.test(docker), "no broad COPY");
   assert(/apt-get install[^\n]*git/.test(docker), "git in image for vault clone");
   assert(/COPY vault \.\/vault/.test(docker), "image ships bundled sample vault");
+  assert(/icon-192\.png/.test(docker), "image copies pwa icons");
+  assert(!/w\('icon-192\.png'/.test(docker), "icons are repo files, not a build-time blob");
 });
 
 check("git vault sync is env-gated and does not invent a second write ABI", () => {
@@ -108,6 +113,8 @@ async function waitHealth(base, child) {
 async function liveVaultAbi() {
   const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-abi-"));
   const outside = path.join(os.tmpdir(), "aidanos-abi-secret-" + process.pid + ".md");
+  let outsideDir = "";
+  let outsideLog = "";
   fs.mkdirSync(path.join(vault, "maps"), { recursive: true });
   fs.mkdirSync(path.join(vault, "log"), { recursive: true });
   fs.mkdirSync(path.join(vault, "aidanos"), { recursive: true });
@@ -309,6 +316,119 @@ async function liveVaultAbi() {
 
     const app = await fetch(base + "/app.js");
     assert(app.ok, "app.js still serves");
+
+    fs.symlinkSync(path.join(vault, "maps", "secret.txt"), path.join(vault, "maps", "alias.md"));
+    const alias = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/alias.md"));
+    assert(alias.status === 400, "inside non-md symlink got " + alias.status);
+    const aliasBody = await alias.text();
+    assert(!aliasBody.includes("SECRET_TXT"), "md symlink must not read a text file");
+    assert(!aliasBody.includes(vault), "path error must not echo the vault path");
+
+    fs.mkdirSync(path.join(vault, ".git"));
+    fs.writeFileSync(
+      path.join(vault, ".git", "config"),
+      "url = https://x-access-token:ghp_symlink_should_not_leak@github.com/example/vault.git\n",
+      "utf8"
+    );
+    fs.symlinkSync(path.join(vault, ".git", "config"), path.join(vault, "maps", "git.md"));
+    const gitFile = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/git.md"));
+    assert(gitFile.status === 400, "git config symlink got " + gitFile.status);
+    const gitBody = await gitFile.text();
+    assert(!gitBody.includes("ghp_symlink_should_not_leak"), "symlink must not return git config");
+    const gitPut = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/git.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "overwrite\n", mtime: 0 }),
+    });
+    assert(gitPut.status === 400, "git config symlink write got " + gitPut.status);
+    assert(
+      fs.readFileSync(path.join(vault, ".git", "config"), "utf8").includes("ghp_symlink_should_not_leak"),
+      "git config left alone"
+    );
+
+    outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-abi-dir-"));
+    fs.writeFileSync(path.join(outsideDir, "x.md"), "SECRET_DIR\n", "utf8");
+    fs.symlinkSync(outsideDir, path.join(vault, "maps", "linked"));
+    const viaDir = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/linked/x.md"));
+    assert(viaDir.status === 400, "symlink dir got " + viaDir.status);
+    assert(!(await viaDir.text()).includes("SECRET_DIR"), "symlink dir must not be listed through");
+    const viaPut = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/linked/x.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "overwrite\n", mtime: 0 }),
+    });
+    assert(viaPut.status === 400, "symlink dir write got " + viaPut.status);
+    assert(fs.readFileSync(path.join(outsideDir, "x.md"), "utf8") === "SECRET_DIR\n", "outside dir file left alone");
+
+    fs.symlinkSync(outside, path.join(vault, "log", "2026-08-15.md"));
+    const daySym = await fetch(base + "/api/day?date=2026-08-15");
+    assert(daySym.status === 400, "day symlink got " + daySym.status);
+    assert(!(await daySym.text()).includes("SECRET_OUTSIDE"), "day symlink must not leak");
+
+    const weekStart = "2026-09-07";
+    fs.mkdirSync(path.join(vault, "aidanos", "weeks"), { recursive: true });
+    fs.writeFileSync(path.join(vault, "log", "2026-09-08.md"), "- [ ] only this\n", "utf8");
+    fs.writeFileSync(
+      path.join(vault, "aidanos", "weeks", weekStart + ".md"),
+      [
+        "| date | role | energy | mission_eve | summary |",
+        "|---|---|---|---|---|",
+        "| ../../../../../../etc/passwd | x | green | false | x |",
+        "| 2026-09-<img src=x onerror=alert(1)> | x | green | false | x |",
+        "| 2026-09-08 | x | green | false | x |",
+        "| 2026-09-09 | x | green | false | x |",
+        "| 2026-09-10 | x | green | false | x |",
+        "| 2026-09-11 | x | green | false | x |",
+        "| 2026-09-12 | x | green | false | x |",
+        "| 2026-09-13 | x | green | false | x |",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const week = await fetch(base + "/api/week?start=" + weekStart);
+    assert(week.ok, "week " + week.status);
+    const weekBody = await week.json();
+    const weekText = JSON.stringify(weekBody);
+    assert(!weekText.includes("passwd"), "week must not join a date outside log");
+    assert(!weekText.includes("<img"), "week must not return a non-date cell");
+    assert(weekBody.days.every((d) => /^\d{4}-\d{2}-\d{2}$/.test(d.date)), "week dates stay iso");
+    const noted = weekBody.days.find((d) => d.date === "2026-09-08");
+    assert(noted && noted.task_open === 1, "iso day still counts tasks");
+
+    outsideLog = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-abi-log-"));
+    fs.writeFileSync(path.join(outsideLog, "2026-03-03.md"), "SECRET_LOGDIR\n- [ ] leak\n", "utf8");
+    fs.renameSync(path.join(vault, "log"), path.join(vault, "log-real"));
+    fs.symlinkSync(outsideLog, path.join(vault, "log"));
+    const dayDir = await fetch(base + "/api/day?date=2026-03-03");
+    assert(dayDir.status === 400, "log dir symlink day " + dayDir.status);
+    assert(!(await dayDir.text()).includes("SECRET_LOGDIR"), "day must not follow log symlink");
+    const dayPut = await fetch(base + "/api/day?date=2026-03-04", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ date: "2026-03-04", markdown: "pwn\n", paper: "pwn\n" }),
+    });
+    assert(dayPut.status === 400, "log dir symlink put " + dayPut.status);
+    assert(!fs.existsSync(path.join(outsideLog, "2026-03-04.md")), "put must not create a day outside");
+    const monthLeak = await fetch(base + "/api/month?year=2026&month=3");
+    assert(monthLeak.ok, "month still ok");
+    const monthText = await monthLeak.text();
+    assert(!monthText.includes("2026-03-03") && !monthText.includes("SECRET_LOGDIR"), "month must not follow log symlink");
+    const taskLeak = await fetch(base + "/api/open-tasks");
+    assert(taskLeak.ok, "open-tasks still ok");
+    const taskText = await taskLeak.text();
+    assert(!taskText.includes("SECRET_LOGDIR") && !taskText.includes("leak"), "open-tasks must not follow log symlink");
+
+    fs.symlinkSync(outside, path.join(vault, "aidanos", "skin.css"));
+    const skin = await fetch(base + "/api/skin.css");
+    assert(skin.ok, "skin still served");
+    assert(!(await skin.text()).includes("SECRET_OUTSIDE"), "skin must not follow a symlink");
+
+    for (const icon of ["icon-180.png", "icon-192.png", "apple-touch-icon.png"]) {
+      const res = await fetch(base + "/" + icon);
+      assert(res.status === 200, icon + " " + res.status);
+      const buf = Buffer.from(await res.arrayBuffer());
+      assert(buf.length > 32 && buf[0] === 0x89 && buf[1] === 0x50, icon + " is a png");
+    }
   } finally {
     try { child.kill("SIGTERM"); } catch {}
     const deadline = Date.now() + 2000;
@@ -318,6 +438,8 @@ async function liveVaultAbi() {
     try { child.kill("SIGKILL"); } catch {}
     try { fs.rmSync(vault, { recursive: true, force: true }); } catch {}
     try { fs.rmSync(outside, { force: true }); } catch {}
+    try { if (outsideDir) fs.rmSync(outsideDir, { recursive: true, force: true }); } catch {}
+    try { if (outsideLog) fs.rmSync(outsideLog, { recursive: true, force: true }); } catch {}
   }
 }
 

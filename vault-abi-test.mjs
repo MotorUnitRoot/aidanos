@@ -191,6 +191,31 @@ async function liveVaultAbi() {
     const leakBody = await leak.text();
     assert(!leakBody.includes("SECRET_OUTSIDE"), "symlink must not leak outside file");
 
+    fs.writeFileSync(path.join(vault, "maps", "note-a.md"), "NOTE_A\n", "utf8");
+    fs.linkSync(path.join(vault, "maps", "note-a.md"), path.join(vault, "maps", "note-b.md"));
+    const noteLink = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/note-b.md"));
+    assert(noteLink.ok, "ordinary hard link " + noteLink.status);
+    assert((await noteLink.json()).markdown === "NOTE_A\n", "ordinary hard link still reads");
+
+    fs.mkdirSync(path.join(vault, ".git"), { recursive: true });
+    const gitConfig = path.join(vault, ".git", "config");
+    const gitToken = "ghp_hardlink_should_not_leak";
+    fs.writeFileSync(gitConfig, "url = https://x-access-token:" + gitToken + "@github.com/example/vault.git\n", "utf8");
+    fs.linkSync(gitConfig, path.join(vault, "maps", "git-hard.md"));
+    fs.linkSync(gitConfig, path.join(vault, "log", "2026-04-04.md"));
+    const hard = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/git-hard.md"));
+    assert(hard.status === 404, "git config hard link got " + hard.status);
+    const hardBody = await hard.text();
+    assert(!hardBody.includes(gitToken), "hard link must not return git config");
+    assert(!hardBody.includes(vault), "hard link error must not echo the vault path");
+    const hardDay = await fetch(base + "/api/day?date=2026-04-04");
+    assert(hardDay.ok, "day hard link still responds");
+    assert(!(await hardDay.text()).includes(gitToken), "day hard link must not return git config");
+    const hardSearch = await fetch(base + "/api/search?q=" + encodeURIComponent(gitToken));
+    assert(hardSearch.ok, "search after hard link");
+    assert(!(await hardSearch.text()).includes(gitToken), "search must not return git config");
+    assert(fs.readFileSync(gitConfig, "utf8").includes(gitToken), "git config left on disk");
+
     const putLeak = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/leak.md"), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },

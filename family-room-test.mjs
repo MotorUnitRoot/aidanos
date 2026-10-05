@@ -1,0 +1,227 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const root = path.dirname(fileURLToPath(import.meta.url));
+const src = fs.readFileSync(path.join(root, "app.js"), "utf8");
+const letter = fs.readFileSync(path.join(root, "vault/maps/reply-to-a-letter.md"), "utf8");
+const mapMd = fs.readFileSync(path.join(root, "vault/family-room-to-office/map.md"), "utf8");
+const planMd = fs.readFileSync(path.join(root, "vault/family-room-to-office/plan.md"), "utf8");
+const answersMd = fs.readFileSync(path.join(root, "vault/family-room-to-office/answers.md"), "utf8");
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
+}
+
+function grab(name, nextName) {
+  const start = src.indexOf("function " + name + "(");
+  if (start < 0) throw new Error("missing " + name);
+  const next = src.indexOf("\nfunction " + nextName + "(", start + 1);
+  if (next < 0) throw new Error("missing next " + nextName);
+  return src.slice(start, next);
+}
+
+const sandbox = {};
+new Function(
+  "sandbox",
+  grab("isWorkMapPath", "isMapDoc") +
+    grab("parseTaskLine", "parseBlocks") +
+    grab("stageGateText", "mapNextStepLines") +
+    grab("mapNextStepLines", "taskLineKey") +
+    grab("appendDoorTasks", "hideDoorProposals") +
+    grab("mapCanvasRows", "paintStagePaper") +
+    "\nsandbox.isWorkMapPath = isWorkMapPath;" +
+    " sandbox.parseProcessMap = parseProcessMap;" +
+    " sandbox.familyRoomStops = familyRoomStops;" +
+    " sandbox.linesToAddToday = linesToAddToday;" +
+    " sandbox.planMarkdownFromChecks = planMarkdownFromChecks;" +
+    " sandbox.placeStopsFirst = placeStopsFirst;" +
+    " sandbox.ensureFamilySeason = ensureFamilySeason;" +
+    " sandbox.mapCanvasRows = mapCanvasRows;"
+)(sandbox);
+
+const {
+  isWorkMapPath,
+  parseProcessMap,
+  familyRoomStops,
+  linesToAddToday,
+  planMarkdownFromChecks,
+  placeStopsFirst,
+  ensureFamilySeason,
+  mapCanvasRows,
+} = sandbox;
+
+const results = [];
+function check(name, run) {
+  try {
+    const out = run();
+    if (out && typeof out.then === "function") {
+      return out.then(() => {
+        results.push({ name, ok: true });
+        console.log("pass  " + name);
+      }).catch((err) => {
+        results.push({ name, ok: false, error: err.message });
+        console.log("FAIL  " + name + "  " + err.message);
+      });
+    }
+    results.push({ name, ok: true });
+    console.log("pass  " + name);
+  } catch (err) {
+    results.push({ name, ok: false, error: err.message });
+    console.log("FAIL  " + name + "  " + err.message);
+  }
+}
+
+check("exact Door sentence opens Questions and nothing else does", () => {
+  const submit = src.slice(src.indexOf('$("door-form")'), src.indexOf('$("door-skip")'));
+  const sentenceAt = submit.indexOf("FAMILY_ROOM_SENTENCE");
+  assert(sentenceAt >= 0, "submit knows the sentence");
+  assert(sentenceAt < submit.indexOf("landDoorQueryOnToday"), "sentence before map search");
+  assert(submit.includes("openFamilyRoomQuestions"), "sentence opens Questions");
+  assert(submit.indexOf("landDoorQueryOnToday") < submit.indexOf("proposeDoorLines"), "other sentences still search then propose");
+  const skip = src.slice(src.indexOf('$("door-skip")'), src.indexOf("(function wireDoorCapture()"));
+  assert(!skip.includes("openFamilyRoomQuestions"), "Get to work does not open Questions");
+  assert(!skip.includes("FAMILY_ROOM_SENTENCE"), "Get to work ignores the sentence");
+  const capture = src.slice(src.indexOf("(function wireDoorCapture()"), src.indexOf('$("door-accept")'));
+  assert(!capture.includes("openFamilyRoomQuestions"), "Capture thoughts does not open Questions");
+  assert(!capture.includes("landDoorQueryOnToday"), "Capture thoughts does not land maps");
+});
+
+check("job map is the only canvas in the folder", () => {
+  assert(isWorkMapPath("family-room-to-office/map.md") === true, "map.md");
+  assert(isWorkMapPath("family-room-to-office/answers.md") === false, "answers");
+  assert(isWorkMapPath("family-room-to-office/plan.md") === false, "plan");
+  assert(isWorkMapPath("maps/reply-to-a-letter.md") === true, "letter still a map");
+  assert(isWorkMapPath("maps/the-reply.md") === false, "last-mile still skipped");
+});
+
+check("two forks and the last two stages share the next row", () => {
+  const map = parseProcessMap(mapMd);
+  assert(map.title === "Family room to office", map.title);
+  assert(map.stages.map((s) => s.title).join(" | ") === "See the room | Name the use | Read the structure | Ask the town | Rough | Close and finish | Final", map.stages.map((s) => s.title).join(" | "));
+  assert(map.forks.length === 2, "two forks, got " + map.forks.length);
+  assert(map.forks[0].title === "Wall stays / might carry load", map.forks[0].title);
+  assert(map.forks[1].title === "Surface only / open the wall", map.forks[1].title);
+  assert(map.forks.every((f) => f.forkKind === "only-one"), "both forks are only one");
+  const rows = mapCanvasRows(map);
+  assert(rows.length === 2, "two rows, got " + rows.length);
+  const second = rows[1].filter((n) => n.type === "stage").map((n) => n.stage.title);
+  assert(second.join(" | ") === "Close and finish | Final", second.join(" | "));
+  assert(rows[0].filter((n) => n.type === "fork").length === 2, "both forks stay on the first row");
+  const letterMap = parseProcessMap(letter);
+  assert(letterMap.stages.length === 5, "letter stages");
+  assert(letterMap.forks.length === 1, "letter fork");
+  assert(mapCanvasRows(letterMap).length === 1, "letter stays one row");
+});
+
+check("drawing writes checks and invents no measurements", () => {
+  assert(planMd.includes("- [ ] Overall sizes"), "seed starts unchecked");
+  assert(!/\d+\s*(ft|feet|in|inch|inches)/i.test(planMd), "seed has no measurements");
+  const written = planMarkdownFromChecks(["Door swing and window"]);
+  assert(written.includes("- [x] Door swing and window"), "checked line stays");
+  assert(written.includes("- [ ] Overall sizes"), "unchecked stays unchecked");
+  assert(written.includes("- [ ] Where the built-in meets the floor"), "last line stays");
+  assert(!/\d+\s*(ft|feet|in|inch|inches)/i.test(written), "no invented measurements");
+  assert(!written.includes("- [ ] Cut"), "no cut line");
+});
+
+check("a stop blocks the next cut", () => {
+  const sleeping = answersMd.replace(
+    "1. Which room, and will anyone sleep there?",
+    "1. Which room, and will anyone sleep there? Yes, someone will sleep there."
+  );
+  const stops = familyRoomStops(sleeping, planMd);
+  assert(stops[0] === "Someone would sleep there. Stop.", stops.join(" | "));
+  const lines = linesToAddToday([
+    "- [ ] Paint",
+    "- [ ] Open the wall",
+    "- [ ] Cut the wall",
+  ], stops);
+  assert(lines.length === 1 && lines[0] === "- [ ] Paint", lines.join(" | "));
+  const quiet = familyRoomStops(answersMd, planMd);
+  assert(quiet.some((s) => /building department/i.test(s)), "empty town answer is a stop");
+  assert(!quiet.some((s) => /sleep there/i.test(s)), "blank sleep answer is not a stop");
+  const walk = placeStopsFirst("# From the doorway\n\nA chair.\n", stops);
+  assert(walk.indexOf("Someone would sleep there. Stop.") < walk.indexOf("A chair."), "stop is first");
+  const season = ensureFamilySeason("# Stay on the plan\n\n## Why\nThe week is already written.\n", stops);
+  assert(season.includes("# Stay on the plan"), "season title stays");
+  assert(season.includes("## Before you cut"), "before you cut");
+  assert(season.includes("Someone would sleep there. Stop."), "stop in the season file");
+});
+
+const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+async function pngRoundTrip() {
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-room-"));
+  fs.mkdirSync(path.join(vault, "family-room-to-office"), { recursive: true });
+  fs.mkdirSync(path.join(vault, "maps"), { recursive: true });
+  fs.writeFileSync(path.join(vault, "maps", "secret.txt"), "SECRET_TXT\n");
+  const port = 18600 + Math.floor(Math.random() * 2000);
+  const child = spawn(process.execPath, ["server.mjs"], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      AIDANOS_HOST: "127.0.0.1",
+      AIDANOS_VAULT: vault,
+      AIDANOS_VAULT_GIT_URL: "",
+      AIDANOS_VAULT_GIT_TOKEN: "",
+      GITHUB_TOKEN: "",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      if (child.exitCode != null) throw new Error("server exited");
+      try {
+        const res = await fetch(base + "/api/health");
+        if (res.ok) break;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    const outside = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/note.png"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ png: PNG }),
+    });
+    assert(outside.status === 400, "png outside the folder got " + outside.status);
+    const txt = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/secret.txt"));
+    assert(txt.status === 400, "plain text still refused");
+    const put = await fetch(base + "/api/file?path=" + encodeURIComponent("family-room-to-office/plan.png"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ png: PNG }),
+    });
+    assert(put.ok, "png in the job folder");
+    const got = await fetch(base + "/api/file?path=" + encodeURIComponent("family-room-to-office/plan.png"));
+    assert(got.ok, "read the png");
+    assert(got.headers.get("content-type") === "image/png", got.headers.get("content-type"));
+    const buf = Buffer.from(await got.arrayBuffer());
+    assert(buf[0] === 0x89 && buf.toString("ascii", 1, 4) === "PNG", "bytes are a png");
+    assert(!fs.existsSync(path.join(root, "vault/family-room-to-office/plan.png")), "repo seed has no generated png");
+    assert(!fs.existsSync(path.join(root, "vault/family-room-to-office/walk.png")), "repo seed has no walk png");
+  } finally {
+    try { child.kill("SIGTERM"); } catch {}
+    const deadline = Date.now() + 2000;
+    while (child.exitCode == null && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    try { child.kill("SIGKILL"); } catch {}
+    try { fs.rmSync(vault, { recursive: true, force: true }); } catch {}
+  }
+}
+
+await check("png stays inside the job folder", pngRoundTrip);
+
+const failed = results.filter((r) => !r.ok);
+console.log("");
+if (failed.length) {
+  console.log(failed.length + " failed, " + (results.length - failed.length) + " passed");
+  process.exit(1);
+}
+console.log("family-room-test ok  (" + results.length + " passed)");

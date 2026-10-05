@@ -41,6 +41,7 @@ new Function(
     " sandbox.planMarkdownFromChecks = planMarkdownFromChecks;" +
     " sandbox.placeStopsFirst = placeStopsFirst;" +
     " sandbox.ensureFamilySeason = ensureFamilySeason;" +
+    " sandbox.familyRoomSeed = familyRoomSeed;" +
     " sandbox.mapCanvasRows = mapCanvasRows;"
 )(sandbox);
 
@@ -53,6 +54,7 @@ const {
   planMarkdownFromChecks,
   placeStopsFirst,
   ensureFamilySeason,
+  familyRoomSeed,
   mapCanvasRows,
 } = sandbox;
 
@@ -76,6 +78,22 @@ function check(name, run) {
     console.log("FAIL  " + name + "  " + err.message);
   }
 }
+
+check("a missing answers file still opens the eight questions", () => {
+  const md = familyRoomSeed("family-room-to-office/answers.md");
+  const qs = md.split("\n").filter((line) => /^\d+\.\s/.test(line));
+  assert(qs.length === 8, "eight lines, got " + qs.length);
+  assert(qs[0].includes("Which room"), qs[0]);
+  assert(qs[7].includes("building department"), qs[7]);
+  assert(familyRoomSeed("family-room-to-office/plan.md").includes("- [ ] Overall sizes"), "drawing seed");
+  assert(familyRoomSeed("family-room-to-office/map.md").includes("Cut the wall"), "map seed");
+  assert(familyRoomSeed("family-room-to-office/walk.md").startsWith("# From the doorway"), "walk seed");
+  assert(familyRoomSeed("maps/reply-to-a-letter.md") === "", "other notes are not seeded");
+  const open = src.slice(src.indexOf("async function openVaultNote("), src.indexOf("async function openVaultSearchHit("));
+  assert(open.includes("familyRoomSeed"), "a missing file falls through to the seed");
+  assert(open.includes("isMissingFileError"), "only a missing file");
+  assert(open.includes("renderNote()"), "the note still paints");
+});
 
 check("exact Door sentence opens Questions and nothing else does", () => {
   const submit = src.slice(src.indexOf('$("door-form")'), src.indexOf('$("door-skip")'));

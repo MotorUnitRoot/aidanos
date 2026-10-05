@@ -2049,7 +2049,15 @@ async function openVaultNote(rel) {
   }
   // Cancel any in-flight openDay/loadWeek so Capture is not stolen back to Today
   const noteGen = ++state.openDayGen;
-  const data = await api("/api/file?path=" + encodeURIComponent(path));
+  let data;
+  try {
+    data = await api("/api/file?path=" + encodeURIComponent(path));
+  } catch (err) {
+    const seed = familyRoomSeed(path);
+    if (!seed || !isMissingFileError(err)) throw err;
+    if (noteGen !== state.openDayGen) return;
+    data = { path, markdown: seed, mtime: 0 };
+  }
   if (noteGen !== state.openDayGen) return;
   state.day = null;
   let noteMd = typeof data.markdown === "string" ? data.markdown : "";
@@ -3646,6 +3654,30 @@ function jobPath() {
   return String(state.doc.path || "").replace(/\\/g, "/");
 }
 
+function isMissingFileError(err) {
+  return /not found/i.test(String((err && err.message) || err || ""));
+}
+
+function familyRoomSeed(rel) {
+  const p = String(rel || "").replace(/\\/g, "/");
+  if (p === "family-room-to-office/answers.md") {
+    return "# " + FAMILY_ROOM_SENTENCE + "\n\n" +
+      "1. Which room, and will anyone sleep there?\n" +
+      "2. What must stay?\n" +
+      "3. Will any wall or opening change?\n" +
+      "4. Where does the desk go, and which way does the door swing?\n" +
+      "5. What has to be plugged in, and where is the panel?\n" +
+      "6. Supply, return, and will a new door close the room?\n" +
+      "7. When was the house built?\n" +
+      "8. What did the building department say?\n";
+  }
+  if (p === "family-room-to-office/plan.md") return planMarkdownFromChecks([]);
+  if (p === "family-room-to-office/walk.md") return "# From the doorway\n";
+  if (p === "family-room-to-office/today.md") return "# Today\n";
+  if (p === "family-room-to-office/map.md") return "# Family room to office\n\n## Why\nA finished family room that stays living space.\n\n## Stages\n\n### 1. See the room\nEnter: You are in the doorway\nExit: The room is the one on the drawing\n\n### 2. Name the use\nEnter: The room is named\nExit: It stays living space\n\n### 3. Read the structure\nEnter: The walls are in front of you\nExit: You know whether a wall might carry load\n\n### Fork: Wall stays / might carry load\nOnly one\n- Wall stays \u2192 Ask the town\n- Might carry load \u2192 Ask the town\n\n### 4. Ask the town\nEnter: The structure is read\nExit: The town has been asked\nWhy: The town\u2019s answer controls the permit, not this spec.\n\n### Fork: Surface only / open the wall\nOnly one\n- Surface only \u2192 Rough\n- Open the wall \u2192 Rough\n\n### 5. Rough\nEnter: The town has been asked\nExit: Rough work is ready for inspection\nWhy: If the wall opens, rough work and the rough inspection happen before drywall.\nNext steps:\n- [ ] Rough work before drywall\n- [ ] The rough inspection before drywall\n- [ ] Cut the wall\n\nNext row\n\n### 6. Close and finish\nEnter: The room is ready to close\nExit: The finish is on\nWhy: Paint, flooring in the same place, casing, base, and a simple built-in.\nNext steps:\n- [ ] Paint\n- [ ] Flooring in the same place\n- [ ] Casing\n- [ ] Base\n- [ ] A simple built-in\n- [ ] Prime\n- [ ] Casing and crown\n- [ ] The hard floor\n- [ ] Plates and grilles\n\n### 7. Final\nEnter: The finish is on\nExit: The desk can move in\nWhy: If a permit was pulled, the final inspection is before the desk moves in.\nNext steps:\n- [ ] A built-in that sits on the subfloor goes in before the floor\n- [ ] One that sits on the finish floor goes in after\n- [ ] The final inspection is before the desk moves in\n";
+  return "";
+}
+
 let doorProposed = [];
 
 function hideDoorProposals() {
@@ -3898,11 +3930,17 @@ $("door-reject").addEventListener("click", () => {
 });
 
 async function readJobFile(rel) {
-  const data = await api("/api/file?path=" + encodeURIComponent(rel));
-  return {
-    markdown: typeof data.markdown === "string" ? data.markdown : "",
-    mtime: Number(data.mtime) || 0,
-  };
+  try {
+    const data = await api("/api/file?path=" + encodeURIComponent(rel));
+    return {
+      markdown: typeof data.markdown === "string" ? data.markdown : "",
+      mtime: Number(data.mtime) || 0,
+    };
+  } catch (err) {
+    const seed = familyRoomSeed(rel);
+    if (!seed || !isMissingFileError(err)) throw err;
+    return { markdown: seed, mtime: 0 };
+  }
 }
 
 async function writeJobFile(rel, markdown, mtime) {

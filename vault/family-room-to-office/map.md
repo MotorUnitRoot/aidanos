@@ -36,6 +36,10 @@ Only one
 Enter: The town has been asked
 Exit: Rough work is ready for inspection
 Why: If the wall opens, rough work and the rough inspection happen before drywall.
+Next steps:
+- [ ] Rough work before drywall
+- [ ] The rough inspection before drywall
+- [ ] Cut the wall
 
 Next row
 

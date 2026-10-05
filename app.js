@@ -2857,6 +2857,7 @@ $("paper").addEventListener("click", (e) => {
   lines[idx] = paperTaskSrc(hit[1], hit[2], !/x/i.test(hit[3]), hit[4]);
   dump.value = lines.join("\n");
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
+  if (isNoteDoc() && state.doc) state.doc.markdown = dump.value;
   scheduleSave();
   paintPaper();
   renderRail();
@@ -3523,6 +3524,14 @@ function familyAnswerMap(md) {
   return answers;
 }
 
+function townNotCalled(answer) {
+  const a = String(answer || "").trim();
+  if (!a) return true;
+  if (/\bnot called\b/i.test(a)) return true;
+  if (/\b(haven't|have not|didn't|did not|never)\b/i.test(a) && /\bcall/i.test(a)) return true;
+  return false;
+}
+
 function affirmsSleep(answer) {
   const a = String(answer || "").trim();
   if (!a) return false;
@@ -3550,7 +3559,7 @@ function familyRoomStops(answersMd, planMd) {
   if (affirmsSleep(answers[1])) stops.push(FAMILY_ROOM_STOPS[0]);
   const wall = String(answers[3] || "");
   if (/\b(load|bearing)\b/i.test(wall) || /\bmight carry\b/i.test(wall)) stops.push(FAMILY_ROOM_STOPS[1]);
-  if (!String(answers[8] || "").trim()) stops.push(FAMILY_ROOM_STOPS[2]);
+  if (townNotCalled(answers[8])) stops.push(FAMILY_ROOM_STOPS[2]);
   const blob = Object.keys(answers).map((k) => answers[k]).join("\n");
   const plugged = String(answers[5] || "");
   const trade = /\b(wiring|rewir|electrical|hvac|plumbing|asbestos|\blead\b|bearing wall)\b/i.test(blob)
@@ -3948,12 +3957,39 @@ async function standAnswers() {
   await openVaultNote("family-room-to-office/plan.md");
 }
 
-async function standDrawing() {
-  flushActiveLineToDump();
+function drawingChecksFromPaper() {
+  const marked = [];
+  const seen = {};
   const dump = $("dump");
-  const next = planMarkdownFromChecks(checksFromPlanMarkdown(dump ? dump.value : ""));
+  const dumpLines = dump ? dump.value.split("\n") : [];
+  for (const el of paperLines()) {
+    if (!el.classList || !el.classList.contains("task")) continue;
+    const idx = paperLines().indexOf(el);
+    const fromDump = dumpLines[idx] || "";
+    const fromSrc = el.getAttribute("data-src") || "";
+    const hit = matchPaperTask(fromDump) || matchPaperTask(fromSrc);
+    const on = el.classList.contains("done") || !!(hit && /x/i.test(hit[3]));
+    const label = hit ? String(hit[4] || "").trim() : lineBody(el).trim();
+    const key = label.toLowerCase();
+    if (!on || !label || seen[key]) continue;
+    seen[key] = true;
+    marked.push(label);
+  }
+  for (const label of checksFromPlanMarkdown(dump ? dump.value : "")) {
+    const key = label.toLowerCase();
+    if (seen[key]) continue;
+    seen[key] = true;
+    marked.push(label);
+  }
+  return marked;
+}
+
+async function standDrawing() {
+  const next = planMarkdownFromChecks(drawingChecksFromPaper());
+  const dump = $("dump");
   if (dump) dump.value = next;
   if (state.doc) state.doc.markdown = next;
+  paintPaper();
   state.dirty = true;
   await saveDay();
   const stops = await currentFamilyStops();

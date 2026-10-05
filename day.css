@@ -1124,6 +1124,19 @@ body.doc-stage .paper-wrap {
   margin: 1.15rem 0 0.4rem;
 }
 
+.job-actions[hidden],
+.job-picture[hidden],
+.job-season[hidden],
+#stage-actions[hidden] {
+  display: none !important;
+}
+
+body.doc-plan #job-actions,
+body.doc-map #job-actions,
+body.doc-capture #job-actions {
+  display: none !important;
+}
+
 .job-picture {
   margin: 0 0 1.15rem;
 }

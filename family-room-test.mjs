@@ -35,6 +35,7 @@ new Function(
     grab("mapCanvasRows", "paintStagePaper") +
     "\nsandbox.isWorkMapPath = isWorkMapPath;" +
     " sandbox.parseProcessMap = parseProcessMap;" +
+    " sandbox.stageNextStepLines = stageNextStepLines;" +
     " sandbox.familyRoomStops = familyRoomStops;" +
     " sandbox.linesToAddToday = linesToAddToday;" +
     " sandbox.planMarkdownFromChecks = planMarkdownFromChecks;" +
@@ -46,6 +47,7 @@ new Function(
 const {
   isWorkMapPath,
   parseProcessMap,
+  stageNextStepLines,
   familyRoomStops,
   linesToAddToday,
   planMarkdownFromChecks,
@@ -144,6 +146,19 @@ check("a stop blocks the next cut", () => {
   const quiet = familyRoomStops(answersMd, planMd);
   assert(quiet.some((s) => /building department/i.test(s)), "empty town answer is a stop");
   assert(!quiet.some((s) => /sleep there/i.test(s)), "blank sleep answer is not a stop");
+  const notCalled = answersMd.replace(
+    "8. What did the building department say?",
+    "8. What did the building department say? Not called yet"
+  );
+  const town = familyRoomStops(notCalled, planMd);
+  assert(town.some((s) => /building department/i.test(s)), "Not called yet is the town stop");
+  const rough = parseProcessMap(mapMd).stages.find((s) => s.title === "Rough");
+  const roughSteps = stageNextStepLines(rough);
+  assert(roughSteps.some((s) => /Cut the wall/.test(s)), "Rough has a cut to refuse");
+  assert(roughSteps.some((s) => /rough inspection/i.test(s)), "Rough has a step to add");
+  const added = linesToAddToday(roughSteps, town);
+  assert(!added.some((s) => /Cut the wall/i.test(s)), "cut stays off today: " + added.join(" | "));
+  assert(added.some((s) => /rough inspection/i.test(s)), "inspection still lands");
   const walk = placeStopsFirst("# From the doorway\n\nA chair.\n", stops);
   assert(walk.indexOf("Someone would sleep there. Stop.") < walk.indexOf("A chair."), "stop is first");
   const season = ensureFamilySeason("# Stay on the plan\n\n## Why\nThe week is already written.\n", stops);

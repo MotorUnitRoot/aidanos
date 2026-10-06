@@ -164,9 +164,14 @@ function paintWiki(escaped, showMarks) {
 function paintBold(escaped) {
   return String(escaped || "").replace(/\*\*([^*]+)\*\*/g, '<strong class="md-b">$1</strong>');
 }
+function paintMdLinks(escaped) {
+  return String(escaped || "").replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, href) => {
+    return '<a class="text-link" href="' + href + '" target="_blank" rel="noopener noreferrer">' + label + "</a>";
+  });
+}
 function paintInline(s) {
-  return paintWiki(paintBold(escapeHtml(s)
-    .replace(/@(\d{1,2}:\d{2})\b/g, '<span class="md-when">@$1</span>')), false);
+  const escaped = escapeHtml(s).replace(/@(\d{1,2}:\d{2})\b/g, '<span class="md-when">@$1</span>');
+  return paintWiki(paintBold(paintMdLinks(escaped)), false);
 }
 
 function indentPad(spaces) {
@@ -302,7 +307,7 @@ function joinBrokenHyphens(md) {
     let line = lines[i];
     while (i + 1 < lines.length) {
       const next = lines[i + 1];
-      if (line && /^-\S/.test(next)) {
+      if (line && /^-\S/.test(next) && !/^---\s*$/.test(next)) {
         line += next;
         i += 1;
         continue;
@@ -856,6 +861,10 @@ function syncTodayNav() {
 
 function notePaperTitle(doc) {
   const rel = String((doc && doc.path) || "").replace(/\\/g, "/");
+  if (/^projects\/[^/]+\/plan\.md$/i.test(rel) || /^maps\/the-.+\.md$/i.test(rel)) {
+    const h = String((doc && doc.markdown) || "").match(/^#\s+(.+)$/m);
+    if (h && String(h[1] || "").trim()) return String(h[1]).trim();
+  }
   return wikiNoteTitle(rel);
 }
 
@@ -987,6 +996,7 @@ function renderDay() {
   dump.value = cleanPaperMarkdown(dayMarkdown(d));
   paintPaper();
   renderRail();
+  syncAskLabel();
 }
 
 function renderRail() {
@@ -1919,15 +1929,40 @@ async function loadPlan() {
   } catch (e) {}
 }
 
+function askSubject() {
+  const doc = state.doc;
+  const path = doc && doc.path ? String(doc.path).replace(/\\/g, "/") : "";
+  if (isStepPath(path)) {
+    const h = String(doc.markdown || "").match(/^#\s+(.+)$/m);
+    return (h && String(h[1] || "").trim()) || notePaperTitle(doc);
+  }
+  if (isMapDoc() && state.mapStageId) {
+    const dump = $("dump");
+    const parsed = parseProcessMap(dump ? dump.value : String((doc && doc.markdown) || ""));
+    const stage = (parsed.stages || []).find((s) => s.id === state.mapStageId);
+    if (stage && String(stage.title || "").trim()) return String(stage.title).trim();
+  }
+  return "";
+}
+
+function syncAskLabel() {
+  const btn = $("ask-open");
+  if (!btn) return;
+  const span = btn.querySelector("span");
+  if (!span) return;
+  span.textContent = askSubject() ? "Ask about this" : "Ask or find";
+}
+
 function openAsk() {
   const modal = $("ask-modal");
   modal.classList.remove("hidden");
   modal.removeAttribute("hidden");
-  $("ask-q").value = "";
+  const subject = askSubject();
+  $("ask-q").value = subject;
   $("ask-hits").innerHTML = "";
   state.folderDir = "";
   $("ask-q").focus();
-  runAsk("");
+  runAsk(subject);
 }
 
 function closeAsk() {
@@ -2015,6 +2050,7 @@ function renderNote() {
     renderMap();
     renderRail();
     syncTodayNav();
+    syncAskLabel();
     return;
   }
   hideMapRoom();
@@ -2022,6 +2058,7 @@ function renderNote() {
   paintPaper();
   renderRail();
   syncTodayNav();
+  syncAskLabel();
 }
 
 async function openVaultNote(rel) {
@@ -2134,6 +2171,7 @@ function renderMap() {
     }
   }
   const stage = (parsed.stages || []).find((s) => s.id === state.mapStageId);
+  syncAskLabel();
   if (state.mapStageId && stage) {
     canvas.setAttribute("hidden", "");
     sheet.removeAttribute("hidden");
@@ -2253,11 +2291,28 @@ function paintStagePaper(stage) {
           box.setAttribute("aria-hidden", "true");
           const words = document.createElement("span");
           words.className = "words";
-          words.textContent = item.text;
+          const raw = String(item.text || "");
+          words.textContent = raw.replace(/\s*\[\[[^\]]+\]\]\s*/g, " ").replace(/\s+/g, " ").trim();
           btn.appendChild(box);
           btn.appendChild(words);
           btn.addEventListener("click", () => toggleMapLine(item.line));
           block.appendChild(btn);
+          const wikiRe = /\[\[([^\]]+)\]\]/g;
+          let wm;
+          while ((wm = wikiRe.exec(raw))) {
+            const name = String(wm[1] || "").trim();
+            if (!name) continue;
+            const link = document.createElement("button");
+            link.type = "button";
+            link.className = "text-link";
+            link.textContent = "Open the note";
+            link.addEventListener("click", (ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              openWiki(name);
+            });
+            block.appendChild(link);
+          }
         });
         return;
       }
@@ -2288,13 +2343,15 @@ function toggleMapLine(idx) {
   const lines = dump.value.split("\n");
   const n = Number(idx);
   if (!lines[n] || !/^\s*[-*+]\s+\[[ xX]\]/.test(lines[n])) return;
-  lines[n] = /\[[xX]\]/.test(lines[n])
-    ? lines[n].replace(/\[[xX]\]/, "[ ]")
-    : lines[n].replace(/\[ \]/, "[x]");
+  const turnedOn = !/\[[xX]\]/.test(lines[n]);
+  lines[n] = turnedOn
+    ? lines[n].replace(/\[ \]/, "[x]")
+    : lines[n].replace(/\[[xX]\]/, "[ ]");
   dump.value = lines.join("\n");
   if (state.doc) state.doc.markdown = dump.value;
   scheduleSave();
   renderMap();
+  if (turnedOn) void maybeCrystallize(taskLabel(lines[n]));
 }
 
 function openVaultPath(rel) {
@@ -2810,9 +2867,11 @@ $("paper").addEventListener("click", (e) => {
   lines[idx] = paperTaskSrc(hit[1], hit[2], !/x/i.test(hit[3]), hit[4]);
   dump.value = lines.join("\n");
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
+  if (isNoteDoc() && state.doc) state.doc.markdown = dump.value;
   scheduleSave();
   paintPaper();
   renderRail();
+  if (/\[x\]/i.test(lines[idx])) void afterTaskChecked(lines[idx]);
 });
 
 function selectionText() {
@@ -3420,6 +3479,330 @@ function appendDoorTasks(markdown, lines) {
   return existing + "\n\n" + block;
 }
 
+function projectTitle(intent) {
+  const t = String(intent || "").replace(/\s+/g, " ").trim().replace(/[.?!]+$/, "");
+  if (!t) return "Project";
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+function projectSlug(title) {
+  const stop = new Set("a an the my our your to for of and or have has had with into in on at from be is it this that do".split(" "));
+  const words = String(title || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .split(/\s+/)
+    .filter((w) => w && !stop.has(w));
+  const slug = words.slice(0, 4).join("-");
+  return slug || "project";
+}
+
+function stepSlug(title) {
+  return String(title || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "") || "step";
+}
+
+function stepStem(slug, stageTitle) {
+  return "the-" + slug + "-" + stepSlug(stageTitle);
+}
+
+function isProjectPlanPath(rel) {
+  return /^projects\/[^/]+\/plan\.md$/i.test(String(rel || "").replace(/\\/g, "/"));
+}
+
+function isStepPath(rel) {
+  return /^maps\/the-.+\.md$/i.test(String(rel || "").replace(/\\/g, "/"));
+}
+
+function interviewPhase(md) {
+  const lines = String(md || "").split("\n");
+  if (!/^---\s*$/.test(lines[0] || "")) return "";
+  for (let i = 1; i < lines.length; i++) {
+    if (/^---\s*$/.test(lines[i])) break;
+    const m = lines[i].match(/^interview:\s*([a-z]+)\b/i);
+    if (m) return String(m[1] || "").toLowerCase();
+  }
+  return "";
+}
+
+function interviewTitle(md) {
+  const m = String(md || "").match(/^#\s+(.+)$/m);
+  return m ? String(m[1] || "").trim() : "Project";
+}
+
+function sectionLines(md, name) {
+  const lines = String(md || "").split("\n");
+  const head = new RegExp("^##\\s+" + name + "\\s*$", "i");
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (head.test(lines[i])) {
+      start = i + 1;
+      break;
+    }
+  }
+  if (start < 0) return [];
+  const out = [];
+  for (let i = start; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) break;
+    out.push(lines[i]);
+  }
+  return out;
+}
+
+const MATERIALS_PROMPT = "I'll lay out a rough project plan and find something to learn from for each step. Videos, written materials, or both?";
+
+function sectionProse(md, name) {
+  return sectionLines(md, name)
+    .filter((line) => !/^\s*[-*+]\s+\[[ xX]\]\s+This is the answer\s*$/.test(line))
+    .filter((line) => line.trim() !== MATERIALS_PROMPT)
+    .join("\n")
+    .trim();
+}
+
+function gateTicked(md, name) {
+  return sectionLines(md, name).some((line) => /^\s*[-*+]\s+\[[xX]\]\s+This is the answer\s*$/.test(line));
+}
+
+function setGate(md, name, on) {
+  const lines = String(md || "").split("\n");
+  const head = new RegExp("^##\\s+" + name + "\\s*$", "i");
+  let inSec = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (head.test(lines[i])) {
+      inSec = true;
+      continue;
+    }
+    if (inSec && /^##\s+/.test(lines[i])) break;
+    if (inSec && /^\s*[-*+]\s+\[[ xX]\]\s+This is the answer\s*$/.test(lines[i])) {
+      lines[i] = "- [" + (on ? "x" : " ") + "] This is the answer";
+    }
+  }
+  return lines.join("\n");
+}
+
+function interviewExperienceMarkdown(title) {
+  const name = projectTitle(title);
+  return [
+    "---",
+    "interview: experience",
+    "---",
+    "",
+    "# " + name,
+    "",
+    "I don't think we've done this together. Where are you at?",
+    "",
+    "## Experience",
+    "",
+    "- [ ] This is the answer",
+    "",
+  ].join("\n");
+}
+
+function interviewMaterialsMarkdown(title, experience) {
+  const name = projectTitle(title);
+  return [
+    "---",
+    "interview: materials",
+    "---",
+    "",
+    "# " + name,
+    "",
+    "## Experience",
+    String(experience || "").trim(),
+    "",
+    "## Materials",
+    "",
+    MATERIALS_PROMPT,
+    "",
+    "- [ ] This is the answer",
+    "",
+  ].join("\n");
+}
+
+function advanceInterview(md) {
+  const phase = interviewPhase(md);
+  if (phase === "experience") {
+    if (!gateTicked(md, "Experience")) return null;
+    const prose = sectionProse(md, "Experience");
+    if (prose.length < 8) return { markdown: setGate(md, "Experience", false) };
+    return { markdown: interviewMaterialsMarkdown(interviewTitle(md), prose) };
+  }
+  if (phase === "materials") {
+    if (!gateTicked(md, "Materials")) return null;
+    const prose = sectionProse(md, "Materials");
+    if (prose.length < 3) return { markdown: setGate(md, "Materials", false) };
+    return {
+      build: true,
+      title: interviewTitle(md),
+      experience: sectionProse(md, "Experience"),
+      materials: prose,
+    };
+  }
+  return null;
+}
+
+function materialsPreference(text) {
+  const s = String(text || "").toLowerCase();
+  if (!s.trim()) return "";
+  const video = /\bvideo/.test(s);
+  const written = /\b(written|article|articles|read|reading|text)\b/.test(s);
+  if (/\bboth\b/.test(s) || (video && written)) return "both";
+  if (video) return "video";
+  if (written) return "written";
+  return "both";
+}
+
+function projectStages(title) {
+  const work = String(title || "this work").trim() || "this work";
+  return [
+    {
+      title: "See the place",
+      why: "Look before changing anything. The goal is " + work + ".",
+      enter: "The work is named",
+      exit: "The place and the goal are written down",
+    },
+    {
+      title: "Learn the skill",
+      why: "Each piece needs one way to do it before the tools come out.",
+      enter: "The next piece is named",
+      exit: "One way to do it is chosen",
+    },
+    {
+      title: "Do the work",
+      why: "The finish comes from the piece in front of you.",
+      enter: "A way is chosen",
+      exit: "That piece is done",
+    },
+    {
+      title: "Check the finish",
+      why: "Hold the work up to the goal you named.",
+      enter: "The pieces are done",
+      exit: "The work matches the goal",
+    },
+  ];
+}
+
+function clipWords(text, max) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1).trim() + "…";
+}
+
+function stepArticle(stage, experience) {
+  const said = clipWords(experience, 280);
+  const lead = said ? "You said: " + said : "This work is new.";
+  return lead + "\n\n" + String((stage && stage.why) || "").trim();
+}
+
+function searchUrl(kind, query) {
+  const q = encodeURIComponent(String(query || "").trim());
+  if (kind === "video") return "https://www.youtube.com/results?search_query=" + q;
+  return "https://www.google.com/search?q=" + q;
+}
+
+function stepFileMarkdown(stage, spec) {
+  const pref = spec.materials;
+  const query = stage.title + " " + spec.title;
+  const lines = ["# " + stage.title, ""];
+  if (pref === "video") lines.push(stage.why, "");
+  else lines.push(stepArticle(stage, spec.experience), "");
+  if (pref === "video" || pref === "both") {
+    lines.push("[A short video on this step](" + searchUrl("video", query) + ")", "");
+  }
+  lines.push("[See more materials](" + searchUrl("web", query) + ")", "");
+  lines.push("Ask about this step from the strip below.", "");
+  lines.push("Map: [[" + spec.slug + "]]", "");
+  return lines.join("\n");
+}
+
+function workspaceFiles(spec) {
+  // First loop: interview answers become a plan, a map, and one note per step.
+  const title = projectTitle(spec && spec.title);
+  const slug = projectSlug(title);
+  const experience = String((spec && spec.experience) || "").trim();
+  const pref = materialsPreference(spec && spec.materials) || "both";
+  const full = { title, slug, experience, materials: pref };
+  const stages = projectStages(title);
+  const taskLines = stages.map((s) => "- [ ] " + s.title + " [[" + slug + "]]");
+  const files = [];
+  for (const stage of stages) {
+    files.push({
+      path: "maps/" + stepStem(slug, stage.title) + ".md",
+      markdown: stepFileMarkdown(stage, full),
+    });
+  }
+  const map = ["# " + title, "", "## Why", title + ".", "", "## Stages", ""];
+  stages.forEach((stage, i) => {
+    const stem = stepStem(slug, stage.title);
+    map.push("### " + (i + 1) + ". " + stage.title);
+    map.push("Why: " + stage.why);
+    map.push("Enter: " + stage.enter);
+    map.push("Exit: " + stage.exit);
+    map.push("Next steps:");
+    map.push("- [ ] Open the note [[" + stem + "]]");
+    map.push("");
+  });
+  map.push("## Next steps");
+  taskLines.forEach((line) => map.push(line));
+  map.push("", "## Waiting", "- A clearer picture, once the place has been walked", "", "## Last-mile");
+  stages.forEach((stage) => map.push("[[" + stepStem(slug, stage.title) + "]]"));
+  map.push("");
+  files.push({ path: "maps/" + slug + ".md", markdown: map.join("\n") });
+  const plan = [
+    "---",
+    "materials: " + pref,
+    "---",
+    "",
+    "# " + title,
+    "",
+    "## Why",
+    title + ".",
+    "",
+    "## Experience",
+    experience,
+    "",
+    "## Next steps",
+  ];
+  taskLines.forEach((line) => plan.push(line));
+  plan.push("", "## Waiting", "- A clearer picture, once the place has been walked", "");
+  files.push({ path: "projects/" + slug + "/plan.md", markdown: plan.join("\n") });
+  return files;
+}
+
+function doneTaskKey(line) {
+  const m = String(line || "").match(/^\s*[-*+]\s+\[[xX]\]\s+(.*)$/);
+  if (!m) return "";
+  return m[1].replace(/\s*\[\[[^\]]*\]\]\s*/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function taskLabel(line) {
+  const m = String(line || "").match(/^\s*[-*+]\s+\[[ xX]\]\s+(.*)$/);
+  if (!m) return "";
+  return m[1].replace(/\s*\[\[[^\]]*\]\]\s*/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function stableStepPaths(key, hits) {
+  const want = String(key || "").trim().toLowerCase();
+  if (!want || want === "this is the answer") return [];
+  const paths = new Set();
+  for (const h of hits || []) {
+    if (doneTaskKey(h && h.text) !== want) continue;
+    const p = String((h && h.path) || "").replace(/\\/g, "/");
+    if (p) paths.add(p);
+  }
+  return [...paths];
+}
+
+function crystallizePath(slug, label) {
+  return "projects/" + (slug || "repeat") + "/repeat-" + stepSlug(label) + ".md";
+}
+
+function crystallizeMarkdown(label) {
+  const title = String(label || "").trim() || "This step";
+  return "# " + title + "\n\nThis step has been done twice. The same check is the work now.\n\n## Next steps\n- [ ] " + title + "\n";
+}
+
 let doorProposed = [];
 
 function hideDoorProposals() {
@@ -3473,6 +3856,122 @@ document.querySelectorAll("a[href='#plan']").forEach((a) => {
     openPlanNote().catch((err) => setStatus(String(err && err.message || err), "error"));
   });
 });
+async function putVaultFile(path, markdown, mtime) {
+  const res = await fetch("/api/file?path=" + encodeURIComponent(path), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, paper: markdown, markdown, mtime: mtime || 0 }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || res.statusText);
+  }
+  return res.json().catch(() => ({}));
+}
+
+async function openProjectInterview(intent) {
+  const title = projectTitle(intent);
+  const path = "projects/" + projectSlug(title) + "/plan.md";
+  let existing = null;
+  try {
+    existing = await api("/api/file?path=" + encodeURIComponent(path));
+  } catch (e) {
+    existing = null;
+  }
+  if (!existing) {
+    try {
+      await putVaultFile(path, interviewExperienceMarkdown(title), 0);
+    } catch (e) {
+      setStatus(String(e && e.message || e), "error");
+      return;
+    }
+  }
+  await openVaultNote(path);
+}
+
+async function buildWorkspace(spec) {
+  clearTimeout(state.saveTimer);
+  state.saveTimer = null;
+  try { await saveDay(); } catch (e) {}
+  const files = workspaceFiles(spec);
+  const planFile = files.find((f) => /\/plan\.md$/i.test(f.path));
+  const dump = $("dump");
+  if (dump && planFile) dump.value = planFile.markdown;
+  if (state.doc && planFile) {
+    state.doc.markdown = planFile.markdown;
+    if ($("paper-title")) $("paper-title").textContent = notePaperTitle(state.doc);
+  }
+  paintPaper();
+  try {
+    for (const file of files) {
+      const mtime = state.doc && file.path === state.doc.path ? (Number(state.doc.mtime) || 0) : 0;
+      const out = await putVaultFile(file.path, file.markdown, mtime);
+      if (state.doc && file.path === state.doc.path && out && out.mtime != null) {
+        state.doc.mtime = Number(out.mtime) || 0;
+      }
+    }
+    const map = files.find((f) => /^maps\/[^/]+\.md$/i.test(f.path) && !/^maps\/the-/i.test(f.path));
+    if (map) await applyStepsToToday(mapNextStepLines(map.markdown), todayIso());
+    state.dirty = false;
+    syncAskLabel();
+    setStatus("Saved", "saved");
+  } catch (e) {
+    setStatus(String(e && e.message || e), "error");
+  }
+}
+
+async function afterTaskChecked(line) {
+  const path = isNoteDoc() && state.doc ? String(state.doc.path || "") : "";
+  if (isProjectPlanPath(path)) {
+    const dump = $("dump");
+    const next = advanceInterview(dump ? dump.value : "");
+    if (next && next.build) {
+      await buildWorkspace(next);
+      return;
+    }
+    if (next && next.markdown) {
+      if (dump) dump.value = next.markdown;
+      if (state.doc) state.doc.markdown = next.markdown;
+      if ($("paper-title") && state.doc) $("paper-title").textContent = notePaperTitle(state.doc);
+      scheduleSave();
+      paintPaper();
+      return;
+    }
+  }
+  const label = taskLabel(line);
+  if (label) await maybeCrystallize(label);
+}
+
+async function maybeCrystallize(label) {
+  // Second loop: a deterministic note only after the same step is done in two vault files.
+  const key = doneTaskKey("- [x] " + label);
+  if (!key) return;
+  try { await saveDay(); } catch (e) {}
+  let data;
+  try {
+    data = await api("/api/search?q=" + encodeURIComponent(label));
+  } catch (e) {
+    return;
+  }
+  const paths = stableStepPaths(key, (data && data.hits) || []);
+  if (paths.length < 2) return;
+  let slug = "repeat";
+  for (const p of paths) {
+    const map = String(p).match(/^maps\/(?!the-)([^/]+)\.md$/i);
+    if (map) { slug = map[1]; break; }
+    const proj = String(p).match(/^projects\/([^/]+)\//);
+    if (proj) { slug = proj[1]; break; }
+  }
+  const path = crystallizePath(slug, label);
+  try {
+    await api("/api/file?path=" + encodeURIComponent(path));
+    return;
+  } catch (e) {}
+  try {
+    await putVaultFile(path, crystallizeMarkdown(label), 0);
+  } catch (e) {}
+}
+
 $("door-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const input = $("door-input");
@@ -3489,14 +3988,9 @@ $("door-form").addEventListener("submit", async (e) => {
     goToday();
     return;
   }
-  const lines = proposeDoorLines(raw);
-  if (lines.length) {
-    paintDoorProposals(lines);
-    return;
-  }
   if (input) input.value = "";
   hideDoorProposals();
-  goToday();
+  await openProjectInterview(raw);
 });
 
 async function openPlanNote() {

@@ -96,14 +96,15 @@ check("helper never says horse or Mark", () => {
   assert(!/\bhorse\b/i.test(helperSrc) && !/\bMark\b/.test(helperSrc), "proposeDoorLines source");
 });
 
-check("submit-with-text proposes and does not write", () => {
+check("submit-with-text opens a project paper and does not propose", () => {
   const submit = doorBlock(
     '$("door-form").addEventListener("submit"',
     "async function openPlanNote("
   );
   assert(submit.includes("e.preventDefault()"), "preventDefault");
-  assert(submit.includes("proposeDoorLines("), "submit proposes");
-  assert(submit.includes("paintDoorProposals("), "paints proposals");
+  assert(submit.includes("openProjectInterview("), "unknown work opens a project paper");
+  assert(!submit.includes("proposeDoorLines("), "unknown work is not a sentence split");
+  assert(!submit.includes("paintDoorProposals("), "unknown work does not paint proposals");
   assert(!submit.includes("saveDay"), "submit must not saveDay");
   assert(!submit.includes("openDay"), "submit must not openDay");
   assert(!/\/api\/day/.test(submit), "submit must not hit /api/day");
@@ -111,11 +112,9 @@ check("submit-with-text proposes and does not write", () => {
   assert(!submit.includes("applyDoorPending"), "applyDoorPending stays dead");
   assert(!/sessionStorage/.test(submit), "no sessionStorage dump inject");
   assert(!/dump\.value/.test(submit), "must not append to dump");
-  const withText = submit.match(/if \(lines\.length\) \{[\s\S]*?return;\s*\}/);
-  assert(withText, "with-text branch");
-  assert(withText[0].includes("paintDoorProposals("), "with-text paints");
-  assert(!withText[0].includes("goToday"), "with-text does not goToday");
-  assert(!withText[0].includes("saveDay"), "with-text does not saveDay");
+  assert(submit.indexOf("landDoorQueryOnToday") < submit.indexOf("openProjectInterview"), "known map before a new project");
+  const unknown = submit.slice(submit.indexOf("openProjectInterview"));
+  assert(!unknown.includes("goToday"), "unknown work does not goToday");
   assert(submit.includes("goToday()"), "empty Enter still goToday");
   assert(submit.includes("hideDoorProposals()"), "empty Enter hides proposals");
 });

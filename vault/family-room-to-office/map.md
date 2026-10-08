@@ -48,21 +48,17 @@ Enter: The room is ready to close
 Exit: The finish is on
 Why: Paint, flooring in the same place, casing, base, and a simple built-in.
 Next steps:
-- [ ] Paint
-- [ ] Flooring in the same place
-- [ ] Casing
-- [ ] Base
-- [ ] A simple built-in
 - [ ] Prime
 - [ ] Casing and crown
 - [ ] The hard floor
+- [ ] Base
 - [ ] Plates and grilles
+- [ ] Paint
+- [ ] A simple built-in
 
 ### 7. Final
 Enter: The finish is on
 Exit: The desk can move in
-Why: If a permit was pulled, the final inspection is before the desk moves in.
+Why: A built-in that sits on the subfloor goes in before the floor. One that sits on the finish floor goes in after. If a permit was pulled, the final inspection is before the desk moves in.
 Next steps:
-- [ ] A built-in that sits on the subfloor goes in before the floor
-- [ ] One that sits on the finish floor goes in after
 - [ ] The final inspection is before the desk moves in

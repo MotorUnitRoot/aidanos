@@ -25,3 +25,5 @@ Paint, flooring in the same place, casing, base, and a simple built-in.
 The town’s answer.
 
 ## Before you cut
+
+[[Map]] [[Drawing]]

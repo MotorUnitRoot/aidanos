@@ -1122,6 +1122,16 @@ body.doc-stage .paper-wrap {
   align-items: center;
   gap: 0.85rem 1.25rem;
   margin: 1.15rem 0 0.4rem;
+  position: relative;
+  z-index: 2;
+  flex: 0 0 auto;
+}
+
+/* Questions, the drawing, and the walk share Today's paper.
+   min-height: 18rem lets that flex item shrink under its text,
+   and the spilled lines cover These answers stand. */
+body.doc-note:not(.doc-map):not(.doc-capture):not(.doc-plan) .paper {
+  flex: 0 0 auto;
 }
 
 .job-actions[hidden],

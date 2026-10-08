@@ -3646,6 +3646,9 @@ function ensureFamilySeason(md, stops) {
   for (const stop of list) {
     if (!body.includes(stop)) body = body.replace(/\s*$/, "\n") + stop + "\n";
   }
+  const links = "[[Map]] [[Drawing]]";
+  body = body.split("\n").filter((line) => line.trim() !== links).join("\n");
+  body = body.replace(/\s*$/, "\n") + links + "\n";
   return (head + "## Before you cut\n" + body.replace(/^\n/, "") + after).replace(/\n{3,}/g, "\n\n");
 }
 
@@ -3674,7 +3677,7 @@ function familyRoomSeed(rel) {
   if (p === "family-room-to-office/plan.md") return planMarkdownFromChecks([]);
   if (p === "family-room-to-office/walk.md") return "# From the doorway\n";
   if (p === "family-room-to-office/today.md") return "# Today\n";
-  if (p === "family-room-to-office/map.md") return "# Family room to office\n\n## Why\nA finished family room that stays living space.\n\n## Stages\n\n### 1. See the room\nEnter: You are in the doorway\nExit: The room is the one on the drawing\n\n### 2. Name the use\nEnter: The room is named\nExit: It stays living space\n\n### 3. Read the structure\nEnter: The walls are in front of you\nExit: You know whether a wall might carry load\n\n### Fork: Wall stays / might carry load\nOnly one\n- Wall stays \u2192 Ask the town\n- Might carry load \u2192 Ask the town\n\n### 4. Ask the town\nEnter: The structure is read\nExit: The town has been asked\nWhy: The town\u2019s answer controls the permit, not this spec.\n\n### Fork: Surface only / open the wall\nOnly one\n- Surface only \u2192 Rough\n- Open the wall \u2192 Rough\n\n### 5. Rough\nEnter: The town has been asked\nExit: Rough work is ready for inspection\nWhy: If the wall opens, rough work and the rough inspection happen before drywall.\nNext steps:\n- [ ] Rough work before drywall\n- [ ] The rough inspection before drywall\n- [ ] Cut the wall\n\nNext row\n\n### 6. Close and finish\nEnter: The room is ready to close\nExit: The finish is on\nWhy: Paint, flooring in the same place, casing, base, and a simple built-in.\nNext steps:\n- [ ] Paint\n- [ ] Flooring in the same place\n- [ ] Casing\n- [ ] Base\n- [ ] A simple built-in\n- [ ] Prime\n- [ ] Casing and crown\n- [ ] The hard floor\n- [ ] Plates and grilles\n\n### 7. Final\nEnter: The finish is on\nExit: The desk can move in\nWhy: If a permit was pulled, the final inspection is before the desk moves in.\nNext steps:\n- [ ] A built-in that sits on the subfloor goes in before the floor\n- [ ] One that sits on the finish floor goes in after\n- [ ] The final inspection is before the desk moves in\n";
+  if (p === "family-room-to-office/map.md") return "# Family room to office\n\n## Why\nA finished family room that stays living space.\n\n## Stages\n\n### 1. See the room\nEnter: You are in the doorway\nExit: The room is the one on the drawing\n\n### 2. Name the use\nEnter: The room is named\nExit: It stays living space\n\n### 3. Read the structure\nEnter: The walls are in front of you\nExit: You know whether a wall might carry load\n\n### Fork: Wall stays / might carry load\nOnly one\n- Wall stays \u2192 Ask the town\n- Might carry load \u2192 Ask the town\n\n### 4. Ask the town\nEnter: The structure is read\nExit: The town has been asked\nWhy: The town\u2019s answer controls the permit, not this spec.\n\n### Fork: Surface only / open the wall\nOnly one\n- Surface only \u2192 Rough\n- Open the wall \u2192 Rough\n\n### 5. Rough\nEnter: The town has been asked\nExit: Rough work is ready for inspection\nWhy: If the wall opens, rough work and the rough inspection happen before drywall.\nNext steps:\n- [ ] Rough work before drywall\n- [ ] The rough inspection before drywall\n- [ ] Cut the wall\n\nNext row\n\n### 6. Close and finish\nEnter: The room is ready to close\nExit: The finish is on\nWhy: Paint, flooring in the same place, casing, base, and a simple built-in.\nNext steps:\n- [ ] Prime\n- [ ] Casing and crown\n- [ ] The hard floor\n- [ ] Base\n- [ ] Plates and grilles\n- [ ] Paint\n- [ ] A simple built-in\n\n### 7. Final\nEnter: The finish is on\nExit: The desk can move in\nWhy: A built-in that sits on the subfloor goes in before the floor. One that sits on the finish floor goes in after. If a permit was pulled, the final inspection is before the desk moves in.\nNext steps:\n- [ ] The final inspection is before the desk moves in\n";
   return "";
 }
 
@@ -4191,7 +4194,7 @@ async function paintJobSeason() {
       host.appendChild(h);
       const p = document.createElement("p");
       p.className = "stage-why";
-      p.textContent = body;
+      p.textContent = body.split("\n").filter((line) => line.trim() !== "[[Map]] [[Drawing]]").join("\n").trim();
       host.appendChild(p);
     }
     const links = document.createElement("p");

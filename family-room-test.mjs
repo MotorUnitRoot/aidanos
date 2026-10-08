@@ -183,6 +183,21 @@ check("a stop blocks the next cut", () => {
   assert(season.includes("# Stay on the plan"), "season title stays");
   assert(season.includes("## Before you cut"), "before you cut");
   assert(season.includes("Someone would sleep there. Stop."), "stop in the season file");
+  const cutAt = season.indexOf("## Before you cut");
+  const linkAt = season.indexOf("[[Map]] [[Drawing]]");
+  assert(linkAt > cutAt, "map and drawing links sit under Before you cut");
+  assert(season.indexOf("Someone would sleep there. Stop.") < linkAt, "the stop stays ahead of the links");
+  const finish = parseProcessMap(mapMd).stages.find((s) => s.title === "Close and finish");
+  const finishSteps = stageNextStepLines(finish).map((s) => s.replace(/^- \[ \] /, ""));
+  assert(finishSteps.join(" | ") === "Prime | Casing and crown | The hard floor | Base | Plates and grilles | Paint | A simple built-in", finishSteps.join(" | "));
+  assert(finishSteps.filter((s) => /casing/i.test(s)).length === 1, "casing once");
+  const finalStage = parseProcessMap(mapMd).stages.find((s) => s.title === "Final");
+  const finalSteps = stageNextStepLines(finalStage);
+  assert(finalSteps.length === 1 && /final inspection/i.test(finalSteps[0]), finalSteps.join(" | "));
+  assert(/subfloor/.test(finalStage.why) && /finish floor/.test(finalStage.why), "built-in placement stays in the why");
+  const seeded = parseProcessMap(familyRoomSeed("family-room-to-office/map.md"));
+  const seededFinish = stageNextStepLines(seeded.stages.find((s) => s.title === "Close and finish")).map((s) => s.replace(/^- \[ \] /, ""));
+  assert(seededFinish.join(" | ") === finishSteps.join(" | "), "fresh vault seed matches the map");
 });
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";

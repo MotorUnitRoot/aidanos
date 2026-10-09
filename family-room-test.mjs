@@ -201,9 +201,16 @@ check("a stop blocks the next cut", () => {
   const noteStart = src.indexOf("function renderNote(");
   const noteEnd = src.indexOf("async function openVaultNote(", noteStart);
   const note = src.slice(noteStart, noteEnd);
-  assert(note.includes('path === "family-room-to-office/plan.md"'), "drawing is named in renderNote");
-  assert(/drawing \? formatPaperTitle\(/.test(note), "day title stays beside the arrows");
-  assert(/drawing \? formatRailDate\(/.test(note), "week rail keeps the day");
+  assert(note.includes("jobNoteUsesDayChrome(path)"), "job papers keep the day beside the arrows");
+  assert(/jobDay \? formatPaperTitle\(/.test(note), "day title stays beside the arrows");
+  assert(/jobDay \? formatRailDate\(/.test(note), "week rail keeps the day");
+  assert(!note.includes("writeJobFile") && !/vault\/log|log\//.test(note), "the day title is not written into the day file");
+  const chromeStart = src.indexOf("function jobNoteUsesDayChrome(");
+  const chrome = src.slice(chromeStart, src.indexOf("function notePaperTitle(", chromeStart));
+  assert(chrome.includes("family-room-to-office/answers.md"), "questions use the day chrome");
+  assert(chrome.includes("family-room-to-office/plan.md"), "drawing uses the day chrome");
+  assert(chrome.includes("family-room-to-office/walk.md"), "walk uses the day chrome");
+  assert(chrome.includes("family-room-to-office/today.md"), "today note uses the day chrome");
   assert(planMarkdownFromChecks([]).startsWith("# The room as it is\n"), "the paper keeps the one heading");
 });
 

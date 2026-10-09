@@ -859,6 +859,14 @@ function syncTodayNav() {
   });
 }
 
+function jobNoteUsesDayChrome(path) {
+  const p = String(path || "").replace(/\\/g, "/");
+  return p === "family-room-to-office/answers.md"
+    || p === "family-room-to-office/plan.md"
+    || p === "family-room-to-office/walk.md"
+    || p === "family-room-to-office/today.md";
+}
+
 function notePaperTitle(doc) {
   const rel = String((doc && doc.path) || "").replace(/\\/g, "/");
   if (rel === "family-room-to-office/answers.md") return FAMILY_ROOM_SENTENCE;
@@ -2016,10 +2024,10 @@ function renderNote() {
   document.body.classList.toggle("doc-map", isWorkMapPath(path));
   document.body.classList.toggle("doc-stage", isWorkMapPath(path) && !!state.mapStageId);
   const title = path === "aidanos/active-horse.md" ? "Plan" : notePaperTitle(doc);
-  const drawing = path === "family-room-to-office/plan.md";
   const day = state.selectedDate || todayIso();
-  if ($("paper-title")) $("paper-title").textContent = drawing ? formatPaperTitle(day) : title;
-  if ($("rail-date")) $("rail-date").textContent = drawing ? formatRailDate(day) : title;
+  const jobDay = jobNoteUsesDayChrome(path);
+  if ($("paper-title")) $("paper-title").textContent = jobDay ? formatPaperTitle(day) : title;
+  if ($("rail-date")) $("rail-date").textContent = jobDay ? formatRailDate(day) : title;
   const dump = $("dump");
   const md = cleanPaperMarkdown(doc.markdown || "");
   if (dump) dump.value = md;

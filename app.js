@@ -2012,8 +2012,10 @@ function renderNote() {
   document.body.classList.toggle("doc-map", isWorkMapPath(path));
   document.body.classList.toggle("doc-stage", isWorkMapPath(path) && !!state.mapStageId);
   const title = path === "aidanos/active-horse.md" ? "Plan" : notePaperTitle(doc);
-  if ($("paper-title")) $("paper-title").textContent = title;
-  if ($("rail-date")) $("rail-date").textContent = title;
+  const drawing = path === "family-room-to-office/plan.md";
+  const day = state.selectedDate || todayIso();
+  if ($("paper-title")) $("paper-title").textContent = drawing ? formatPaperTitle(day) : title;
+  if ($("rail-date")) $("rail-date").textContent = drawing ? formatRailDate(day) : title;
   const dump = $("dump");
   const md = cleanPaperMarkdown(doc.markdown || "");
   if (dump) dump.value = md;

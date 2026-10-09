@@ -198,6 +198,13 @@ check("a stop blocks the next cut", () => {
   const seeded = parseProcessMap(familyRoomSeed("family-room-to-office/map.md"));
   const seededFinish = stageNextStepLines(seeded.stages.find((s) => s.title === "Close and finish")).map((s) => s.replace(/^- \[ \] /, ""));
   assert(seededFinish.join(" | ") === finishSteps.join(" | "), "fresh vault seed matches the map");
+  const noteStart = src.indexOf("function renderNote(");
+  const noteEnd = src.indexOf("async function openVaultNote(", noteStart);
+  const note = src.slice(noteStart, noteEnd);
+  assert(note.includes('path === "family-room-to-office/plan.md"'), "drawing is named in renderNote");
+  assert(/drawing \? formatPaperTitle\(/.test(note), "day title stays beside the arrows");
+  assert(/drawing \? formatRailDate\(/.test(note), "week rail keeps the day");
+  assert(planMarkdownFromChecks([]).startsWith("# The room as it is\n"), "the paper keeps the one heading");
 });
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";

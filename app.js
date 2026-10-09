@@ -645,11 +645,13 @@ function paintPaper() {
   const paper = $("paper");
   const dump = $("dump");
   if (!paper || !dump) return;
+  parkJobPicture();
   painting = true;
   paper.innerHTML = formatPaper(dump.value);
   syncPaperEmptyClass();
   state.activeLine = -1;
   painting = false;
+  placeJobPicture();
 }
 
 function paintPaperAt(activeIndex, caretInLine) {
@@ -658,6 +660,7 @@ function paintPaperAt(activeIndex, caretInLine) {
   if (!paper || !dump) return;
   keepPaperFocus = true;
   const gen = ++keepPaperFocusGen;
+  parkJobPicture();
   painting = true;
   paper.innerHTML = formatPaper(dump.value, activeIndex);
   syncPaperEmptyClass();
@@ -670,6 +673,7 @@ function paintPaperAt(activeIndex, caretInLine) {
     rememberPaperCaret(activeIndex, pos);
   }
   painting = false;
+  placeJobPicture();
   setTimeout(() => { if (gen === keepPaperFocusGen) keepPaperFocus = false; }, 0);
 }
 
@@ -4110,6 +4114,7 @@ function syncJobChrome() {
     if (picture) {
       picture.setAttribute("hidden", "");
       picture.innerHTML = "";
+      parkJobPicture();
     }
     return;
   }
@@ -4121,6 +4126,7 @@ function syncJobChrome() {
   else {
     picture.setAttribute("hidden", "");
     picture.innerHTML = "";
+    parkJobPicture();
   }
 }
 
@@ -4141,15 +4147,41 @@ async function paintJobPicture(rel) {
     picture.innerHTML = "";
     picture.appendChild(img);
     picture.removeAttribute("hidden");
+    placeJobPicture();
   };
   img.onerror = () => {
     if (gen !== paintJobPicture.gen) return;
     picture.innerHTML = "";
     picture.setAttribute("hidden", "");
+    parkJobPicture();
   };
   img.src = jobPictureUrl(rel);
 }
 paintJobPicture.gen = 0;
+
+function parkJobPicture() {
+  const picture = $("job-picture");
+  const paper = $("paper");
+  const wrap = $("dump-wrap");
+  if (!picture || !paper || !wrap) return;
+  if (picture.parentElement !== wrap) wrap.insertBefore(picture, paper);
+}
+
+function placeJobPicture() {
+  const picture = $("job-picture");
+  const paper = $("paper");
+  if (!picture || !paper) return;
+  if (picture.hasAttribute("hidden") || !picture.querySelector("img")) {
+    parkJobPicture();
+    return;
+  }
+  const heading = paper.querySelector(".md-line.h1");
+  if (!heading) {
+    parkJobPicture();
+    return;
+  }
+  if (heading.nextSibling !== picture) heading.after(picture);
+}
 
 function seasonSection(md, name) {
   const lines = String(md || "").replace(/\r\n/g, "\n").split("\n");

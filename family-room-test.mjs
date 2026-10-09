@@ -231,6 +231,23 @@ check("the picture is painted from the file url", () => {
   assert(!/img-src[^"]*blob:/.test(fs.readFileSync(path.join(root, "server.mjs"), "utf8")), "csp is not loosened");
 });
 
+check("the picture sits under the heading at the paper width", () => {
+  const css = fs.readFileSync(path.join(root, "day.css"), "utf8");
+  const block = css.slice(css.indexOf(".job-picture {"), css.indexOf(".job-season {"));
+  assert(block.includes("width: 100%"), "picture uses the paper width");
+  assert(block.includes("border: 0"), "no frame");
+  assert(block.includes("box-shadow: none"), "no card");
+  assert(block.includes("background: transparent"), "no card fill");
+  const place = src.slice(src.indexOf("function placeJobPicture("), src.indexOf("function seasonSection("));
+  assert(place.includes('paper.querySelector(".md-line.h1")'), "under the heading");
+  assert(place.includes("heading.after(picture)"), "checkboxes stay below the picture");
+  const painted = src.slice(src.indexOf("function paintPaper()"), src.indexOf("function paintPaperAt("));
+  assert(painted.includes("parkJobPicture()"), "a repaint does not drop the picture");
+  assert(painted.includes("placeJobPicture()"), "a repaint puts the picture back under the heading");
+  const hidden = css.slice(css.indexOf(".job-picture[hidden]"), css.indexOf(".job-picture {"));
+  assert(hidden.includes("display: none"), "no picture leaves no gap");
+});
+
 async function pngRoundTrip() {
   const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-room-"));
   fs.mkdirSync(path.join(vault, "family-room-to-office"), { recursive: true });

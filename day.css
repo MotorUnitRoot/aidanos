@@ -1148,13 +1148,22 @@ body.doc-capture #job-actions {
 }
 
 .job-picture {
-  margin: 0 0 1.15rem;
+  margin: 0.35rem 0 0.85rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  width: 100%;
 }
 
 .job-picture img {
   display: block;
+  width: 100%;
   max-width: 100%;
   height: auto;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .job-season {

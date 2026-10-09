@@ -4435,9 +4435,19 @@ document.addEventListener("visibilitychange", () => {
     btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
     btn.textContent = collapsed ? "Timeline" : "Hide timeline";
   }
-  if (window.matchMedia("(max-width: 720px)").matches) sync(true);
+  const narrow = window.matchMedia("(max-width: 720px)");
+  let handCollapsed = null;
+  if (narrow.matches) sync(true);
+  narrow.addEventListener("change", (event) => {
+    if (event.matches) {
+      sync(true);
+      return;
+    }
+    sync(handCollapsed === null ? false : handCollapsed);
+  });
   btn.addEventListener("click", () => {
-    sync(!room.classList.contains("rail-collapsed"));
+    handCollapsed = !room.classList.contains("rail-collapsed");
+    sync(handCollapsed);
   });
 })();
 

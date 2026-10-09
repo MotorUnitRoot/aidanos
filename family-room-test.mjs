@@ -209,6 +209,28 @@ check("a stop blocks the next cut", () => {
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
+check("a drop on the paper uploads the picture", () => {
+  const start = src.indexOf('$("paper").addEventListener("drop"');
+  const end = src.indexOf('document.addEventListener("selectionchange"', start);
+  const paperDrop = src.slice(start, end);
+  assert(paperDrop.includes("saveJobPicture"), paperDrop.slice(0, 240));
+  assert(paperDrop.includes("jobPictureRel()"), "paper drop only uploads on the drawing and the walk");
+  const save = src.slice(src.indexOf("function saveJobPicture("), src.indexOf("const paperWrap"));
+  assert(save.includes("family-room-to-office/plan.png") || src.includes('return "family-room-to-office/plan.png"'), "drawing drop writes plan.png");
+  assert(src.includes('return "family-room-to-office/walk.png"'), "walk drop writes walk.png");
+});
+
+check("the picture is painted from the file url", () => {
+  const urlFn = src.slice(src.indexOf("function jobPictureUrl("), src.indexOf("async function paintJobPicture("));
+  const start = src.indexOf("async function paintJobPicture(");
+  const end = src.indexOf("function seasonSection(", start);
+  const paint = src.slice(start, end);
+  assert(urlFn.includes('"/api/file?path="'), "same-origin file url");
+  assert(paint.includes("jobPictureUrl(rel)"), "picture uses that url");
+  assert(!paint.includes("createObjectURL"), "no blob url");
+  assert(!/img-src[^"]*blob:/.test(fs.readFileSync(path.join(root, "server.mjs"), "utf8")), "csp is not loosened");
+});
+
 async function pngRoundTrip() {
   const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-room-"));
   fs.mkdirSync(path.join(vault, "family-room-to-office"), { recursive: true });
@@ -272,6 +294,74 @@ async function pngRoundTrip() {
 }
 
 await check("png stays inside the job folder", pngRoundTrip);
+
+async function pngSymlinkStaysInJob() {
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-room-"));
+  const job = path.join(vault, "family-room-to-office");
+  const logDir = path.join(vault, "log");
+  fs.mkdirSync(job, { recursive: true });
+  fs.mkdirSync(logDir, { recursive: true });
+  const day = path.join(logDir, "2026-10-09.md");
+  fs.writeFileSync(day, "SECRET_DAY_NOTE\n");
+  const port = 20600 + Math.floor(Math.random() * 2000);
+  const child = spawn(process.execPath, ["server.mjs"], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      AIDANOS_HOST: "127.0.0.1",
+      AIDANOS_VAULT: vault,
+      AIDANOS_VAULT_GIT_URL: "",
+      AIDANOS_VAULT_GIT_TOKEN: "",
+      GITHUB_TOKEN: "",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const base = "http://127.0.0.1:" + port;
+  const putPng = (rel) => fetch(base + "/api/file?path=" + encodeURIComponent(rel), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ png: PNG }),
+  });
+  try {
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      if (child.exitCode != null) throw new Error("server exited");
+      try {
+        const res = await fetch(base + "/api/health");
+        if (res.ok) break;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    const walkPut = await putPng("family-room-to-office/walk.png");
+    assert(walkPut.ok, "walk.png in the real folder");
+    fs.unlinkSync(path.join(job, "walk.png"));
+    fs.symlinkSync(day, path.join(job, "walk.png"));
+    const leaked = await fetch(base + "/api/file?path=" + encodeURIComponent("family-room-to-office/walk.png"));
+    const leakedBody = Buffer.from(await leaked.arrayBuffer());
+    assert(leaked.status === 400, "symlink read got " + leaked.status);
+    assert(!leakedBody.includes("SECRET_DAY_NOTE"), "symlink must not return the day note");
+    const overwrite = await putPng("family-room-to-office/walk.png");
+    assert(overwrite.status === 400, "symlink write got " + overwrite.status);
+    assert(fs.readFileSync(day, "utf8") === "SECRET_DAY_NOTE\n", "day note stays");
+    assert(fs.lstatSync(path.join(job, "walk.png")).isSymbolicLink(), "write does not replace the symlink");
+    fs.rmSync(job, { recursive: true, force: true });
+    fs.symlinkSync(logDir, job);
+    const escaped = await putPng("family-room-to-office/plan.png");
+    assert(escaped.status === 400, "directory symlink write got " + escaped.status);
+    assert(!fs.existsSync(path.join(logDir, "plan.png")), "plan.png must not land in log");
+  } finally {
+    try { child.kill("SIGTERM"); } catch {}
+    const deadline = Date.now() + 2000;
+    while (child.exitCode == null && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    try { child.kill("SIGKILL"); } catch {}
+    try { fs.rmSync(vault, { recursive: true, force: true }); } catch {}
+  }
+}
+
+await check("a symlink cannot leave the job folder", pngSymlinkStaysInJob);
 
 const failed = results.filter((r) => !r.ok);
 console.log("");

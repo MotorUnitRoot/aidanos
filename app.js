@@ -3054,6 +3054,13 @@ $("paper").addEventListener("dragover", (e) => {
   if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
 });
 $("paper").addEventListener("drop", (e) => {
+  const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (file && jobPictureRel()) {
+    e.preventDefault();
+    e.stopPropagation();
+    saveJobPicture(file);
+    return;
+  }
   e.preventDefault();
   e.stopPropagation();
 });
@@ -4117,30 +4124,30 @@ function syncJobChrome() {
   }
 }
 
+function jobPictureUrl(rel) {
+  return "/api/file?path=" + encodeURIComponent(rel);
+}
+
 async function paintJobPicture(rel) {
   const picture = $("job-picture");
   if (!picture) return;
   const gen = ++paintJobPicture.gen;
-  try {
-    const res = await fetch("/api/file?path=" + encodeURIComponent(rel), { cache: "no-store" });
-    if (!res.ok) throw new Error("missing");
-    const blob = await res.blob();
-    if (!blob || !blob.size) throw new Error("empty");
+  picture.innerHTML = "";
+  picture.setAttribute("hidden", "");
+  const img = document.createElement("img");
+  img.alt = rel.endsWith("walk.png") ? "From the doorway" : "The room as it is";
+  img.onload = () => {
     if (gen !== paintJobPicture.gen) return;
-    if (picture.dataset.url) URL.revokeObjectURL(picture.dataset.url);
-    const url = URL.createObjectURL(blob);
-    picture.dataset.url = url;
     picture.innerHTML = "";
-    const img = document.createElement("img");
-    img.alt = rel.endsWith("walk.png") ? "From the doorway" : "The room as it is";
-    img.src = url;
     picture.appendChild(img);
     picture.removeAttribute("hidden");
-  } catch (e) {
+  };
+  img.onerror = () => {
     if (gen !== paintJobPicture.gen) return;
     picture.innerHTML = "";
     picture.setAttribute("hidden", "");
-  }
+  };
+  img.src = jobPictureUrl(rel);
 }
 paintJobPicture.gen = 0;
 
@@ -4276,35 +4283,42 @@ if (stagePlan) {
     openPlanNote().catch((err) => setStatus(String(err && err.message || err), "error"));
   });
 }
+function jobPictureRel() {
+  const path = jobPath();
+  if (path === "family-room-to-office/walk.md") return "family-room-to-office/walk.png";
+  if (path === "family-room-to-office/plan.md") return "family-room-to-office/plan.png";
+  return "";
+}
+
+function saveJobPicture(file) {
+  const rel = jobPictureRel();
+  if (!rel || !file) return;
+  file.arrayBuffer().then((buf) => {
+    const bytes = new Uint8Array(buf);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return fetch(jobPictureUrl(rel), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ png: btoa(binary) }),
+    });
+  }).then((res) => {
+    if (!res || !res.ok) throw new Error("bad png");
+    return paintJobPicture(rel);
+  }).catch((err) => setStatus(String(err && err.message || err), "error"));
+}
+
 const paperWrap = $("dump-wrap");
 if (paperWrap) {
   paperWrap.addEventListener("dragover", (e) => {
-    const path = jobPath();
-    if (path !== "family-room-to-office/plan.md" && path !== "family-room-to-office/walk.md") return;
+    if (!jobPictureRel()) return;
     e.preventDefault();
   });
   paperWrap.addEventListener("drop", (e) => {
-    const path = jobPath();
-    if (path !== "family-room-to-office/plan.md" && path !== "family-room-to-office/walk.md") return;
     const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-    if (!file) return;
+    if (!file || !jobPictureRel()) return;
     e.preventDefault();
-    const rel = path === "family-room-to-office/walk.md"
-      ? "family-room-to-office/walk.png"
-      : "family-room-to-office/plan.png";
-    file.arrayBuffer().then((buf) => {
-      const bytes = new Uint8Array(buf);
-      let binary = "";
-      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-      return fetch("/api/file?path=" + encodeURIComponent(rel), {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ png: btoa(binary) }),
-      });
-    }).then((res) => {
-      if (!res || !res.ok) throw new Error("bad png");
-      return paintJobPicture(rel);
-    }).catch((err) => setStatus(String(err && err.message || err), "error"));
+    saveJobPicture(file);
   });
 }
 

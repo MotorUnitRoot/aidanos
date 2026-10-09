@@ -1104,9 +1104,86 @@ body.doc-stage .paper-wrap {
 }
 
 .map-board {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   width: 100%;
   overflow-x: auto;
   padding: 1.25rem 0.4rem 2.4rem;
+}
+
+.map-flow-next {
+  margin-top: 0.85rem;
+}
+
+.job-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.85rem 1.25rem;
+  margin: 1.15rem 0 0.4rem;
+  position: relative;
+  z-index: 2;
+  flex: 0 0 auto;
+}
+
+/* Questions, the drawing, and the walk share Today's paper.
+   min-height: 18rem lets that flex item shrink under its text,
+   and the spilled lines cover These answers stand. */
+body.doc-note:not(.doc-map):not(.doc-capture):not(.doc-plan) .paper {
+  flex: 0 0 auto;
+}
+
+.job-actions[hidden],
+.job-picture[hidden],
+.job-season[hidden],
+#stage-actions[hidden] {
+  display: none !important;
+}
+
+body.doc-plan #job-actions,
+body.doc-map #job-actions,
+body.doc-capture #job-actions {
+  display: none !important;
+}
+
+.job-picture {
+  margin: 0.35rem 0 0.85rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  width: 100%;
+}
+
+.job-picture img {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.job-season {
+  margin: 0 0 1.35rem;
+}
+
+.job-season .stage-kicker {
+  margin: 1rem 0 0.35rem;
+}
+
+.job-season .stage-kicker:first-child {
+  margin-top: 0;
+}
+
+.job-links {
+  margin: 0.85rem 0 1rem;
+}
+
+.job-links .text-link + .text-link {
+  margin-left: 1rem;
 }
 
 .map-flow {

@@ -645,11 +645,13 @@ function paintPaper() {
   const paper = $("paper");
   const dump = $("dump");
   if (!paper || !dump) return;
+  parkJobPicture();
   painting = true;
   paper.innerHTML = formatPaper(dump.value);
   syncPaperEmptyClass();
   state.activeLine = -1;
   painting = false;
+  placeJobPicture();
 }
 
 function paintPaperAt(activeIndex, caretInLine) {
@@ -658,6 +660,7 @@ function paintPaperAt(activeIndex, caretInLine) {
   if (!paper || !dump) return;
   keepPaperFocus = true;
   const gen = ++keepPaperFocusGen;
+  parkJobPicture();
   painting = true;
   paper.innerHTML = formatPaper(dump.value, activeIndex);
   syncPaperEmptyClass();
@@ -670,6 +673,7 @@ function paintPaperAt(activeIndex, caretInLine) {
     rememberPaperCaret(activeIndex, pos);
   }
   painting = false;
+  placeJobPicture();
   setTimeout(() => { if (gen === keepPaperFocusGen) keepPaperFocus = false; }, 0);
 }
 
@@ -828,6 +832,7 @@ function isPlanDoc() {
 
 function isWorkMapPath(rel) {
   const p = String(rel || "").replace(/\\/g, "/");
+  if (p === "family-room-to-office/map.md") return true;
   return /^maps\/.+\.md$/i.test(p) && !/^maps\/the-/i.test(p);
 }
 
@@ -854,8 +859,19 @@ function syncTodayNav() {
   });
 }
 
+function jobNoteUsesDayChrome(path) {
+  const p = String(path || "").replace(/\\/g, "/");
+  return p === "family-room-to-office/answers.md"
+    || p === "family-room-to-office/plan.md"
+    || p === "family-room-to-office/walk.md"
+    || p === "family-room-to-office/today.md";
+}
+
 function notePaperTitle(doc) {
   const rel = String((doc && doc.path) || "").replace(/\\/g, "/");
+  if (rel === "family-room-to-office/answers.md") return FAMILY_ROOM_SENTENCE;
+  if (rel === "family-room-to-office/plan.md") return "The room as it is";
+  if (rel === "family-room-to-office/walk.md") return "From the doorway";
   return wikiNoteTitle(rel);
 }
 
@@ -986,6 +1002,8 @@ function renderDay() {
   const dump = $("dump");
   dump.value = cleanPaperMarkdown(dayMarkdown(d));
   paintPaper();
+  syncJobChrome();
+  paintJobSeason();
   renderRail();
 }
 
@@ -2006,13 +2024,16 @@ function renderNote() {
   document.body.classList.toggle("doc-map", isWorkMapPath(path));
   document.body.classList.toggle("doc-stage", isWorkMapPath(path) && !!state.mapStageId);
   const title = path === "aidanos/active-horse.md" ? "Plan" : notePaperTitle(doc);
-  if ($("paper-title")) $("paper-title").textContent = title;
-  if ($("rail-date")) $("rail-date").textContent = title;
+  const day = state.selectedDate || todayIso();
+  const jobDay = jobNoteUsesDayChrome(path);
+  if ($("paper-title")) $("paper-title").textContent = jobDay ? formatPaperTitle(day) : title;
+  if ($("rail-date")) $("rail-date").textContent = jobDay ? formatRailDate(day) : title;
   const dump = $("dump");
   const md = cleanPaperMarkdown(doc.markdown || "");
   if (dump) dump.value = md;
   if (isWorkMapPath(path)) {
     renderMap();
+    syncJobChrome();
     renderRail();
     syncTodayNav();
     return;
@@ -2020,6 +2041,7 @@ function renderNote() {
   hideMapRoom();
   state.mapStageId = "";
   paintPaper();
+  syncJobChrome();
   renderRail();
   syncTodayNav();
 }
@@ -2041,7 +2063,15 @@ async function openVaultNote(rel) {
   }
   // Cancel any in-flight openDay/loadWeek so Capture is not stolen back to Today
   const noteGen = ++state.openDayGen;
-  const data = await api("/api/file?path=" + encodeURIComponent(path));
+  let data;
+  try {
+    data = await api("/api/file?path=" + encodeURIComponent(path));
+  } catch (err) {
+    const seed = familyRoomSeed(path);
+    if (!seed || !isMissingFileError(err)) throw err;
+    if (noteGen !== state.openDayGen) return;
+    data = { path, markdown: seed, mtime: 0 };
+  }
   if (noteGen !== state.openDayGen) return;
   state.day = null;
   let noteMd = typeof data.markdown === "string" ? data.markdown : "";
@@ -2096,6 +2126,8 @@ function hideMapRoom() {
   if (canvas) canvas.removeAttribute("hidden");
   const sheet = $("stage-sheet");
   if (sheet) sheet.setAttribute("hidden", "");
+  const actions = $("stage-actions");
+  if (actions) actions.setAttribute("hidden", "");
 }
 
 function matchStageName(stage, name) {
@@ -2145,72 +2177,93 @@ function renderMap() {
   canvas.removeAttribute("hidden");
   sheet.setAttribute("hidden", "");
   board.innerHTML = "";
-  const flow = document.createElement("div");
-  flow.className = "map-flow";
-  const nodes = [];
-  for (const s of parsed.stages || []) nodes.push({ type: "stage", stage: s });
-  const fork = (parsed.forks || [])[0];
-  if (fork) {
-    let at = nodes.findIndex((n) => n.type === "stage" && matchStageName(n.stage, (fork.branches[0] && fork.branches[0].target) || ""));
-    if (at < 0) at = Math.min(2, nodes.length);
-    nodes.splice(at, 0, { type: "fork", fork });
-  }
-  nodes.forEach((node, i) => {
-    if (i) {
-      const join = document.createElement("span");
-      join.className = "map-join";
-      join.setAttribute("aria-hidden", "true");
-      flow.appendChild(join);
-    }
-    if (node.type === "fork") {
-      const col = document.createElement("div");
-      col.className = "map-fork-col";
-      const diamond = document.createElement("div");
-      diamond.className = "map-fork";
-      const label = document.createElement("span");
-      label.textContent = node.fork.title || "Fork";
-      diamond.appendChild(label);
-      col.appendChild(diamond);
-      const kind = document.createElement("p");
-      kind.className = "map-fork-kind";
-      kind.textContent = node.fork.forkKind === "all-together" ? "All together" : (node.fork.forkKind === "only-one" ? "Only one" : "");
-      if (kind.textContent) col.appendChild(kind);
-      const no = (node.fork.branches || []).find((b) => /^no$/i.test(b.label));
-      if (no && no.target) {
-        const bye = document.createElement("p");
-        bye.className = "map-fork-no";
-        bye.textContent = "No → " + no.target;
-        col.appendChild(bye);
+  const familyMap = jobPath() === "family-room-to-office/map.md";
+  const gateJoin = familyMap ? " · " : ": ";
+  const rows = mapCanvasRows(parsed);
+  rows.forEach((nodes, ri) => {
+    const flow = document.createElement("div");
+    flow.className = "map-flow" + (ri ? " map-flow-next" : "");
+    nodes.forEach((node, i) => {
+      if (i) {
+        const join = document.createElement("span");
+        join.className = "map-join";
+        join.setAttribute("aria-hidden", "true");
+        flow.appendChild(join);
       }
-      flow.appendChild(col);
-      return;
-    }
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "map-stage";
-    btn.setAttribute("data-stage", node.stage.id);
-    const name = document.createElement("span");
-    name.className = "map-stage-name";
-    name.textContent = (node.stage.number ? node.stage.number + ". " : "") + node.stage.title;
-    btn.appendChild(name);
-    const enter = stageGateText(node.stage, "enter");
-    const exit = stageGateText(node.stage, "exit");
-    if (enter) {
-      const line = document.createElement("span");
-      line.className = "map-stage-gate";
-      line.textContent = "Enter: " + enter;
-      btn.appendChild(line);
-    }
-    if (exit) {
-      const line = document.createElement("span");
-      line.className = "map-stage-gate";
-      line.textContent = "Exit: " + exit;
-      btn.appendChild(line);
-    }
-    btn.addEventListener("click", () => openMapStage(node.stage.id));
-    flow.appendChild(btn);
+      if (node.type === "fork") {
+        const col = document.createElement("div");
+        col.className = "map-fork-col";
+        const diamond = document.createElement("div");
+        diamond.className = "map-fork";
+        const label = document.createElement("span");
+        label.textContent = node.fork.title || "Fork";
+        diamond.appendChild(label);
+        col.appendChild(diamond);
+        const kind = document.createElement("p");
+        kind.className = "map-fork-kind";
+        kind.textContent = node.fork.forkKind === "all-together" ? "All together" : (node.fork.forkKind === "only-one" ? "Only one" : "");
+        if (kind.textContent) col.appendChild(kind);
+        const no = (node.fork.branches || []).find((b) => /^no$/i.test(b.label));
+        if (no && no.target) {
+          const bye = document.createElement("p");
+          bye.className = "map-fork-no";
+          bye.textContent = "No → " + no.target;
+          col.appendChild(bye);
+        }
+        flow.appendChild(col);
+        return;
+      }
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "map-stage";
+      btn.setAttribute("data-stage", node.stage.id);
+      const name = document.createElement("span");
+      name.className = "map-stage-name";
+      name.textContent = (node.stage.number ? node.stage.number + ". " : "") + node.stage.title;
+      btn.appendChild(name);
+      const enter = stageGateText(node.stage, "enter");
+      const exit = stageGateText(node.stage, "exit");
+      if (enter) {
+        const line = document.createElement("span");
+        line.className = "map-stage-gate";
+        line.textContent = "Enter" + gateJoin + enter;
+        btn.appendChild(line);
+      }
+      if (exit) {
+        const line = document.createElement("span");
+        line.className = "map-stage-gate";
+        line.textContent = "Exit" + gateJoin + exit;
+        btn.appendChild(line);
+      }
+      btn.addEventListener("click", () => openMapStage(node.stage.id));
+      flow.appendChild(btn);
+    });
+    board.appendChild(flow);
   });
-  board.appendChild(flow);
+}
+
+function mapCanvasRows(parsed) {
+  const flow = Array.isArray(parsed && parsed.flow) ? parsed.flow : [];
+  if (!flow.length) {
+    const nodes = [];
+    for (const s of (parsed && parsed.stages) || []) nodes.push({ type: "stage", stage: s });
+    const fork = ((parsed && parsed.forks) || [])[0];
+    if (fork) {
+      let at = nodes.findIndex((n) => n.type === "stage" && matchStageName(n.stage, (fork.branches[0] && fork.branches[0].target) || ""));
+      if (at < 0) at = Math.min(2, nodes.length);
+      nodes.splice(at, 0, { type: "fork", fork });
+    }
+    return nodes.length ? [nodes] : [];
+  }
+  const rows = [[]];
+  for (const node of flow) {
+    if (node.type === "row") {
+      if (rows[rows.length - 1].length) rows.push([]);
+      continue;
+    }
+    rows[rows.length - 1].push(node);
+  }
+  return rows.filter((row) => row.length);
 }
 
 function paintStagePaper(stage) {
@@ -2219,6 +2272,12 @@ function paintStagePaper(stage) {
   if (title) title.textContent = stage.title || "Stage";
   if (!body) return;
   body.innerHTML = "";
+  const family = jobPath() === "family-room-to-office/map.md";
+  const actions = $("stage-actions");
+  if (actions) {
+    if (family) actions.removeAttribute("hidden");
+    else actions.setAttribute("hidden", "");
+  }
   const addBlock = (kicker, inner) => {
     const block = document.createElement("section");
     block.className = "stage-block";
@@ -2267,7 +2326,7 @@ function paintStagePaper(stage) {
       block.appendChild(p);
     });
   };
-  addChecks("Enter", stage.enterItems, stage.enter);
+  if (!family) addChecks("Enter", stage.enterItems, stage.enter);
   addChecks("Exit", stage.exitItems, stage.exit);
   if ((stage.nextItems || []).length) addChecks("Next steps", stage.nextItems, "");
 }
@@ -2726,6 +2785,16 @@ async function openWiki(name) {
     await openDay(todayIso());
     return;
   }
+  if (/^map$/i.test(n)) {
+    closeAsk();
+    await openVaultNote("family-room-to-office/map.md");
+    return;
+  }
+  if (/^drawing$/i.test(n)) {
+    closeAsk();
+    await openVaultNote("family-room-to-office/plan.md");
+    return;
+  }
   try {
     const data = await api("/api/tree?dir=.");
     const files = data.files || [];
@@ -2810,6 +2879,7 @@ $("paper").addEventListener("click", (e) => {
   lines[idx] = paperTaskSrc(hit[1], hit[2], !/x/i.test(hit[3]), hit[4]);
   dump.value = lines.join("\n");
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
+  if (isNoteDoc() && state.doc) state.doc.markdown = dump.value;
   scheduleSave();
   paintPaper();
   renderRail();
@@ -2996,6 +3066,13 @@ $("paper").addEventListener("dragover", (e) => {
   if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
 });
 $("paper").addEventListener("drop", (e) => {
+  const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (file && jobPictureRel()) {
+    e.preventDefault();
+    e.stopPropagation();
+    saveJobPicture(file);
+    return;
+  }
   e.preventDefault();
   e.stopPropagation();
 });
@@ -3090,14 +3167,22 @@ function parseProcessMap(md) {
   }
   const stages = [];
   const forks = [];
+  const flow = [];
+  let row = 1;
   let inStages = false;
   let current = null;
   const finish = () => {
     if (!current) return;
     if (current.kind === "fork") {
       inferExclusiveForkKind(current);
+      current.row = row;
       forks.push(current);
-    } else stages.push(current);
+      flow.push({ type: "fork", fork: current, row });
+    } else {
+      current.row = row;
+      stages.push(current);
+      flow.push({ type: "stage", stage: current, row });
+    }
     current = null;
   };
   const startFork = (heading, named, lineNo) => {
@@ -3125,6 +3210,12 @@ function parseProcessMap(md) {
       continue;
     }
     if (!inStages) continue;
+    if (/^Next row\s*:?\s*$/i.test(line.trim())) {
+      finish();
+      row += 1;
+      flow.push({ type: "row", row });
+      continue;
+    }
     const forkHead = line.match(/^###\s+Fork:\s*(.*)$/i) || line.match(/^###\s+Fork\s*$/i);
     if (forkHead) {
       startFork("", String(forkHead[1] || "").trim(), i);
@@ -3227,7 +3318,7 @@ function parseProcessMap(md) {
     else if (current.field === "exit" && !current.exit) current.exit = trimmed;
   }
   finish();
-  return { title, why, stages, forks };
+  return { title, why, stages, forks, flow };
 }
 
 function processMapLints(map) {
@@ -3334,6 +3425,7 @@ async function applyStepsToToday(steps, date) {
 }
 
 async function landMapNextStepsOnToday() {
+  if (jobPath() === "family-room-to-office/map.md") return;
   if (!isMapDoc()) flushActiveLineToDump();
   const dump = $("dump");
   const md = dump ? dump.value : (isNoteDoc() ? String(state.doc.markdown || "") : "");
@@ -3350,6 +3442,7 @@ async function landMapNextStepsOnToday() {
 
 async function landMapFileOnToday(rel) {
   const path = String(rel || "").replace(/\\/g, "/");
+  if (path === "family-room-to-office/map.md") return;
   if (!isWorkMapPath(path)) return;
   const day = state.selectedDate || todayIso();
   const key = day + ":" + path;
@@ -3378,6 +3471,7 @@ async function findMapPathsForQuery(q) {
       const path = String(h.path || "").replace(/\\/g, "/");
       if (!isWorkMapPath(path) || seen[path]) continue;
       if (/^maps\/the-/i.test(path)) continue;
+      if (path === "family-room-to-office/map.md") continue;
       seen[path] = true;
       maps.push(path);
     }
@@ -3418,6 +3512,194 @@ function appendDoorTasks(markdown, lines) {
   if (existing.endsWith("\n\n")) return existing + block;
   if (existing.endsWith("\n")) return existing + "\n" + block;
   return existing + "\n\n" + block;
+}
+
+const FAMILY_ROOM_SENTENCE = "I want to convert my family room to an office.";
+const FAMILY_ROOM_STOPS = [
+  "Someone would sleep there. Stop.",
+  "A wall might carry load. Do not cut it.",
+  "Call the building department with the real scope before anything comes off the wall. The town’s answer controls the permit, not this spec.",
+  "New or moved wiring, a bearing wall, HVAC, plumbing, and suspect lead or asbestos: licensed trade, a permit, and an inspection while the work is still visible.",
+  "If the wall stays closed, do not open it to look.",
+  "If the wall opens, rough work and the rough inspection happen before drywall.",
+];
+const DRAWING_CHECKS = [
+  "Overall sizes",
+  "Door swing and window",
+  "Desk and chair clearance",
+  "Outlets and data jack",
+  "Supply and return",
+  "Walls stay. None come out.",
+  "Where the built-in meets the floor",
+];
+
+function familyAnswerMap(md) {
+  const lines = String(md || "").replace(/\r\n/g, "\n").split("\n");
+  const answers = {};
+  let n = 0;
+  for (const line of lines) {
+    const m = line.match(/^\s*(\d+)\.\s+(.*)$/);
+    if (m) {
+      n = Number(m[1]);
+      const rest = String(m[2] || "");
+      const q = rest.indexOf("?");
+      answers[n] = q >= 0 ? rest.slice(q + 1).trim() : "";
+      continue;
+    }
+    if (n && String(line || "").trim() && !/^#/.test(line)) {
+      answers[n] = (answers[n] ? answers[n] + "\n" : "") + line.trim();
+    }
+  }
+  return answers;
+}
+
+function townNotCalled(answer) {
+  const a = String(answer || "").trim();
+  if (!a) return true;
+  if (/\bnot called\b/i.test(a)) return true;
+  if (/\b(haven't|have not|didn't|did not|never)\b/i.test(a) && /\bcall/i.test(a)) return true;
+  return false;
+}
+
+function affirmsSleep(answer) {
+  const a = String(answer || "").trim();
+  if (!a) return false;
+  if (/\b(nobody|no one|will not|won't|wont)\b/i.test(a)) return false;
+  if (/\bsleep\b/i.test(a) && /\b(no|not|never)\b/i.test(a) && !/\byes\b/i.test(a)) return false;
+  if (/\b(yes|someone)\b/i.test(a) && /\bsleep\b/i.test(a)) return true;
+  if (/\b(will sleep|sleeps there|sleep there)\b/i.test(a)) return true;
+  return false;
+}
+
+function drawingChecksOn(planMd) {
+  const on = {};
+  for (const line of String(planMd || "").split("\n")) {
+    const m = line.match(/^\s*[-*+]\s+\[([ xX])\]\s+(.*)$/);
+    if (!m) continue;
+    on[String(m[2] || "").trim().toLowerCase()] = /x/i.test(m[1]);
+  }
+  return on;
+}
+
+function familyRoomStops(answersMd, planMd) {
+  const answers = familyAnswerMap(answersMd);
+  const checks = drawingChecksOn(planMd);
+  const stops = [];
+  if (affirmsSleep(answers[1])) stops.push(FAMILY_ROOM_STOPS[0]);
+  const wall = String(answers[3] || "");
+  if (/\b(load|bearing)\b/i.test(wall) || /\bmight carry\b/i.test(wall)) stops.push(FAMILY_ROOM_STOPS[1]);
+  if (townNotCalled(answers[8])) stops.push(FAMILY_ROOM_STOPS[2]);
+  const blob = Object.keys(answers).map((k) => answers[k]).join("\n");
+  const plugged = String(answers[5] || "");
+  const trade = /\b(wiring|rewir|electrical|hvac|plumbing|asbestos|\blead\b|bearing wall)\b/i.test(blob)
+    || (/\b(new|moved|move)\b/i.test(plugged) && /\b(wire|wiring|outlet|panel)\b/i.test(plugged));
+  if (trade) stops.push(FAMILY_ROOM_STOPS[3]);
+  if (checks["walls stay. none come out."]) stops.push(FAMILY_ROOM_STOPS[4]);
+  if (/\bopen/i.test(wall) && !/\b(no|not|won't|wont|never)\b/i.test(wall)) stops.push(FAMILY_ROOM_STOPS[5]);
+  return stops;
+}
+
+function isNextCutLine(line) {
+  return /\b(cut|demolish|tear out|open the wall|opened wall|comes off the wall|come off the wall)\b/i.test(String(line || ""));
+}
+
+function linesToAddToday(lines, stops) {
+  const list = (Array.isArray(lines) ? lines : []).filter((line) => /^- \[ \] /.test(String(line)));
+  if (!stops || !stops.length) return list;
+  return list.filter((line) => !isNextCutLine(line));
+}
+
+function planMarkdownFromChecks(marked) {
+  const on = new Set((Array.isArray(marked) ? marked : []).map((s) => String(s || "").trim().toLowerCase()));
+  const lines = ["# The room as it is", ""];
+  for (const label of DRAWING_CHECKS) {
+    lines.push("- [" + (on.has(label.toLowerCase()) ? "x" : " ") + "] " + label);
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+function checksFromPlanMarkdown(md) {
+  const on = [];
+  for (const line of String(md || "").split("\n")) {
+    const m = line.match(/^\s*[-*+]\s+\[([ xX])\]\s+(.*)$/);
+    if (m && /x/i.test(m[1])) on.push(String(m[2] || "").trim());
+  }
+  return on;
+}
+
+function placeStopsFirst(md, stops) {
+  const known = new Set(FAMILY_ROOM_STOPS);
+  const lines = String(md || "").replace(/\r\n/g, "\n").split("\n").filter((line) => !known.has(line.trim()));
+  const h = lines.findIndex((line) => /^#\s+/.test(line));
+  const at = h >= 0 ? h + 1 : 0;
+  const block = [];
+  const list = Array.isArray(stops) ? stops.filter(Boolean) : [];
+  if (list.length) {
+    block.push("");
+    for (const stop of list) block.push(stop);
+    block.push("");
+  }
+  lines.splice(at, 0, ...block);
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").replace(/^\n/, "");
+}
+
+function ensureFamilySeason(md, stops) {
+  let s = String(md || "").replace(/\r\n/g, "\n");
+  if (!/^## Why it matters\s*$/m.test(s)) {
+    s = s.replace(/\s*$/, "") + "\n\n## Why it matters\nA finished family room that stays living space.\n\n## What comes next\nPaint, flooring in the same place, casing, base, and a simple built-in.\n\n## What is waiting\nThe town’s answer.\n\n## Before you cut\n";
+  }
+  if (!/^## Before you cut\s*$/m.test(s)) {
+    s = s.replace(/\s*$/, "") + "\n\n## Before you cut\n";
+  }
+  const list = (Array.isArray(stops) ? stops : []).filter(Boolean);
+  const parts = s.split(/^## Before you cut\s*$/m);
+  const head = parts[0];
+  let rest = parts.slice(1).join("## Before you cut\n");
+  const next = rest.search(/\n## /);
+  let body = next >= 0 ? rest.slice(0, next) : rest;
+  const after = next >= 0 ? rest.slice(next) : "";
+  for (const stop of FAMILY_ROOM_STOPS) {
+    if (!list.includes(stop)) {
+      body = body.split("\n").filter((line) => line.trim() !== stop).join("\n");
+    }
+  }
+  for (const stop of list) {
+    if (!body.includes(stop)) body = body.replace(/\s*$/, "\n") + stop + "\n";
+  }
+  const links = "[[Map]] [[Drawing]]";
+  body = body.split("\n").filter((line) => line.trim() !== links).join("\n");
+  body = body.replace(/\s*$/, "\n") + links + "\n";
+  return (head + "## Before you cut\n" + body.replace(/^\n/, "") + after).replace(/\n{3,}/g, "\n\n");
+}
+
+function jobPath() {
+  if (!isNoteDoc() || !state.doc) return "";
+  return String(state.doc.path || "").replace(/\\/g, "/");
+}
+
+function isMissingFileError(err) {
+  return /not found/i.test(String((err && err.message) || err || ""));
+}
+
+function familyRoomSeed(rel) {
+  const p = String(rel || "").replace(/\\/g, "/");
+  if (p === "family-room-to-office/answers.md") {
+    return "# " + FAMILY_ROOM_SENTENCE + "\n\n" +
+      "1. Which room, and will anyone sleep there?\n" +
+      "2. What must stay?\n" +
+      "3. Will any wall or opening change?\n" +
+      "4. Where does the desk go, and which way does the door swing?\n" +
+      "5. What has to be plugged in, and where is the panel?\n" +
+      "6. Supply, return, and will a new door close the room?\n" +
+      "7. When was the house built?\n" +
+      "8. What did the building department say?\n";
+  }
+  if (p === "family-room-to-office/plan.md") return planMarkdownFromChecks([]);
+  if (p === "family-room-to-office/walk.md") return "# From the doorway\n";
+  if (p === "family-room-to-office/today.md") return "# Today\n";
+  if (p === "family-room-to-office/map.md") return "# Family room to office\n\n## Why\nA finished family room that stays living space.\n\n## Stages\n\n### 1. See the room\nEnter: You are in the doorway\nExit: The room is the one on the drawing\n\n### 2. Name the use\nEnter: The room is named\nExit: It stays living space\n\n### 3. Read the structure\nEnter: The walls are in front of you\nExit: You know whether a wall might carry load\n\n### Fork: Wall stays / might carry load\nOnly one\n- Wall stays \u2192 Ask the town\n- Might carry load \u2192 Ask the town\n\n### 4. Ask the town\nEnter: The structure is read\nExit: The town has been asked\nWhy: The town\u2019s answer controls the permit, not this spec.\n\n### Fork: Surface only / open the wall\nOnly one\n- Surface only \u2192 Rough\n- Open the wall \u2192 Rough\n\n### 5. Rough\nEnter: The town has been asked\nExit: Rough work is ready for inspection\nWhy: If the wall opens, rough work and the rough inspection happen before drywall.\nNext steps:\n- [ ] Rough work before drywall\n- [ ] The rough inspection before drywall\n- [ ] Cut the wall\n\nNext row\n\n### 6. Close and finish\nEnter: The room is ready to close\nExit: The finish is on\nWhy: Paint, flooring in the same place, casing, base, and a simple built-in.\nNext steps:\n- [ ] Prime\n- [ ] Casing and crown\n- [ ] The hard floor\n- [ ] Base\n- [ ] Plates and grilles\n- [ ] Paint\n- [ ] A simple built-in\n\n### 7. Final\nEnter: The finish is on\nExit: The desk can move in\nWhy: A built-in that sits on the subfloor goes in before the floor. One that sits on the finish floor goes in after. If a permit was pulled, the final inspection is before the desk moves in.\nNext steps:\n- [ ] The final inspection is before the desk moves in\n";
+  return "";
 }
 
 let doorProposed = [];
@@ -3480,6 +3762,12 @@ $("door-form").addEventListener("submit", async (e) => {
   if (!String(raw || "").trim()) {
     hideDoorProposals();
     goToday();
+    return;
+  }
+  if (String(raw || "").trim() === FAMILY_ROOM_SENTENCE) {
+    if (input) input.value = "";
+    hideDoorProposals();
+    openFamilyRoomQuestions().catch((err) => setStatus(String(err && err.message || err), "error"));
     return;
   }
   const landed = await landDoorQueryOnToday(raw);
@@ -3664,6 +3952,415 @@ $("door-reject").addEventListener("click", () => {
   if (input) input.value = "";
   hideDoorProposals();
 });
+
+async function readJobFile(rel) {
+  try {
+    const data = await api("/api/file?path=" + encodeURIComponent(rel));
+    return {
+      markdown: typeof data.markdown === "string" ? data.markdown : "",
+      mtime: Number(data.mtime) || 0,
+    };
+  } catch (err) {
+    const seed = familyRoomSeed(rel);
+    if (!seed || !isMissingFileError(err)) throw err;
+    return { markdown: seed, mtime: 0 };
+  }
+}
+
+async function writeJobFile(rel, markdown, mtime) {
+  const res = await fetch("/api/file?path=" + encodeURIComponent(rel), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: rel, paper: markdown, markdown, mtime: mtime || 0 }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || res.statusText);
+  }
+  return res.json().catch(() => ({}));
+}
+
+async function writeFamilyStops(stops) {
+  const walk = await readJobFile("family-room-to-office/walk.md");
+  const nextWalk = placeStopsFirst(walk.markdown, stops);
+  if (nextWalk !== walk.markdown) await writeJobFile("family-room-to-office/walk.md", nextWalk, walk.mtime);
+  const season = await readJobFile("aidanos/active-horse.md");
+  const nextSeason = ensureFamilySeason(season.markdown, stops);
+  if (nextSeason !== season.markdown) await writeJobFile("aidanos/active-horse.md", nextSeason, season.mtime);
+}
+
+async function currentFamilyStops() {
+  const answers = await readJobFile("family-room-to-office/answers.md");
+  const plan = await readJobFile("family-room-to-office/plan.md");
+  return familyRoomStops(answers.markdown, plan.markdown);
+}
+
+function leaveJobPaper() {
+  state.dirty = false;
+  clearTimeout(state.saveTimer);
+  state.saveTimer = null;
+  state.doc = null;
+  state.mapStageId = "";
+  document.body.classList.remove("doc-note", "doc-capture", "doc-plan", "doc-map", "doc-stage");
+  if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+  showView("door");
+  syncJobChrome();
+}
+
+async function openFamilyRoomQuestions() {
+  await openVaultNote("family-room-to-office/answers.md");
+}
+
+async function standAnswers() {
+  flushActiveLineToDump();
+  await saveDay();
+  const stops = await currentFamilyStops();
+  await writeFamilyStops(stops);
+  await openVaultNote("family-room-to-office/plan.md");
+}
+
+function drawingChecksFromPaper() {
+  const marked = [];
+  const seen = {};
+  const dump = $("dump");
+  const dumpLines = dump ? dump.value.split("\n") : [];
+  for (const el of paperLines()) {
+    if (!el.classList || !el.classList.contains("task")) continue;
+    const idx = paperLines().indexOf(el);
+    const fromDump = dumpLines[idx] || "";
+    const fromSrc = el.getAttribute("data-src") || "";
+    const hit = matchPaperTask(fromDump) || matchPaperTask(fromSrc);
+    const on = el.classList.contains("done") || !!(hit && /x/i.test(hit[3]));
+    const label = hit ? String(hit[4] || "").trim() : lineBody(el).trim();
+    const key = label.toLowerCase();
+    if (!on || !label || seen[key]) continue;
+    seen[key] = true;
+    marked.push(label);
+  }
+  for (const label of checksFromPlanMarkdown(dump ? dump.value : "")) {
+    const key = label.toLowerCase();
+    if (seen[key]) continue;
+    seen[key] = true;
+    marked.push(label);
+  }
+  return marked;
+}
+
+async function standDrawing() {
+  const next = planMarkdownFromChecks(drawingChecksFromPaper());
+  const dump = $("dump");
+  if (dump) dump.value = next;
+  if (state.doc) state.doc.markdown = next;
+  paintPaper();
+  state.dirty = true;
+  await saveDay();
+  const stops = await currentFamilyStops();
+  await writeFamilyStops(stops);
+  await openVaultNote("family-room-to-office/walk.md");
+}
+
+async function standWalk() {
+  flushActiveLineToDump();
+  const stops = await currentFamilyStops();
+  const dump = $("dump");
+  const next = placeStopsFirst(dump ? dump.value : "", stops);
+  if (dump) dump.value = next;
+  if (state.doc) state.doc.markdown = next;
+  state.dirty = true;
+  await saveDay();
+  await writeFamilyStops(stops);
+  state.mapStageId = "";
+  await openVaultNote("family-room-to-office/map.md");
+}
+
+function taskLinesIn(md) {
+  const out = [];
+  for (const line of String(md || "").split("\n")) {
+    const m = String(line).match(/^\s*[-*+]\s+\[ \]\s+(.*)$/);
+    if (m && String(m[1]).trim()) out.push("- [ ] " + String(m[1]).trim());
+  }
+  return out;
+}
+
+async function addTheseToToday() {
+  const stops = await currentFamilyStops();
+  await writeFamilyStops(stops);
+  let lines = [];
+  if (jobPath() === "family-room-to-office/map.md" && state.mapStageId) {
+    const dump = $("dump");
+    const parsed = parseProcessMap(dump ? dump.value : "");
+    const stage = (parsed.stages || []).find((s) => s.id === state.mapStageId);
+    lines = linesToAddToday(stageNextStepLines(stage), stops);
+  } else {
+    const todayFile = await readJobFile("family-room-to-office/today.md");
+    lines = linesToAddToday(taskLinesIn(todayFile.markdown), stops);
+  }
+  if (lines.length) {
+    await applyStepsToToday(lines, todayIso());
+    const todayFile = await readJobFile("family-room-to-office/today.md");
+    const next = appendMapTasks(todayFile.markdown || "", lines);
+    if (next !== (todayFile.markdown || "")) await writeJobFile("family-room-to-office/today.md", next, todayFile.mtime);
+  }
+  if (!isNoteDoc()) paintJobSeason();
+}
+
+function syncJobChrome() {
+  const actions = $("job-actions");
+  const button = $("job-button");
+  const link = $("job-link");
+  const picture = $("job-picture");
+  const path = jobPath();
+  const jobs = {
+    "family-room-to-office/answers.md": ["These answers stand", "Not yet", ""],
+    "family-room-to-office/plan.md": ["This drawing is the plan", "Back to the answers", "family-room-to-office/plan.png"],
+    "family-room-to-office/walk.md": ["This is the room", "Change the drawing", "family-room-to-office/walk.png"],
+  };
+  const job = jobs[path];
+  if (!actions || !button || !link) return;
+  if (!job) {
+    actions.setAttribute("hidden", "");
+    if (picture) {
+      picture.setAttribute("hidden", "");
+      picture.innerHTML = "";
+      parkJobPicture();
+    }
+    return;
+  }
+  button.textContent = job[0];
+  link.textContent = job[1];
+  actions.removeAttribute("hidden");
+  if (!picture) return;
+  if (job[2]) paintJobPicture(job[2]);
+  else {
+    picture.setAttribute("hidden", "");
+    picture.innerHTML = "";
+    parkJobPicture();
+  }
+}
+
+function jobPictureUrl(rel) {
+  return "/api/file?path=" + encodeURIComponent(rel);
+}
+
+async function paintJobPicture(rel) {
+  const picture = $("job-picture");
+  if (!picture) return;
+  const gen = ++paintJobPicture.gen;
+  picture.innerHTML = "";
+  picture.setAttribute("hidden", "");
+  const img = document.createElement("img");
+  img.alt = rel.endsWith("walk.png") ? "From the doorway" : "The room as it is";
+  img.onload = () => {
+    if (gen !== paintJobPicture.gen) return;
+    picture.innerHTML = "";
+    picture.appendChild(img);
+    picture.removeAttribute("hidden");
+    placeJobPicture();
+  };
+  img.onerror = () => {
+    if (gen !== paintJobPicture.gen) return;
+    picture.innerHTML = "";
+    picture.setAttribute("hidden", "");
+    parkJobPicture();
+  };
+  img.src = jobPictureUrl(rel);
+}
+paintJobPicture.gen = 0;
+
+function parkJobPicture() {
+  const picture = $("job-picture");
+  const paper = $("paper");
+  const wrap = $("dump-wrap");
+  if (!picture || !paper || !wrap) return;
+  if (picture.parentElement !== wrap) wrap.insertBefore(picture, paper);
+}
+
+function placeJobPicture() {
+  const picture = $("job-picture");
+  const paper = $("paper");
+  if (!picture || !paper) return;
+  if (picture.hasAttribute("hidden") || !picture.querySelector("img")) {
+    parkJobPicture();
+    return;
+  }
+  const heading = paper.querySelector(".md-line.h1");
+  if (!heading) {
+    parkJobPicture();
+    return;
+  }
+  if (heading.nextSibling !== picture) heading.after(picture);
+}
+
+function seasonSection(md, name) {
+  const lines = String(md || "").replace(/\r\n/g, "\n").split("\n");
+  const head = "## " + name;
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() === head) { start = i; break; }
+  }
+  if (start < 0) return "";
+  const bits = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) break;
+    bits.push(lines[i]);
+  }
+  return bits.join("\n").trim();
+}
+
+let jobSeasonGen = 0;
+async function paintJobSeason() {
+  const host = $("job-season");
+  const gen = ++jobSeasonGen;
+  if (!host) return;
+  if (isNoteDoc() || !state.day) {
+    host.setAttribute("hidden", "");
+    host.innerHTML = "";
+    return;
+  }
+  try {
+    const todayFile = await readJobFile("family-room-to-office/today.md");
+    if (gen !== jobSeasonGen) return;
+    const tasks = taskLinesIn(todayFile.markdown);
+    if (!tasks.length) {
+      host.setAttribute("hidden", "");
+      host.innerHTML = "";
+      return;
+    }
+    const season = await readJobFile("aidanos/active-horse.md");
+    if (gen !== jobSeasonGen) return;
+    host.innerHTML = "";
+    const blocks = [
+      ["Why it matters", "Why it matters"],
+      ["What comes next", "What comes next"],
+      ["What is waiting", "What is waiting"],
+      ["Before you cut", "Before you cut"],
+    ];
+    for (const pair of blocks) {
+      const body = seasonSection(season.markdown, pair[1]);
+      const h = document.createElement("h2");
+      h.className = "stage-kicker";
+      h.textContent = pair[0] + ".";
+      host.appendChild(h);
+      const p = document.createElement("p");
+      p.className = "stage-why";
+      p.textContent = body.split("\n").filter((line) => line.trim() !== "[[Map]] [[Drawing]]").join("\n").trim();
+      host.appendChild(p);
+    }
+    const links = document.createElement("p");
+    links.className = "job-links";
+    const mapLink = document.createElement("button");
+    mapLink.type = "button";
+    mapLink.className = "text-link";
+    mapLink.textContent = "Map";
+    mapLink.addEventListener("click", () => openWiki("Map"));
+    const drawingLink = document.createElement("button");
+    drawingLink.type = "button";
+    drawingLink.className = "text-link";
+    drawingLink.textContent = "Drawing";
+    drawingLink.addEventListener("click", () => openWiki("Drawing"));
+    links.appendChild(mapLink);
+    links.appendChild(document.createTextNode(" "));
+    links.appendChild(drawingLink);
+    host.appendChild(links);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "hairline-button";
+    button.textContent = "Add these to today";
+    button.addEventListener("click", () => {
+      addTheseToToday().catch((err) => setStatus(String(err && err.message || err), "error"));
+    });
+    host.appendChild(button);
+    host.removeAttribute("hidden");
+  } catch (e) {
+    if (gen !== jobSeasonGen) return;
+    host.setAttribute("hidden", "");
+    host.innerHTML = "";
+  }
+}
+
+const jobButton = $("job-button");
+if (jobButton) {
+  jobButton.addEventListener("click", () => {
+    const path = jobPath();
+    const run = path === "family-room-to-office/answers.md"
+      ? standAnswers
+      : path === "family-room-to-office/plan.md"
+        ? standDrawing
+        : path === "family-room-to-office/walk.md"
+          ? standWalk
+          : null;
+    if (run) run().catch((err) => setStatus(String(err && err.message || err), "error"));
+  });
+}
+const jobLink = $("job-link");
+if (jobLink) {
+  jobLink.addEventListener("click", (e) => {
+    e.preventDefault();
+    const path = jobPath();
+    if (path === "family-room-to-office/answers.md") {
+      leaveJobPaper();
+      return;
+    }
+    if (path === "family-room-to-office/plan.md") {
+      openVaultNote("family-room-to-office/answers.md").catch((err) => setStatus(String(err && err.message || err), "error"));
+      return;
+    }
+    if (path === "family-room-to-office/walk.md") {
+      openVaultNote("family-room-to-office/plan.md").catch((err) => setStatus(String(err && err.message || err), "error"));
+    }
+  });
+}
+const stageAdd = $("stage-add");
+if (stageAdd) {
+  stageAdd.addEventListener("click", () => {
+    addTheseToToday().catch((err) => setStatus(String(err && err.message || err), "error"));
+  });
+}
+const stagePlan = $("stage-plan");
+if (stagePlan) {
+  stagePlan.addEventListener("click", (e) => {
+    e.preventDefault();
+    openPlanNote().catch((err) => setStatus(String(err && err.message || err), "error"));
+  });
+}
+function jobPictureRel() {
+  const path = jobPath();
+  if (path === "family-room-to-office/walk.md") return "family-room-to-office/walk.png";
+  if (path === "family-room-to-office/plan.md") return "family-room-to-office/plan.png";
+  return "";
+}
+
+function saveJobPicture(file) {
+  const rel = jobPictureRel();
+  if (!rel || !file) return;
+  file.arrayBuffer().then((buf) => {
+    const bytes = new Uint8Array(buf);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return fetch(jobPictureUrl(rel), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ png: btoa(binary) }),
+    });
+  }).then((res) => {
+    if (!res || !res.ok) throw new Error("bad png");
+    return paintJobPicture(rel);
+  }).catch((err) => setStatus(String(err && err.message || err), "error"));
+}
+
+const paperWrap = $("dump-wrap");
+if (paperWrap) {
+  paperWrap.addEventListener("dragover", (e) => {
+    if (!jobPictureRel()) return;
+    e.preventDefault();
+  });
+  paperWrap.addEventListener("drop", (e) => {
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!file || !jobPictureRel()) return;
+    e.preventDefault();
+    saveJobPicture(file);
+  });
+}
 
 $("toggle-month").addEventListener("click", () => {
   state.monthShown = !state.monthShown;

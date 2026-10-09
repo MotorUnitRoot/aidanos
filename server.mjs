@@ -772,6 +772,49 @@ function kernelRel(rel) {
   return top === "log" || top === "tasks" || top === "aidanos";
 }
 
+function familyRoomPngPath(rel) {
+  const p = String(rel || "").replace(/\\/g, "/");
+  if (p === "family-room-to-office/plan.png" || p === "family-room-to-office/walk.png") return p;
+  return "";
+}
+
+async function familyRoomPngReal(relPath, abs) {
+  const want = familyRoomPngPath(relPath);
+  if (!want) throw new Error("bad path");
+  const rootReal = await fs.realpath(VAULT);
+  let cursor = path.resolve(abs);
+  const missing = [];
+  let base = null;
+  for (;;) {
+    try {
+      base = await fs.realpath(cursor);
+      break;
+    } catch (e) {
+      if (e.code !== "ENOENT") throw e;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) throw new Error("bad path");
+      missing.push(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+  const real = missing.length ? path.join(base, ...missing.reverse()) : base;
+  const rel = path.relative(rootReal, real).split(path.sep).join("/");
+  if (rel !== want) throw new Error("path escapes vault");
+  return real;
+}
+
+async function atomicWriteBuffer(filePath, buf) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+  try {
+    await fs.writeFile(tmpPath, buf, { flag: "wx" });
+    await fs.rename(tmpPath, filePath);
+  } catch (e) {
+    try { await fs.unlink(tmpPath); } catch {}
+    throw e;
+  }
+}
+
 function sendDayWatch(date, mtime) {
   const payload = `data: ${JSON.stringify({ date, mtime })}\n\n`;
   for (const client of sseClients) {
@@ -1050,6 +1093,28 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: e.message || "bad path" });
       }
       const relPath = path.relative(VAULT, abs).split(path.sep).join("/");
+      if (familyRoomPngPath(relPath)) {
+        let real;
+        try {
+          real = await familyRoomPngReal(relPath, abs);
+        } catch (e) {
+          return json(res, 400, { error: e.message || "bad path" });
+        }
+        let buf = null;
+        try {
+          buf = await fs.readFile(real);
+        } catch (e) {
+          if (e.code !== "ENOENT") throw e;
+        }
+        if (buf == null) return json(res, 404, { error: "not found", path: relPath });
+        res.writeHead(200, {
+          "Content-Type": "image/png",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+        });
+        res.end(buf);
+        return;
+      }
       if (!String(relPath).endsWith(".md")) {
         return json(res, 400, { error: "markdown only" });
       }
@@ -1070,6 +1135,37 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: e.message || "bad path" });
       }
       const relPath = path.relative(VAULT, abs).split(path.sep).join("/");
+      if (familyRoomPngPath(relPath)) {
+        let real;
+        try {
+          real = await familyRoomPngReal(relPath, abs);
+        } catch (e) {
+          return json(res, 400, { error: e.message || "bad path" });
+        }
+        const incoming = await readBody(req);
+        let body;
+        try {
+          body = JSON.parse(incoming);
+        } catch {
+          return json(res, 400, { error: "bad png" });
+        }
+        const b64 = body && typeof body.png === "string" ? body.png : "";
+        if (!b64) return json(res, 400, { error: "bad png" });
+        const buf = Buffer.from(b64, "base64");
+        if (buf.length < 8 || buf[0] !== 0x89 || buf.toString("ascii", 1, 4) !== "PNG") {
+          return json(res, 400, { error: "bad png" });
+        }
+        pendingSelfWrites.add("f:" + relPath);
+        try {
+          await atomicWriteBuffer(real, buf);
+          const mtime = await fileMtimeMs(real);
+          lastSelfWrites.set("f:" + relPath, mtime);
+          scheduleVaultSync(relPath);
+          return json(res, 200, { ok: true, path: relPath, mtime, git: gitHint() });
+        } finally {
+          pendingSelfWrites.delete("f:" + relPath);
+        }
+      }
       if (!String(relPath).endsWith(".md")) {
         return json(res, 400, { error: "markdown only" });
       }

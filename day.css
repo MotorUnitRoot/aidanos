@@ -1107,9 +1107,18 @@ body.doc-stage .paper-wrap {
   display: flex;
   flex-direction: column;
   align-items: center;
+  position: relative;
   width: 100%;
   overflow-x: auto;
   padding: 1.25rem 0.4rem 2.4rem;
+}
+
+.map-row-svg {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  overflow: visible;
 }
 
 .map-flow-next {
@@ -1167,7 +1176,9 @@ body.doc-capture #job-actions {
 }
 
 .job-season {
-  margin: 0 0 1.35rem;
+  width: 42rem;
+  max-width: 100%;
+  margin: 0 auto 1.35rem;
 }
 
 .job-season .stage-kicker {
@@ -1184,6 +1195,46 @@ body.doc-capture #job-actions {
 
 .job-links .text-link + .text-link {
   margin-left: 1rem;
+}
+
+/* The glyphs stay the same size. The hit area is the 44px box. */
+.job-links .text-link,
+.day-shift .text-link,
+.week-arrows .icon-btn {
+  position: relative;
+}
+.job-links .text-link::before,
+.day-shift .text-link::before,
+.week-arrows .icon-btn::before {
+  content: "";
+  position: absolute;
+  width: 44px;
+  height: 44px;
+}
+.job-links .text-link::before {
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+#prev-day::before {
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+}
+#next-day::before {
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+}
+#prev-week::before {
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+}
+#next-week::before {
+  left: 50%;
+  top: 0;
+  transform: translateX(-50%);
 }
 
 .map-flow {
@@ -1282,7 +1333,9 @@ body.doc-capture #job-actions {
   letter-spacing: -0.01em;
 }
 .map-fork-kind {
-  margin: 0.7rem 0 0;
+  /* The diamond is a 7.1rem square rotated 45deg. Its point hangs
+     7.1 * (sqrt(2) - 1) / 2 ≈ 1.47rem below the layout box. */
+  margin: 1.9rem 0 0;
   color: var(--muted);
   font-size: 0.72rem;
   letter-spacing: 0.02em;
@@ -1412,7 +1465,42 @@ body.doc-capture #job-actions {
     margin: 0 !important;
     border: 0 !important;
   }
-  .map-flow { justify-content: flex-start; }
+  body.doc-map .paper-wrap {
+    overflow: hidden;
+    padding-left: 0;
+    padding-right: 0;
+  }
+  body.doc-map .map-room {
+    overflow: hidden;
+    min-width: 0;
+    min-height: 0;
+  }
+  body.doc-map:not(.doc-stage) #map-canvas {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+  }
+  .map-board {
+    align-items: flex-start;
+    justify-content: flex-start;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    width: 100%;
+    max-width: 100%;
+    overflow: auto;
+    padding-left: 0;
+    padding-right: 0;
+  }
+  .map-flow {
+    justify-content: flex-start;
+    width: max-content;
+    max-width: none;
+    padding-left: 0.85rem;
+    padding-right: 0.85rem;
+  }
 }
 
 /* NotePlan-style formatting capsule above keyboard */

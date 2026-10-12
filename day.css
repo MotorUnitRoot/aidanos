@@ -351,14 +351,6 @@ body.view-today.day-page {
   flex: 0 0 auto;
 }
 .day-shift .text-link {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  box-sizing: border-box;
-  min-width: 44px;
-  min-height: 44px;
-  margin-top: -12px;
-  margin-bottom: -12px;
   font-size: 1.15rem;
   color: var(--faint);
   line-height: 1;

@@ -2309,6 +2309,11 @@ function drawMapRowJoins(board) {
   board.appendChild(svg);
 }
 
+function clearMapRowJoin(board) {
+  const old = board.querySelector(".map-row-svg");
+  if (old) old.remove();
+}
+
 function mapBoardOverflows(board) {
   return board.scrollWidth > board.clientWidth + 1;
 }
@@ -2320,6 +2325,7 @@ function scheduleMapRowJoins() {
   const pass = (again) => {
     if (gen !== scheduleMapRowJoins.gen) return;
     if (!board.isConnected || board.closest("[hidden]")) return;
+    clearMapRowJoin(board);
     const overflow = mapBoardOverflows(board);
     if (board.classList.contains("is-overflow") !== overflow) {
       board.classList.toggle("is-overflow", overflow);

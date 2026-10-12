@@ -424,6 +424,10 @@ check("Only one sits clear of the diamond and the next row is joined", () => {
   assert(margin > hang + 0.7, "caption clears the point: margin " + margin + " hang " + hang);
   assert(css.includes(".map-board.is-overflow"), "a wide map starts at the left");
   assert(src.includes("mapBoardOverflows"), "overflow pins the map to the left edge");
+  const sched = src.slice(src.indexOf("function scheduleMapRowJoins("), src.indexOf("scheduleMapRowJoins.gen = 0"));
+  assert(sched.includes("clearMapRowJoin(board)"), "resize clears the old line");
+  assert(sched.indexOf("clearMapRowJoin(board)") < sched.indexOf("mapBoardOverflows(board)"), "the old line is gone before the width is measured");
+  assert(src.includes('addEventListener("resize"') && src.includes("scheduleMapRowJoins()"), "a resize measures the map again");
   const join = mapRowJoinPath({ x: 100, y: 10, w: 40, h: 20 }, { x: 10, y: 80, w: 40, h: 20 });
   assert(join === "M 120 30 L 120 55 L 30 55 L 30 80", join);
   const render = src.slice(src.indexOf("function renderMap("), src.indexOf("function mapRowJoinPath("));
@@ -455,6 +459,16 @@ check("Map, Drawing, and the day arrows have a 44px tap area", () => {
   assert(/width:\s*44px/.test(box) && /height:\s*44px/.test(box), "44px box");
   assert(css.includes("#prev-day::before") && css.includes("#next-day::before"), "each date arrow");
   assert(css.includes("#prev-week::before") && css.includes("#next-week::before"), "each week arrow");
+  const dayShift = css.slice(css.indexOf(".day-shift .text-link {"), css.indexOf(".view-today .dump-src"));
+  assert(!/min-width:\s*44px/.test(dayShift) && !/min-height:\s*44px/.test(dayShift), "the date row keeps its size");
+  const weekBtn = css.slice(css.indexOf(".view-today .icon-btn {"), css.indexOf(".view-today .icon-btn:hover"));
+  assert(!/::before|:before/.test(weekBtn), "the week arrow glyph is not a pseudo element");
+  const iconCss = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+  const iconBtn = iconCss.slice(iconCss.indexOf("\n.icon-btn {"), iconCss.indexOf(".icon-btn:hover"));
+  assert(!/::before|:before/.test(iconBtn), "icon buttons do not paint their glyph with ::before");
+  const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
+  assert(html.includes('id="prev-week"') && html.includes("&#8249;"), "the week arrow glyph is a character");
+  assert(html.includes('id="next-week"') && html.includes("&#8250;"), "the next week arrow glyph is a character");
   const links = src.slice(src.indexOf("links.className = \"job-links\""), src.indexOf("host.appendChild(button)"));
   assert(links.includes("openWiki(\"Map\")") && links.includes("openWiki(\"Drawing\")"), "the season links are Map and Drawing");
 });

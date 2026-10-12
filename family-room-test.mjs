@@ -421,7 +421,9 @@ check("Only one sits clear of the diamond and the next row is joined", () => {
   const margin = Number((kind.match(/margin:\s*([0-9.]+)rem/) || [])[1]);
   const hang = size * (Math.SQRT2 - 1) / 2;
   assert(size === 7.1, "diamond size");
-  assert(margin > hang + 0.2, "caption clears the point: margin " + margin + " hang " + hang);
+  assert(margin > hang + 0.7, "caption clears the point: margin " + margin + " hang " + hang);
+  assert(css.includes(".map-board.is-overflow"), "a wide map starts at the left");
+  assert(src.includes("mapBoardOverflows"), "overflow pins the map to the left edge");
   const join = mapRowJoinPath({ x: 100, y: 10, w: 40, h: 20 }, { x: 10, y: 80, w: 40, h: 20 });
   assert(join === "M 120 30 L 120 55 L 30 55 L 30 80", join);
   const render = src.slice(src.indexOf("function renderMap("), src.indexOf("function mapRowJoinPath("));

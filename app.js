@@ -2309,15 +2309,28 @@ function drawMapRowJoins(board) {
   board.appendChild(svg);
 }
 
+function mapBoardOverflows(board) {
+  return board.scrollWidth > board.clientWidth + 1;
+}
+
 function scheduleMapRowJoins() {
   const board = $("map-board");
   if (!board) return;
   const gen = ++scheduleMapRowJoins.gen;
-  requestAnimationFrame(() => {
+  const pass = (again) => {
     if (gen !== scheduleMapRowJoins.gen) return;
     if (!board.isConnected || board.closest("[hidden]")) return;
+    const overflow = mapBoardOverflows(board);
+    if (board.classList.contains("is-overflow") !== overflow) {
+      board.classList.toggle("is-overflow", overflow);
+      if (!again) {
+        requestAnimationFrame(() => pass(true));
+        return;
+      }
+    }
     drawMapRowJoins(board);
-  });
+  };
+  requestAnimationFrame(() => pass(false));
 }
 scheduleMapRowJoins.gen = 0;
 

@@ -351,6 +351,14 @@ body.view-today.day-page {
   flex: 0 0 auto;
 }
 .day-shift .text-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 44px;
+  min-height: 44px;
+  margin-top: -12px;
+  margin-bottom: -12px;
   font-size: 1.15rem;
   color: var(--faint);
   line-height: 1;
@@ -1125,6 +1133,14 @@ body.doc-stage .paper-wrap {
   margin-top: 0.85rem;
 }
 
+.map-board.is-overflow {
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+.map-board.is-overflow .map-flow {
+  justify-content: flex-start;
+}
+
 .job-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1335,7 +1351,7 @@ body.doc-capture #job-actions {
 .map-fork-kind {
   /* The diamond is a 7.1rem square rotated 45deg. Its point hangs
      7.1 * (sqrt(2) - 1) / 2 ≈ 1.47rem below the layout box. */
-  margin: 1.9rem 0 0;
+  margin: 2.4rem 0 0;
   color: var(--muted);
   font-size: 0.72rem;
   letter-spacing: 0.02em;

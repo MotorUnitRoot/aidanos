@@ -772,16 +772,33 @@ function kernelRel(rel) {
   return top === "log" || top === "tasks" || top === "aidanos";
 }
 
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
 function familyRoomPngPath(rel) {
   const p = String(rel || "").replace(/\\/g, "/");
   if (p === "family-room-to-office/plan.png" || p === "family-room-to-office/walk.png") return p;
   return "";
 }
 
+function isPngBuffer(buf) {
+  return Buffer.isBuffer(buf) && buf.length >= PNG_SIG.length && buf.subarray(0, PNG_SIG.length).equals(PNG_SIG);
+}
+
+function publicPathError(e) {
+  const msg = e && e.message;
+  if (msg === "bad path" || msg === "path escapes vault" || msg === "bad png") return msg;
+  return "bad path";
+}
+
 async function familyRoomPngReal(relPath, abs) {
   const want = familyRoomPngPath(relPath);
   if (!want) throw new Error("bad path");
-  const rootReal = await fs.realpath(VAULT);
+  let rootReal;
+  try {
+    rootReal = await fs.realpath(VAULT);
+  } catch {
+    throw new Error("bad path");
+  }
   let cursor = path.resolve(abs);
   const missing = [];
   let base = null;
@@ -790,7 +807,8 @@ async function familyRoomPngReal(relPath, abs) {
       base = await fs.realpath(cursor);
       break;
     } catch (e) {
-      if (e.code !== "ENOENT") throw e;
+      // A raw realpath error includes the vault's absolute path.
+      if (e.code !== "ENOENT") throw new Error("bad path");
       const parent = path.dirname(cursor);
       if (parent === cursor) throw new Error("bad path");
       missing.push(path.basename(cursor));
@@ -801,6 +819,42 @@ async function familyRoomPngReal(relPath, abs) {
   const rel = path.relative(rootReal, real).split(path.sep).join("/");
   if (rel !== want) throw new Error("path escapes vault");
   return real;
+}
+
+async function readFamilyRoomPng(filePath) {
+  let listed;
+  try {
+    listed = await fs.lstat(filePath);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw new Error("bad path");
+  }
+  // A symlink, pipe, or directory must not be opened. A hard link shares its
+  // inode with another name, so the path check alone would return that file.
+  if (listed.isSymbolicLink() || !listed.isFile() || listed.nlink > 1) throw new Error("bad path");
+  if (listed.size > MAX_BODY || listed.size < PNG_SIG.length) throw new Error("bad png");
+  const flags = fsSync.constants.O_RDONLY
+    | (fsSync.constants.O_NOFOLLOW || 0)
+    | (fsSync.constants.O_NONBLOCK || 0);
+  let fh;
+  try {
+    fh = await fs.open(filePath, flags);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw new Error("bad path");
+  }
+  try {
+    const st = await fh.stat();
+    if (!st.isFile() || st.nlink > 1) throw new Error("bad path");
+    if (st.size > MAX_BODY || st.size < PNG_SIG.length) throw new Error("bad png");
+    const buf = Buffer.alloc(st.size);
+    const { bytesRead } = await fh.read(buf, 0, st.size, 0);
+    const got = buf.subarray(0, bytesRead);
+    if (!isPngBuffer(got)) throw new Error("bad png");
+    return Buffer.from(got);
+  } finally {
+    await fh.close();
+  }
 }
 
 async function atomicWriteBuffer(filePath, buf) {
@@ -1088,32 +1142,30 @@ const server = http.createServer(async (req, res) => {
       let abs;
       try {
         abs = safeJoin(VAULT, rel);
-        await resolveInside(VAULT, abs);
       } catch (e) {
         return json(res, 400, { error: e.message || "bad path" });
       }
       const relPath = path.relative(VAULT, abs).split(path.sep).join("/");
       if (familyRoomPngPath(relPath)) {
-        let real;
         try {
-          real = await familyRoomPngReal(relPath, abs);
+          const real = await familyRoomPngReal(relPath, abs);
+          const buf = await readFamilyRoomPng(real);
+          if (buf == null) return json(res, 404, { error: "not found", path: relPath });
+          res.writeHead(200, {
+            "Content-Type": "image/png",
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+          });
+          res.end(buf);
+          return;
         } catch (e) {
-          return json(res, 400, { error: e.message || "bad path" });
+          return json(res, 400, { error: publicPathError(e) });
         }
-        let buf = null;
-        try {
-          buf = await fs.readFile(real);
-        } catch (e) {
-          if (e.code !== "ENOENT") throw e;
-        }
-        if (buf == null) return json(res, 404, { error: "not found", path: relPath });
-        res.writeHead(200, {
-          "Content-Type": "image/png",
-          "Cache-Control": "no-store",
-          "X-Content-Type-Options": "nosniff",
-        });
-        res.end(buf);
-        return;
+      }
+      try {
+        await resolveInside(VAULT, abs);
+      } catch (e) {
+        return json(res, 400, { error: e.message || "bad path" });
       }
       if (!String(relPath).endsWith(".md")) {
         return json(res, 400, { error: "markdown only" });
@@ -1130,7 +1182,6 @@ const server = http.createServer(async (req, res) => {
       let abs;
       try {
         abs = safeJoin(VAULT, rel);
-        await resolveInside(VAULT, abs);
       } catch (e) {
         return json(res, 400, { error: e.message || "bad path" });
       }
@@ -1140,7 +1191,7 @@ const server = http.createServer(async (req, res) => {
         try {
           real = await familyRoomPngReal(relPath, abs);
         } catch (e) {
-          return json(res, 400, { error: e.message || "bad path" });
+          return json(res, 400, { error: publicPathError(e) });
         }
         const incoming = await readBody(req);
         let body;
@@ -1152,7 +1203,7 @@ const server = http.createServer(async (req, res) => {
         const b64 = body && typeof body.png === "string" ? body.png : "";
         if (!b64) return json(res, 400, { error: "bad png" });
         const buf = Buffer.from(b64, "base64");
-        if (buf.length < 8 || buf[0] !== 0x89 || buf.toString("ascii", 1, 4) !== "PNG") {
+        if (!isPngBuffer(buf)) {
           return json(res, 400, { error: "bad png" });
         }
         pendingSelfWrites.add("f:" + relPath);
@@ -1165,6 +1216,11 @@ const server = http.createServer(async (req, res) => {
         } finally {
           pendingSelfWrites.delete("f:" + relPath);
         }
+      }
+      try {
+        await resolveInside(VAULT, abs);
+      } catch (e) {
+        return json(res, 400, { error: e.message || "bad path" });
       }
       if (!String(relPath).endsWith(".md")) {
         return json(res, 400, { error: "markdown only" });

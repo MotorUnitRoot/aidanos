@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -386,6 +386,113 @@ async function pngSymlinkStaysInJob() {
 }
 
 await check("a symlink cannot leave the job folder", pngSymlinkStaysInJob);
+
+async function pngReadIsOnlyThePicture() {
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-room-"));
+  const job = path.join(vault, "family-room-to-office");
+  fs.mkdirSync(job, { recursive: true });
+  fs.mkdirSync(path.join(vault, "maps"), { recursive: true });
+  const port = 24600 + Math.floor(Math.random() * 2000);
+  const child = spawn(process.execPath, ["server.mjs"], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      AIDANOS_HOST: "127.0.0.1",
+      AIDANOS_VAULT: vault,
+      AIDANOS_VAULT_GIT_URL: "",
+      AIDANOS_VAULT_GIT_TOKEN: "",
+      GITHUB_TOKEN: "",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const base = "http://127.0.0.1:" + port;
+  const picture = (rel) => base + "/api/file?path=" + encodeURIComponent(rel);
+  const putPng = (rel, png) => fetch(picture(rel), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ png }),
+  });
+  try {
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      if (child.exitCode != null) throw new Error("server exited");
+      try {
+        const res = await fetch(base + "/api/health");
+        if (res.ok) break;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    const secret = path.join(vault, "maps", "secret.txt");
+    fs.writeFileSync(secret, "SECRET_HARD_LINK\n");
+    fs.linkSync(secret, path.join(job, "plan.png"));
+    const linked = await fetch(picture("family-room-to-office/plan.png"));
+    const linkedBody = Buffer.from(await linked.arrayBuffer());
+    assert(linked.status === 400, "hard link read got " + linked.status);
+    assert(linkedBody.length < 400, "hard link response is the file");
+    assert(!linkedBody.includes(Buffer.from("SECRET_HARD_LINK")), "hard link must not return the other file");
+    assert(!linkedBody.includes(Buffer.from(vault)), "hard link error must not include the vault path");
+    const pngBytes = Buffer.from(PNG, "base64");
+    const other = path.join(job, "other.png");
+    fs.writeFileSync(other, pngBytes);
+    fs.unlinkSync(path.join(job, "plan.png"));
+    fs.linkSync(other, path.join(job, "plan.png"));
+    const linkedPng = await fetch(picture("family-room-to-office/plan.png"));
+    const linkedPngBody = Buffer.from(await linkedPng.arrayBuffer());
+    assert(linkedPng.status === 400, "png hard link read got " + linkedPng.status);
+    assert(!linkedPngBody.includes(pngBytes), "a hard-linked png is not served");
+    const replaced = await putPng("family-room-to-office/plan.png", PNG);
+    assert(replaced.ok, "a new picture can replace the hard link name");
+    assert(Buffer.compare(fs.readFileSync(other), pngBytes) === 0, "the other name keeps its bytes");
+    const got = await fetch(picture("family-room-to-office/plan.png"));
+    assert(got.ok && got.headers.get("content-type") === "image/png", "replaced picture reads back");
+    assert(got.headers.get("x-content-type-options") === "nosniff", "picture response is not sniffed");
+    const gotBytes = Buffer.from(await got.arrayBuffer());
+    assert(gotBytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])), "full png signature");
+    fs.writeFileSync(path.join(job, "walk.png"), "SECRET_PLAIN_FILE\n");
+    const plain = await fetch(picture("family-room-to-office/walk.png"));
+    const plainBody = Buffer.from(await plain.arrayBuffer());
+    assert(plain.status === 400, "plain file read got " + plain.status);
+    assert(!plainBody.includes(Buffer.from("SECRET_PLAIN_FILE")), "plain file must not be returned");
+    const fake = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47]), Buffer.alloc(8)]).toString("base64");
+    const badPut = await putPng("family-room-to-office/walk.png", fake);
+    assert(badPut.status === 400, "short signature got " + badPut.status);
+    assert(fs.readFileSync(path.join(job, "walk.png"), "utf8") === "SECRET_PLAIN_FILE\n", "short signature is not stored");
+    fs.writeFileSync(path.join(job, "walk.png"), Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.alloc(1_000_000),
+    ]));
+    const huge = await fetch(picture("family-room-to-office/walk.png"));
+    const hugeBody = Buffer.from(await huge.arrayBuffer());
+    assert(huge.status === 400, "oversize picture got " + huge.status);
+    assert(hugeBody.length < 400, "oversize picture was sent to the client");
+    fs.unlinkSync(path.join(job, "walk.png"));
+    fs.symlinkSync("plan.png", path.join(job, "walk.png"));
+    fs.unlinkSync(path.join(job, "plan.png"));
+    fs.symlinkSync("walk.png", path.join(job, "plan.png"));
+    const loop = await fetch(picture("family-room-to-office/plan.png"));
+    const loopBody = Buffer.from(await loop.arrayBuffer());
+    assert(loop.status === 400, "symlink loop got " + loop.status);
+    assert(!loopBody.includes(Buffer.from(vault)), "symlink loop must not include the vault path");
+    fs.unlinkSync(path.join(job, "walk.png"));
+    execFileSync("mkfifo", [path.join(job, "walk.png")]);
+    const started = Date.now();
+    const pipe = await fetch(picture("family-room-to-office/walk.png"));
+    assert(Date.now() - started < 2000, "fifo read stalled");
+    assert(pipe.status === 400, "fifo read got " + pipe.status);
+    assert(fs.lstatSync(path.join(job, "walk.png")).isFIFO(), "fifo is left in place");
+  } finally {
+    try { child.kill("SIGTERM"); } catch {}
+    const deadline = Date.now() + 2000;
+    while (child.exitCode == null && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    try { child.kill("SIGKILL"); } catch {}
+    try { fs.rmSync(vault, { recursive: true, force: true }); } catch {}
+  }
+}
+
+await check("picture bytes have to be the picture", pngReadIsOnlyThePicture);
 
 const failed = results.filter((r) => !r.ok);
 console.log("");

@@ -146,15 +146,22 @@ function gitHint() {
   return hint;
 }
 
-function gitEnv() {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
-  delete env.GIT_ASKPASS;
+export function gitEnv(baseEnv) {
+  // A parent shell's GIT_DIR writes config into the wrong repo. GIT_CONFIG_* can
+  // set core.hooksPath and run a hook on commit. Keep only the prompt flag and
+  // explicit CA bundle paths.
+  const env = { ...(baseEnv || process.env), GIT_TERMINAL_PROMPT: "0" };
+  for (const key of Object.keys(env)) {
+    if (!key.startsWith("GIT_")) continue;
+    if (key === "GIT_TERMINAL_PROMPT" || key === "GIT_SSL_CAINFO" || key === "GIT_SSL_CAPATH") continue;
+    delete env[key];
+  }
   return env;
 }
 
 function runGit(args, { cwd, timeoutMs = 20000 } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn("git", args, {
+    const child = spawn("git", ["--literal-pathspecs", ...args], {
       cwd: cwd || undefined,
       env: gitEnv(),
       stdio: ["ignore", "pipe", "pipe"],
@@ -451,12 +458,35 @@ function addDays(iso, n) {
   return isoDate(x);
 }
 
-async function readFileSafe(p) {
+async function gitConfigIdentity() {
   try {
-    return await fs.readFile(p, "utf8");
+    const st = await fs.stat(path.join(VAULT, ".git", "config"));
+    if (!st.isFile()) return null;
+    return { dev: st.dev, ino: st.ino };
+  } catch {
+    return null;
+  }
+}
+
+async function readFileSafe(p) {
+  let fh;
+  try {
+    fh = await fs.open(p, "r");
   } catch (e) {
     if (e.code === "ENOENT") return null;
     throw e;
+  }
+  try {
+    const st = await fh.stat();
+    // A hard link of .git/config onto a .md name is still that inode (nlink > 1).
+    // Read the opened fd so the check and the bytes are the same file.
+    if (st.isFile() && st.nlink > 1) {
+      const id = await gitConfigIdentity();
+      if (id && st.dev === id.dev && st.ino === id.ino) return null;
+    }
+    return await fh.readFile("utf8");
+  } finally {
+    await fh.close();
   }
 }
 

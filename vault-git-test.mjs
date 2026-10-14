@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { authenticatedGitUrl, redactSecrets, sanitizeGitError, seedBundledVault } from "./server.mjs";
+import { authenticatedGitUrl, gitEnv, redactSecrets, sanitizeGitError, seedBundledVault } from "./server.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
@@ -190,6 +190,29 @@ async function liveGitSync() {
   }
 }
 
+function gitEnvDoesNotInherit() {
+  const env = gitEnv({
+    PATH: "/usr/bin",
+    GIT_DIR: "/tmp/other/.git",
+    GIT_WORK_TREE: "/tmp/other",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "core.hooksPath",
+    GIT_CONFIG_VALUE_0: "/tmp/evil-hooks",
+    GIT_SSH_COMMAND: "echo pwned",
+    GIT_SSL_CAINFO: "/etc/ssl/cert.pem",
+    GIT_TERMINAL_PROMPT: "1",
+  });
+  assert(env.GIT_TERMINAL_PROMPT === "0", "prompts stay disabled");
+  assert(env.GIT_SSL_CAINFO === "/etc/ssl/cert.pem", "explicit CA bundle kept");
+  assert(env.GIT_DIR == null, "GIT_DIR must not steer vault git");
+  assert(env.GIT_WORK_TREE == null, "GIT_WORK_TREE must not steer vault git");
+  assert(env.GIT_CONFIG_COUNT == null, "GIT_CONFIG_COUNT must not inject config");
+  assert(env.GIT_CONFIG_KEY_0 == null, "GIT_CONFIG_KEY must not inject hooksPath");
+  assert(env.GIT_CONFIG_VALUE_0 == null, "GIT_CONFIG_VALUE must not inject hooksPath");
+  assert(env.GIT_SSH_COMMAND == null, "GIT_SSH_COMMAND must not be inherited");
+  assert(/--literal-pathspecs/.test(fs.readFileSync(path.join(root, "server.mjs"), "utf8")), "git add is literal");
+}
+
 function authUrlShaping() {
   const token = "ghp_unit_test_token_9f3a2c1b";
   const url = "https://github.com/MotorUnitRoot/aidanos-vault.git";
@@ -342,12 +365,87 @@ async function bundledSeedWhenCloneFails() {
   }
 }
 
+async function inheritedGitEnvDoesNotSteerOrHook() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-git-env-"));
+  const bare = path.join(tmp, "remote.git");
+  const other = path.join(tmp, "other");
+  const vault = path.join(tmp, "vault");
+  const hooks = path.join(tmp, "hooks");
+  const marker = path.join(tmp, "hook-ran");
+  fs.mkdirSync(hooks, { recursive: true });
+  fs.writeFileSync(path.join(hooks, "pre-commit"), "#!/bin/sh\necho RAN >> " + JSON.stringify(marker) + "\n", "utf8");
+  fs.chmodSync(path.join(hooks, "pre-commit"), 0o755);
+  const seed = path.join(tmp, "seed");
+  fs.mkdirSync(seed, { recursive: true });
+  fs.mkdirSync(other, { recursive: true });
+  git(["init", "--bare", "-b", "main", bare], tmp);
+  git(["init", "-b", "main"], seed);
+  git(["config", "user.name", "Seed"], seed);
+  git(["config", "user.email", "seed@local"], seed);
+  fs.writeFileSync(path.join(seed, "README.md"), "vault\n", "utf8");
+  git(["add", "README.md"], seed);
+  git(["commit", "-m", "seed"], seed);
+  git(["remote", "add", "origin", bare], seed);
+  git(["push", "-u", "origin", "HEAD"], seed);
+  git(["init", "-b", "main"], other);
+  git(["config", "user.name", "Other Name"], other);
+  git(["config", "user.email", "other@local"], other);
+  fs.writeFileSync(path.join(other, "other.txt"), "other\n", "utf8");
+  git(["add", "other.txt"], other);
+  git(["commit", "-m", "other"], other);
+  fs.mkdirSync(vault, { recursive: true });
+
+  const port = 25000 + Math.floor(Math.random() * 2000);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: bare,
+    AIDANOS_VAULT_GIT_DEBOUNCE_MS: "80",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+    GIT_DIR: path.join(other, ".git"),
+    GIT_WORK_TREE: other,
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "core.hooksPath",
+    GIT_CONFIG_VALUE_0: hooks,
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    assert(git(["config", "user.name"], other).trim() === "Other Name", "GIT_DIR must not rewrite another repo");
+    fs.mkdirSync(path.join(vault, "maps"), { recursive: true });
+    fs.writeFileSync(path.join(vault, "maps", "private.md"), "PRIVATE_NOTE\n", "utf8");
+    const magic = ":(glob)**/*.md";
+    const put = await fetch(base + "/api/file?path=" + encodeURIComponent(magic), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "magic\n", paper: "magic\n", mtime: 0 }),
+    });
+    assert(put.ok, "literal path write " + put.status);
+    await waitFor(() => {
+      const listed = git(["ls-files"], vault);
+      return listed.includes(magic) ? listed : "";
+    }, 5000, "literal pathspec commit");
+    const listed = git(["ls-files"], vault);
+    assert(!listed.includes("maps/private.md"), "magic pathspec must not stage other notes");
+    assert(!fs.existsSync(marker), "inherited hooksPath must not run");
+    const otherLog = git(["log", "--oneline"], other);
+    assert(!otherLog.includes("vault:"), "vault commit must stay out of GIT_DIR");
+  } finally {
+    await stop(child);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 try {
+  gitEnvDoesNotInherit();
   authUrlShaping();
   await seedDoesNotOverwrite();
   await liveGitSync();
   await authOriginIsEmbedded();
   await bundledSeedWhenCloneFails();
+  await inheritedGitEnvDoesNotSteerOrHook();
   console.log("vault-git-test ok");
 } catch (err) {
   console.error("FAIL  vault-git-test  " + err.message);

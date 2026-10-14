@@ -32,6 +32,7 @@ new Function(
     grab("stageGateText", "mapNextStepLines") +
     grab("mapNextStepLines", "taskLineKey") +
     grab("appendDoorTasks", "hideDoorProposals") +
+    grab("mapRowJoinPath", "mapCanvasRows") +
     grab("mapCanvasRows", "paintStagePaper") +
     "\nsandbox.isWorkMapPath = isWorkMapPath;" +
     " sandbox.parseProcessMap = parseProcessMap;" +
@@ -42,6 +43,7 @@ new Function(
     " sandbox.placeStopsFirst = placeStopsFirst;" +
     " sandbox.ensureFamilySeason = ensureFamilySeason;" +
     " sandbox.familyRoomSeed = familyRoomSeed;" +
+    " sandbox.mapRowJoinPath = mapRowJoinPath;" +
     " sandbox.mapCanvasRows = mapCanvasRows;"
 )(sandbox);
 
@@ -55,6 +57,7 @@ const {
   placeStopsFirst,
   ensureFamilySeason,
   familyRoomSeed,
+  mapRowJoinPath,
   mapCanvasRows,
 } = sandbox;
 
@@ -386,6 +389,89 @@ async function pngSymlinkStaysInJob() {
 }
 
 await check("a symlink cannot leave the job folder", pngSymlinkStaysInJob);
+
+check("the season block lines up with the day heading", () => {
+  const css = fs.readFileSync(path.join(root, "day.css"), "utf8");
+  const season = css.slice(css.indexOf(".job-season {"), css.indexOf(".job-season .stage-kicker"));
+  assert(/width:\s*42rem/.test(season), "season column is the paper width");
+  assert(/max-width:\s*100%/.test(season), "season column shrinks with the paper");
+  assert(/margin:\s*0 auto/.test(season), "season column is centered with the heading");
+});
+
+check("Map and Drawing open their own screens and Today comes back", () => {
+  const noteStart = src.indexOf("function renderNote(");
+  const note = src.slice(noteStart, src.indexOf("async function openVaultNote(", noteStart));
+  assert(note.includes("paintJobSeason()"), "opening a note clears the season block off the day paper");
+  const season = src.slice(src.indexOf("async function paintJobSeason("), src.indexOf("const jobButton"));
+  assert(season.includes("isNoteDoc()"), "a note does not keep the day season");
+  assert(season.includes('setAttribute("hidden"'), "the season block hides");
+  const wiki = src.slice(src.indexOf("async function openWiki("), src.indexOf("function wikiNameAtPoint("));
+  assert(wiki.includes('openVaultNote("family-room-to-office/map.md")'), "Map opens the map");
+  assert(wiki.includes('openVaultNote("family-room-to-office/plan.md")'), "Drawing opens the drawing");
+  const back = src.slice(src.indexOf("async function goToday("), src.indexOf("document.querySelectorAll(\"a[href='#today']\")"));
+  assert(back.includes("doc-map"), "Today drops the map screen");
+  assert(back.includes("openDay(todayIso()"), "Today opens the day again");
+});
+
+check("Only one sits clear of the diamond and the next row is joined", () => {
+  const css = fs.readFileSync(path.join(root, "day.css"), "utf8");
+  const fork = css.slice(css.indexOf(".map-fork {"), css.indexOf(".map-fork span"));
+  const kind = css.slice(css.indexOf(".map-fork-kind {"), css.indexOf(".map-fork-no"));
+  const size = Number((fork.match(/width:\s*([0-9.]+)rem/) || [])[1]);
+  const margin = Number((kind.match(/margin:\s*([0-9.]+)rem/) || [])[1]);
+  const hang = size * (Math.SQRT2 - 1) / 2;
+  assert(size === 7.1, "diamond size");
+  assert(margin > hang + 0.7, "caption clears the point: margin " + margin + " hang " + hang);
+  assert(css.includes(".map-board.is-overflow"), "a wide map starts at the left");
+  assert(src.includes("mapBoardOverflows"), "overflow pins the map to the left edge");
+  const sched = src.slice(src.indexOf("function scheduleMapRowJoins("), src.indexOf("scheduleMapRowJoins.gen = 0"));
+  assert(sched.includes("clearMapRowJoin(board)"), "resize clears the old line");
+  assert(sched.indexOf("clearMapRowJoin(board)") < sched.indexOf("mapBoardOverflows(board)"), "the old line is gone before the width is measured");
+  assert(src.includes('addEventListener("resize"') && src.includes("scheduleMapRowJoins()"), "a resize measures the map again");
+  const join = mapRowJoinPath({ x: 100, y: 10, w: 40, h: 20 }, { x: 10, y: 80, w: 40, h: 20 });
+  assert(join === "M 120 30 L 120 55 L 30 55 L 30 80", join);
+  const render = src.slice(src.indexOf("function renderMap("), src.indexOf("function mapRowJoinPath("));
+  assert(render.includes("scheduleMapRowJoins()"), "the canvas draws the join");
+  assert(src.includes("function drawMapRowJoins("), "a line is drawn between rows");
+  assert(src.includes('class", "map-row-svg"'), "the join is a line on the canvas");
+});
+
+check("a narrow map starts at the left edge and scrolls", () => {
+  const css = fs.readFileSync(path.join(root, "day.css"), "utf8");
+  const at = css.indexOf(".map-board {\n    align-items: flex-start;");
+  assert(at > css.indexOf("@media (max-width: 720px)"), "the left start is the phone map");
+  const narrow = css.slice(at, css.indexOf("/* NotePlan", at));
+  const board = narrow.slice(0, narrow.indexOf(".map-flow {"));
+  assert(/align-items:\s*flex-start/.test(board), "rows start at the left");
+  assert(/overflow:\s*auto/.test(board), "the map scrolls");
+  assert(/min-width:\s*0/.test(board), "the board can be narrower than the map");
+  const flow = narrow.slice(narrow.indexOf(".map-flow {"), narrow.indexOf("\n}"));
+  assert(/justify-content:\s*flex-start/.test(flow), "the first stage is the start of the row");
+  assert(/width:\s*max-content/.test(flow), "the row keeps its width and scrolls");
+});
+
+check("Map, Drawing, and the day arrows have a 44px tap area", () => {
+  const css = fs.readFileSync(path.join(root, "day.css"), "utf8");
+  const hit = css.slice(css.indexOf(".job-links .text-link::before,"), css.indexOf(".job-links .text-link::before {"));
+  assert(hit.includes(".day-shift .text-link::before"), "date arrows");
+  assert(hit.includes(".week-arrows .icon-btn::before"), "day strip arrows");
+  const box = css.slice(css.indexOf(".job-links .text-link::before,"), css.indexOf(".job-links .text-link::before {") + 180);
+  assert(/width:\s*44px/.test(box) && /height:\s*44px/.test(box), "44px box");
+  assert(css.includes("#prev-day::before") && css.includes("#next-day::before"), "each date arrow");
+  assert(css.includes("#prev-week::before") && css.includes("#next-week::before"), "each week arrow");
+  const dayShift = css.slice(css.indexOf(".day-shift .text-link {"), css.indexOf(".view-today .dump-src"));
+  assert(!/min-width:\s*44px/.test(dayShift) && !/min-height:\s*44px/.test(dayShift), "the date row keeps its size");
+  const weekBtn = css.slice(css.indexOf(".view-today .icon-btn {"), css.indexOf(".view-today .icon-btn:hover"));
+  assert(!/::before|:before/.test(weekBtn), "the week arrow glyph is not a pseudo element");
+  const iconCss = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+  const iconBtn = iconCss.slice(iconCss.indexOf("\n.icon-btn {"), iconCss.indexOf(".icon-btn:hover"));
+  assert(!/::before|:before/.test(iconBtn), "icon buttons do not paint their glyph with ::before");
+  const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
+  assert(html.includes('id="prev-week"') && html.includes("&#8249;"), "the week arrow glyph is a character");
+  assert(html.includes('id="next-week"') && html.includes("&#8250;"), "the next week arrow glyph is a character");
+  const links = src.slice(src.indexOf("links.className = \"job-links\""), src.indexOf("host.appendChild(button)"));
+  assert(links.includes("openWiki(\"Map\")") && links.includes("openWiki(\"Drawing\")"), "the season links are Map and Drawing");
+});
 
 async function pngReadIsOnlyThePicture() {
   const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-room-"));

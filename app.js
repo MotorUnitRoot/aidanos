@@ -2031,6 +2031,7 @@ function renderNote() {
   const dump = $("dump");
   const md = cleanPaperMarkdown(doc.markdown || "");
   if (dump) dump.value = md;
+  paintJobSeason();
   if (isWorkMapPath(path)) {
     renderMap();
     syncJobChrome();
@@ -2240,7 +2241,104 @@ function renderMap() {
     });
     board.appendChild(flow);
   });
+  scheduleMapRowJoins();
 }
+
+function mapRowJoinPath(from, to) {
+  const x1 = from.x + from.w / 2;
+  const y1 = from.y + from.h;
+  const x2 = to.x + to.w / 2;
+  const y2 = to.y;
+  const gap = y2 - y1;
+  const mid = y1 + (gap > 0 ? gap / 2 : 8);
+  return "M " + x1 + " " + y1 + " L " + x1 + " " + mid + " L " + x2 + " " + mid + " L " + x2 + " " + y2;
+}
+
+function mapRowJoinArrow(x, y) {
+  return "M " + (x - 4) + " " + (y - 5) + " L " + x + " " + y + " L " + (x + 4) + " " + (y - 5);
+}
+
+function drawMapRowJoins(board) {
+  const old = board.querySelector(".map-row-svg");
+  if (old) old.remove();
+  const flows = Array.from(board.querySelectorAll(".map-flow"));
+  if (flows.length < 2) return;
+  const boardRect = board.getBoundingClientRect();
+  if (boardRect.width < 2) return;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "map-row-svg");
+  svg.setAttribute("aria-hidden", "true");
+  const parts = [];
+  for (let i = 0; i < flows.length - 1; i++) {
+    const fromEl = flows[i].lastElementChild;
+    const toEl = flows[i + 1].querySelector(".map-stage");
+    if (!fromEl || !toEl) continue;
+    const a = fromEl.getBoundingClientRect();
+    const b = toEl.getBoundingClientRect();
+    if (a.width < 2 || b.width < 2) continue;
+    const from = {
+      x: a.left - boardRect.left + board.scrollLeft,
+      y: a.top - boardRect.top + board.scrollTop,
+      w: a.width,
+      h: a.height,
+    };
+    const to = {
+      x: b.left - boardRect.left + board.scrollLeft,
+      y: b.top - boardRect.top + board.scrollTop,
+      w: b.width,
+      h: b.height,
+    };
+    parts.push(mapRowJoinPath(from, to));
+    const endX = to.x + to.w / 2;
+    parts.push(mapRowJoinArrow(endX, to.y));
+  }
+  if (!parts.length) return;
+  const width = board.scrollWidth;
+  const height = board.scrollHeight;
+  svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+  svg.setAttribute("width", String(width));
+  svg.setAttribute("height", String(height));
+  for (const d of parts) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", d);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", "#a89f91");
+    path.setAttribute("stroke-width", "1");
+    svg.appendChild(path);
+  }
+  board.appendChild(svg);
+}
+
+function clearMapRowJoin(board) {
+  const old = board.querySelector(".map-row-svg");
+  if (old) old.remove();
+}
+
+function mapBoardOverflows(board) {
+  return board.scrollWidth > board.clientWidth + 1;
+}
+
+function scheduleMapRowJoins() {
+  const board = $("map-board");
+  if (!board) return;
+  const gen = ++scheduleMapRowJoins.gen;
+  const pass = (again) => {
+    if (gen !== scheduleMapRowJoins.gen) return;
+    if (!board.isConnected || board.closest("[hidden]")) return;
+    clearMapRowJoin(board);
+    const overflow = mapBoardOverflows(board);
+    if (board.classList.contains("is-overflow") !== overflow) {
+      board.classList.toggle("is-overflow", overflow);
+      if (!again) {
+        requestAnimationFrame(() => pass(true));
+        return;
+      }
+    }
+    drawMapRowJoins(board);
+  };
+  requestAnimationFrame(() => pass(false));
+}
+scheduleMapRowJoins.gen = 0;
 
 function mapCanvasRows(parsed) {
   const flow = Array.isArray(parsed && parsed.flow) ? parsed.flow : [];
@@ -3737,7 +3835,7 @@ async function goToday() {
   await leaveCurrentPaper();
   state.doc = null;
   state.openDayGen++;
-  document.body.classList.remove("doc-note", "doc-capture", "doc-plan");
+  document.body.classList.remove("doc-note", "doc-capture", "doc-plan", "doc-map", "doc-stage");
   if (location.hash !== "#today") location.hash = "today";
   else showView("today");
   syncTodayNav();
@@ -4420,6 +4518,9 @@ document.addEventListener("keydown", (e) => {
 });
 
 window.addEventListener("hashchange", route);
+window.addEventListener("resize", () => {
+  if (isMapDoc() && !state.mapStageId) scheduleMapRowJoins();
+});
 window.addEventListener("pagehide", flushOnLeave);
 window.addEventListener("beforeunload", flushOnLeave);
 document.addEventListener("visibilitychange", () => {

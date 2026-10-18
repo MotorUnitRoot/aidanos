@@ -1,16 +1,16 @@
 # Family room to office
 
-Level 3 AidanOS app. One job: a finished family room in a US house that stays living space. Not a bedroom, a garage, or an addition. No new controls. No second store. Markdown files in one folder are the disk.
+Level 3 AidanOS app. One job: a finished family room in a US house that stays living space. Not a bedroom, a garage, or an addition. No new controls. No second store. The vault is the disk. The job has its own folder, and two writes land outside that folder.
 
 Door prompt, exact: `What do you want to do today?`
 
 The sentence that starts this job, exact: `I want to convert my family room to an office.`
 
-Entering on that sentence opens Questions. `Get to work` and `Capture thoughts` do not start this job.
+Entering on that sentence opens Questions. `Get to Work` and `Capture thoughts` do not start this job.
 
 ## Folder
 
-One folder for the job. These files, and nothing else:
+The job folder holds these files:
 
 - `answers.md` — the eight answers
 - `plan.png` — the hand drawing (or the file he dropped)
@@ -20,13 +20,15 @@ One folder for the job. These files, and nothing else:
 - `map.md` — stages, the two forks, and the lesson for the open stage
 - `today.md` — the boxes added to the day he already has
 
+The job also writes outside that folder. `writeFamilyStops` writes the season file `aidanos/active-horse.md`. `addTheseToToday` calls `applyStepsToToday`, which writes today's `log/YYYY-MM-DD.md`. The same step also copies the boxes into `today.md`.
+
 ## Screens
 
-Reuse only: the Door prompt, hairline buttons, paper, a hanging list, checkboxes, the process canvas, Plan blocks, the week rail, Ask, wiki links.
+Reuse only: the Door prompt, hairline buttons, paper, a hanging list, checkboxes, the process canvas, Plan blocks, the week cards, the day timeline, Ask, wiki links.
 
 ### 1. Door
 
-Almost empty. The prompt. Two buttons: `Get to work`, `Capture thoughts`. Enter on the sentence above is the only way into this job.
+Almost empty. The prompt. Two buttons: `Get to Work`, `Capture thoughts`. Enter on the sentence above is the only way into this job.
 
 ### 2. Questions
 
@@ -78,18 +80,20 @@ Process canvas. Title: `Family room to office`. Each stage shows `Enter · Exit`
 
 Stages, in order: See the room, Name the use, Read the structure, the load fork, Ask the town, the surface fork, Rough, Close and finish, Final. Close and finish and Final sit on the next row. They are the same sequence, not a second process.
 
-Under the canvas, the open stage: why, the exit condition, then the checkboxes for that stage. Button: `Add these to today`. Link: `The plan`.
+Opening a stage replaces the canvas. The stage paper shows why, the exit condition, then the checkboxes for that stage. It does not sit under the canvas. Button: `Add these to today`. Link: `The plan`.
 
 ### 6. Today
 
-The day he already has. Week rail on the side. Season file for this job, in this order:
+The day he already has. Week cards are the top row of the left column. The side rail is the day timeline. It folds at 720px.
+
+The season block shows only on the open calendar day, and only when `today.md` has an unchecked task (`paintJobSeason`). It stays hidden on a note. When it shows, the order is:
 
 - Why it matters.
 - What comes next.
 - What is waiting.
 - Before you cut.
 
-Then links: `Map`, `Drawing`. Then the boxes from `Add these to today`. The same button may appear here. It only adds boxes to this day. It does not create a new day or a new list.
+Then links: `Map`, `Drawing`. Then the boxes from `Add these to today`. The same button may appear here. It adds those boxes to today's `log/YYYY-MM-DD.md`. It does not create a new day or a new list.
 
 ## Stops
 
@@ -110,4 +114,4 @@ Order when the wall was opened: prime, casing and crown, the hard floor, then ba
 
 ## Out of scope
 
-No 3D renderer. No new screen chrome. No ticket system. No second vault. Do not change DESIGN.md. Do not touch open PRs 11, 25, 29, or 30.
+No 3D renderer. No new screen chrome. No ticket system. No second vault. Do not change DESIGN.md.

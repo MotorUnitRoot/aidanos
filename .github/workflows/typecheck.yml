@@ -1,0 +1,49 @@
+name: typecheck
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5.1.0
+      - name: Set up Node.js
+        uses: actions/setup-node@v6.5.0
+        with:
+          node-version: "22"
+      # tsc reads tsconfig.json, not jsconfig.json, unless -p points at it.
+      # The flags match the brief; -p selects the JavaScript project file.
+      # Warnings only: always exit 0 and record the error count.
+      - name: tsc
+        shell: bash
+        run: |
+          set +e
+          set +o pipefail
+          npx --yes -p typescript@5.9.3 tsc -p jsconfig.json --noEmit --allowJs --checkJs --pretty false > tsc-out.txt 2>&1
+          status=$?
+          count=$(grep -c 'error TS' tsc-out.txt || true)
+          {
+            echo "### Typecheck"
+            echo ""
+            echo "tsc reported **${count}** error(s) (exit ${status}). This job is warnings-only and does not fail the build."
+            echo ""
+            if [ "${count}" -gt 0 ]; then
+              echo "<details><summary>tsc output (first 200 lines)</summary>"
+              echo ""
+              echo '```'
+              head -n 200 tsc-out.txt
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "tsc errors: ${count} (exit ${status})"
+          exit 0

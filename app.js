@@ -4617,7 +4617,7 @@ function fmtBoldSelectionOrLine() {
   let end = -1;
   if (sel && sel.rangeCount && paper.contains(sel.anchorNode) && !sel.isCollapsed) {
     try {
-      const off = caretOffset(el);
+      void caretOffset(el);
       const selected = String(sel.toString() || "");
       if (selected && text.includes(selected)) {
         start = text.indexOf(selected);

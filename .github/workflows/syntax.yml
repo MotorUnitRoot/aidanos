@@ -1,0 +1,40 @@
+name: syntax
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5.1.0
+      - name: Set up Node.js
+        uses: actions/setup-node@v6.5.0
+        with:
+          node-version: "22"
+      - name: node --check
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          found=0
+          while IFS= read -r -d '' file; do
+            case "$file" in
+              public/fonts/*) continue ;;
+            esac
+            found=1
+            echo "node --check $file"
+            node --check "$file" || status=1
+          done < <(git ls-files -z '*.js' '*.mjs')
+          if [ "$found" -eq 0 ]; then
+            echo "No tracked JS files to check."
+          fi
+          exit "$status"

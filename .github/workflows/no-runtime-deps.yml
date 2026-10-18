@@ -1,0 +1,44 @@
+name: no-runtime-deps
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  no-runtime-deps:
+    name: no-runtime-deps
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5.1.0
+      - name: Set up Node.js
+        uses: actions/setup-node@v6.5.0
+        with:
+          node-version: "22"
+      - name: dependencies must be empty
+        shell: bash
+        run: |
+          node --input-type=module <<'EOF'
+          import { readFile } from "node:fs/promises";
+          const pkg = JSON.parse(await readFile("package.json", "utf8"));
+          const deps = pkg.dependencies;
+          if (deps == null) {
+            console.log("package.json has no dependencies field");
+            process.exit(0);
+          }
+          if (typeof deps !== "object" || Array.isArray(deps)) {
+            console.error("package.json dependencies must be an object");
+            process.exit(1);
+          }
+          const names = Object.keys(deps);
+          if (names.length > 0) {
+            console.error("package.json dependencies is not empty: " + names.join(", "));
+            process.exit(1);
+          }
+          console.log("package.json dependencies is empty");
+          EOF

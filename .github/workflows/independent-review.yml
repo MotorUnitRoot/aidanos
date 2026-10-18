@@ -1,0 +1,32 @@
+name: independent-review
+
+on:
+  pull_request:
+    branches: [main]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  checks: write
+  actions: write
+
+jobs:
+  independent-review:
+    name: independent-review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5.1.0
+      - name: Set up Node.js
+        uses: actions/setup-node@v6.5.0
+        with:
+          node-version: "22"
+      - name: Self-test
+        run: node .github/independent-review.mjs --self-test
+      - name: Require a review comment for this head
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/independent-review.mjs

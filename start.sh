@@ -10,7 +10,6 @@ PIDF=logs/aidanos.pid
 LOGF=logs/aidanos.log
 PORT_N="${PORT:-3847}"
 HEALTH=http://127.0.0.1:${PORT_N}/api/health
-SIT=32457
 alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 hcode() { curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "$HEALTH" 2>/dev/null || echo 000; }
 if [ "$(hcode)" = 200 ] && [ -f "$PIDF" ]; then
@@ -30,21 +29,6 @@ if [ -f "$PIDF" ]; then
     alive "$old" && kill -9 "$old" 2>/dev/null || true
     pkill -9 -P "$old" 2>/dev/null || true
   fi
-fi
-if alive "$SIT"; then
-  cmd=$(ps -p "$SIT" -o args= 2>/dev/null || true)
-  on=0
-  ss -tlnp 2>/dev/null | grep ":${PORT_N}" | grep -q "pid=$SIT" && on=1
-  case "$cmd" in
-    *node\ server.mjs*)
-      if [ "$on" = 1 ]; then
-        kill "$SIT" 2>/dev/null || true
-        n=0
-        while [ "$n" -lt 20 ] && alive "$SIT"; do sleep 0.1; n=$((n+1)); done
-        alive "$SIT" && kill -9 "$SIT" 2>/dev/null || true
-      fi
-      ;;
-  esac
 fi
 n=0
 while [ "$n" -lt 20 ] && [ "$(hcode)" = 200 ]; do sleep 0.1; n=$((n+1)); done

@@ -146,15 +146,21 @@ function gitHint() {
   return hint;
 }
 
-function gitEnv() {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
-  delete env.GIT_ASKPASS;
+export function gitEnv(baseEnv) {
+  // GIT_DIR writes config into another repo. GIT_CONFIG_* can set core.hooksPath
+  // and run that hook on the next commit. Keep the prompt flag and explicit CA paths.
+  const env = { ...(baseEnv || process.env), GIT_TERMINAL_PROMPT: "0" };
+  for (const key of Object.keys(env)) {
+    if (!key.startsWith("GIT_")) continue;
+    if (key === "GIT_TERMINAL_PROMPT" || key === "GIT_SSL_CAINFO" || key === "GIT_SSL_CAPATH") continue;
+    delete env[key];
+  }
   return env;
 }
 
 function runGit(args, { cwd, timeoutMs = 20000 } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn("git", args, {
+    const child = spawn("git", ["--literal-pathspecs", ...args], {
       cwd: cwd || undefined,
       env: gitEnv(),
       stdio: ["ignore", "pipe", "pipe"],
@@ -224,6 +230,14 @@ async function vaultHasDemo(dir) {
 }
 
 async function copyBundledTree(src, dest) {
+  let destStat = null;
+  try {
+    destStat = await fs.lstat(dest);
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
+  // A planted symlink must not receive the sample vault.
+  if (destStat && destStat.isSymbolicLink()) return;
   await fs.mkdir(dest, { recursive: true });
   let entries = [];
   try {
@@ -232,15 +246,23 @@ async function copyBundledTree(src, dest) {
     return;
   }
   for (const ent of entries) {
-    if (ent.name === ".git") continue;
+    if (ent.name === ".git" || ent.isSymbolicLink()) continue;
     const from = path.join(src, ent.name);
     const to = path.join(dest, ent.name);
+    let existing = null;
+    try {
+      existing = await fs.lstat(to);
+    } catch (e) {
+      if (e.code !== "ENOENT") throw e;
+    }
+    if (existing && existing.isSymbolicLink()) continue;
     if (ent.isDirectory()) {
+      if (existing && !existing.isDirectory()) continue;
       await copyBundledTree(from, to);
       continue;
     }
     if (!ent.isFile()) continue;
-    if (await pathExists(to)) continue;
+    if (existing) continue;
     await fs.copyFile(from, to);
   }
 }
@@ -451,12 +473,39 @@ function addDays(iso, n) {
   return isoDate(x);
 }
 
-async function readFileSafe(p) {
+async function gitConfigIdentity() {
   try {
-    return await fs.readFile(p, "utf8");
+    const st = await fs.stat(path.join(VAULT, ".git", "config"));
+    if (!st.isFile()) return null;
+    return { dev: st.dev, ino: st.ino };
+  } catch {
+    return null;
+  }
+}
+
+async function readFileSafe(p) {
+  const flags = fsSync.constants.O_RDONLY
+    | (fsSync.constants.O_NOFOLLOW || 0)
+    | (fsSync.constants.O_NONBLOCK || 0);
+  let fh;
+  try {
+    fh = await fs.open(p, flags);
   } catch (e) {
-    if (e.code === "ENOENT") return null;
+    if (e.code === "ENOENT" || e.code === "ELOOP" || e.code === "EMLINK" || e.code === "ENXIO") return null;
     throw e;
+  }
+  try {
+    const st = await fh.stat();
+    // A fifo would block a plain read. A hard link of .git/config is still that
+    // inode (nlink > 1); the open fd is the file we are about to return.
+    if (!st.isFile()) return null;
+    if (st.nlink > 1) {
+      const id = await gitConfigIdentity();
+      if (id && st.dev === id.dev && st.ino === id.ino) return null;
+    }
+    return await fh.readFile("utf8");
+  } finally {
+    await fh.close();
   }
 }
 
@@ -541,7 +590,7 @@ function parseWeekMarkdown(raw, weekStart) {
         .split("|")
         .map((c) => c.trim())
         .filter((_, i, a) => i > 0 && i < a.length - 1);
-      if (cells.length >= 4 && cells[0] !== "date") {
+      if (cells.length >= 4 && isIsoDate(cells[0])) {
         days.push({
           date: cells[0],
           role: cells[1] || "",
@@ -626,21 +675,71 @@ function safeJoin(root, rel) {
 }
 
 async function resolveInside(root, abs) {
-  const rootReal = await fs.realpath(root);
-  let cursor = path.resolve(abs);
-  for (;;) {
-    try {
-      const real = await fs.realpath(cursor);
-      if (!contained(real, rootReal)) {
-        throw new Error("path escapes vault");
-      }
-      return abs;
-    } catch (e) {
-      if (e.code !== "ENOENT") throw e;
-      const parent = path.dirname(cursor);
-      if (parent === cursor) throw new Error("bad path");
-      cursor = parent;
+  const rootResolved = path.resolve(root);
+  let rootReal = rootResolved;
+  try {
+    rootReal = await fs.realpath(rootResolved);
+  } catch (e) {
+    if (e.code !== "ENOENT") throw new Error("bad path");
+  }
+  const target = path.resolve(abs);
+  if (!contained(target, rootResolved) && !contained(target, rootReal)) {
+    throw new Error("path escapes vault");
+  }
+  const rel = path.relative(rootResolved, target);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) throw new Error("path escapes vault");
+  const parts = rel ? rel.split(path.sep).filter(Boolean) : [];
+  let cursor = rootResolved;
+  for (const part of parts) {
+    if (!part || part === "." || part === ".." || part.startsWith(".")) {
+      throw new Error("path escapes vault");
     }
+    cursor = path.join(cursor, part);
+    let st;
+    try {
+      st = await fs.lstat(cursor);
+    } catch (e) {
+      if (e.code !== "ENOENT") throw new Error("bad path");
+      return target;
+    }
+    // A symlink named like a note, or a directory symlink, is not a vault path.
+    // realpath() would follow maps/note.md -> .git/config or log/ -> elsewhere.
+    if (st.isSymbolicLink()) throw new Error("path escapes vault");
+  }
+  if (parts.length) {
+    let real;
+    try {
+      real = await fs.realpath(cursor);
+    } catch (e) {
+      if (e.code === "ENOENT") return target;
+      throw new Error("bad path");
+    }
+    if (!contained(real, rootReal)) throw new Error("path escapes vault");
+  }
+  return target;
+}
+
+async function readVaultRel(rel) {
+  const abs = safeJoin(VAULT, rel);
+  await resolveInside(VAULT, abs);
+  return readFileSafe(abs);
+}
+
+async function readLogNames() {
+  const logDir = path.join(VAULT, "log");
+  try {
+    await resolveInside(VAULT, logDir);
+    const st = await fs.lstat(logDir);
+    if (st.isSymbolicLink() || !st.isDirectory()) return [];
+  } catch (e) {
+    if (e.code === "ENOENT" || e.message === "bad path" || e.message === "path escapes vault") return [];
+    throw e;
+  }
+  try {
+    return await fs.readdir(logDir);
+  } catch (e) {
+    if (e.code === "ENOENT") return [];
+    throw e;
   }
 }
 
@@ -879,8 +978,24 @@ function sendDayWatch(date, mtime) {
 function startLogWatch() {
   const logDir = path.join(VAULT, "log");
   try {
+    if (fsSync.lstatSync(logDir).isSymbolicLink()) return;
+  } catch (e) {
+    if (e.code !== "ENOENT") {
+      logSafe("log watch", e);
+      return;
+    }
+  }
+  try {
     fsSync.mkdirSync(logDir, { recursive: true });
   } catch {}
+  try {
+    if (fsSync.lstatSync(logDir).isSymbolicLink()) return;
+    const rootReal = fsSync.realpathSync(VAULT);
+    const dirReal = fsSync.realpathSync(logDir);
+    if (!contained(dirReal, rootReal)) return;
+  } catch {
+    return;
+  }
   try {
     const watcher = fsSync.watch(logDir, { persistent: true, recursive: false }, (_eventType, filename) => {
       if (!filename) return;
@@ -889,8 +1004,8 @@ function startLogWatch() {
       if (!DAY_FILE_RE.test(name)) return;
       const date = name.slice(0, 10);
       const logPath = path.join(logDir, name);
-      fsSync.stat(logPath, (err, st) => {
-        if (err || !st) return;
+      fsSync.lstat(logPath, (err, st) => {
+        if (err || !st || !st.isFile() || st.isSymbolicLink()) return;
         const mtime = Math.trunc(st.mtimeMs);
         if (isSelfWrite(date, mtime)) return;
         sendDayWatch(date, mtime);
@@ -949,8 +1064,12 @@ const server = http.createServer(async (req, res) => {
       else if (!isIsoDate(start)) {
         return json(res, 400, { error: "start must be YYYY-MM-DD" });
       }
-      const weekPath = path.join(VAULT, "aidanos", "weeks", `${start}.md`);
-      let raw = await readFileSafe(weekPath);
+      let raw = null;
+      try {
+        raw = await readVaultRel(`aidanos/weeks/${start}.md`);
+      } catch (e) {
+        if (e.message !== "bad path" && e.message !== "path escapes vault") throw e;
+      }
       if (!raw) {
         const days = [];
         for (let i = 0; i < 7; i++) {
@@ -967,7 +1086,13 @@ const server = http.createServer(async (req, res) => {
       }
       const days = parseWeekMarkdown(raw, start);
       for (const d of days) {
-        const logRaw = await readFileSafe(path.join(VAULT, "log", `${d.date}.md`));
+        if (!isIsoDate(d.date)) continue;
+        let logRaw = null;
+        try {
+          logRaw = await readVaultRel(`log/${d.date}.md`);
+        } catch (e) {
+          if (e.message !== "bad path" && e.message !== "path escapes vault") throw e;
+        }
         if (logRaw) {
           const items = parseCheckboxes(logRaw);
           d.rx_total = items.length;
@@ -986,7 +1111,13 @@ const server = http.createServer(async (req, res) => {
       const date = url.searchParams.get("date");
       if (!date) return json(res, 400, { error: "date required" });
       if (!isIsoDate(date)) return json(res, 400, { error: "date must be YYYY-MM-DD" });
-      const logPath = path.join(VAULT, "log", `${date}.md`);
+      let logPath;
+      try {
+        logPath = safeJoin(VAULT, `log/${date}.md`);
+        await resolveInside(VAULT, logPath);
+      } catch (e) {
+        return json(res, 400, { error: publicPathError(e) });
+      }
       const raw = await readFileSafe(logPath);
       const markdown = raw == null ? "" : raw;
       const mtime = raw == null ? 0 : await fileMtimeMs(logPath);
@@ -1017,21 +1148,20 @@ const server = http.createServer(async (req, res) => {
         }
       }
       const prefix = `${year}-${String(month).padStart(2, "0")}-`;
-      const logDir = path.join(VAULT, "log");
-      let names = [];
-      try {
-        names = await fs.readdir(logDir);
-      } catch (e) {
-        if (e.code === "ENOENT") return json(res, 200, { year, month, days: [] });
-        throw e;
-      }
+      const names = await readLogNames();
       const days = [];
       for (const name of names) {
         if (name.endsWith(".tmp")) continue;
         if (!DAY_FILE_RE.test(name)) continue;
         if (!name.startsWith(prefix)) continue;
         const date = name.slice(0, 10);
-        const raw = await readFileSafe(path.join(logDir, name));
+        let raw = null;
+        try {
+          raw = await readVaultRel(`log/${name}`);
+        } catch (e) {
+          if (e.message === "bad path" || e.message === "path escapes vault") continue;
+          throw e;
+        }
         if (raw == null) continue;
         if (!String(raw).trim()) continue;
         days.push(date);
@@ -1055,7 +1185,13 @@ const server = http.createServer(async (req, res) => {
       const clientMtime = body && typeof body === "object" && body.mtime != null
         ? Number(body.mtime)
         : NaN;
-      const logPath = path.join(VAULT, "log", `${date}.md`);
+      let logPath;
+      try {
+        logPath = safeJoin(VAULT, `log/${date}.md`);
+        await resolveInside(VAULT, logPath);
+      } catch (e) {
+        return json(res, 400, { error: publicPathError(e) });
+      }
       let diskMtime = 0;
       let exists = false;
       try {
@@ -1092,26 +1228,30 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/plan" && req.method === "GET") {
-      const raw = await readFileSafe(path.join(VAULT, "aidanos", "active-horse.md"));
+      let raw = null;
+      try {
+        raw = await readVaultRel("aidanos/active-horse.md");
+      } catch (e) {
+        if (e.message !== "bad path" && e.message !== "path escapes vault") throw e;
+      }
       return json(res, 200, { plan: parsePlan(raw), exists: Boolean(raw) });
     }
 
     if (pathname === "/api/open-tasks" && req.method === "GET") {
-      const logDir = path.join(VAULT, "log");
-      let names = [];
-      try {
-        names = await fs.readdir(logDir);
-      } catch (e) {
-        if (e.code === "ENOENT") return json(res, 200, { items: [] });
-        throw e;
-      }
+      const names = await readLogNames();
       const items = [];
       names.sort((a, b) => a.localeCompare(b));
       for (const name of names) {
         if (name.endsWith(".tmp")) continue;
         if (!DAY_FILE_RE.test(name)) continue;
         const date = name.slice(0, 10);
-        const raw = await readFileSafe(path.join(logDir, name));
+        let raw = null;
+        try {
+          raw = await readVaultRel(`log/${name}`);
+        } catch (e) {
+          if (e.message === "bad path" || e.message === "path escapes vault") continue;
+          throw e;
+        }
         if (raw == null) continue;
         const lines = raw.split("\n");
         for (let i = 0; i < lines.length; i++) {
@@ -1128,7 +1268,7 @@ const server = http.createServer(async (req, res) => {
       const entries = await fs.readdir(VAULT, { withFileTypes: true });
       const folders = [];
       for (const e of entries) {
-        if (!e.isDirectory() || e.name.startsWith(".")) continue;
+        if (e.isSymbolicLink() || !e.isDirectory() || e.name.startsWith(".")) continue;
         if (e.name === "log" || e.name === "tasks" || e.name === "aidanos") continue;
         folders.push({ name: e.name, path: e.name });
       }
@@ -1143,7 +1283,7 @@ const server = http.createServer(async (req, res) => {
       try {
         abs = safeJoin(VAULT, rel);
       } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
+        return json(res, 400, { error: publicPathError(e) });
       }
       const relPath = path.relative(VAULT, abs).split(path.sep).join("/");
       if (familyRoomPngPath(relPath)) {
@@ -1165,7 +1305,7 @@ const server = http.createServer(async (req, res) => {
       try {
         await resolveInside(VAULT, abs);
       } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
+        return json(res, 400, { error: publicPathError(e) });
       }
       if (!String(relPath).endsWith(".md")) {
         return json(res, 400, { error: "markdown only" });
@@ -1183,7 +1323,7 @@ const server = http.createServer(async (req, res) => {
       try {
         abs = safeJoin(VAULT, rel);
       } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
+        return json(res, 400, { error: publicPathError(e) });
       }
       const relPath = path.relative(VAULT, abs).split(path.sep).join("/");
       if (familyRoomPngPath(relPath)) {
@@ -1220,7 +1360,7 @@ const server = http.createServer(async (req, res) => {
       try {
         await resolveInside(VAULT, abs);
       } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
+        return json(res, 400, { error: publicPathError(e) });
       }
       if (!String(relPath).endsWith(".md")) {
         return json(res, 400, { error: "markdown only" });
@@ -1287,7 +1427,7 @@ const server = http.createServer(async (req, res) => {
         abs = dirParam === "." || dirParam === "" ? VAULT : safeJoin(VAULT, dirParam);
         await resolveInside(VAULT, abs);
       } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
+        return json(res, 400, { error: publicPathError(e) });
       }
       let stat;
       try {
@@ -1371,8 +1511,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/skin.css" && req.method === "GET") {
-      const skinPath = path.join(VAULT, "aidanos", "skin.css");
-      const raw = await readFileSafe(skinPath);
+      let raw = null;
+      try {
+        raw = await readVaultRel("aidanos/skin.css");
+      } catch (e) {
+        if (e.message !== "bad path" && e.message !== "path escapes vault") throw e;
+      }
       res.writeHead(200, {
         "Content-Type": "text/css; charset=utf-8",
         "Cache-Control": "no-store",

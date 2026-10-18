@@ -1,5 +1,7 @@
 name: independent-review
 
+# issue_comment runs only from the default branch, so it starts working
+# after this file is on main. Until then, a pull_request run is the check.
 on:
   pull_request:
     branches: [main]

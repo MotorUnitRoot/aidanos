@@ -1,25 +1,35 @@
 name: independent-review
 
-# issue_comment runs only from the default branch, so that job starts
-# working after this file is on main. The pull_request job is the check
-# until then. It stays read-only: a pull request can change this file,
-# and write tokens must not be handed to that code.
+# The binding gate is the commit status `independent-review/approved`.
+# Only the job below posts it, and only for events whose workflow file
+# comes from the default branch: issue_comment, and pull_request_target.
+# A pull request cannot change that file until it is merged.
+#
+# pull_request_target re-evaluates on open, push, and reopen. It checks
+# out github.sha, which is the base branch, and never checks out or runs
+# the pull request head. The head SHA is taken from the event payload.
+# Until this file is on main, a push does not post the status; a later
+# comment still does, through the copy of this file already on main.
 on:
   pull_request:
     branches: [main]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [main]
   issue_comment:
-    types: [created]
+    types: [created, edited]
 
 permissions:
   contents: read
 
 jobs:
-  independent-review:
+  independent-review-advisory:
     if: github.event_name == 'pull_request'
-    name: independent-review
+    name: independent-review (advisory)
     runs-on: ubuntu-latest
-    # Read-only. issues: read lists conversation comments; pull-requests: read
-    # does not. No checks, statuses, or actions write on this job.
+    # Early signal only. A pull request can change this job, so it stays
+    # read-only and must not post independent-review/approved.
+    # issues: read lists conversation comments; pull-requests: read does not.
     permissions:
       contents: read
       pull-requests: read
@@ -37,26 +47,24 @@ jobs:
           node-version: "22"
       - name: Self-test
         run: node .github/independent-review.mjs --self-test
-      - name: Require a review comment for this head
+      - name: Advisory review signal for this head
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node .github/independent-review.mjs
 
-  # Workflow source for this event is the default branch, not the PR head.
-  # Checkout stays on github.sha. checks:write and statuses:write live only here.
-  independent-review-on-comment:
-    if: github.event_name == 'issue_comment' && github.event.issue.pull_request
-    name: independent-review-on-comment
+  # Default-branch workflow only. Checkout stays on github.sha.
+  independent-review-status:
+    if: github.event_name == 'pull_request_target' || (github.event_name == 'issue_comment' && github.event.issue.pull_request)
+    name: independent-review-status
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
       issues: read
-      checks: write
       statuses: write
     steps:
       - name: Checkout default branch
-        # v5.1.0
+        # v5.1.0 — base branch SHA, never the pull request head.
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: ${{ github.sha }}
@@ -68,7 +76,7 @@ jobs:
           node-version: "22"
       - name: Self-test
         run: node .github/independent-review.mjs --self-test
-      - name: Publish the review result on the PR head
+      - name: Post independent-review/approved on the PR head
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node .github/independent-review.mjs

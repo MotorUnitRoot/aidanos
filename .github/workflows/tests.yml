@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # v5.1.0
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - name: Set up Node.js
+        # v6.5.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "22"
+      - name: npm test
+        run: npm test

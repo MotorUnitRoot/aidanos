@@ -1,9 +1,38 @@
 import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-// ESLint and the transitive `globals` package live in the npx cache.
-// Resolve them from the ESLint binary so CI can run
-// `npx --yes eslint@9.39.5` without devDependencies or a lockfile.
-const require = createRequire(process.argv[1]);
+// ESLint and the transitive `globals` package live in the npx cache, not in
+// this repo. Walk up from this file and from the running CLI until both
+// packages are found, so `npx --yes eslint@9.39.5` works without
+// devDependencies or a lockfile.
+function requireEslintPackages() {
+  const seeds = [fileURLToPath(import.meta.url)];
+  for (const arg of process.argv) {
+    if (typeof arg === "string" && arg.length > 0) seeds.push(arg);
+  }
+  const seen = new Set();
+  for (const seed of seeds) {
+    let dir = dirname(seed);
+    while (!seen.has(dir)) {
+      seen.add(dir);
+      const eslintPkg = join(dir, "node_modules", "@eslint", "js", "package.json");
+      const globalsPkg = join(dir, "node_modules", "globals", "package.json");
+      if (existsSync(eslintPkg) && existsSync(globalsPkg)) {
+        return createRequire(eslintPkg);
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  throw new Error(
+    "Could not resolve @eslint/js and globals. Run npx --yes eslint@9.39.5.",
+  );
+}
+
+const require = requireEslintPackages();
 const js = require("@eslint/js");
 const globals = require("globals");
 

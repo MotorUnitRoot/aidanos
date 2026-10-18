@@ -2,18 +2,22 @@
 /**
  * Independent review gate.
  *
- * Passes only when a PR comment begins with "Independent review: PASS"
- * followed by the PR's current head SHA. Fails on "Independent review: BLOCK"
- * for this head (or a BLOCK that names no SHA), and when no comment names
- * the current head SHA.
+ * A comment counts only when all of these are true:
+ * - It begins with "Independent review: PASS" or "Independent review: BLOCK".
+ * - PASS is followed by the pull request's current head SHA.
+ * - The comment has not been edited.
+ * - The author has write, maintain, or admin on this repo, from
+ *   GET /repos/{owner}/{repo}/collaborators/{username}/permission.
  *
- * GitHub accounts cannot separate the bots today, so this does not check
- * who wrote the comment. That remains a process rule.
+ * The pull_request job only reads. The issue_comment job, whose workflow
+ * file comes from the default branch, publishes the check and commit status
+ * on the PR head.
  */
 import fs from "node:fs";
 
 const PASS_PREFIX = "Independent review: PASS";
 const BLOCK_PREFIX = "Independent review: BLOCK";
+const REVIEW_ROLES = new Set(["admin", "maintain", "write"]);
 
 export function commentKind(body, headSha) {
   const text = String(body || "")
@@ -33,6 +37,16 @@ export function commentKind(body, headSha) {
   const pass = text.match(/^Independent review: PASS\s+([0-9a-fA-F]{40})\b/);
   if (pass && pass[1].toLowerCase() === sha) return "pass";
   return null;
+}
+
+export function hasReviewAccess(record) {
+  if (!record || typeof record !== "object") return false;
+  return REVIEW_ROLES.has(record.permission) || REVIEW_ROLES.has(record.role_name);
+}
+
+export function commentWasEdited(comment) {
+  if (!comment || !comment.created_at || !comment.updated_at) return false;
+  return comment.created_at !== comment.updated_at;
 }
 
 export function classifyReview(comments, headSha) {
@@ -56,7 +70,7 @@ export function summaryFor(result, headSha) {
   const lines = [
     `Head SHA: \`${headSha}\`.`,
     "",
-    "This check confirms a review comment for that SHA. It cannot prove the commenter is a different author, because every bot posts under the same GitHub account today.",
+    "Only an unedited comment from an author with write, maintain, or admin access counts.",
   ];
   if (result.reason === "pass") {
     const ids = result.pass.map((comment) => comment.id).filter(Boolean).join(", ");
@@ -71,7 +85,7 @@ export function summaryFor(result, headSha) {
   lines.splice(
     1,
     0,
-    `No comment begins with \`${PASS_PREFIX} ${headSha}\`.`,
+    `No unedited comment from a write, maintain, or admin author begins with \`${PASS_PREFIX} ${headSha}\`.`,
   );
   return lines.join("\n");
 }
@@ -101,6 +115,20 @@ export function selfTest() {
     const got = commentKind(body, head);
     assert(got === want, `${name}: got ${got}, want ${want}`);
   }
+
+  assert(hasReviewAccess({ permission: "admin", role_name: "admin" }), "admin");
+  assert(hasReviewAccess({ permission: "write", role_name: "write" }), "write");
+  assert(hasReviewAccess({ permission: "write", role_name: "maintain" }), "maintain maps to write");
+  assert(hasReviewAccess({ permission: "maintain", role_name: "maintain" }), "maintain");
+  assert(!hasReviewAccess({ permission: "read", role_name: "read" }), "read");
+  assert(!hasReviewAccess({ permission: "read", role_name: "triage" }), "triage");
+  assert(!hasReviewAccess({ permission: "none", role_name: "" }), "none");
+  assert(!hasReviewAccess(null), "missing record");
+
+  const stamp = "2026-10-18T00:00:00Z";
+  assert(!commentWasEdited({ created_at: stamp, updated_at: stamp }), "unedited");
+  assert(!commentWasEdited({ body: "no timestamps" }), "timestamps absent");
+  assert(commentWasEdited({ created_at: stamp, updated_at: "2026-10-18T00:00:01Z" }), "edited");
 
   const pass = classifyReview([{ id: 1, body: `${PASS_PREFIX} ${sha}` }], sha);
   assert(pass.conclusion === "success" && pass.reason === "pass", "pass class");
@@ -136,7 +164,7 @@ export function selfTest() {
   assert(bare.conclusion === "failure" && bare.reason === "block", "bare block still fails");
 
   const text = summaryFor(pass, sha);
-  assert(text.includes(sha) && text.includes("same GitHub account"), "summary");
+  assert(text.includes(sha) && text.includes("write, maintain, or admin"), "summary");
   console.log("independent-review self-test ok");
 }
 
@@ -159,7 +187,9 @@ async function gh(pathname, { method = "GET", body } = {}) {
   });
   const text = await response.text();
   if (!response.ok) {
-    throw new Error(`${method} ${pathname} -> ${response.status} ${text.slice(0, 500)}`);
+    const error = new Error(`${method} ${pathname} -> ${response.status} ${text.slice(0, 300)}`);
+    error.status = response.status;
+    throw error;
   }
   if (!text) return null;
   return JSON.parse(text);
@@ -175,6 +205,45 @@ async function listComments(owner, repo, number) {
     if (batch.length < 100) break;
   }
   return comments;
+}
+
+async function permissionFor(owner, repo, login, cache) {
+  if (cache.has(login)) return cache.get(login);
+  let record = null;
+  try {
+    record = await gh(
+      `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`,
+    );
+  } catch (error) {
+    console.log(`Permission lookup failed for ${login}: ${error.message}`);
+    record = null;
+  }
+  cache.set(login, record);
+  return record;
+}
+
+async function commentsFromReviewers(owner, repo, comments) {
+  const cache = new Map();
+  const accepted = [];
+  for (const comment of comments) {
+    const login = comment && comment.user && comment.user.login;
+    if (commentWasEdited(comment)) {
+      console.log(`Ignoring edited comment ${comment.id || "?"} from ${login || "unknown"}.`);
+      continue;
+    }
+    if (!login) {
+      console.log(`Ignoring comment ${comment && comment.id} with no author.`);
+      continue;
+    }
+    const record = await permissionFor(owner, repo, login, cache);
+    const role = record && (record.role_name || record.permission);
+    if (!hasReviewAccess(record)) {
+      console.log(`Ignoring comment ${comment.id} from ${login} (${role || "no access"}).`);
+      continue;
+    }
+    accepted.push(comment);
+  }
+  return accepted;
 }
 
 async function publishCheck(owner, repo, headSha, conclusion, summary) {
@@ -198,21 +267,20 @@ async function publishCheck(owner, repo, headSha, conclusion, summary) {
   });
 }
 
-async function rerunPullRequestWorkflow(owner, repo, headSha) {
-  const listed = await gh(
-    `/repos/${owner}/${repo}/actions/workflows/independent-review.yml/runs?head_sha=${headSha}&event=pull_request&per_page=5`,
-  );
-  const latest = listed && listed.workflow_runs && listed.workflow_runs[0];
-  if (!latest) {
-    console.log("No pull_request run to re-run.");
-    return;
-  }
-  if (["queued", "in_progress", "waiting", "pending", "requested"].includes(latest.status)) {
-    console.log(`Run ${latest.id} is ${latest.status}; not re-running.`);
-    return;
-  }
-  await gh(`/repos/${owner}/${repo}/actions/runs/${latest.id}/rerun`, { method: "POST" });
-  console.log(`Re-ran workflow run ${latest.id} for ${headSha}.`);
+async function publishStatus(owner, repo, headSha, conclusion, summary) {
+  const server = process.env.GITHUB_SERVER_URL || "https://github.com";
+  const runId = process.env.GITHUB_RUN_ID;
+  const repository = process.env.GITHUB_REPOSITORY;
+  const description = summary.split("\n").find((line) => line.trim()) || "Independent review";
+  await gh(`/repos/${owner}/${repo}/statuses/${headSha}`, {
+    method: "POST",
+    body: {
+      state: conclusion === "success" ? "success" : "failure",
+      context: "independent-review",
+      description: description.slice(0, 140),
+      target_url: runId && repository ? `${server}/${repository}/actions/runs/${runId}` : undefined,
+    },
+  });
 }
 
 function writeStepSummary(summary) {
@@ -231,6 +299,11 @@ async function main() {
   const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
   const [owner, repo] = String(process.env.GITHUB_REPOSITORY || "").split("/");
   if (!owner || !repo) throw new Error("GITHUB_REPOSITORY is required");
+
+  if (eventName === "issue_comment" && event.action === "edited") {
+    console.log("Ignoring an edited comment.");
+    return;
+  }
 
   if (eventName === "issue_comment" && !(event.issue && event.issue.pull_request)) {
     console.log("Not a pull request comment. Skipping.");
@@ -259,21 +332,17 @@ async function main() {
     return;
   }
 
-  const comments = await listComments(owner, repo, number);
+  const comments = await commentsFromReviewers(owner, repo, await listComments(owner, repo, number));
   const result = classifyReview(comments, headSha);
   const summary = summaryFor(result, headSha);
   console.log(summary);
   writeStepSummary(summary);
 
   if (eventName === "issue_comment") {
-    // This run is attached to the default branch. Publish the real result
-    // on the PR head, then re-run the pull_request job so that check updates.
+    // This run uses the workflow on the default branch. Publish onto the PR
+    // head. Do not fail the default-branch commit when the review is missing.
     await publishCheck(owner, repo, headSha, result.conclusion, summary);
-    try {
-      await rerunPullRequestWorkflow(owner, repo, headSha);
-    } catch (error) {
-      console.log(`Could not re-run the pull_request check: ${error.message}`);
-    }
+    await publishStatus(owner, repo, headSha, result.conclusion, summary);
     return;
   }
 

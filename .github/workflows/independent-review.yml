@@ -1,34 +1,74 @@
 name: independent-review
 
-# issue_comment runs only from the default branch, so it starts working
-# after this file is on main. Until then, a pull_request run is the check.
+# issue_comment runs only from the default branch, so that job starts
+# working after this file is on main. The pull_request job is the check
+# until then. It stays read-only: a pull request can change this file,
+# and write tokens must not be handed to that code.
 on:
   pull_request:
     branches: [main]
   issue_comment:
-    types: [created, edited]
+    types: [created]
 
 permissions:
   contents: read
-  issues: read
-  pull-requests: read
-  checks: write
-  actions: write
 
 jobs:
   independent-review:
+    if: github.event_name == 'pull_request'
     name: independent-review
     runs-on: ubuntu-latest
+    # Read-only. issues: read lists conversation comments; pull-requests: read
+    # does not. No checks, statuses, or actions write on this job.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v5.1.0
+        # v5.1.0
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
       - name: Set up Node.js
-        uses: actions/setup-node@v6.5.0
+        # v6.5.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: "22"
       - name: Self-test
         run: node .github/independent-review.mjs --self-test
       - name: Require a review comment for this head
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/independent-review.mjs
+
+  # Workflow source for this event is the default branch, not the PR head.
+  # Checkout stays on github.sha. checks:write and statuses:write live only here.
+  independent-review-on-comment:
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+    name: independent-review-on-comment
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: write
+      statuses: write
+    steps:
+      - name: Checkout default branch
+        # v5.1.0
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js
+        # v6.5.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "22"
+      - name: Self-test
+        run: node .github/independent-review.mjs --self-test
+      - name: Publish the review result on the PR head
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node .github/independent-review.mjs

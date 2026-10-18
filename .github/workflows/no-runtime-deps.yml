@@ -15,30 +15,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5.1.0
+        # v5.1.0
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
       - name: Set up Node.js
-        uses: actions/setup-node@v6.5.0
+        # v6.5.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: "22"
-      - name: dependencies must be empty
+      - name: runtime dependency fields must be empty
         shell: bash
         run: |
           node --input-type=module <<'EOF'
           import { readFile } from "node:fs/promises";
           const pkg = JSON.parse(await readFile("package.json", "utf8"));
-          const deps = pkg.dependencies;
-          if (deps == null) {
-            console.log("package.json has no dependencies field");
-            process.exit(0);
+          const fields = ["dependencies", "optionalDependencies", "peerDependencies"];
+          let failed = false;
+          for (const field of fields) {
+            const value = pkg[field];
+            if (value == null) {
+              console.log("package.json has no " + field + " field");
+              continue;
+            }
+            if (typeof value !== "object" || Array.isArray(value)) {
+              console.error("package.json " + field + " must be an object");
+              failed = true;
+              continue;
+            }
+            const names = Object.keys(value);
+            if (names.length > 0) {
+              console.error("package.json " + field + " is not empty: " + names.join(", "));
+              failed = true;
+              continue;
+            }
+            console.log("package.json " + field + " is empty");
           }
-          if (typeof deps !== "object" || Array.isArray(deps)) {
-            console.error("package.json dependencies must be an object");
-            process.exit(1);
-          }
-          const names = Object.keys(deps);
-          if (names.length > 0) {
-            console.error("package.json dependencies is not empty: " + names.join(", "));
-            process.exit(1);
-          }
-          console.log("package.json dependencies is empty");
+          process.exit(failed ? 1 : 0);
           EOF

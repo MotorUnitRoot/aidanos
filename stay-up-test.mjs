@@ -13,6 +13,8 @@ assert((mode & 0o111) !== 0, "start.sh not executable");
 assert(sh.includes("n"+"pm start"), "start.sh must use package start");
 assert(sh.includes("setsid") && sh.includes("nohup"), "detach via setsid or nohup");
 assert(/command -v setsid/.test(sh), "do not require Linux setsid");
+assert(sh.indexOf("32457") < 0, "do not hardcode a sit pid");
+assert(!/^SIT=/m.test(sh), "do not keep a leftover sit pid");
 assert(sh.indexOf("/Users/colby") < 0, "do not bake Mac path");
 assert(sh.includes("AIDANOS_VAULT"), "honor vault env");
 assert(/unset\s+AIDANOS_VAULT/.test(sh), "empty vault env must be unset");

@@ -217,6 +217,69 @@ check("a stop blocks the next cut", () => {
   assert(planMarkdownFromChecks([]).startsWith("# The room as it is\n"), "the paper keeps the one heading");
 });
 
+check("line 8 is not called unless it reports what the town said", () => {
+  const ask = (phrase) => familyRoomStops(answersMd.replace(
+    "8. What did the building department say?",
+    "8. What did the building department say? " + phrase
+  ), planMd);
+  const town = (stops) => stops.some((s) => /building department/i.test(s));
+  for (const phrase of ["Not asked yet", "not asked", "not yet", "no", "TBD", "Not called yet", ""]) {
+    assert(town(ask(phrase)), JSON.stringify(phrase) + " is not a town answer");
+  }
+  for (const phrase of ["No permit needed", "The town said no", "Called Maria on October 19"]) {
+    assert(!town(ask(phrase)), JSON.stringify(phrase) + " is what the town said");
+  }
+});
+
+check("no walls change never offers Cut the wall", () => {
+  const walls = answersMd
+    .replace(
+      "3. Will any wall or opening change?",
+      "3. Will any wall or opening change? No walls change"
+    )
+    .replace(
+      "8. What did the building department say?",
+      "8. What did the building department say? No permit needed"
+    );
+  const stops = familyRoomStops(walls, planMd);
+  assert(!stops.some((s) => /building department/i.test(s)), "the permit answer is not a town stop");
+  assert(stops.some((s) => /wall stays closed/i.test(s)), "no walls change keeps the wall closed");
+  const rough = parseProcessMap(mapMd).stages.find((s) => s.title === "Rough");
+  const roughSteps = stageNextStepLines(rough);
+  const offered = linesToAddToday(roughSteps, stops, walls);
+  assert(!offered.some((s) => /Cut the wall/i.test(s)), "cut stays off: " + offered.join(" | "));
+  assert(offered.some((s) => /rough inspection/i.test(s)), "the inspection still lands");
+  const fromAnswer = linesToAddToday(roughSteps, [], walls);
+  assert(!fromAnswer.some((s) => /Cut the wall/i.test(s)), "the answer blocks the cut with no other stop");
+  const changing = answersMd
+    .replace(
+      "3. Will any wall or opening change?",
+      "3. Will any wall or opening change? The north wall will change"
+    )
+    .replace(
+      "8. What did the building department say?",
+      "8. What did the building department say? No permit needed"
+    );
+  const openStops = familyRoomStops(changing, planMd);
+  const openOffer = linesToAddToday(roughSteps, openStops, changing);
+  assert(openOffer.some((s) => /Cut the wall/i.test(s)), "a wall that changes can still be cut");
+});
+
+check("a click on a numbered line does not land inside the first word", () => {
+  const start = src.indexOf("function sourceCaretFromRendered(");
+  const end = src.indexOf("\nfunction activateLine(", start);
+  assert(start >= 0 && end > start, "caret mapper is in the paper");
+  const box = {};
+  new Function("box", src.slice(start, end) + "\nbox.sourceCaretFromRendered = sourceCaretFromRendered;")(box);
+  const md = "1. Which room, and will anyone sleep there?";
+  const body = "Which room, and will anyone sleep there?";
+  const marker = "1.".length;
+  assert(box.sourceCaretFromRendered(md, body, marker, marker) === 3, "the number click is the start of the question");
+  assert(box.sourceCaretFromRendered(md, body, marker + 1, marker) === 4, "the first letter stays the first letter");
+  assert(md.slice(box.sourceCaretFromRendered(md, body, marker, marker)).startsWith("Which"), "the tail is not hich room");
+  assert(box.sourceCaretFromRendered(md, body, marker + body.length, marker) === md.length, "the end of the question stays the end");
+});
+
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 check("a drop on the paper uploads the picture", () => {

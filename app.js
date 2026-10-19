@@ -677,6 +677,39 @@ function paintPaperAt(activeIndex, caretInLine) {
   setTimeout(() => { if (gen === keepPaperFocusGen) keepPaperFocus = false; }, 0);
 }
 
+function renderedMarkerLen(el) {
+  if (!el || !el.querySelector) return 0;
+  const body = el.querySelector(".md-body");
+  if (!body || typeof document === "undefined" || !document.createRange) return 0;
+  try {
+    const pre = document.createRange();
+    pre.setStart(el, 0);
+    pre.setEndBefore(body);
+    return pre.toString().length;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// caretInLine is the offset in the rendered line, which already includes the
+// marker ("1."). The markdown prefix ("1. ") is a different length. Subtract
+// the marker once so a click on the number or the first letter does not land
+// inside the word.
+function sourceCaretFromRendered(md, body, caretInLine, markerLen) {
+  const text = String(md ?? "");
+  if (caretInLine == null) return text.length;
+  const words = String(body ?? "");
+  let prefix = 0;
+  if (words && text.indexOf(words) >= 0) prefix = text.indexOf(words);
+  const mark = Math.max(0, Number(markerLen) || 0);
+  const caret = Math.max(0, Number(caretInLine) || 0);
+  const into = Math.max(0, caret - mark);
+  const pos = prefix + into;
+  if (pos < 0) return 0;
+  if (pos > text.length) return text.length;
+  return pos;
+}
+
 function activateLine(idx, caretInVisible) {
   if (idx == null || idx < 0) return;
   const paper = $("paper");
@@ -699,10 +732,9 @@ function activateLine(idx, caretInVisible) {
     if (!el) { state.activeLine = -1; return; }
     if (!el.classList.contains("is-source")) {
       const body = lineBody(el);
+      const markerLen = renderedMarkerLen(el);
       const dumpLines = $("dump") ? $("dump").value.split("\n") : [];
       const md = dumpLines[idx] != null ? dumpLines[idx] : (el.getAttribute("data-src") || "");
-      let prefix = 0;
-      if (body && md.indexOf(body) >= 0) prefix = md.indexOf(body);
       const tmp = document.createElement("div");
       tmp.innerHTML = formatOneLine(md, true, idx < frontmatterLineCount($("dump") ? $("dump").value : ""));
       const next = tmp.firstElementChild;
@@ -710,7 +742,7 @@ function activateLine(idx, caretInVisible) {
         el.replaceWith(next);
         const pos = isSourceTask(next)
           ? (caretInVisible == null ? lineBody(next).length : Math.max(0, caretInVisible))
-          : (caretInVisible == null ? md.length : Math.max(0, Math.min(md.length, prefix + caretInVisible)));
+          : sourceCaretFromRendered(md, body, caretInVisible, markerLen);
         placeCaret(next, clampPaperCaret(next, pos));
       }
     }
@@ -3651,11 +3683,43 @@ function familyAnswerMap(md) {
   return answers;
 }
 
-function townNotCalled(answer) {
-  const a = String(answer || "").trim();
+function isTownRefusal(answer) {
+  const a = String(answer || "").replace(/\s+/g, " ").trim();
   if (!a) return true;
-  if (/\bnot called\b/i.test(a)) return true;
-  if (/\b(haven't|have not|didn't|did not|never)\b/i.test(a) && /\bcall/i.test(a)) return true;
+  if (/^(no|nope|nah|none|nothing|tbd|tba|n\/a|na|unknown|unsure|later|pending|todo|to do|idk|not yet|not asked|not asked yet|not called|not called yet)[.!?]*$/i.test(a)) return true;
+  if (/\b(not yet|not asked|not called|haven't asked|have not asked|didn't ask|did not ask|never asked|haven't called|have not called|didn't call|did not call|never called|to be determined|t\.?b\.?d\.?)\b/i.test(a)) {
+    if (/\bpermits?\b/i.test(a)) return false;
+    if (/\b(town|department|inspector)\b/i.test(a) && /\b(said|says|told|approved|denied|required|yes|no)\b/i.test(a)) return false;
+    return true;
+  }
+  return false;
+}
+
+function townReached(answer) {
+  const a = String(answer || "").replace(/\s+/g, " ").trim();
+  if (!a) return false;
+  if (/\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+\d{1,2}\b/i.test(a)) return true;
+  if (/\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b/.test(a)) return true;
+  if (/\b(spoke|talked|called|emailed|asked|met)\b/i.test(a) && /\b(?:with|to)\s+[A-Z][a-z]/.test(a)) return true;
+  if (isTownRefusal(a)) return false;
+  if (/\bpermits?\b/i.test(a)) return true;
+  if (/\b(town|department|inspector|building official)\b/i.test(a) && /\b(yes|no|approved|denied|required|ok|okay|said|says|told)\b/i.test(a)) return true;
+  return false;
+}
+
+function townNotCalled(answer) {
+  return !townReached(answer);
+}
+
+function wallsDoNotChange(answer) {
+  const a = String(answer || "").replace(/\s+/g, " ").trim();
+  if (!a) return false;
+  if (/^(no|nope|nah|none)[.!?]*$/i.test(a)) return true;
+  if (/\bno walls? change\b/i.test(a)) return true;
+  if (/\bno openings? change\b/i.test(a)) return true;
+  if (/\b(walls?|openings?)\b/i.test(a) && /\b(won't|wont|will not|do not|don't|doesn't|does not)\b/i.test(a) && /\bchange\b/i.test(a)) return true;
+  if (/\b(walls?|openings?) stay\b/i.test(a)) return true;
+  if (/\bnone (?:of them )?(?:come out|change)\b/i.test(a)) return true;
   return false;
 }
 
@@ -3692,7 +3756,7 @@ function familyRoomStops(answersMd, planMd) {
   const trade = /\b(wiring|rewir|electrical|hvac|plumbing|asbestos|\blead\b|bearing wall)\b/i.test(blob)
     || (/\b(new|moved|move)\b/i.test(plugged) && /\b(wire|wiring|outlet|panel)\b/i.test(plugged));
   if (trade) stops.push(FAMILY_ROOM_STOPS[3]);
-  if (checks["walls stay. none come out."]) stops.push(FAMILY_ROOM_STOPS[4]);
+  if (checks["walls stay. none come out."] || wallsDoNotChange(wall)) stops.push(FAMILY_ROOM_STOPS[4]);
   if (/\bopen/i.test(wall) && !/\b(no|not|won't|wont|never)\b/i.test(wall)) stops.push(FAMILY_ROOM_STOPS[5]);
   return stops;
 }
@@ -3701,9 +3765,11 @@ function isNextCutLine(line) {
   return /\b(cut|demolish|tear out|open the wall|opened wall|comes off the wall|come off the wall)\b/i.test(String(line || ""));
 }
 
-function linesToAddToday(lines, stops) {
+function linesToAddToday(lines, stops, answersMd) {
   const list = (Array.isArray(lines) ? lines : []).filter((line) => /^- \[ \] /.test(String(line)));
-  if (!stops || !stops.length) return list;
+  let blockCut = !!(stops && stops.length);
+  if (!blockCut && answersMd) blockCut = wallsDoNotChange(familyAnswerMap(answersMd)[3]);
+  if (!blockCut) return list;
   return list.filter((line) => !isNextCutLine(line));
 }
 
@@ -4181,17 +4247,19 @@ function taskLinesIn(md) {
 }
 
 async function addTheseToToday() {
-  const stops = await currentFamilyStops();
+  const answers = await readJobFile("family-room-to-office/answers.md");
+  const plan = await readJobFile("family-room-to-office/plan.md");
+  const stops = familyRoomStops(answers.markdown, plan.markdown);
   await writeFamilyStops(stops);
   let lines = [];
   if (jobPath() === "family-room-to-office/map.md" && state.mapStageId) {
     const dump = $("dump");
     const parsed = parseProcessMap(dump ? dump.value : "");
     const stage = (parsed.stages || []).find((s) => s.id === state.mapStageId);
-    lines = linesToAddToday(stageNextStepLines(stage), stops);
+    lines = linesToAddToday(stageNextStepLines(stage), stops, answers.markdown);
   } else {
     const todayFile = await readJobFile("family-room-to-office/today.md");
-    lines = linesToAddToday(taskLinesIn(todayFile.markdown), stops);
+    lines = linesToAddToday(taskLinesIn(todayFile.markdown), stops, answers.markdown);
   }
   if (lines.length) {
     await applyStepsToToday(lines, todayIso());

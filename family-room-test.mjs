@@ -31,6 +31,8 @@ new Function(
     grab("parseTaskLine", "parseBlocks") +
     grab("stageGateText", "mapNextStepLines") +
     grab("mapNextStepLines", "taskLineKey") +
+    grab("taskLineKey", "appendMapTasks") +
+    grab("appendMapTasks", "appendDoorTasks") +
     grab("appendDoorTasks", "hideDoorProposals") +
     grab("mapRowJoinPath", "mapCanvasRows") +
     grab("mapCanvasRows", "paintStagePaper") +
@@ -38,7 +40,9 @@ new Function(
     " sandbox.parseProcessMap = parseProcessMap;" +
     " sandbox.stageNextStepLines = stageNextStepLines;" +
     " sandbox.familyRoomStops = familyRoomStops;" +
+    " sandbox.appendMapTasks = appendMapTasks;" +
     " sandbox.linesToAddToday = linesToAddToday;" +
+    " sandbox.boxesOnToday = boxesOnToday;" +
     " sandbox.planMarkdownFromChecks = planMarkdownFromChecks;" +
     " sandbox.placeStopsFirst = placeStopsFirst;" +
     " sandbox.ensureFamilySeason = ensureFamilySeason;" +
@@ -52,7 +56,9 @@ const {
   parseProcessMap,
   stageNextStepLines,
   familyRoomStops,
+  appendMapTasks,
   linesToAddToday,
+  boxesOnToday,
   planMarkdownFromChecks,
   placeStopsFirst,
   ensureFamilySeason,
@@ -278,6 +284,29 @@ check("a click on a numbered line does not land inside the first word", () => {
   assert(box.sourceCaretFromRendered(md, body, marker + 1, marker) === 4, "the first letter stays the first letter");
   assert(md.slice(box.sourceCaretFromRendered(md, body, marker, marker)).startsWith("Which"), "the tail is not hich room");
   assert(box.sourceCaretFromRendered(md, body, marker + body.length, marker) === md.length, "the end of the question stays the end");
+});
+
+check("a second add does not duplicate, and a removal brings the button back", () => {
+  const lines = [
+    "- [ ] Rough work before drywall",
+    "- [ ] The rough inspection before drywall",
+  ];
+  const once = appendMapTasks("# Monday\n", lines);
+  const twice = appendMapTasks(once, lines);
+  assert(twice === once, "a second add writes nothing new");
+  assert((twice.match(/Rough work before drywall/g) || []).length === 1, "the rough line is once");
+  assert((twice.match(/rough inspection/g) || []).length === 1, "the inspection is once");
+  assert(boxesOnToday(lines, once) === true, "every offered box is on today");
+  const removed = once.split("\n").filter((line) => !/Rough work before drywall/.test(line)).join("\n");
+  assert(boxesOnToday(lines, removed) === false, "removing one box is not On today");
+  assert(boxesOnToday([], once) === false, "a stage with nothing to add is not On today");
+  const paint = src.slice(src.indexOf("function paintAddTodayButton("), src.indexOf("let stageAddGen"));
+  assert(paint.includes('"On today"'), "the same button reads On today");
+  assert(paint.includes("disabled"), "On today stops responding");
+  const sync = src.slice(src.indexOf("async function syncStageAddButton("), src.indexOf("const stageAdd"));
+  assert(sync.includes("boxesOnToday"), "the label is read from today's paper");
+  assert(sync.includes("/api/day?date="), "today's paper is the day");
+  assert(!/wasAdded|addFlag|alreadyAdded/.test(paint + sync), "there is no click flag");
 });
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";

@@ -2203,6 +2203,7 @@ function renderMap() {
     canvas.setAttribute("hidden", "");
     sheet.removeAttribute("hidden");
     paintStagePaper(stage, parsed);
+    if (jobPath() === "family-room-to-office/map.md") syncStageAddButton().catch(() => {});
     return;
   }
   state.mapStageId = "";
@@ -3773,6 +3774,20 @@ function linesToAddToday(lines, stops, answersMd) {
   return list.filter((line) => !isNextCutLine(line));
 }
 
+function boxesOnToday(lines, markdown) {
+  const want = [];
+  for (const line of Array.isArray(lines) ? lines : []) {
+    const key = taskLineKey(line);
+    if (key && want.indexOf(key) < 0) want.push(key);
+  }
+  if (!want.length) return false;
+  const have = new Set(String(markdown || "").split("\n").map(taskLineKey).filter(Boolean));
+  for (const key of want) {
+    if (!have.has(key)) return false;
+  }
+  return true;
+}
+
 function planMarkdownFromChecks(marked) {
   const on = new Set((Array.isArray(marked) ? marked : []).map((s) => String(s || "").trim().toLowerCase()));
   const lines = ["# The room as it is", ""];
@@ -4268,6 +4283,7 @@ async function addTheseToToday() {
     if (next !== (todayFile.markdown || "")) await writeJobFile("family-room-to-office/today.md", next, todayFile.mtime);
   }
   if (!isNoteDoc()) paintJobSeason();
+  else syncStageAddButton().catch(() => {});
 }
 
 function syncJobChrome() {
@@ -4394,6 +4410,12 @@ async function paintJobSeason() {
     }
     const season = await readJobFile("aidanos/active-horse.md");
     if (gen !== jobSeasonGen) return;
+    const answers = await readJobFile("family-room-to-office/answers.md");
+    const plan = await readJobFile("family-room-to-office/plan.md");
+    if (gen !== jobSeasonGen) return;
+    const day = await api("/api/day?date=" + encodeURIComponent(state.selectedDate || todayIso()));
+    if (gen !== jobSeasonGen) return;
+    const offer = linesToAddToday(tasks, familyRoomStops(answers.markdown, plan.markdown), answers.markdown);
     host.innerHTML = "";
     const blocks = [
       ["Why it matters", "Why it matters"],
@@ -4431,8 +4453,9 @@ async function paintJobSeason() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "hairline-button";
-    button.textContent = "Add these to today";
+    paintAddTodayButton(button, boxesOnToday(offer, day.markdown));
     button.addEventListener("click", () => {
+      if (button.disabled) return;
       addTheseToToday().catch((err) => setStatus(String(err && err.message || err), "error"));
     });
     host.appendChild(button);
@@ -4476,9 +4499,46 @@ if (jobLink) {
     }
   });
 }
+function paintAddTodayButton(button, on) {
+  if (!button) return;
+  const placed = !!on;
+  button.textContent = placed ? "On today" : "Add these to today";
+  button.classList.toggle("is-on-today", placed);
+  button.disabled = placed;
+}
+
+let stageAddGen = 0;
+async function syncStageAddButton() {
+  const button = $("stage-add");
+  const gen = ++stageAddGen;
+  if (!button) return;
+  if (jobPath() !== "family-room-to-office/map.md" || !state.mapStageId) {
+    paintAddTodayButton(button, false);
+    return;
+  }
+  paintAddTodayButton(button, false);
+  try {
+    const answers = await readJobFile("family-room-to-office/answers.md");
+    const plan = await readJobFile("family-room-to-office/plan.md");
+    const stops = familyRoomStops(answers.markdown, plan.markdown);
+    const dump = $("dump");
+    const parsed = parseProcessMap(dump ? dump.value : "");
+    const stage = (parsed.stages || []).find((s) => s.id === state.mapStageId);
+    const lines = linesToAddToday(stageNextStepLines(stage), stops, answers.markdown);
+    const day = await api("/api/day?date=" + encodeURIComponent(todayIso()));
+    if (gen !== stageAddGen) return;
+    if (jobPath() !== "family-room-to-office/map.md" || !state.mapStageId) return;
+    paintAddTodayButton(button, boxesOnToday(lines, day.markdown));
+  } catch (e) {
+    if (gen !== stageAddGen) return;
+    paintAddTodayButton(button, false);
+  }
+}
+
 const stageAdd = $("stage-add");
 if (stageAdd) {
   stageAdd.addEventListener("click", () => {
+    if (stageAdd.disabled) return;
     addTheseToToday().catch((err) => setStatus(String(err && err.message || err), "error"));
   });
 }

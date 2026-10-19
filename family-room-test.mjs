@@ -27,7 +27,8 @@ function grab(name, nextName) {
 const sandbox = {};
 new Function(
   "sandbox",
-  grab("isWorkMapPath", "isMapDoc") +
+  grab("familyQuestionText", "formatOneLine") +
+    grab("isWorkMapPath", "isMapDoc") +
     grab("parseTaskLine", "parseBlocks") +
     grab("stageGateText", "mapNextStepLines") +
     grab("mapNextStepLines", "taskLineKey") +
@@ -47,6 +48,8 @@ new Function(
     " sandbox.placeStopsFirst = placeStopsFirst;" +
     " sandbox.ensureFamilySeason = ensureFamilySeason;" +
     " sandbox.familyRoomSeed = familyRoomSeed;" +
+    " sandbox.repairQuestionLine = repairQuestionLine;" +
+    " sandbox.familyAnswerMap = familyAnswerMap;" +
     " sandbox.mapRowJoinPath = mapRowJoinPath;" +
     " sandbox.mapCanvasRows = mapCanvasRows;"
 )(sandbox);
@@ -63,6 +66,8 @@ const {
   placeStopsFirst,
   ensureFamilySeason,
   familyRoomSeed,
+  repairQuestionLine,
+  familyAnswerMap,
   mapRowJoinPath,
   mapCanvasRows,
 } = sandbox;
@@ -284,6 +289,34 @@ check("a click on a numbered line does not land inside the first word", () => {
   assert(box.sourceCaretFromRendered(md, body, marker + 1, marker) === 4, "the first letter stays the first letter");
   assert(md.slice(box.sourceCaretFromRendered(md, body, marker, marker)).startsWith("Which"), "the tail is not hich room");
   assert(box.sourceCaretFromRendered(md, body, marker + body.length, marker) === md.length, "the end of the question stays the end");
+});
+
+check("a corrupted question keeps the canonical wording and the typed answer", () => {
+  const line = "1. WFahich room, and will anyone sleep there?mily room, nobody sleeps there";
+  const fixed = repairQuestionLine(line);
+  assert(fixed === "1. Which room, and will anyone sleep there?Family room, nobody sleeps there", fixed);
+  const shelves = repairQuestionLine("2. W The built-in shelveshat must stay?X");
+  assert(shelves === "2. What must stay? The built-in shelvesX", shelves);
+  const kept = repairQuestionLine("8. What did the building department say? Not asked yet");
+  assert(kept === "8. What did the building department say? Not asked yet", kept);
+  const corrupted = answersMd
+    .replace(
+      "3. Will any wall or opening change?",
+      "3. No walls changeWill any wall or opening change?"
+    )
+    .replace(
+      "8. What did the building department say?",
+      "8. Not asked yetWhat did the building department say?"
+    );
+  assert(familyAnswerMap(corrupted)[3] === "No walls change", familyAnswerMap(corrupted)[3]);
+  assert(familyAnswerMap(corrupted)[8] === "Not asked yet", familyAnswerMap(corrupted)[8]);
+  assert(!/sleep there/.test(familyAnswerMap(answersMd)[1] || ""), "the question is not the answer");
+  const stops = familyRoomStops(corrupted, planMd);
+  assert(stops.some((s) => /building department/i.test(s)), "the town stop reads the answer");
+  assert(stops.some((s) => /wall stays closed/i.test(s)), "no walls change is read from the answer");
+  const rough = parseProcessMap(mapMd).stages.find((s) => s.title === "Rough");
+  const offered = linesToAddToday(stageNextStepLines(rough), stops, corrupted);
+  assert(!offered.some((s) => /Cut the wall/i.test(s)), "the answer still blocks the cut");
 });
 
 check("a second add does not duplicate, and a removal brings the button back", () => {

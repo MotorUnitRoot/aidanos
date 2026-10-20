@@ -118,6 +118,14 @@ body.view-door.day-page {
   outline: 1px solid #d4cbb8;
   outline-offset: 2px;
 }
+.hairline-button.is-on-today,
+.hairline-button.is-on-today:hover,
+.hairline-button.is-on-today:focus,
+.hairline-button.is-on-today:disabled {
+  color: var(--muted);
+  cursor: default;
+  opacity: 1;
+}
 .door-actions {
   display: flex;
   flex-direction: row;
@@ -475,6 +483,11 @@ body.view-today.day-page {
 .md-num {
   min-width: 1.4em;
   margin-right: 0.15em;
+}
+.md-q {
+  cursor: text;
+  user-select: none;
+  -webkit-user-select: none;
 }
 .md-box {
   display: inline-flex;

@@ -188,7 +188,65 @@ function paintTaskBodyHtml(body, asSource) {
   return html || "<br>";
 }
 
+function familyQuestionText(n) {
+  const qs = [
+    "Which room, and will anyone sleep there?",
+    "What must stay?",
+    "Will any wall or opening change?",
+    "Where does the desk go, and which way does the door swing?",
+    "What has to be plugged in, and where is the panel?",
+    "Supply, return, and will a new door close the room?",
+    "When was the house built?",
+    "What did the building department say?",
+  ];
+  const i = Number(n) - 1;
+  if (!Number.isInteger(i) || i < 0 || i >= qs.length) return "";
+  return qs[i];
+}
+
+function answersNoteOpen() {
+  try {
+    if (typeof isNoteDoc !== "function" || !isNoteDoc()) return false;
+    const path = String(state.doc && state.doc.path || "").replace(/\\/g, "/");
+    return path === "family-room-to-office/answers.md";
+  } catch (e) {
+    return false;
+  }
+}
+
+function familyQuestionLine(line) {
+  const m = String(line ?? "").match(/^(\s*)(\d+)([.)])(\s+)([\s\S]*)$/);
+  if (!m) return null;
+  const question = familyQuestionText(m[2]);
+  if (!question) return null;
+  const rest = m[5];
+  if (rest !== question && !rest.startsWith(question)) return null;
+  return {
+    indent: m[1],
+    num: m[2] + m[3],
+    question: question,
+    answer: rest.slice(question.length),
+  };
+}
+
+function formatQuestionLine(line, asSource, hidden) {
+  if (!answersNoteOpen()) return "";
+  const parts = familyQuestionLine(line);
+  if (!parts) return "";
+  const front = hidden ? " md-front" : "";
+  const src = asSource ? " is-source" : "";
+  const nest = parts.indent ? " nest" : "";
+  const answer = parts.answer ? escapeHtml(parts.answer) : "\u200b";
+  return '<div draggable="true" class="md-line' + src + front + " ol" + nest + '" data-kind="ol" data-src="' + attr(line) +
+    '" data-indent="' + attr(parts.indent) + '" data-num="' + attr(parts.num) + '" style="' + indentPad(parts.indent) +
+    '"><span class="md-num" contenteditable="false">' + escapeHtml(parts.num) +
+    '</span><span class="md-q" contenteditable="false">' + escapeHtml(parts.question) +
+    '</span><span class="md-body">' + answer + "</span></div>";
+}
+
 function formatOneLine(line, asSource, hidden) {
+  const questionHtml = formatQuestionLine(line, asSource, hidden);
+  if (questionHtml) return questionHtml;
   if (asSource) {
     let cls = "md-line is-source";
     if (hidden) cls += " md-front";
@@ -396,7 +454,20 @@ function sourceTaskMarkdown(el) {
   return paperTaskSrc(indent, mark, done, body);
 }
 
+function lockedQuestionMarkdown(el) {
+  if (!el || !el.querySelector) return "";
+  const q = el.querySelector(".md-q");
+  if (!q) return "";
+  const num = (el.dataset && el.dataset.num) || "";
+  const indent = (el.dataset && el.dataset.indent) || "";
+  const question = String(q.textContent || "");
+  const answer = lineBody(el).replace(/\u200b/g, "");
+  return indent + num + " " + question + answer;
+}
+
 function serializeLine(n) {
+  const locked = lockedQuestionMarkdown(n);
+  if (locked) return locked;
   if (n.classList && n.classList.contains("is-source")) {
     if (n.dataset && n.dataset.kind === "h") return lineMarkdown(n);
     if (n.dataset && n.dataset.kind === "task") return sourceTaskMarkdown(n);
@@ -505,6 +576,22 @@ function ensurePaperBodyCaret(host) {
 }
 
 function placeCaret(root, offset) {
+  const line = root && root.closest
+    ? (root.classList && root.classList.contains("md-line") ? root : root.closest(".md-line"))
+    : null;
+  const q = line && line.querySelector && line.querySelector(".md-q");
+  const answerBody = q && line.querySelector(".md-body");
+  if (q && answerBody && root !== answerBody && !(root.classList && root.classList.contains("md-body"))) {
+    let locked = 0;
+    try {
+      const pre = document.createRange();
+      pre.setStart(line, 0);
+      pre.setEndBefore(answerBody);
+      locked = pre.toString().length;
+    } catch (e) {}
+    placeCaret(answerBody, Math.max(0, (Number(offset) || 0) - locked));
+    return;
+  }
   const host = ensurePaperBodyCaret(paperCaretHost(root));
   const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
   let n, count = 0;
@@ -556,6 +643,8 @@ function lineIndexOfCaret() {
 
 function lineMarkdown(el) {
   if (!el) return "";
+  const locked = lockedQuestionMarkdown(el);
+  if (locked) return locked;
   const dump = $("dump");
   const idx = paperLines().indexOf(el);
   const dumpLine = (dump && idx >= 0) ? dump.value.split("\n")[idx] : null;
@@ -592,7 +681,9 @@ function writeDumpLine(idx, text) {
   if (!dump || idx == null || idx < 0) return dump;
   const lines = dump.value.split("\n");
   while (lines.length <= idx) lines.push("");
-  lines[idx] = stripAccidentalBulletSpace(String(text ?? "").replace(/\r\n/g, "\n").replace(/\n/g, ""));
+  let nextLine = stripAccidentalBulletSpace(String(text ?? "").replace(/\r\n/g, "\n").replace(/\n/g, ""));
+  if (answersNoteOpen()) nextLine = repairQuestionLine(nextLine);
+  lines[idx] = nextLine;
   dump.value = lines.join("\n");
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
   return dump;
@@ -677,6 +768,39 @@ function paintPaperAt(activeIndex, caretInLine) {
   setTimeout(() => { if (gen === keepPaperFocusGen) keepPaperFocus = false; }, 0);
 }
 
+function renderedMarkerLen(el) {
+  if (!el || !el.querySelector) return 0;
+  const body = el.querySelector(".md-body");
+  if (!body || typeof document === "undefined" || !document.createRange) return 0;
+  try {
+    const pre = document.createRange();
+    pre.setStart(el, 0);
+    pre.setEndBefore(body);
+    return pre.toString().length;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// caretInLine is the offset in the rendered line, which already includes the
+// marker ("1."). The markdown prefix ("1. ") is a different length. Subtract
+// the marker once so a click on the number or the first letter does not land
+// inside the word.
+function sourceCaretFromRendered(md, body, caretInLine, markerLen) {
+  const text = String(md ?? "");
+  if (caretInLine == null) return text.length;
+  const words = String(body ?? "");
+  let prefix = 0;
+  if (words && text.indexOf(words) >= 0) prefix = text.indexOf(words);
+  const mark = Math.max(0, Number(markerLen) || 0);
+  const caret = Math.max(0, Number(caretInLine) || 0);
+  const into = Math.max(0, caret - mark);
+  const pos = prefix + into;
+  if (pos < 0) return 0;
+  if (pos > text.length) return text.length;
+  return pos;
+}
+
 function activateLine(idx, caretInVisible) {
   if (idx == null || idx < 0) return;
   const paper = $("paper");
@@ -699,19 +823,34 @@ function activateLine(idx, caretInVisible) {
     if (!el) { state.activeLine = -1; return; }
     if (!el.classList.contains("is-source")) {
       const body = lineBody(el);
+      const markerLen = renderedMarkerLen(el);
       const dumpLines = $("dump") ? $("dump").value.split("\n") : [];
       const md = dumpLines[idx] != null ? dumpLines[idx] : (el.getAttribute("data-src") || "");
-      let prefix = 0;
-      if (body && md.indexOf(body) >= 0) prefix = md.indexOf(body);
       const tmp = document.createElement("div");
       tmp.innerHTML = formatOneLine(md, true, idx < frontmatterLineCount($("dump") ? $("dump").value : ""));
       const next = tmp.firstElementChild;
       if (next) {
+        let answerOff = null;
+        if (el.querySelector(".md-q") && next.querySelector(".md-q")) {
+          const bodyEl = el.querySelector(".md-body");
+          const sel = window.getSelection();
+          const node = sel && sel.anchorNode;
+          const host = node && (node.nodeType === 1 ? node : node.parentElement);
+          const inBody = !!(bodyEl && host && (host === bodyEl || bodyEl.contains(host)));
+          answerOff = 0;
+          if (inBody) {
+            try { answerOff = caretOffset(bodyEl); } catch (e) { answerOff = 0; }
+          }
+        }
         el.replaceWith(next);
-        const pos = isSourceTask(next)
-          ? (caretInVisible == null ? lineBody(next).length : Math.max(0, caretInVisible))
-          : (caretInVisible == null ? md.length : Math.max(0, Math.min(md.length, prefix + caretInVisible)));
-        placeCaret(next, clampPaperCaret(next, pos));
+        if (next.querySelector(".md-q")) {
+          placeCaret(next.querySelector(".md-body") || next, Math.max(0, answerOff || 0));
+        } else {
+          const pos = isSourceTask(next)
+            ? (caretInVisible == null ? lineBody(next).length : Math.max(0, caretInVisible))
+            : sourceCaretFromRendered(md, body, caretInVisible, markerLen);
+          placeCaret(next, clampPaperCaret(next, pos));
+        }
       }
     }
     state.activeLine = idx;
@@ -1564,6 +1703,9 @@ function paperSaveSnapshot() {
     if (String(state.doc.path || "").replace(/\\/g, "/") === "aidanos/active-horse.md") {
       markdown = normalizeSeasonPlanMarkdown(markdown);
     }
+    if (String(state.doc.path || "").replace(/\\/g, "/") === "family-room-to-office/answers.md") {
+      markdown = repairAnswersMarkdown(markdown);
+    }
     if (dump) dump.value = markdown;
     state.doc.markdown = markdown;
     return {
@@ -2079,6 +2221,9 @@ async function openVaultNote(rel) {
   if (String(data.path || path).replace(/\\/g, "/") === "aidanos/active-horse.md") {
     noteMd = normalizeSeasonPlanMarkdown(noteMd);
   }
+  if (String(data.path || path).replace(/\\/g, "/") === "family-room-to-office/answers.md") {
+    noteMd = repairAnswersMarkdown(noteMd);
+  }
   state.doc = {
     kind: "note",
     path: String(data.path || path).replace(/\\/g, "/"),
@@ -2171,6 +2316,7 @@ function renderMap() {
     canvas.setAttribute("hidden", "");
     sheet.removeAttribute("hidden");
     paintStagePaper(stage, parsed);
+    if (jobPath() === "family-room-to-office/map.md") syncStageAddButton().catch(() => {});
     return;
   }
   state.mapStageId = "";
@@ -2736,6 +2882,190 @@ $("paper").addEventListener("blur", () => {
   paintPaper();
   if (state.dirty) saveDay();
 });
+function nodeInLockedQuestion(node, line) {
+  const el = node && (node.nodeType === 1 ? node : node.parentElement);
+  if (!el || !el.closest || !line) return false;
+  const hit = el.closest(".md-q, .md-num");
+  return !!(hit && line.contains(hit));
+}
+
+function questionLineOfSelection() {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount) return null;
+  const node = sel.anchorNode;
+  const el = node && (node.nodeType === 1 ? node : node.parentElement);
+  const line = el && el.closest ? el.closest(".md-line") : null;
+  if (!line || !line.querySelector(".md-q")) return null;
+  return line;
+}
+
+function selectionInLockedQuestion(line) {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount || !line) return false;
+  const range = sel.getRangeAt(0);
+  if (nodeInLockedQuestion(range.startContainer, line)) return true;
+  if (!sel.isCollapsed && nodeInLockedQuestion(range.endContainer, line)) return true;
+  if (sel.isCollapsed) return false;
+  const q = line.querySelector(".md-q");
+  const num = line.querySelector(".md-num");
+  try {
+    if (q && range.intersectsNode && range.intersectsNode(q)) return true;
+    if (num && range.intersectsNode && range.intersectsNode(num)) return true;
+  } catch (e) {}
+  return false;
+}
+
+function caretAtAnswerStart(line) {
+  const body = line && line.querySelector ? line.querySelector(".md-body") : null;
+  const sel = window.getSelection();
+  if (!body || !sel || !sel.isCollapsed || !sel.rangeCount) return false;
+  const node = sel.anchorNode;
+  const el = node && (node.nodeType === 1 ? node : node.parentElement);
+  if (!el || (el !== body && !body.contains(el))) return false;
+  let off = 0;
+  try { off = caretOffset(body); } catch (e) { return false; }
+  if (off <= 0) return true;
+  return String(body.textContent || "").slice(0, off).replace(/\u200b/g, "").length === 0;
+}
+
+function placeCaretAtAnswerStart(line) {
+  if (!line) return;
+  const body = line.querySelector(".md-body");
+  if (!body) return;
+  const paper = $("paper");
+  if (paper) paper.focus();
+  placeCaret(body, 0);
+  const idx = paperLines().indexOf(line);
+  if (idx >= 0) {
+    state.activeLine = idx;
+    rememberPaperCaret(idx, 0);
+  }
+}
+
+function placeCaretAtAnswerEnd(line) {
+  if (!line) return;
+  const body = line.querySelector(".md-body");
+  if (!body) return;
+  const paper = $("paper");
+  if (paper) paper.focus();
+  const len = lineBody(line).replace(/\u200b/g, "").length;
+  placeCaret(body, len);
+  const idx = paperLines().indexOf(line);
+  if (idx >= 0) {
+    state.activeLine = idx;
+    rememberPaperCaret(idx, len);
+  }
+}
+
+function insertIntoAnswer(line, text, at) {
+  const body = line && line.querySelector ? line.querySelector(".md-body") : null;
+  if (!body) return;
+  const clean = String(text || "").replace(/\r?\n/g, "");
+  if (!clean) return;
+  const cur = lineBody(line).replace(/\u200b/g, "");
+  const pos = at == null ? cur.length : Math.max(0, Math.min(cur.length, at));
+  body.textContent = cur.slice(0, pos) + clean + cur.slice(pos);
+  placeCaret(body, pos + clean.length);
+  const idx = paperLines().indexOf(line);
+  if (idx >= 0) {
+    writeDumpLine(idx, lineMarkdown(line));
+    scheduleSave();
+  }
+}
+
+function questionLineAtEvent(e) {
+  const t = e && e.target;
+  if (!t || !t.closest) return null;
+  const line = t.closest(".md-line");
+  if (!line || !line.querySelector(".md-q")) return null;
+  if (t.closest(".md-q") || t.closest(".md-num")) return line;
+  const q = line.querySelector(".md-q");
+  if (!q || e.clientX == null) return null;
+  const qRect = q.getBoundingClientRect();
+  const lineRect = line.getBoundingClientRect();
+  if (e.clientY >= lineRect.top && e.clientY <= lineRect.bottom && e.clientX >= lineRect.left && e.clientX <= qRect.right + 2) return line;
+  return null;
+}
+
+function snapQuestionClick(e) {
+  if (e.button != null && e.button !== 0) return;
+  const line = questionLineAtEvent(e);
+  if (!line) return;
+  e.preventDefault();
+  const idx = paperLines().indexOf(line);
+  if (idx < 0) return;
+  if (!line.classList.contains("is-source")) activateLine(idx, 0);
+  placeCaretAtAnswerStart(paperLines()[idx]);
+}
+
+function guardQuestionBeforeInput(e) {
+  const line = questionLineOfSelection();
+  if (!line) return;
+  const type = String(e.inputType || "");
+  if (type === "historyUndo" || type === "historyRedo") return;
+  if (selectionInLockedQuestion(line)) {
+    e.preventDefault();
+    if (type === "insertFromPaste" || type === "insertFromDrop") return;
+    if (type.startsWith("insert") && e.data) insertIntoAnswer(line, e.data, 0);
+    else if (!type.startsWith("insert")) placeCaretAtAnswerStart(line);
+    return;
+  }
+  if (caretAtAnswerStart(line) && /^delete(Content|Word|SoftLine|HardLine)Backward/.test(type)) {
+    e.preventDefault();
+  }
+}
+
+$("paper").addEventListener("pointerdown", snapQuestionClick, true);
+$("paper").addEventListener("mousedown", snapQuestionClick, true);
+$("paper").addEventListener("pointerup", (e) => {
+  if (e.button != null && e.button !== 0) return;
+  const line = questionLineAtEvent(e);
+  if (!line) return;
+  const idx = paperLines().indexOf(line);
+  if (idx < 0) return;
+  placeCaretAtAnswerStart(paperLines()[idx]);
+}, true);
+$("paper").addEventListener("beforeinput", guardQuestionBeforeInput, true);
+$("paper").addEventListener("paste", (e) => {
+  const line = questionLineOfSelection();
+  if (!line || !selectionInLockedQuestion(line)) return;
+  e.preventDefault();
+  const text = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
+  if (text) insertIntoAnswer(line, text, 0);
+});
+$("paper").addEventListener("compositionstart", (e) => {
+  const t = e.target;
+  const el = t && (t.nodeType === 1 ? t : t.parentElement);
+  if (!el || !el.closest) return;
+  const locked = el.closest(".md-q, .md-num");
+  if (!locked) return;
+  const line = locked.closest(".md-line");
+  if (line) placeCaretAtAnswerStart(line);
+}, true);
+$("paper").addEventListener("keydown", (e) => {
+  if (e.isComposing || e.keyCode === 229) return;
+  const line = questionLineOfSelection();
+  if (!line) return;
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount || !nodeInLockedQuestion(sel.anchorNode, line)) return;
+  if (e.key === "End") {
+    e.preventDefault();
+    e.stopPropagation();
+    placeCaretAtAnswerEnd(line);
+    return;
+  }
+  if (e.key === "Backspace" || e.key === "Delete" || e.key === "Home" || e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "ArrowUp" || e.key === "ArrowDown") {
+    e.preventDefault();
+    e.stopPropagation();
+    placeCaretAtAnswerStart(line);
+    return;
+  }
+  if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    e.preventDefault();
+    e.stopPropagation();
+    insertIntoAnswer(line, e.key, 0);
+  }
+}, true);
 $("paper").addEventListener("beforeinput", (e) => {
   if (painting || slotDrag.active) return;
   if (e.isComposing) return;
@@ -3631,14 +3961,91 @@ const DRAWING_CHECKS = [
   "Where the built-in meets the floor",
 ];
 
+function typedAnswerOutsideQuestion(question, body) {
+  const q = String(question || "");
+  const b = String(body || "");
+  if (!q) return b;
+  if (b.startsWith(q)) return b.slice(q.length);
+  const n = q.length;
+  const m = b.length;
+  const neg = -1000000000;
+  const score = Array.from({ length: n + 1 }, () => new Int32Array(m + 1).fill(neg));
+  const fromI = Array.from({ length: n + 1 }, () => new Int32Array(m + 1).fill(-1));
+  const fromJ = Array.from({ length: n + 1 }, () => new Int32Array(m + 1).fill(-1));
+  score[0][0] = 0;
+  for (let i = 0; i <= n; i++) {
+    for (let j = 0; j <= m; j++) {
+      const s = score[i][j];
+      if (s === neg) continue;
+      if (j < m && s > score[i][j + 1]) {
+        score[i][j + 1] = s;
+        fromI[i][j + 1] = i;
+        fromJ[i][j + 1] = j;
+      }
+      if (i < n && j < m && q.charAt(i) === b.charAt(j)) {
+        const bond = i > 0 && fromI[i][j] === i - 1 && fromJ[i][j] === j - 1 ? 1 : 0;
+        const next = s + bond;
+        if (next > score[i + 1][j + 1]) {
+          score[i + 1][j + 1] = next;
+          fromI[i + 1][j + 1] = i;
+          fromJ[i + 1][j + 1] = j;
+        }
+      }
+    }
+  }
+  let best = neg;
+  let bestJ = -1;
+  for (let j = 0; j <= m; j++) {
+    if (score[n][j] > best) {
+      best = score[n][j];
+      bestJ = j;
+    }
+  }
+  if (bestJ < 0 || best === neg) return b;
+  const matched = new Array(m).fill(false);
+  let i = n;
+  let j = bestJ;
+  while (i > 0 || j > 0) {
+    const pi = fromI[i][j];
+    const pj = fromJ[i][j];
+    if (pi < 0 || pj < 0) break;
+    if (pi === i - 1 && pj === j - 1) matched[j - 1] = true;
+    i = pi;
+    j = pj;
+  }
+  let answer = "";
+  for (let k = 0; k < m; k++) if (!matched[k]) answer += b.charAt(k);
+  return answer;
+}
+
+function repairQuestionLine(line) {
+  const raw = String(line ?? "");
+  const m = raw.match(/^(\s*)(\d+)([.)])(\s*)([\s\S]*)$/);
+  if (!m) return raw;
+  const question = familyQuestionText(m[2]);
+  if (!question) return raw;
+  const answer = typedAnswerOutsideQuestion(question, m[5]);
+  return m[1] + m[2] + m[3] + " " + question + answer;
+}
+
+function repairAnswersMarkdown(md) {
+  return String(md ?? "").split("\n").map((line) => repairQuestionLine(line)).join("\n");
+}
+
 function familyAnswerMap(md) {
   const lines = String(md || "").replace(/\r\n/g, "\n").split("\n");
   const answers = {};
   let n = 0;
   for (const line of lines) {
-    const m = line.match(/^\s*(\d+)\.\s+(.*)$/);
+    const repaired = repairQuestionLine(line);
+    const m = repaired.match(/^\s*(\d+)\.\s+(.*)$/);
     if (m) {
       n = Number(m[1]);
+      const parts = familyQuestionLine(repaired);
+      if (parts) {
+        answers[n] = parts.answer.trim();
+        continue;
+      }
       const rest = String(m[2] || "");
       const q = rest.indexOf("?");
       answers[n] = q >= 0 ? rest.slice(q + 1).trim() : "";
@@ -3651,11 +4058,43 @@ function familyAnswerMap(md) {
   return answers;
 }
 
-function townNotCalled(answer) {
-  const a = String(answer || "").trim();
+function isTownRefusal(answer) {
+  const a = String(answer || "").replace(/\s+/g, " ").trim();
   if (!a) return true;
-  if (/\bnot called\b/i.test(a)) return true;
-  if (/\b(haven't|have not|didn't|did not|never)\b/i.test(a) && /\bcall/i.test(a)) return true;
+  if (/^(no|nope|nah|none|nothing|tbd|tba|n\/a|na|unknown|unsure|later|pending|todo|to do|idk|not yet|not asked|not asked yet|not called|not called yet)[.!?]*$/i.test(a)) return true;
+  if (/\b(not yet|not asked|not called|haven't asked|have not asked|didn't ask|did not ask|never asked|haven't called|have not called|didn't call|did not call|never called|to be determined|t\.?b\.?d\.?)\b/i.test(a)) {
+    if (/\bpermits?\b/i.test(a)) return false;
+    if (/\b(town|department|inspector)\b/i.test(a) && /\b(said|says|told|approved|denied|required|yes|no)\b/i.test(a)) return false;
+    return true;
+  }
+  return false;
+}
+
+function townReached(answer) {
+  const a = String(answer || "").replace(/\s+/g, " ").trim();
+  if (!a) return false;
+  if (/\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+\d{1,2}\b/i.test(a)) return true;
+  if (/\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b/.test(a)) return true;
+  if (/\b(spoke|talked|called|emailed|asked|met)\b/i.test(a) && /\b(?:with|to)\s+[A-Z][a-z]/.test(a)) return true;
+  if (isTownRefusal(a)) return false;
+  if (/\bpermits?\b/i.test(a)) return true;
+  if (/\b(town|department|inspector|building official)\b/i.test(a) && /\b(yes|no|approved|denied|required|ok|okay|said|says|told)\b/i.test(a)) return true;
+  return false;
+}
+
+function townNotCalled(answer) {
+  return !townReached(answer);
+}
+
+function wallsDoNotChange(answer) {
+  const a = String(answer || "").replace(/\s+/g, " ").trim();
+  if (!a) return false;
+  if (/^(no|nope|nah|none)[.!?]*$/i.test(a)) return true;
+  if (/\bno walls? change\b/i.test(a)) return true;
+  if (/\bno openings? change\b/i.test(a)) return true;
+  if (/\b(walls?|openings?)\b/i.test(a) && /\b(won't|wont|will not|do not|don't|doesn't|does not)\b/i.test(a) && /\bchange\b/i.test(a)) return true;
+  if (/\b(walls?|openings?) stay\b/i.test(a)) return true;
+  if (/\bnone (?:of them )?(?:come out|change)\b/i.test(a)) return true;
   return false;
 }
 
@@ -3692,7 +4131,7 @@ function familyRoomStops(answersMd, planMd) {
   const trade = /\b(wiring|rewir|electrical|hvac|plumbing|asbestos|\blead\b|bearing wall)\b/i.test(blob)
     || (/\b(new|moved|move)\b/i.test(plugged) && /\b(wire|wiring|outlet|panel)\b/i.test(plugged));
   if (trade) stops.push(FAMILY_ROOM_STOPS[3]);
-  if (checks["walls stay. none come out."]) stops.push(FAMILY_ROOM_STOPS[4]);
+  if (checks["walls stay. none come out."] || wallsDoNotChange(wall)) stops.push(FAMILY_ROOM_STOPS[4]);
   if (/\bopen/i.test(wall) && !/\b(no|not|won't|wont|never)\b/i.test(wall)) stops.push(FAMILY_ROOM_STOPS[5]);
   return stops;
 }
@@ -3701,10 +4140,26 @@ function isNextCutLine(line) {
   return /\b(cut|demolish|tear out|open the wall|opened wall|comes off the wall|come off the wall)\b/i.test(String(line || ""));
 }
 
-function linesToAddToday(lines, stops) {
+function linesToAddToday(lines, stops, answersMd) {
   const list = (Array.isArray(lines) ? lines : []).filter((line) => /^- \[ \] /.test(String(line)));
-  if (!stops || !stops.length) return list;
+  let blockCut = !!(stops && stops.length);
+  if (!blockCut && answersMd) blockCut = wallsDoNotChange(familyAnswerMap(answersMd)[3]);
+  if (!blockCut) return list;
   return list.filter((line) => !isNextCutLine(line));
+}
+
+function boxesOnToday(lines, markdown) {
+  const want = [];
+  for (const line of Array.isArray(lines) ? lines : []) {
+    const key = taskLineKey(line);
+    if (key && want.indexOf(key) < 0) want.push(key);
+  }
+  if (!want.length) return false;
+  const have = new Set(String(markdown || "").split("\n").map(taskLineKey).filter(Boolean));
+  for (const key of want) {
+    if (!have.has(key)) return false;
+  }
+  return true;
 }
 
 function planMarkdownFromChecks(marked) {
@@ -3783,15 +4238,9 @@ function isMissingFileError(err) {
 function familyRoomSeed(rel) {
   const p = String(rel || "").replace(/\\/g, "/");
   if (p === "family-room-to-office/answers.md") {
-    return "# " + FAMILY_ROOM_SENTENCE + "\n\n" +
-      "1. Which room, and will anyone sleep there?\n" +
-      "2. What must stay?\n" +
-      "3. Will any wall or opening change?\n" +
-      "4. Where does the desk go, and which way does the door swing?\n" +
-      "5. What has to be plugged in, and where is the panel?\n" +
-      "6. Supply, return, and will a new door close the room?\n" +
-      "7. When was the house built?\n" +
-      "8. What did the building department say?\n";
+    let lines = "# " + FAMILY_ROOM_SENTENCE + "\n\n";
+    for (let n = 1; n <= 8; n++) lines += n + ". " + familyQuestionText(n) + "\n";
+    return lines;
   }
   if (p === "family-room-to-office/plan.md") return planMarkdownFromChecks([]);
   if (p === "family-room-to-office/walk.md") return "# From the doorway\n";
@@ -4181,17 +4630,19 @@ function taskLinesIn(md) {
 }
 
 async function addTheseToToday() {
-  const stops = await currentFamilyStops();
+  const answers = await readJobFile("family-room-to-office/answers.md");
+  const plan = await readJobFile("family-room-to-office/plan.md");
+  const stops = familyRoomStops(answers.markdown, plan.markdown);
   await writeFamilyStops(stops);
   let lines = [];
   if (jobPath() === "family-room-to-office/map.md" && state.mapStageId) {
     const dump = $("dump");
     const parsed = parseProcessMap(dump ? dump.value : "");
     const stage = (parsed.stages || []).find((s) => s.id === state.mapStageId);
-    lines = linesToAddToday(stageNextStepLines(stage), stops);
+    lines = linesToAddToday(stageNextStepLines(stage), stops, answers.markdown);
   } else {
     const todayFile = await readJobFile("family-room-to-office/today.md");
-    lines = linesToAddToday(taskLinesIn(todayFile.markdown), stops);
+    lines = linesToAddToday(taskLinesIn(todayFile.markdown), stops, answers.markdown);
   }
   if (lines.length) {
     await applyStepsToToday(lines, todayIso());
@@ -4200,6 +4651,7 @@ async function addTheseToToday() {
     if (next !== (todayFile.markdown || "")) await writeJobFile("family-room-to-office/today.md", next, todayFile.mtime);
   }
   if (!isNoteDoc()) paintJobSeason();
+  else syncStageAddButton().catch(() => {});
 }
 
 function syncJobChrome() {
@@ -4326,6 +4778,12 @@ async function paintJobSeason() {
     }
     const season = await readJobFile("aidanos/active-horse.md");
     if (gen !== jobSeasonGen) return;
+    const answers = await readJobFile("family-room-to-office/answers.md");
+    const plan = await readJobFile("family-room-to-office/plan.md");
+    if (gen !== jobSeasonGen) return;
+    const day = await api("/api/day?date=" + encodeURIComponent(state.selectedDate || todayIso()));
+    if (gen !== jobSeasonGen) return;
+    const offer = linesToAddToday(tasks, familyRoomStops(answers.markdown, plan.markdown), answers.markdown);
     host.innerHTML = "";
     const blocks = [
       ["Why it matters", "Why it matters"],
@@ -4363,8 +4821,9 @@ async function paintJobSeason() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "hairline-button";
-    button.textContent = "Add these to today";
+    paintAddTodayButton(button, boxesOnToday(offer, day.markdown));
     button.addEventListener("click", () => {
+      if (button.disabled) return;
       addTheseToToday().catch((err) => setStatus(String(err && err.message || err), "error"));
     });
     host.appendChild(button);
@@ -4408,9 +4867,46 @@ if (jobLink) {
     }
   });
 }
+function paintAddTodayButton(button, on) {
+  if (!button) return;
+  const placed = !!on;
+  button.textContent = placed ? "On today" : "Add these to today";
+  button.classList.toggle("is-on-today", placed);
+  button.disabled = placed;
+}
+
+let stageAddGen = 0;
+async function syncStageAddButton() {
+  const button = $("stage-add");
+  const gen = ++stageAddGen;
+  if (!button) return;
+  if (jobPath() !== "family-room-to-office/map.md" || !state.mapStageId) {
+    paintAddTodayButton(button, false);
+    return;
+  }
+  paintAddTodayButton(button, false);
+  try {
+    const answers = await readJobFile("family-room-to-office/answers.md");
+    const plan = await readJobFile("family-room-to-office/plan.md");
+    const stops = familyRoomStops(answers.markdown, plan.markdown);
+    const dump = $("dump");
+    const parsed = parseProcessMap(dump ? dump.value : "");
+    const stage = (parsed.stages || []).find((s) => s.id === state.mapStageId);
+    const lines = linesToAddToday(stageNextStepLines(stage), stops, answers.markdown);
+    const day = await api("/api/day?date=" + encodeURIComponent(todayIso()));
+    if (gen !== stageAddGen) return;
+    if (jobPath() !== "family-room-to-office/map.md" || !state.mapStageId) return;
+    paintAddTodayButton(button, boxesOnToday(lines, day.markdown));
+  } catch (e) {
+    if (gen !== stageAddGen) return;
+    paintAddTodayButton(button, false);
+  }
+}
+
 const stageAdd = $("stage-add");
 if (stageAdd) {
   stageAdd.addEventListener("click", () => {
+    if (stageAdd.disabled) return;
     addTheseToToday().catch((err) => setStatus(String(err && err.message || err), "error"));
   });
 }

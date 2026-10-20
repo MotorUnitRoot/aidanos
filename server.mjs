@@ -7,7 +7,9 @@
  * Never rebase, never force-push, and never combine two copies of a file.
  * Same-file divergence keeps both copies until an explicit Keep mine,
  * Take theirs, or Edit. An ordinary save does not resolve that conflict.
- * Sync stages only the note paths this app wrote. Histories that diverge
+ * Sync stages only the note paths this app wrote. Those paths stay pending
+ * until the push that contains them succeeds, including across a restart.
+ * Histories that diverge
  * with no shared file wait for an explicit join. That join re-checks there
  * is still no overlap, then makes a normal merge commit and pushes.
  * If clone/pull cannot populate the checkout, seed the bundled sample vault/
@@ -90,6 +92,7 @@ const vaultGit = {
   suppressWatch: 0,
   join: false,
   resolvePending: new Set(),
+  hold: new Set(),
   left: "",
 };
 
@@ -319,6 +322,7 @@ async function retryVaultGit() {
       await ensureGitIdentity(VAULT);
       await ensureOrigin(VAULT);
       vaultGit.ready = true;
+      loadPending();
       await syncVault(null);
       if (vaultGit.fetchFailed) await seedBundledVaultIfNeeded("git retry");
       return;
@@ -354,6 +358,7 @@ async function initVaultGit() {
       await ensureGitIdentity(VAULT);
       await ensureOrigin(VAULT);
       vaultGit.ready = true;
+      loadPending();
       await syncVault(null);
       if (vaultGit.fetchFailed) {
         await seedBundledVaultIfNeeded("pull failed");
@@ -381,7 +386,10 @@ async function initVaultGit() {
       }
       await ensureGitIdentity(VAULT);
       vaultGit.ready = await isGitRepo(VAULT);
-      if (vaultGit.ready) await syncVault(null);
+      if (vaultGit.ready) {
+        loadPending();
+        await syncVault(null);
+      }
       return;
     }
     vaultGit.error = "vault path is not a git checkout";
@@ -418,23 +426,92 @@ function enqueueVaultGit(work) {
   return run;
 }
 
+function pendingFilePath() {
+  return path.join(VAULT, ".git", "aidanos-pending");
+}
+
+function persistPending() {
+  if (!vaultGit.ready) return;
+  try {
+    const file = pendingFilePath();
+    const body = JSON.stringify({
+      paths: [...vaultGit.pending],
+      resolve: [...vaultGit.resolvePending],
+      hold: [...vaultGit.hold],
+    });
+    fsSync.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = file + ".tmp";
+    fsSync.writeFileSync(tmp, body, { encoding: "utf8", flag: "w" });
+    fsSync.renameSync(tmp, file);
+  } catch (e) {
+    console.error("vault pending:", sanitizeGitError(e && e.message || "save failed"));
+  }
+}
+
+function loadPending() {
+  let raw = "";
+  try {
+    raw = fsSync.readFileSync(pendingFilePath(), "utf8");
+  } catch {
+    return;
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  vaultGit.pending.clear();
+  vaultGit.resolvePending.clear();
+  vaultGit.hold.clear();
+  const paths = data && Array.isArray(data.paths) ? data.paths : [];
+  const resolving = data && Array.isArray(data.resolve) ? data.resolve : [];
+  const held = data && Array.isArray(data.hold) ? data.hold : [];
+  for (const rel of paths) {
+    if (isAppNotePath(rel)) vaultGit.pending.add(rel);
+  }
+  for (const rel of resolving) {
+    if (isAppNotePath(rel) && vaultGit.pending.has(rel)) vaultGit.resolvePending.add(rel);
+  }
+  for (const rel of held) {
+    if (isAppNotePath(rel)) vaultGit.hold.add(rel);
+  }
+}
+
+function refreshHold() {
+  const next = new Set();
+  for (const [rel, item] of vaultGit.conflicts) {
+    if (!item.resolved) next.add(rel);
+  }
+  let changed = next.size !== vaultGit.hold.size;
+  if (!changed) {
+    for (const rel of next) {
+      if (!vaultGit.hold.has(rel)) changed = true;
+    }
+  }
+  vaultGit.hold = next;
+  if (changed) persistPending();
+}
+
 function scheduleVaultSync(relPath, resolve) {
   if (!vaultGit.enabled || !vaultGit.ready) return;
   const rel = String(relPath || "").replace(/\\/g, "/");
   if (!isAppNotePath(rel)) return;
   vaultGit.pending.add(rel);
   if (resolve) vaultGit.resolvePending.add(rel);
+  persistPending();
   if (vaultGit.timer) clearTimeout(vaultGit.timer);
+  const started = new Set(vaultGit.pending);
   vaultGit.timer = setTimeout(() => {
     vaultGit.timer = null;
-    const paths = [...vaultGit.pending];
-    const resolving = [...vaultGit.resolvePending];
-    vaultGit.pending.clear();
-    vaultGit.resolvePending.clear();
-    enqueueVaultGit(() => syncVault(paths, resolving)).catch((e) => {
+    enqueueVaultGit(() => syncVault(null)).catch((e) => {
       setGitError(e && e.message || "git failed");
     }).finally(() => {
-      if (vaultGit.pending.size) scheduleVaultSync([...vaultGit.pending][0]);
+      for (const extra of vaultGit.pending) {
+        if (started.has(extra)) continue;
+        scheduleVaultSync(extra, vaultGit.resolvePending.has(extra));
+        return;
+      }
     });
   }, GIT_DEBOUNCE_MS);
 }
@@ -852,20 +929,42 @@ async function commitAppPaths(paths, blocked) {
   return stageAndCommit(list);
 }
 
-async function commitPendingNotes(blocked) {
+function pendingList() {
+  return [...vaultGit.pending].filter((rel) => isAppNotePath(rel));
+}
+
+function committablePending() {
   const list = [];
-  for (const rel of vaultGit.pending) {
-    if (!isAppNotePath(rel) || list.includes(rel)) continue;
-    if (blocked && blocked.has(rel)) continue;
-    if (vaultGit.conflicts.has(rel)) continue;
+  for (const rel of pendingList()) {
+    if (vaultGit.hold.has(rel)) continue;
+    const item = vaultGit.conflicts.get(rel);
+    if (item && !item.resolved) continue;
     list.push(rel);
   }
-  for (const rel of list) {
+  return list;
+}
+
+async function commitPendingNotes(blocked) {
+  return commitAppPaths(pendingList(), blocked);
+}
+
+async function releaseCleanPending() {
+  let dirty;
+  try {
+    dirty = await dirtySet();
+  } catch {
+    return;
+  }
+  let changed = false;
+  for (const rel of [...vaultGit.pending]) {
+    if (dirty.has(rel)) continue;
+    const item = vaultGit.conflicts.get(rel);
+    if (item && !item.resolved) continue;
     vaultGit.pending.delete(rel);
     vaultGit.resolvePending.delete(rel);
+    changed = true;
   }
-  if (!list.length) return false;
-  return stageAndCommit(list);
+  if (changed) persistPending();
 }
 
 async function noteUnrelated() {
@@ -879,6 +978,7 @@ async function noteUnrelated() {
   let extra = false;
   for (const file of dirty) {
     if (vaultGit.conflicts.has(file)) continue;
+    if (vaultGit.hold.has(file)) continue;
     if (vaultGit.pending.has(file)) continue;
     extra = true;
     break;
@@ -891,6 +991,7 @@ async function publishPush() {
   setGitError("");
   vaultGit.lastPushAt = Date.now();
   vaultGit.join = false;
+  await releaseCleanPending();
 }
 
 async function publishDiverged(rel, choices) {
@@ -1047,19 +1148,43 @@ async function joinVault() {
 
 async function syncVault(commitPaths, resolvePaths) {
   if (!vaultGit.enabled || !vaultGit.ready) return;
+  if (Array.isArray(commitPaths)) {
+    let changed = false;
+    for (const rel of commitPaths) {
+      if (!isAppNotePath(rel) || vaultGit.pending.has(rel)) continue;
+      vaultGit.pending.add(rel);
+      changed = true;
+    }
+    if (Array.isArray(resolvePaths)) {
+      for (const rel of resolvePaths) {
+        if (!isAppNotePath(rel)) continue;
+        vaultGit.pending.add(rel);
+        if (!vaultGit.resolvePending.has(rel)) changed = true;
+        vaultGit.resolvePending.add(rel);
+      }
+    }
+    if (changed) persistPending();
+  }
   try {
-    await syncVaultBody(commitPaths, resolvePaths);
+    await syncVaultBody();
   } catch (e) {
     setGitError(e && e.message || "git failed");
   } finally {
+    if (!vaultGit.fetchFailed) refreshHold();
     await noteUnrelated().catch(() => {});
     finishGitNotice();
   }
 }
 
-async function syncVaultBody(commitPaths, resolvePaths) {
-  const paths = Array.isArray(commitPaths) ? commitPaths.filter((rel) => isAppNotePath(rel)) : null;
-  const resolving = Array.isArray(resolvePaths) ? resolvePaths.filter((rel) => isAppNotePath(rel)) : [];
+async function commitPendingNow() {
+  if (!vaultGit.fetchFailed) refreshHold();
+  const ready = committablePending();
+  if (!ready.length) return false;
+  return stageAndCommit(ready);
+}
+
+async function syncVaultBody() {
+  const resolving = [...vaultGit.resolvePending].filter((rel) => isAppNotePath(rel));
   if (resolving.length) await noteChoices(resolving);
 
   let rel = null;
@@ -1069,32 +1194,26 @@ async function syncVaultBody(commitPaths, resolvePaths) {
   } catch (e) {
     vaultGit.fetchFailed = true;
     setGitError(e && e.message || "fetch failed");
-    if (paths && paths.length && !hasUnresolved()) {
-      try {
-        if (await stageAndCommit(paths)) await publishPush();
-      } catch (pushErr) {
-        setGitError(pushErr && pushErr.message || "push failed");
-      }
+    try {
+      if (await commitPendingNow()) await publishPush();
+    } catch (pushErr) {
+      setGitError(pushErr && pushErr.message || "push failed");
     }
     return;
   }
 
   if (!rel || rel.kind === "none") {
-    if (paths && paths.length && !hasUnresolved()) {
-      try {
-        if (await stageAndCommit(paths)) await publishPush();
-      } catch (e) {
-        setGitError(e && e.message || "push failed");
-      }
+    try {
+      if (await commitPendingNow()) await publishPush();
+    } catch (e) {
+      setGitError(e && e.message || "push failed");
     }
     return;
   }
 
   if (rel.kind === "unknown") {
     setGitError("push refused");
-    if (paths && paths.length) {
-      try { await stageAndCommit(paths); } catch (e) { setGitError(e && e.message || "git failed"); }
-    }
+    try { await commitPendingNow(); } catch (e) { setGitError(e && e.message || "git failed"); }
     return;
   }
 
@@ -1143,7 +1262,7 @@ async function syncVaultBody(commitPaths, resolvePaths) {
       if (!item.resolved) blocked.add(item.path);
     }
     try {
-      await commitAppPaths(paths, blocked);
+      await commitAppPaths(pendingList(), blocked);
     } catch (e) {
       setGitError(e && e.message || "git failed");
     }
@@ -1190,16 +1309,12 @@ async function syncVaultBody(commitPaths, resolvePaths) {
     vaultGit.join = false;
   }
 
-  if (hasUnresolved()) return;
-
   let committed = false;
-  if (paths && paths.length) {
-    try {
-      committed = await stageAndCommit(paths);
-    } catch (e) {
-      setGitError(e && e.message || "git failed");
-      return;
-    }
+  try {
+    committed = await commitPendingNow();
+  } catch (e) {
+    setGitError(e && e.message || "git failed");
+    return;
   }
   let ahead = rel.kind === "ahead";
   if (committed) {
@@ -1207,7 +1322,7 @@ async function syncVaultBody(commitPaths, resolvePaths) {
       const again = await compareToRemote();
       ahead = !again || again.kind === "ahead" || again.kind === "none" || again.kind === "equal";
       if (again && (again.kind === "behind" || again.kind === "diverged")) {
-        await syncVaultBody(null);
+        await syncVaultBody();
         return;
       }
     } catch {}
@@ -1224,7 +1339,7 @@ async function syncVaultBody(commitPaths, resolvePaths) {
           if (again.kind === "diverged") {
             const noted = await noteDivergence(again);
             try {
-              await commitAppPaths(paths, new Set(noted.overlap || []));
+              await commitAppPaths(pendingList(), new Set(noted.overlap || []));
             } catch (commitErr) {
               setGitError(commitErr && commitErr.message || "git failed");
             }

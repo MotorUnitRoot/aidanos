@@ -209,6 +209,10 @@ function assertClientSurfacesConflict() {
   assert(server.includes('error: "still conflicted"'), "an ordinary save of a conflict is refused");
   assert(!server.includes("commitDisjointDirty"), "sync does not stage every dirty file");
   assert(!server.includes('add", "-A"') && !server.includes('add", "."') && !server.includes('commit", "-a"'), "sync does not broad-stage");
+  const sched = server.slice(server.indexOf("function scheduleVaultSync("), server.indexOf("function startVaultSyncLoop("));
+  assert(!sched.includes("pending.clear()") && !sched.includes("resolvePending.clear()"), "starting a sync does not drop pending notes");
+  const loop = server.slice(server.indexOf("function startVaultSyncLoop("), server.indexOf("function pushWatchSilence("));
+  assert(loop.includes("syncVault(null)"), "the minute sync reads the pending list");
 }
 
 function retryUsesSyncQueue() {
@@ -786,6 +790,186 @@ async function strayFileLeftAlone() {
   }
 }
 
+function pendingSaved(vault) {
+  const file = path.join(vault, ".git", "aidanos-pending");
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+async function otherNoteSurvivesConflict() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-other-"));
+  const bare = seedBare(tmp);
+  const vaultA = path.join(tmp, "a");
+  const vaultB = path.join(tmp, "b");
+  fs.mkdirSync(vaultA, { recursive: true });
+  fs.mkdirSync(vaultB, { recursive: true });
+  const portA = 41000 + Math.floor(Math.random() * 400);
+  const portB = portA + 1;
+  const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
+  const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
+  const childB = spawnServer(serverEnv(portB, vaultB, bare, extra));
+  const baseA = "http://127.0.0.1:" + portA;
+  const baseB = "http://127.0.0.1:" + portB;
+  const today = "2026-10-19";
+  const tomorrow = "2026-10-20";
+  const fromA = "today from A\n";
+  const fromB = "today from B\n";
+  const later = "tomorrow from B\n";
+  try {
+    await waitHealth(baseA, childA);
+    await waitHealth(baseB, childB);
+    const putA = await putDay(baseA, today, fromA);
+    assert(putA.res.ok, "A save " + putA.res.status);
+    await waitFor(async () => git(["show", "main:log/" + today + ".md"], bare) === fromA, 8000, "A on remote");
+    const putB = await putDay(baseB, today, fromB);
+    assert(putB.res.ok, "B save " + putB.res.status + " " + JSON.stringify(putB.body));
+    await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      const hit = (body.conflicts || []).find((item) => item && item.path === "log/" + today + ".md");
+      return hit && hit.mine === fromB && hit.theirs === fromA ? body : "";
+    }, 5000, "conflict on today");
+    const next = await putDay(baseB, tomorrow, later, 0);
+    assert(next.res.ok, "tomorrow save " + next.res.status + " " + JSON.stringify(next.body));
+    assert(fileText(vaultB, "log/" + tomorrow + ".md") === later, "tomorrow is on disk");
+    await new Promise((r) => setTimeout(r, 500));
+    let missing = false;
+    try { git(["show", "main:log/" + tomorrow + ".md"], bare); } catch { missing = true; }
+    assert(missing, "tomorrow is not pushed while today is in conflict");
+    const during = await (await fetch(baseB + "/api/sync")).json();
+    const still = (during.conflicts || []).find((item) => item && item.path === "log/" + today + ".md");
+    assert(still && still.mine === fromB && still.theirs === fromA, "today still has both versions");
+    assert(during.left === "", "tomorrow is not called an unrelated file " + JSON.stringify(during));
+    const queued = pendingSaved(vaultB);
+    assert(queued.paths.includes("log/" + tomorrow + ".md"), "tomorrow stays pending " + JSON.stringify(queued));
+    const kept = await putDay(baseB, today, fromB, still.mtime, "keep");
+    assert(kept.res.ok, "resolve today " + kept.res.status + " " + JSON.stringify(kept.body));
+    await waitFor(async () => git(["show", "main:log/" + tomorrow + ".md"], bare) === later, 5000, "tomorrow reaches the remote");
+    assert(git(["show", "main:log/" + today + ".md"], bare) === fromB, "today resolved to B");
+    assert(!git(["ls-files"], vaultB).includes("aidanos-pending"), "the pending list is not a vault file");
+    assert(!historyNames(bare).includes("aidanos-pending"), "the pending list was not pushed");
+  } finally {
+    await stop(childA);
+    await stop(childB);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+async function otherNoteSurvivesConflictOffline() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-other-off-"));
+  const bare = seedBare(tmp);
+  const vaultA = path.join(tmp, "a");
+  const vaultB = path.join(tmp, "b");
+  fs.mkdirSync(vaultA, { recursive: true });
+  fs.mkdirSync(vaultB, { recursive: true });
+  const portA = 43000 + Math.floor(Math.random() * 400);
+  const portB = portA + 1;
+  const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
+  const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
+  const childB = spawnServer(serverEnv(portB, vaultB, bare, extra));
+  const baseA = "http://127.0.0.1:" + portA;
+  const baseB = "http://127.0.0.1:" + portB;
+  const today = "2026-10-19";
+  const tomorrow = "2026-10-20";
+  const fromA = "today from A\n";
+  const fromB = "today from B\n";
+  const later = "tomorrow while offline\n";
+  try {
+    await waitHealth(baseA, childA);
+    await waitHealth(baseB, childB);
+    const putA = await putDay(baseA, today, fromA);
+    assert(putA.res.ok, "A save " + putA.res.status);
+    await waitFor(async () => git(["show", "main:log/" + today + ".md"], bare) === fromA, 8000, "A on remote");
+    const putB = await putDay(baseB, today, fromB);
+    assert(putB.res.ok, "B save " + putB.res.status);
+    const opened = await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      const hit = (body.conflicts || []).find((item) => item && item.path === "log/" + today + ".md");
+      return hit && hit.mine === fromB && hit.theirs === fromA ? body : "";
+    }, 5000, "conflict before the outage");
+    git(["remote", "set-url", "origin", path.join(tmp, "down.git")], vaultB);
+    const next = await putDay(baseB, tomorrow, later, 0);
+    assert(next.res.ok, "tomorrow save during the outage " + next.res.status);
+    const failed = await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      return body.error ? body : "";
+    }, 5000, "sync notices the outage");
+    assert(failed.left === "", "an app note is not unrelated during the outage " + JSON.stringify(failed));
+    let missing = false;
+    try { git(["show", "main:log/" + tomorrow + ".md"], bare); } catch { missing = true; }
+    assert(missing, "tomorrow is not on the remote while the network is down");
+    assert(pendingSaved(vaultB).paths.includes("log/" + tomorrow + ".md"), "tomorrow stays pending through the failed sync");
+    git(["remote", "set-url", "origin", bare], vaultB);
+    const kept = await putDay(baseB, today, fromB, opened.conflicts.find((item) => item.path === "log/" + today + ".md").mtime, "keep");
+    assert(kept.res.ok, "resolve after the network returns " + kept.res.status + " " + JSON.stringify(kept.body));
+    await waitFor(async () => git(["show", "main:log/" + tomorrow + ".md"], bare) === later, 5000, "tomorrow reaches the remote after the network returns");
+    assert(git(["show", "main:log/" + today + ".md"], bare) === fromB, "today still resolved to B");
+  } finally {
+    await stop(childA);
+    await stop(childB);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+async function pendingSurvivesRestart() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-restart-"));
+  const bare = seedBare(tmp);
+  const vaultA = path.join(tmp, "a");
+  const vaultB = path.join(tmp, "b");
+  fs.mkdirSync(vaultA, { recursive: true });
+  fs.mkdirSync(vaultB, { recursive: true });
+  const portA = 45000 + Math.floor(Math.random() * 400);
+  const portB = portA + 1;
+  const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
+  const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
+  let childB = spawnServer(serverEnv(portB, vaultB, bare, extra));
+  const baseA = "http://127.0.0.1:" + portA;
+  const baseB = "http://127.0.0.1:" + portB;
+  const today = "2026-10-19";
+  const tomorrow = "2026-10-20";
+  const fromA = "today from A\n";
+  const fromB = "today from B\n";
+  const later = "tomorrow across a restart\n";
+  try {
+    await waitHealth(baseA, childA);
+    await waitHealth(baseB, childB);
+    const putA = await putDay(baseA, today, fromA);
+    assert(putA.res.ok, "A save " + putA.res.status);
+    await waitFor(async () => git(["show", "main:log/" + today + ".md"], bare) === fromA, 8000, "A on remote");
+    const putB = await putDay(baseB, today, fromB);
+    assert(putB.res.ok, "B save " + putB.res.status);
+    await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      const hit = (body.conflicts || []).find((item) => item && item.path === "log/" + today + ".md");
+      return hit && hit.mine === fromB && hit.theirs === fromA ? body : "";
+    }, 5000, "conflict before restart");
+    const next = await putDay(baseB, tomorrow, later, 0);
+    assert(next.res.ok, "tomorrow save " + next.res.status);
+    await new Promise((r) => setTimeout(r, 400));
+    const queued = pendingSaved(vaultB);
+    assert(queued.paths.includes("log/" + tomorrow + ".md"), "pending file has tomorrow before the restart " + JSON.stringify(queued));
+    assert(fs.existsSync(path.join(vaultB, ".git", "aidanos-pending")), "pending file lives inside .git");
+    await stop(childB);
+    childB = spawnServer(serverEnv(portB, vaultB, bare, extra));
+    await waitHealth(baseB, childB);
+    const reopened = await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      const hit = (body.conflicts || []).find((item) => item && item.path === "log/" + today + ".md");
+      return hit && hit.mine === fromB && hit.theirs === fromA ? body : "";
+    }, 5000, "conflict comes back after restart");
+    assert(pendingSaved(vaultB).paths.includes("log/" + tomorrow + ".md"), "restart kept tomorrow pending");
+    assert(reopened.left === "", "restart does not call tomorrow unrelated");
+    const kept = await putDay(baseB, today, fromB, reopened.conflicts.find((item) => item.path === "log/" + today + ".md").mtime, "keep");
+    assert(kept.res.ok, "resolve after restart " + kept.res.status + " " + JSON.stringify(kept.body));
+    await waitFor(async () => git(["show", "main:log/" + tomorrow + ".md"], bare) === later, 5000, "tomorrow reaches the remote after restart");
+    assert(!git(["ls-files"], vaultB).includes("aidanos-pending"), "restart did not commit the pending file");
+    assert(!historyNames(vaultB).includes("aidanos-pending"), "the pending file is not in local history");
+    assert(!historyNames(bare).includes("aidanos-pending"), "the pending file was not pushed");
+  } finally {
+    await stop(childA);
+    await stop(childB);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 try {
   assertClientSurfacesConflict();
   retryUsesSyncQueue();
@@ -797,6 +981,9 @@ try {
   await mixedOverlapAndDisjoint();
   await conflictSurvivesDaySwitch();
   await strayFileLeftAlone();
+  await otherNoteSurvivesConflict();
+  await otherNoteSurvivesConflictOffline();
+  await pendingSurvivesRestart();
   console.log("vault-sync-test ok");
 } catch (err) {
   console.error("FAIL  vault-sync-test  " + (err && err.stack || err));

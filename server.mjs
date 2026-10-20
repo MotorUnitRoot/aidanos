@@ -919,6 +919,18 @@ async function joinVault() {
   if (rel.kind !== "diverged") return refuseJoin(rel);
   const noted = await noteDivergence(rel);
   if (noted.blocking.length || hasUnresolved()) return refuseJoin(null);
+  const choices = resolvedChoices();
+  if (choices.size) {
+    const dirty = await dirtySet();
+    const extras = new Map();
+    for (const file of dirty) {
+      if (choices.has(file) || !isSafeRel(file)) continue;
+      extras.set(file, await readRel(file));
+    }
+    await publishDiverged(rel, choices, extras);
+    const status = syncStatus();
+    return { status: status.ok ? 200 : 409, body: status };
+  }
   const incoming = await listDiff(rel.head, rel.rev);
   pushWatchSilence();
   try {
@@ -1070,6 +1082,19 @@ async function syncVaultBody(commitPaths) {
     }
     const choices = resolvedChoices();
     if (choices.size) {
+      const remoteChanged = rel.base ? await listDiff(rel.base, rel.rev) : [];
+      const waiting = remoteChanged.filter((file) => !choices.has(file));
+      if (waiting.length) {
+        vaultGit.join = true;
+        try {
+          await publishPush();
+        } catch (e) {
+          setGitError(e && e.message || "push refused");
+          vaultGit.join = true;
+        }
+        if (vaultGit.join && !vaultGit.error) setGitError("push refused");
+        return;
+      }
       vaultGit.join = false;
       const dirty = await dirtySet();
       const extras = new Map();

@@ -1651,6 +1651,8 @@ body.has-conflict.conflict-edit .conflict-cols { grid-template-columns: 1fr; }
 .conflict-sheet.is-join #conflict-take,
 .conflict-sheet.is-join #conflict-edit { display: none; }
 .conflict-sheet.is-join .conflict-actions { margin-top: 0.55rem; }
+.conflict-sheet:not(.is-join) #conflict-join,
+#conflict-join[hidden] { display: none !important; }
 
 @media (max-width: 720px) {
   .conflict-cols { grid-template-columns: 1fr; }

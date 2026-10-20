@@ -175,6 +175,15 @@ function assertClientSurfacesConflict() {
   assert(joinUi.includes("Your other copy has changes."), "the sentence is on the sheet");
   assert(!joinUi.includes(', "error"'), "the diverged sentence is not a red status");
   assert(joinUi.includes('setStatus("")'), "the status line stays quiet while the sheet offers join");
+  const css = fs.readFileSync(path.join(root, "day.css"), "utf8");
+  assert(css.includes(".conflict-sheet:not(.is-join) #conflict-join"), "Bring them in is hidden on the conflict sheet");
+  const paperOpen = app.slice(app.indexOf("function openPaperConflict("), app.indexOf("function closePaperConflict("));
+  assert(paperOpen.includes('classList.remove("is-join")'), "a file conflict is not the other-copy sheet");
+  assert(paperOpen.includes("conflict-join") && paperOpen.includes("hidden = true"), "opening the conflict sheet hides Bring them in");
+  const keepFn = app.slice(app.indexOf("async function resolveConflictKeep("), app.indexOf("async function resolveConflictTheirs("));
+  const takeFn = app.slice(app.indexOf("async function resolveConflictTheirs("), app.indexOf("function gitConflictForOpenPage("));
+  assert(keepFn.includes("afterGitChoice(") && takeFn.includes("afterGitChoice("), "a choice looks for changes still waiting");
+  assert(app.includes("function afterGitChoice(") && app.slice(app.indexOf("function afterGitChoice("), app.indexOf("function gitConflictForOpenPage(")).includes("openGitJoin("), "a choice opens the other-copy sheet when changes are still waiting");
   assert(app.includes("function resolveGitJoin("), "join waits for the click");
   assert(app.includes('body: JSON.stringify({ join: true })'), "join posts only after the click");
   assert(htmlIncludesJoin(), "join action sits on the existing sheet");
@@ -570,9 +579,24 @@ async function mixedOverlapAndDisjoint() {
     assert(git(["show", "main:log/" + overlap + ".md"], bare) === textA, "remote overlap stays A's until the sheet");
     const kept = await putDay(baseB, overlap, textB, hit.mtime);
     assert(kept.res.ok, "keep mine " + kept.res.status + " " + JSON.stringify(kept.body) + " " + childB._log().slice(-400));
+    const offered = await waitFor(async () => {
+      const sync = await (await fetch(baseB + "/api/sync")).json();
+      return sync.join === true && !(sync.conflicts || []).length ? sync : "";
+    }, 5000, "other-copy sheet after the choice");
+    assert(offered.join === true, "after the choice the other copy is still waiting");
+    let notMerged = false;
+    try { git(["show", "main:log/" + localOnly + ".md"], bare); } catch { notMerged = true; }
+    assert(notMerged, "the choice does not bring the other days in by itself");
+    const joined = await fetch(baseB + "/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ join: true }),
+    });
+    const joinedBody = await joined.json();
+    assert(joined.ok, "bring them in after the choice " + joined.status + " " + JSON.stringify(joinedBody) + " " + childB._log().slice(-400));
     await waitFor(async () => {
       try { return git(["show", "main:log/" + localOnly + ".md"], bare) === textLocal; } catch { return ""; }
-    }, 5000, "merge after the sheet");
+    }, 5000, "merge after Bring them in");
     assert(git(["show", "main:log/" + overlap + ".md"], bare) === textB, "overlap resolved to one whole version");
     assert(!git(["show", "main:log/" + overlap + ".md"], bare).includes("overlap from A"), "overlap text was not combined");
     assert(git(["show", "main:log/" + remoteOnly + ".md"], bare) === textRemote, "remote-only day kept");

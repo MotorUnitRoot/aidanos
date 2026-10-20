@@ -1902,6 +1902,10 @@ async function resolveConflictKeep() {
       paintPaper();
     }
     closePaperConflict();
+    if (info.git) {
+      await afterGitChoice(info.kind === "note" ? info.path : ("log/" + info.date + ".md"));
+      if (gitJoin) return;
+    }
     setStatus("Saved", "saved");
     setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
   } catch (e) {
@@ -1959,9 +1963,38 @@ async function resolveConflictTheirs() {
       applyRemoteDay({ date: info.date, markdown: info.theirs, mtime });
     }
     closePaperConflict();
+    if (info.git) {
+      await afterGitChoice(info.kind === "note" ? info.path : ("log/" + info.date + ".md"));
+      if (gitJoin) return;
+    }
     setStatus("");
   } catch (e) {
     setStatus(String(e.message), "error");
+  }
+}
+
+async function afterGitChoice(path) {
+  const rel = String(path || "").replace(/\\/g, "/");
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    let data = null;
+    try { data = await api("/api/sync"); } catch { data = null; }
+    if (!data || data.enabled === false) return;
+    const conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
+    const still = conflicts.some((item) => item && String(item.path || "").replace(/\\/g, "/") === rel);
+    if (still) {
+      await new Promise((r) => setTimeout(r, 80));
+      continue;
+    }
+    if (data.join) {
+      openGitJoin();
+      return;
+    }
+    if (conflicts.length) {
+      surfaceGitConflict(data);
+      return;
+    }
+    return;
   }
 }
 

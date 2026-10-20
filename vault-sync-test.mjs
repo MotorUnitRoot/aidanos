@@ -204,6 +204,12 @@ function assertClientSurfacesConflict() {
   assert(joinFn.includes('merge", "--no-ff", "--no-commit"'), "join is a normal merge commit");
   assert(joinFn.includes("unmergedFiles"), "join aborts when a file overlaps");
   assert(joinFn.indexOf("noteDivergence") < joinFn.indexOf('merge", "--no-ff"'), "join re-checks overlap before merging");
+  assert(joinFn.includes("dropStaleChoices("), "Bring them in checks the recorded blob");
+  const publish = server.slice(server.indexOf("async function publishDiverged("), server.indexOf("async function refuseJoin("));
+  assert(publish.indexOf("dropStaleChoices(") !== -1 && publish.indexOf("dropStaleChoices(") < publish.indexOf('merge", "--no-ff"'), "the merge checks the blob immediately before applying a choice");
+  const diverge = server.slice(server.indexOf("async function noteDivergence("), server.indexOf("async function stageAndCommit("));
+  const recordAt = diverge.indexOf("recordConflicts(");
+  assert(recordAt !== -1 && recordAt < diverge.indexOf("!item.resolved"), "compare re-checks a recorded choice before treating it as settled");
   assert(!syncBody.includes("noteChoices(paths)"), "an ordinary save does not resolve a conflict");
   assert(syncBody.includes("noteChoices(resolving)"), "only an explicit resolution resolves a conflict");
   assert(server.includes('error: "still conflicted"'), "an ordinary save of a conflict is refused");
@@ -970,6 +976,134 @@ async function pendingSurvivesRestart() {
   }
 }
 
+async function withChoiceThenSecondEdit(portBase, resolve, chosen, fn) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-stale-"));
+  const bare = seedBare(tmp);
+  const vaultA = path.join(tmp, "a");
+  const vaultB = path.join(tmp, "b");
+  fs.mkdirSync(vaultA, { recursive: true });
+  fs.mkdirSync(vaultB, { recursive: true });
+  const portA = portBase + Math.floor(Math.random() * 200);
+  const portB = portA + 1;
+  const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
+  const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
+  const childB = spawnServer(serverEnv(portB, vaultB, bare, extra));
+  const baseB = "http://127.0.0.1:" + portB;
+  const overlap = "2026-10-19";
+  const textA = "A1\n";
+  const textB = "B1\n";
+  const textA2 = "A2 second edit\n";
+  try {
+    await waitHealth("http://127.0.0.1:" + portA, childA);
+    await waitHealth(baseB, childB);
+    commitFile(vaultA, "log/" + overlap + ".md", textA, "A overlap");
+    commitFile(vaultA, "log/2026-10-20.md", "only on A\n", "A disjoint");
+    git(["push", "origin", "HEAD"], vaultA);
+    commitFile(vaultB, "log/" + overlap + ".md", textB, "B overlap");
+    commitFile(vaultB, "log/2026-10-21.md", "only on B\n", "B disjoint");
+    const trigger = await putDay(baseB, "2026-10-18", "trigger compare\n", 0);
+    assert(trigger.res.ok, "trigger " + trigger.res.status + " " + JSON.stringify(trigger.body));
+    const opened = await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      const hit = (body.conflicts || []).find((item) => item && item.path === "log/" + overlap + ".md");
+      return hit && hit.mine === textB && hit.theirs === textA ? body : "";
+    }, 8000, "conflict before the choice");
+    const hit = opened.conflicts.find((item) => item.path === "log/" + overlap + ".md");
+    const picked = await putDay(baseB, overlap, chosen, hit.mtime, resolve);
+    assert(picked.res.ok, resolve + " " + picked.res.status + " " + JSON.stringify(picked.body) + " " + childB._log().slice(-400));
+    let lastSync = "";
+    try {
+      await waitFor(async () => {
+        const sync = await (await fetch(baseB + "/api/sync")).json();
+        lastSync = JSON.stringify(sync);
+        return sync.join === true && !(sync.conflicts || []).length ? sync : "";
+      }, 15000, "waiting for Bring them in");
+    } catch (err) {
+      throw new Error(String(err && err.message || err) + " last=" + lastSync + " log=" + childB._log().slice(-800));
+    }
+    assert(fileText(vaultB, "log/" + overlap + ".md") === chosen, "the choice is what is on disk");
+    commitFile(vaultA, "log/" + overlap + ".md", textA2, "A second edit");
+    git(["push", "origin", "HEAD"], vaultA);
+    await waitFor(async () => git(["show", "main:log/" + overlap + ".md"], bare) === textA2, 8000, "A2 on remote");
+    const remoteAt = git(["rev-parse", "main"], bare).trim();
+    await fn({ baseB, vaultB, bare, overlap, textA2, chosen, remoteAt, childB });
+  } finally {
+    await stop(childA);
+    await stop(childB);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+async function staleChoiceAfterKeepMine() {
+  await withChoiceThenSecondEdit(46100, "keep", "B1\n", async (ctx) => {
+    const nudge = await putDay(ctx.baseB, "2026-10-17", "nudge compare\n", 0);
+    assert(nudge.res.ok, "nudge " + nudge.res.status);
+    const again = await waitFor(async () => {
+      const body = await (await fetch(ctx.baseB + "/api/sync")).json();
+      const hit = (body.conflicts || []).find((item) => item && item.path === "log/" + ctx.overlap + ".md");
+      return hit && hit.mine === "B1\n" && hit.theirs === ctx.textA2 ? body : "";
+    }, 8000, "Keep mine reopens with the new text");
+    assert(again.join !== true, "Bring them in stays hidden while the new conflict is open");
+    assert(fileText(ctx.vaultB, "log/" + ctx.overlap + ".md") === "B1\n", "Keep mine was not overwritten");
+    await new Promise((r) => setTimeout(r, 500));
+    assert(git(["show", "main:log/" + ctx.overlap + ".md"], ctx.bare) === ctx.textA2, "the old choice did not replace A2");
+    assert(git(["rev-parse", "main"], ctx.bare).trim() === ctx.remoteAt, "nothing was pushed over the second edit");
+  });
+}
+
+async function staleChoiceAfterTakeTheirs() {
+  await withChoiceThenSecondEdit(47100, "theirs", "A1\n", async (ctx) => {
+    const nudge = await putDay(ctx.baseB, "2026-10-17", "nudge compare\n", 0);
+    assert(nudge.res.ok, "nudge " + nudge.res.status);
+    const again = await waitFor(async () => {
+      const body = await (await fetch(ctx.baseB + "/api/sync")).json();
+      const hit = (body.conflicts || []).find((item) => item && item.path === "log/" + ctx.overlap + ".md");
+      return hit && hit.mine === "A1\n" && hit.theirs === ctx.textA2 ? body : "";
+    }, 8000, "Take theirs reopens with the new text");
+    assert(again.join !== true, "Bring them in stays hidden while the new conflict is open");
+    assert(fileText(ctx.vaultB, "log/" + ctx.overlap + ".md") === "A1\n", "Take theirs was not overwritten");
+    await new Promise((r) => setTimeout(r, 500));
+    assert(git(["show", "main:log/" + ctx.overlap + ".md"], ctx.bare) === ctx.textA2, "the old choice did not replace A2");
+    assert(git(["rev-parse", "main"], ctx.bare).trim() === ctx.remoteAt, "nothing was pushed over the second edit");
+  });
+}
+
+async function staleChoiceAfterEdit() {
+  const edited = "edited on B\n";
+  await withChoiceThenSecondEdit(48100, "edit", edited, async (ctx) => {
+    const nudge = await putDay(ctx.baseB, "2026-10-17", "nudge compare\n", 0);
+    assert(nudge.res.ok, "nudge " + nudge.res.status);
+    const again = await waitFor(async () => {
+      const body = await (await fetch(ctx.baseB + "/api/sync")).json();
+      const hit = (body.conflicts || []).find((item) => item && item.path === "log/" + ctx.overlap + ".md");
+      return hit && hit.mine === edited && hit.theirs === ctx.textA2 ? body : "";
+    }, 8000, "Edit reopens with the new text");
+    assert(again.join !== true, "Bring them in stays hidden while the new conflict is open");
+    assert(fileText(ctx.vaultB, "log/" + ctx.overlap + ".md") === edited, "Edit was not overwritten");
+    await new Promise((r) => setTimeout(r, 500));
+    assert(git(["show", "main:log/" + ctx.overlap + ".md"], ctx.bare) === ctx.textA2, "the old choice did not replace A2");
+    assert(git(["rev-parse", "main"], ctx.bare).trim() === ctx.remoteAt, "nothing was pushed over the second edit");
+  });
+}
+
+async function staleChoiceBeforeMerge() {
+  await withChoiceThenSecondEdit(49100, "keep", "B1\n", async (ctx) => {
+    const joined = await fetch(ctx.baseB + "/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ join: true }),
+    });
+    const body = await joined.json();
+    assert(joined.status === 409, "Bring them in refuses a stale choice " + joined.status + " " + JSON.stringify(body) + " " + ctx.childB._log().slice(-500));
+    const hit = (body.conflicts || []).find((item) => item && item.path === "log/" + ctx.overlap + ".md");
+    assert(hit && hit.mine === "B1\n" && hit.theirs === ctx.textA2, "the merge reopens the conflict with the new text " + JSON.stringify(body.conflicts || []));
+    assert(body.join !== true, "Bring them in is not offered over the new conflict");
+    assert(fileText(ctx.vaultB, "log/" + ctx.overlap + ".md") === "B1\n", "the merge did not overwrite the local copy");
+    assert(git(["show", "main:log/" + ctx.overlap + ".md"], ctx.bare) === ctx.textA2, "the merge did not overwrite the second edit");
+    assert(git(["rev-parse", "main"], ctx.bare).trim() === ctx.remoteAt, "Bring them in did not push the old choice");
+  });
+}
+
 try {
   assertClientSurfacesConflict();
   retryUsesSyncQueue();
@@ -984,6 +1118,10 @@ try {
   await otherNoteSurvivesConflict();
   await otherNoteSurvivesConflictOffline();
   await pendingSurvivesRestart();
+  await staleChoiceAfterKeepMine();
+  await staleChoiceAfterTakeTheirs();
+  await staleChoiceAfterEdit();
+  await staleChoiceBeforeMerge();
   console.log("vault-sync-test ok");
 } catch (err) {
   console.error("FAIL  vault-sync-test  " + (err && err.stack || err));

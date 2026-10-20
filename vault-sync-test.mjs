@@ -167,7 +167,14 @@ function assertClientSurfacesConflict() {
   assert(!server.includes('merge", "--rebase"') && !server.includes("pull --rebase"), "sync does not rebase");
   assert(!server.includes('"--force"') && !server.includes("push --force"), "sync does not force-push");
   assert(server.includes("if (!GIT_URL || !GIT_SYNC_MS) return;"), "no remote means no sync timer");
-  assert(app.includes("Another copy has changes."), "diverged copies use the status line");
+  assert(app.includes("Your other copy has changes."), "diverged copies say the other copy has changes");
+  assert(!app.includes("Another copy has changes."), "the old diverged sentence is gone");
+  const joinUiStart = app.indexOf("function openGitJoin(");
+  const joinUiEnd = app.indexOf("function closeGitJoin(", joinUiStart);
+  const joinUi = app.slice(joinUiStart, joinUiEnd);
+  assert(joinUi.includes("Your other copy has changes."), "the sentence is on the sheet");
+  assert(!joinUi.includes(', "error"'), "the diverged sentence is not a red status");
+  assert(joinUi.includes('setStatus("")'), "the status line stays quiet while the sheet offers join");
   assert(app.includes("function resolveGitJoin("), "join waits for the click");
   assert(app.includes('body: JSON.stringify({ join: true })'), "join posts only after the click");
   assert(htmlIncludesJoin(), "join action sits on the existing sheet");

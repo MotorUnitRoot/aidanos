@@ -2018,7 +2018,7 @@ function openGitJoin() {
   gitJoin = true;
   const sheet = $("conflict-sheet");
   const kicker = sheet && sheet.querySelector(".conflict-kicker");
-  if (kicker) kicker.textContent = "Another copy has changes.";
+  if (kicker) kicker.textContent = "Your other copy has changes.";
   const pathEl = $("conflict-path");
   if (pathEl) pathEl.textContent = "";
   const joinBtn = $("conflict-join");
@@ -2029,7 +2029,7 @@ function openGitJoin() {
     sheet.classList.remove("is-edit");
   }
   document.body.classList.remove("has-conflict");
-  setStatus("Another copy has changes.", "error");
+  setStatus("");
 }
 
 function closeGitJoin() {
@@ -2059,8 +2059,13 @@ async function resolveGitJoin() {
       surfaceGitConflict(body);
       return;
     }
-    if (!res.ok || body.join) {
+    if (body && body.join) {
       openGitJoin();
+      return;
+    }
+    if (!res.ok) {
+      closeGitJoin();
+      setStatus(String((body && body.error) || res.statusText || "push refused"), "error");
       return;
     }
     closeGitJoin();

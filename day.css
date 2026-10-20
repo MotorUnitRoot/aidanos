@@ -1641,6 +1641,16 @@ body.doc-capture #job-actions {
 body.has-conflict:not(.conflict-edit) #paper { display: none; }
 body.has-conflict.conflict-edit #conflict-mine-col { display: none; }
 body.has-conflict.conflict-edit .conflict-cols { grid-template-columns: 1fr; }
+.conflict-sheet.is-join {
+  order: -1;
+  margin-bottom: 1.1rem;
+}
+.conflict-sheet.is-join .conflict-path,
+.conflict-sheet.is-join .conflict-cols,
+.conflict-sheet.is-join #conflict-keep,
+.conflict-sheet.is-join #conflict-take,
+.conflict-sheet.is-join #conflict-edit { display: none; }
+.conflict-sheet.is-join .conflict-actions { margin-top: 0.55rem; }
 
 @media (max-width: 720px) {
   .conflict-cols { grid-template-columns: 1fr; }

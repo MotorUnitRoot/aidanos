@@ -1756,6 +1756,7 @@ function paperSaveSnapshot() {
 }
 
 let paperConflict = null;
+let gitJoin = false;
 
 function conflictStillHere(info) {
   if (!info) return false;
@@ -1787,7 +1788,13 @@ function openPaperConflict(info) {
   if (sheet) {
     sheet.hidden = false;
     sheet.classList.remove("is-edit");
+    sheet.classList.remove("is-join");
   }
+  const joinBtn = $("conflict-join");
+  if (joinBtn) joinBtn.hidden = true;
+  const kicker = sheet && sheet.querySelector(".conflict-kicker");
+  if (kicker) kicker.textContent = "This page changed on disk.";
+  gitJoin = false;
   document.body.classList.add("has-conflict");
   document.body.classList.remove("conflict-edit");
   setStatus("This page changed on disk.");
@@ -1799,7 +1806,11 @@ function closePaperConflict() {
   if (sheet) {
     sheet.hidden = true;
     sheet.classList.remove("is-edit");
+    sheet.classList.remove("is-join");
   }
+  const joinBtn = $("conflict-join");
+  if (joinBtn) joinBtn.hidden = true;
+  gitJoin = false;
   document.body.classList.remove("has-conflict");
   document.body.classList.remove("conflict-edit");
 }
@@ -2002,10 +2013,75 @@ function openGitConflict(item) {
   });
 }
 
+function openGitJoin() {
+  if (paperConflict) return;
+  gitJoin = true;
+  const sheet = $("conflict-sheet");
+  const kicker = sheet && sheet.querySelector(".conflict-kicker");
+  if (kicker) kicker.textContent = "Another copy has changes.";
+  const pathEl = $("conflict-path");
+  if (pathEl) pathEl.textContent = "";
+  const joinBtn = $("conflict-join");
+  if (joinBtn) joinBtn.hidden = false;
+  if (sheet) {
+    sheet.hidden = false;
+    sheet.classList.add("is-join");
+    sheet.classList.remove("is-edit");
+  }
+  document.body.classList.remove("has-conflict");
+  setStatus("Another copy has changes.", "error");
+}
+
+function closeGitJoin() {
+  const sheet = $("conflict-sheet");
+  const joinBtn = $("conflict-join");
+  if (joinBtn) joinBtn.hidden = true;
+  if (sheet) sheet.classList.remove("is-join");
+  const kicker = sheet && sheet.querySelector(".conflict-kicker");
+  if (kicker && !paperConflict) kicker.textContent = "This page changed on disk.";
+  if (sheet && !paperConflict) sheet.hidden = true;
+  gitJoin = false;
+}
+
+let gitJoinBusy = false;
+async function resolveGitJoin() {
+  if (gitJoinBusy || paperConflict) return;
+  gitJoinBusy = true;
+  try {
+    const res = await fetch("/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ join: true }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (body && Array.isArray(body.conflicts) && body.conflicts.length) {
+      closeGitJoin();
+      surfaceGitConflict(body);
+      return;
+    }
+    if (!res.ok || body.join) {
+      openGitJoin();
+      return;
+    }
+    closeGitJoin();
+    setStatus("Saved", "saved");
+    setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
+    if (!state.dirty && state.day && state.day.date && !isNoteDoc()) {
+      const day = await api("/api/day?date=" + encodeURIComponent(state.day.date)).catch(() => null);
+      if (day && !paperConflict && !gitJoin) applyRemoteDay(day);
+    }
+  } catch (e) {
+    setStatus(String(e && e.message || e), "error");
+  } finally {
+    gitJoinBusy = false;
+  }
+}
+
 function surfaceGitConflict(data) {
   if (!data || data.enabled === false) return;
   const match = gitConflictForOpenPage(data.conflicts);
   if (match && String(match.mine || "") !== String(match.theirs || "")) {
+    closeGitJoin();
     openGitConflict(match);
     return;
   }
@@ -2022,7 +2098,12 @@ function surfaceGitConflict(data) {
       }).catch(() => {});
     }
   }
-  if (data.error && !paperConflict && currentView() === "today") {
+  if (data.join && !paperConflict && currentView() === "today") {
+    openGitJoin();
+    return;
+  }
+  if (gitJoin && !data.join) closeGitJoin();
+  if (data.error && !paperConflict && !gitJoin && currentView() === "today") {
     setStatus(String(data.error), "error");
   }
 }
@@ -5461,6 +5542,8 @@ function syncFmtBarForKeyboard() {
   if (keep) keep.addEventListener("click", () => { resolveConflictKeep().catch(() => {}); });
   if (take) take.addEventListener("click", () => { resolveConflictTheirs().catch(() => {}); });
   if (edit) edit.addEventListener("click", () => resolveConflictEdit());
+  const join = $("conflict-join");
+  if (join) join.addEventListener("click", () => { resolveGitJoin().catch(() => {}); });
 })();
 
 if (/^https?:$/.test(location.protocol) && "serviceWorker" in navigator) {

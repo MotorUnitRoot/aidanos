@@ -165,7 +165,24 @@ function assertClientSurfacesConflict() {
   const server = fs.readFileSync(path.join(root, "server.mjs"), "utf8");
   assert(server.includes('merge", "--ff-only"'), "sync fast-forwards only");
   assert(!server.includes('merge", "--rebase"') && !server.includes("pull --rebase"), "sync does not rebase");
+  assert(!server.includes('"--force"') && !server.includes("push --force"), "sync does not force-push");
   assert(server.includes("if (!GIT_URL || !GIT_SYNC_MS) return;"), "no remote means no sync timer");
+  assert(app.includes("Another copy has changes."), "diverged copies use the status line");
+  assert(app.includes("function resolveGitJoin("), "join waits for the click");
+  assert(app.includes('body: JSON.stringify({ join: true })'), "join posts only after the click");
+  assert(htmlIncludesJoin(), "join action sits on the existing sheet");
+  const syncBody = server.slice(server.indexOf("async function syncVaultBody("), server.indexOf("function mondayOf("));
+  assert(!syncBody.includes("joinVault("), "a save or the timer does not merge on its own");
+  assert(server.includes("async function joinVault("), "join re-checks before the merge commit");
+  const joinFn = server.slice(server.indexOf("async function joinVault("), server.indexOf("async function syncVault("));
+  assert(joinFn.includes('merge", "--no-ff", "--no-commit"'), "join is a normal merge commit");
+  assert(joinFn.includes("unmergedFiles"), "join aborts when a file overlaps");
+  assert(joinFn.indexOf("noteDivergence") < joinFn.indexOf('merge", "--no-ff"'), "join re-checks overlap before merging");
+}
+
+function htmlIncludesJoin() {
+  const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
+  return html.includes('id="conflict-join"') && html.includes("Bring them in");
 }
 
 async function livePull() {
@@ -391,12 +408,200 @@ async function noRemoteUnchanged() {
   }
 }
 
+function commitFile(vault, rel, text, message) {
+  const abs = path.join(vault, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, text, "utf8");
+  git(["add", "--", rel], vault);
+  git(["commit", "-m", message], vault);
+}
+
+function fileText(vault, rel) {
+  return fs.readFileSync(path.join(vault, rel), "utf8");
+}
+
+async function divergedDifferentFiles() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-disjoint-"));
+  const bare = seedBare(tmp);
+  const vaultA = path.join(tmp, "a");
+  const vaultB = path.join(tmp, "b");
+  fs.mkdirSync(vaultA, { recursive: true });
+  fs.mkdirSync(vaultB, { recursive: true });
+  const portA = 33000 + Math.floor(Math.random() * 800);
+  const portB = portA + 1;
+  const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
+  const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
+  const childB = spawnServer(serverEnv(portB, vaultB, bare, extra));
+  const baseA = "http://127.0.0.1:" + portA;
+  const baseB = "http://127.0.0.1:" + portB;
+  const dayX = "2026-10-20";
+  const dayY = "2026-10-21";
+  const dayW = "2026-10-18";
+  const textX = "day X from A\n";
+  const textY = "day Y from B\n";
+  const textW = "later save\n";
+  let watch;
+  try {
+    await waitHealth(baseA, childA);
+    await waitHealth(baseB, childB);
+    commitFile(vaultA, "log/" + dayX + ".md", textX, "A day X");
+    git(["push", "origin", "HEAD"], vaultA);
+    commitFile(vaultB, "log/" + dayY + ".md", textY, "B day Y");
+    watch = await fetch(baseB + "/api/day-watch");
+    const later = await putDay(baseB, dayW, textW, 0);
+    assert(later.res.ok, "later save reaches disk " + later.res.status + " " + JSON.stringify(later.body));
+    assert(fileText(vaultB, "log/" + dayW + ".md") === textW, "later save is on disk before the join");
+    const notice = await readSseUntil(
+      watch,
+      (data) => data && data.type === "git" && data.join === true && data.error && !(data.conflicts || []).length,
+      5000,
+    );
+    assert(/rejected|non-fast-forward|behind|refused/i.test(notice.error), "refused push is shown when no file overlaps");
+    const sync = await (await fetch(baseB + "/api/sync")).json();
+    assert(sync.ok === false && sync.join === true, "page state offers the one join action " + JSON.stringify(sync));
+    assert(!(sync.conflicts || []).length, "no same-file conflict to resolve");
+    assert(git(["log", "--oneline", "--", "log/" + dayW + ".md"], vaultB).trim(), "later save is in local git");
+    assert(!git(["status", "--porcelain"], vaultB).includes(dayW), "later save is not left untracked");
+    assert(git(["show", "main:log/" + dayX + ".md"], bare) === textX, "remote still has only A's day");
+    let missingY = false;
+    try { git(["show", "main:log/" + dayY + ".md"], bare); } catch { missingY = true; }
+    assert(missingY, "join has not run yet, so B's day is not on the remote");
+    await new Promise((r) => setTimeout(r, 400));
+    try { git(["show", "main:log/" + dayY + ".md"], bare); missingY = false; } catch { missingY = true; }
+    assert(missingY, "nothing merges without the click");
+    const joined = await fetch(baseB + "/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ join: true }),
+    });
+    const joinedBody = await joined.json();
+    assert(joined.ok, "join " + joined.status + " " + JSON.stringify(joinedBody) + " " + childB._log().slice(-500));
+    assert(joinedBody.join === false && joinedBody.ok === true, "join clears the refused state");
+    assert(git(["show", "main:log/" + dayX + ".md"], bare) === textX, "A's day was not rewritten");
+    assert(git(["show", "main:log/" + dayY + ".md"], bare) === textY, "B's day was not rewritten");
+    assert(git(["show", "main:log/" + dayW + ".md"], bare) === textW, "later save was pushed intact");
+    const parents = git(["rev-list", "--parents", "-n", "1", "main"], bare).trim().split(/\s+/);
+    assert(parents.length === 3, "join is a merge commit, not a rebase " + parents.join(" "));
+    assert(fileText(vaultB, "log/" + dayX + ".md") === textX, "B has A's day unchanged");
+    assert(fileText(vaultB, "log/" + dayY + ".md") === textY, "B kept its own day");
+    assert(!fileText(vaultB, "log/" + dayX + ".md").includes("day Y"), "days were not combined");
+    assert(!fileText(vaultB, "log/" + dayY + ".md").includes("day X"), "days were not combined");
+    const nudge = await putDay(baseA, "2026-10-19", "seed day\n");
+    assert(nudge.res.ok, "A sync trigger " + nudge.res.status);
+    await waitFor(async () => fileText(vaultA, "log/" + dayY + ".md") === textY, 5000, "A receives B's day");
+    assert(fileText(vaultA, "log/" + dayX + ".md") === textX, "A still has its own day");
+    assert(fileText(vaultA, "log/" + dayW + ".md") === textW, "A receives the later save");
+    assert(fileText(vaultB, "log/" + dayX + ".md") === textX, "B still has A's day");
+    const after = await (await fetch(baseB + "/api/sync")).json();
+    assert(after.ok === true && after.join === false, "both sides are caught up " + JSON.stringify(after));
+  } finally {
+    try { if (watch) await watch.body.cancel(); } catch {}
+    await stop(childA);
+    await stop(childB);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+async function mixedOverlapAndDisjoint() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-mixed-"));
+  const bare = seedBare(tmp);
+  const vaultA = path.join(tmp, "a");
+  const vaultB = path.join(tmp, "b");
+  fs.mkdirSync(vaultA, { recursive: true });
+  fs.mkdirSync(vaultB, { recursive: true });
+  const portA = 34000 + Math.floor(Math.random() * 800);
+  const portB = portA + 1;
+  const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
+  const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
+  const childB = spawnServer(serverEnv(portB, vaultB, bare, extra));
+  const baseA = "http://127.0.0.1:" + portA;
+  const baseB = "http://127.0.0.1:" + portB;
+  const overlap = "2026-10-19";
+  const localOnly = "2026-10-21";
+  const remoteOnly = "2026-10-20";
+  const laterDay = "2026-10-18";
+  const textA = "overlap from A\n";
+  const textB = "overlap from B\n";
+  const textLocal = "only on B\n";
+  const textRemote = "only on A\n";
+  const textLater = "saved while split\n";
+  let watch;
+  try {
+    await waitHealth(baseA, childA);
+    await waitHealth(baseB, childB);
+    commitFile(vaultA, "log/" + overlap + ".md", textA, "A overlap");
+    commitFile(vaultA, "log/" + remoteOnly + ".md", textRemote, "A disjoint");
+    git(["push", "origin", "HEAD"], vaultA);
+    commitFile(vaultB, "log/" + overlap + ".md", textB, "B overlap");
+    commitFile(vaultB, "log/" + localOnly + ".md", textLocal, "B disjoint");
+    const remoteBefore = git(["rev-parse", "main"], bare).trim();
+    watch = await fetch(baseB + "/api/day-watch");
+    const later = await putDay(baseB, laterDay, textLater, 0);
+    assert(later.res.ok, "mixed later save " + later.res.status);
+    const notice = await readSseUntil(
+      watch,
+      (data) => data && data.type === "git" && Array.isArray(data.conflicts) && data.conflicts.some((item) => item && item.path === "log/" + overlap + ".md"),
+      5000,
+    );
+    assert(notice.join !== true, "an overlapping file does not offer the blind join");
+    assert(notice.error, "mixed divergence still shows the refusal");
+    const hit = notice.conflicts.find((item) => item.path === "log/" + overlap + ".md");
+    assert(hit.mine === textB && hit.theirs === textA, "overlap keeps both versions");
+    assert(notice.conflicts.length === 1, "the disjoint file is not a conflict");
+    assert(fileText(vaultB, "log/" + localOnly + ".md") === textLocal, "B kept the disjoint day");
+    assert(fileText(vaultB, "log/" + overlap + ".md") === textB, "B kept its overlap text");
+    assert(git(["log", "--oneline", "--", "log/" + laterDay + ".md"], vaultB).trim(), "save during a mixed split is in local git");
+    assert(fileText(vaultB, "log/" + laterDay + ".md") === textLater, "save during a mixed split stays on disk");
+    const blocked = await fetch(baseB + "/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ join: true }),
+    });
+    const blockedBody = await blocked.json();
+    assert(blocked.status === 409, "join refuses while a file overlaps " + JSON.stringify(blockedBody));
+    assert(git(["rev-parse", "main"], bare).trim() === remoteBefore, "refused join did not push a merge");
+    assert(git(["show", "main:log/" + overlap + ".md"], bare) === textA, "remote overlap stays A's until the sheet");
+    const kept = await putDay(baseB, overlap, textB, hit.mtime);
+    assert(kept.res.ok, "keep mine " + kept.res.status + " " + JSON.stringify(kept.body) + " " + childB._log().slice(-400));
+    await waitFor(async () => {
+      try { return git(["show", "main:log/" + localOnly + ".md"], bare) === textLocal; } catch { return ""; }
+    }, 5000, "merge after the sheet");
+    assert(git(["show", "main:log/" + overlap + ".md"], bare) === textB, "overlap resolved to one whole version");
+    assert(!git(["show", "main:log/" + overlap + ".md"], bare).includes("overlap from A"), "overlap text was not combined");
+    assert(git(["show", "main:log/" + remoteOnly + ".md"], bare) === textRemote, "remote-only day kept");
+    assert(git(["show", "main:log/" + laterDay + ".md"], bare) === textLater, "later save survived the merge");
+    const parents = git(["rev-list", "--parents", "-n", "1", "main"], bare).trim().split(/\s+/);
+    assert(parents.length === 3, "the rest lands in a merge commit " + parents.join(" "));
+    const first = parents[1];
+    const second = parents[2];
+    assert(git(["show", first + ":log/" + overlap + ".md"], bare) === textB, "local parent kept B's version");
+    assert(git(["show", second + ":log/" + overlap + ".md"], bare) === textA, "other parent kept A's version");
+    assert(fileText(vaultB, "log/" + remoteOnly + ".md") === textRemote, "B received A's disjoint day intact");
+    assert(fileText(vaultB, "log/" + localOnly + ".md") === textLocal, "B still has its disjoint day");
+    const nudge = await putDay(baseA, "2026-10-17", "from A after\n");
+    assert(nudge.res.ok, "A catch-up " + nudge.res.status);
+    await waitFor(async () => {
+      try { return fileText(vaultA, "log/" + localOnly + ".md") === textLocal; } catch { return ""; }
+    }, 5000, "A receives B's disjoint day");
+    assert(fileText(vaultA, "log/" + overlap + ".md") === textB, "A has the chosen overlap text");
+    assert(fileText(vaultA, "log/" + remoteOnly + ".md") === textRemote, "A kept its disjoint day");
+    assert(git(["show", "main:log/" + overlap + ".md"], bare) === textB, "remote overlap is still one version");
+  } finally {
+    try { if (watch) await watch.body.cancel(); } catch {}
+    await stop(childA);
+    await stop(childB);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 try {
   assertClientSurfacesConflict();
   await noRemoteUnchanged();
   await livePull();
   await sameFileKeepsBoth();
   await refusedPushIsShown();
+  await divergedDifferentFiles();
+  await mixedOverlapAndDisjoint();
   console.log("vault-sync-test ok");
 } catch (err) {
   console.error("FAIL  vault-sync-test  " + (err && err.stack || err));

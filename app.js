@@ -1082,6 +1082,10 @@ async function openDay(date, { silent = false, force = false } = {}) {
   const oldMd = dump ? dump.value : (state.day ? dayMarkdown(state.day) : "");
   const oldMtime = state.day ? state.day.mtime : 0;
   const leavingDay = !isNoteDoc() && oldDate && oldDate !== date;
+  const conflictOpen = !!(paperConflict && oldDate && (
+    paperConflict.date === oldDate ||
+    String(paperConflict.path || "").replace(/\\/g, "/") === "log/" + oldDate + ".md"
+  ));
   if (isNoteDoc()) {
     if (date === todayIso()) await landMapNextStepsOnToday();
     await leaveCurrentPaper();
@@ -1123,7 +1127,7 @@ async function openDay(date, { silent = false, force = false } = {}) {
       state.monthView = { year: viewed.getFullYear(), month: viewed.getMonth() + 1 };
     }
     await renderMonth();
-    if (leavingDay) putRawDay(oldDate, oldMd, oldMtime).catch(() => {});
+    if (leavingDay && !conflictOpen) putRawDay(oldDate, oldMd, oldMtime).catch(() => {});
     if (gen === state.openDayGen) await surfaceOpenGitConflict();
   } catch (e) {
     if (gen !== state.openDayGen) return;
@@ -1853,6 +1857,7 @@ async function resolveConflictKeep() {
           paper: mine,
           markdown: mine,
           mtime: info.mtime,
+          resolve: "keep",
         }),
       });
     } else {
@@ -1864,6 +1869,7 @@ async function resolveConflictKeep() {
           paper: mine,
           markdown: mine,
           mtime: info.mtime,
+          resolve: "keep",
         }),
       });
     }
@@ -1927,7 +1933,7 @@ async function resolveConflictTheirs() {
     return;
   }
   try {
-    const payload = { paper: info.theirs, markdown: info.theirs, mtime: info.mtime };
+    const payload = { paper: info.theirs, markdown: info.theirs, mtime: info.mtime, resolve: "theirs" };
     let res;
     if (info.kind === "note") {
       res = await fetch("/api/file?path=" + encodeURIComponent(info.path), {
@@ -2143,6 +2149,10 @@ function surfaceGitConflict(data) {
   if (gitJoin && !data.join) closeGitJoin();
   if (data.error && !paperConflict && !gitJoin && currentView() === "today") {
     setStatus(String(data.error), "error");
+    return;
+  }
+  if (data.left && !paperConflict && !gitJoin && !data.join && currentView() === "today") {
+    setStatus(String(data.left));
   }
 }
 
@@ -2170,10 +2180,12 @@ function resolveConflictEdit() {
 
 async function saveDay({ keepalive = false } = {}) {
   const run = async () => {
-    if (paperConflict && !keepalive) {
-      setStatus("This page changed on disk.");
+    const editInfo = paperConflict && document.body.classList.contains("conflict-edit") ? paperConflict : null;
+    if (paperConflict && !editInfo) {
+      if (!keepalive) setStatus("This page changed on disk.");
       return;
     }
+    const resolveBody = editInfo ? { resolve: "edit" } : {};
     const snap = paperSaveSnapshot();
     if (!snap) {
       setStatus("");
@@ -2186,7 +2198,7 @@ async function saveDay({ keepalive = false } = {}) {
         const res = await fetch("/api/file?path=" + encodeURIComponent(path), {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path, paper: markdown, markdown, mtime: snap.mtime }),
+          body: JSON.stringify({ path, paper: markdown, markdown, mtime: snap.mtime, ...resolveBody }),
           keepalive: !!keepalive,
         });
         if (res.status === 409) {
@@ -2204,6 +2216,11 @@ async function saveDay({ keepalive = false } = {}) {
           const dump = $("dump");
           if (dump && dump.value === markdown) state.dirty = false;
         }
+        if (editInfo) {
+          closePaperConflict();
+          if (editInfo.git) await afterGitChoice(editInfo.path);
+          if (gitJoin) return;
+        }
         if (keepalive) return;
         setStatus("Saved", "saved");
         setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
@@ -2220,7 +2237,7 @@ async function saveDay({ keepalive = false } = {}) {
       const res = await fetch("/api/day?date=" + date, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date, paper: markdown, markdown, mtime }),
+        body: JSON.stringify({ date, paper: markdown, markdown, mtime, ...resolveBody }),
         keepalive: !!keepalive,
       });
       if (res.status === 409) {
@@ -2236,6 +2253,11 @@ async function saveDay({ keepalive = false } = {}) {
       if (state.day && state.day.date === date) {
         if (out && out.mtime != null) state.day.mtime = Number(out.mtime) || 0;
         state.dirty = false;
+      }
+      if (editInfo) {
+        closePaperConflict();
+        if (editInfo.git) await afterGitChoice("log/" + editInfo.date + ".md");
+        if (gitJoin) return;
       }
       if (keepalive) return;
       setStatus("Saved", "saved");

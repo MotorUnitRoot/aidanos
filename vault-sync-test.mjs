@@ -103,17 +103,19 @@ function serverEnv(port, vault, bare, extra) {
   };
 }
 
-async function putDay(base, date, markdown, mtime) {
+async function putDay(base, date, markdown, mtime, resolve) {
   let baseMtime = mtime;
   if (baseMtime == null) {
     const cur = await fetch(base + "/api/day?date=" + date);
     const json = await cur.json().catch(() => ({}));
     baseMtime = Number(json.mtime) || 0;
   }
+  const payload = { date, markdown, paper: markdown, mtime: baseMtime };
+  if (resolve) payload.resolve = resolve;
   const res = await fetch(base + "/api/day?date=" + date, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ date, markdown, paper: markdown, mtime: baseMtime }),
+    body: JSON.stringify(payload),
   });
   const body = await res.json().catch(() => ({}));
   return { res, body };
@@ -182,6 +184,14 @@ function assertClientSurfacesConflict() {
   assert(paperOpen.includes("conflict-join") && paperOpen.includes("hidden = true"), "opening the conflict sheet hides Bring them in");
   const keepFn = app.slice(app.indexOf("async function resolveConflictKeep("), app.indexOf("async function resolveConflictTheirs("));
   const takeFn = app.slice(app.indexOf("async function resolveConflictTheirs("), app.indexOf("function gitConflictForOpenPage("));
+  assert(keepFn.includes('resolve: "keep"'), "Keep mine is an explicit resolution");
+  assert(takeFn.includes('resolve: "theirs"'), "Take theirs is an explicit resolution");
+  const saveFn = app.slice(app.indexOf("async function saveDay("), app.indexOf("function currentView("));
+  assert(saveFn.includes('resolve: "edit"'), "Edit is an explicit resolution");
+  const openDayFn = app.slice(app.indexOf("async function openDay("), app.indexOf("\nfunction renderDay("));
+  assert(openDayFn.includes("leavingDay && !conflictOpen"), "day switch does not re-save an open conflict");
+  const surface = app.slice(app.indexOf("function surfaceGitConflict("), app.indexOf("async function surfaceOpenGitConflict("));
+  assert(surface.indexOf("data.join") < surface.indexOf("data.left"), "an unrelated file stays off the other-copy sheet");
   assert(keepFn.includes("afterGitChoice(") && takeFn.includes("afterGitChoice("), "a choice looks for changes still waiting");
   assert(app.includes("function afterGitChoice(") && app.slice(app.indexOf("function afterGitChoice("), app.indexOf("function gitConflictForOpenPage(")).includes("openGitJoin("), "a choice opens the other-copy sheet when changes are still waiting");
   assert(app.includes("function resolveGitJoin("), "join waits for the click");
@@ -194,6 +204,18 @@ function assertClientSurfacesConflict() {
   assert(joinFn.includes('merge", "--no-ff", "--no-commit"'), "join is a normal merge commit");
   assert(joinFn.includes("unmergedFiles"), "join aborts when a file overlaps");
   assert(joinFn.indexOf("noteDivergence") < joinFn.indexOf('merge", "--no-ff"'), "join re-checks overlap before merging");
+  assert(!syncBody.includes("noteChoices(paths)"), "an ordinary save does not resolve a conflict");
+  assert(syncBody.includes("noteChoices(resolving)"), "only an explicit resolution resolves a conflict");
+  assert(server.includes('error: "still conflicted"'), "an ordinary save of a conflict is refused");
+  assert(!server.includes("commitDisjointDirty"), "sync does not stage every dirty file");
+  assert(!server.includes('add", "-A"') && !server.includes('add", "."') && !server.includes('commit", "-a"'), "sync does not broad-stage");
+}
+
+function retryUsesSyncQueue() {
+  const server = fs.readFileSync(path.join(root, "server.mjs"), "utf8");
+  const sched = server.slice(server.indexOf("function scheduleVaultGitRetry("), server.indexOf("async function retryVaultGit("));
+  assert(sched.includes("enqueueVaultGit(() => retryVaultGit())"), "offline retry runs on the sync queue");
+  assert(!sched.includes("syncVault("), "offline retry does not sync beside the queue");
 }
 
 function htmlIncludesJoin() {
@@ -310,7 +332,7 @@ async function sameFileKeepsBoth() {
     assert(!JSON.stringify(health).includes(bare), "health must not leak the remote path");
     assert(!JSON.stringify(sync).includes(bare), "sync must not leak the remote path");
 
-    const kept = await putDay(baseB, date, fromB, hit.mtime);
+    const kept = await putDay(baseB, date, fromB, hit.mtime, "keep");
     assert(kept.res.ok, "keep mine " + kept.res.status + " " + JSON.stringify(kept.body));
     await waitFor(async () => {
       return git(["show", "main:log/" + date + ".md"], bare) === fromB ? true : "";
@@ -577,7 +599,7 @@ async function mixedOverlapAndDisjoint() {
     assert(blocked.status === 409, "join refuses while a file overlaps " + JSON.stringify(blockedBody));
     assert(git(["rev-parse", "main"], bare).trim() === remoteBefore, "refused join did not push a merge");
     assert(git(["show", "main:log/" + overlap + ".md"], bare) === textA, "remote overlap stays A's until the sheet");
-    const kept = await putDay(baseB, overlap, textB, hit.mtime);
+    const kept = await putDay(baseB, overlap, textB, hit.mtime, "keep");
     assert(kept.res.ok, "keep mine " + kept.res.status + " " + JSON.stringify(kept.body) + " " + childB._log().slice(-400));
     const offered = await waitFor(async () => {
       const sync = await (await fetch(baseB + "/api/sync")).json();
@@ -625,14 +647,156 @@ async function mixedOverlapAndDisjoint() {
   }
 }
 
+async function conflictSurvivesDaySwitch() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-switch-"));
+  const bare = seedBare(tmp);
+  const vaultA = path.join(tmp, "a");
+  const vaultB = path.join(tmp, "b");
+  fs.mkdirSync(vaultA, { recursive: true });
+  fs.mkdirSync(vaultB, { recursive: true });
+  const portA = 35000 + Math.floor(Math.random() * 800);
+  const portB = portA + 1;
+  const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
+  const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
+  const childB = spawnServer(serverEnv(portB, vaultB, bare, extra));
+  const baseA = "http://127.0.0.1:" + portA;
+  const baseB = "http://127.0.0.1:" + portB;
+  const date = "2026-10-19";
+  const other = "2026-10-18";
+  try {
+    await waitHealth(baseA, childA);
+    await waitHealth(baseB, childB);
+    const fromA = "from copy A\n";
+    const putA = await putDay(baseA, date, fromA);
+    assert(putA.res.ok, "A save " + putA.res.status);
+    await waitFor(async () => git(["show", "main:log/" + date + ".md"], bare) === fromA, 5000, "A on remote");
+    const fromB = "from copy B\n";
+    const putB = await putDay(baseB, date, fromB);
+    assert(putB.res.ok, "B save " + putB.res.status + " " + JSON.stringify(putB.body));
+    const sync = await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      const hit = (body.conflicts || []).find((item) => item && item.path === "log/" + date + ".md");
+      return hit && hit.mine === fromB && hit.theirs === fromA ? body : "";
+    }, 5000, "conflict sheet");
+    const hit = sync.conflicts.find((item) => item.path === "log/" + date + ".md");
+    const headBefore = git(["rev-parse", "HEAD"], vaultB).trim();
+    const remoteBefore = git(["rev-parse", "main"], bare).trim();
+    const away = await putDay(baseB, other, "switched away\n", 0);
+    assert(away.res.ok, "switching days can still save the other day " + away.res.status);
+    const switched = await putDay(baseB, date, fromB, hit.mtime);
+    assert(switched.res.status === 409, "leaving the conflicted day is not Keep mine " + switched.res.status + " " + JSON.stringify(switched.body));
+    assert(switched.body && switched.body.error === "still conflicted", "the refusal is not a resolution");
+    await new Promise((r) => setTimeout(r, 500));
+    assert(git(["rev-parse", "HEAD"], vaultB).trim() === headBefore, "day switch did not commit Keep mine");
+    assert(git(["rev-parse", "main"], bare).trim() === remoteBefore, "day switch did not push Keep mine");
+    assert(git(["show", "main:log/" + date + ".md"], bare) === fromA, "the other copy is still the remote version");
+    assert(fileText(vaultB, "log/" + date + ".md") === fromB, "the local copy is still on disk");
+    const back = await (await fetch(baseB + "/api/sync")).json();
+    const again = (back.conflicts || []).find((item) => item && item.path === "log/" + date + ".md");
+    assert(again && again.mine === fromB && again.theirs === fromA, "coming back still shows both versions " + JSON.stringify(back.conflicts || []));
+    assert(back.join !== true, "the conflict sheet is still the one showing");
+    const day = await (await fetch(baseB + "/api/day?date=" + date)).json();
+    assert(day.markdown === fromB, "the open day still has the local copy");
+  } finally {
+    await stop(childA);
+    await stop(childB);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function trackedNames(cwd) {
+  try {
+    return git(["ls-files"], cwd);
+  } catch {
+    return "";
+  }
+}
+
+function historyNames(cwd) {
+  try {
+    return git(["log", "--all", "--name-only", "--pretty=format:"], cwd);
+  } catch {
+    return "";
+  }
+}
+
+async function strayFileLeftAlone() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-stray-"));
+  const bare = seedBare(tmp);
+  const vaultA = path.join(tmp, "a");
+  const vaultB = path.join(tmp, "b");
+  fs.mkdirSync(vaultA, { recursive: true });
+  fs.mkdirSync(vaultB, { recursive: true });
+  const portA = 36000 + Math.floor(Math.random() * 800);
+  const portB = portA + 1;
+  const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
+  const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
+  const childB = spawnServer(serverEnv(portB, vaultB, bare, extra));
+  const baseA = "http://127.0.0.1:" + portA;
+  const baseB = "http://127.0.0.1:" + portB;
+  const dayX = "2026-10-20";
+  const dayY = "2026-10-21";
+  const dayW = "2026-10-18";
+  const textX = "day X from A\n";
+  const textY = "day Y from B\n";
+  const textW = "saved while drifted\n";
+  try {
+    await waitHealth(baseA, childA);
+    await waitHealth(baseB, childB);
+    commitFile(vaultA, "log/" + dayX + ".md", textX, "A day X");
+    git(["push", "origin", "HEAD"], vaultA);
+    commitFile(vaultB, "log/" + dayY + ".md", textY, "B day Y");
+    fs.writeFileSync(path.join(vaultB, "private-scratch.txt"), "not for the vault\n", "utf8");
+    fs.writeFileSync(path.join(vaultB, "README.md"), "vault\nlocal aside\n", "utf8");
+    const later = await putDay(baseB, dayW, textW, 0);
+    assert(later.res.ok, "save during drift " + later.res.status + " " + JSON.stringify(later.body));
+    const sync = await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      return body.join === true ? body : "";
+    }, 5000, "drift offers Bring them in");
+    assert(sync.left === "Left an unrelated file alone.", "the save says the stray file was left alone " + JSON.stringify(sync));
+    assert(!trackedNames(vaultB).includes("private-scratch.txt"), "save did not stage the stray file");
+    assert(!historyNames(vaultB).includes("private-scratch.txt"), "save did not commit the stray file");
+    assert(git(["show", "HEAD:README.md"], vaultB) === "vault\n", "save did not commit the unrelated edit");
+    assert(fileText(vaultB, "README.md") === "vault\nlocal aside\n", "the unrelated edit is still in the working tree");
+    const joined = await fetch(baseB + "/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ join: true }),
+    });
+    const joinedBody = await joined.json();
+    assert(joined.ok, "Bring them in " + joined.status + " " + JSON.stringify(joinedBody) + " " + childB._log().slice(-500));
+    assert(joinedBody.left === "Left an unrelated file alone.", "Bring them in says the stray file was left alone");
+    assert(git(["show", "main:log/" + dayX + ".md"], bare) === textX, "A's day was brought in");
+    assert(git(["show", "main:log/" + dayY + ".md"], bare) === textY, "B's day was pushed");
+    assert(git(["show", "main:log/" + dayW + ".md"], bare) === textW, "the save was pushed");
+    assert(git(["show", "main:README.md"], bare) === "vault\n", "the unrelated edit was not pushed");
+    let scratchMissing = false;
+    try { git(["show", "main:private-scratch.txt"], bare); } catch { scratchMissing = true; }
+    assert(scratchMissing, "the stray file was not pushed");
+    assert(!historyNames(bare).includes("private-scratch.txt"), "the stray file is not in remote history");
+    assert(!trackedNames(vaultB).includes("private-scratch.txt"), "Bring them in did not stage the stray file");
+    assert(fileText(vaultB, "private-scratch.txt") === "not for the vault\n", "the stray file is still on disk");
+    assert(fileText(vaultB, "README.md") === "vault\nlocal aside\n", "Bring them in left the unrelated edit in place");
+    assert(git(["status", "--porcelain", "--", "private-scratch.txt"], vaultB).includes("private-scratch.txt"), "the stray file is still untracked");
+  } finally {
+    await stop(childA);
+    await stop(childB);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 try {
   assertClientSurfacesConflict();
+  retryUsesSyncQueue();
   await noRemoteUnchanged();
   await livePull();
   await sameFileKeepsBoth();
   await refusedPushIsShown();
   await divergedDifferentFiles();
   await mixedOverlapAndDisjoint();
+  await conflictSurvivesDaySwitch();
+  await strayFileLeftAlone();
   console.log("vault-sync-test ok");
 } catch (err) {
   console.error("FAIL  vault-sync-test  " + (err && err.stack || err));

@@ -1082,6 +1082,10 @@ async function openDay(date, { silent = false, force = false } = {}) {
   const oldMd = dump ? dump.value : (state.day ? dayMarkdown(state.day) : "");
   const oldMtime = state.day ? state.day.mtime : 0;
   const leavingDay = !isNoteDoc() && oldDate && oldDate !== date;
+  const conflictOpen = !!(paperConflict && oldDate && (
+    paperConflict.date === oldDate ||
+    String(paperConflict.path || "").replace(/\\/g, "/") === "log/" + oldDate + ".md"
+  ));
   if (isNoteDoc()) {
     if (date === todayIso()) await landMapNextStepsOnToday();
     await leaveCurrentPaper();
@@ -1123,7 +1127,8 @@ async function openDay(date, { silent = false, force = false } = {}) {
       state.monthView = { year: viewed.getFullYear(), month: viewed.getMonth() + 1 };
     }
     await renderMonth();
-    if (leavingDay) putRawDay(oldDate, oldMd, oldMtime).catch(() => {});
+    if (leavingDay && !conflictOpen) putRawDay(oldDate, oldMd, oldMtime).catch(() => {});
+    if (gen === state.openDayGen) await surfaceOpenGitConflict();
   } catch (e) {
     if (gen !== state.openDayGen) return;
     if (!silent) setStatus(String(e.message || e), "error");
@@ -1647,11 +1652,20 @@ function startDayWatch() {
     dayWatch.onmessage = (ev) => {
       let payload;
       try { payload = JSON.parse(ev.data); } catch (e) { return; }
+      if (payload && payload.type === "git") {
+        surfaceGitConflict(payload);
+        return;
+      }
+      if (payload && payload.path && !payload.date) {
+        onNoteFileChanged(payload);
+        return;
+      }
       onDayFileChanged(payload);
     };
   } catch (e) {}
 }
 async function onDayFileChanged(payload) {
+  if (paperConflict) return;
   if (isNoteDoc()) return;
   const date = payload && payload.date;
   const mtime = Number(payload && payload.mtime) || 0;
@@ -1666,6 +1680,22 @@ async function onDayFileChanged(payload) {
     if (applyingHistory) return;
     if (applyingDragSave || state.dirty) return;
     applyRemoteDay(day);
+  } catch (e) {}
+}
+
+async function onNoteFileChanged(payload) {
+  if (paperConflict) return;
+  const rel = payload && payload.path ? String(payload.path).replace(/\\/g, "/") : "";
+  if (!rel || !isNoteDoc() || !state.doc || state.doc.path !== rel) return;
+  const mtime = Number(payload && payload.mtime) || 0;
+  const seen = Number(state.doc.mtime) || 0;
+  if (!(mtime > seen)) return;
+  if (state.dirty || applyingHistory) return;
+  try {
+    const body = await api("/api/file?path=" + encodeURIComponent(rel));
+    if (state.dirty || paperConflict) return;
+    if (!isNoteDoc() || !state.doc || state.doc.path !== rel) return;
+    applyRemoteNote(body);
   } catch (e) {}
 }
 
@@ -1730,6 +1760,7 @@ function paperSaveSnapshot() {
 }
 
 let paperConflict = null;
+let gitJoin = false;
 
 function conflictStillHere(info) {
   if (!info) return false;
@@ -1747,6 +1778,7 @@ function openPaperConflict(info) {
     mine: String(info.mine || ""),
     theirs: String(info.theirs || ""),
     mtime: Number(info.mtime) || 0,
+    git: !!info.git,
   };
   const sheet = $("conflict-sheet");
   const pathEl = $("conflict-path");
@@ -1760,7 +1792,13 @@ function openPaperConflict(info) {
   if (sheet) {
     sheet.hidden = false;
     sheet.classList.remove("is-edit");
+    sheet.classList.remove("is-join");
   }
+  const joinBtn = $("conflict-join");
+  if (joinBtn) joinBtn.hidden = true;
+  const kicker = sheet && sheet.querySelector(".conflict-kicker");
+  if (kicker) kicker.textContent = "This page changed on disk.";
+  gitJoin = false;
   document.body.classList.add("has-conflict");
   document.body.classList.remove("conflict-edit");
   setStatus("This page changed on disk.");
@@ -1772,7 +1810,11 @@ function closePaperConflict() {
   if (sheet) {
     sheet.hidden = true;
     sheet.classList.remove("is-edit");
+    sheet.classList.remove("is-join");
   }
+  const joinBtn = $("conflict-join");
+  if (joinBtn) joinBtn.hidden = true;
+  gitJoin = false;
   document.body.classList.remove("has-conflict");
   document.body.classList.remove("conflict-edit");
 }
@@ -1815,6 +1857,7 @@ async function resolveConflictKeep() {
           paper: mine,
           markdown: mine,
           mtime: info.mtime,
+          resolve: "keep",
         }),
       });
     } else {
@@ -1826,6 +1869,7 @@ async function resolveConflictKeep() {
           paper: mine,
           markdown: mine,
           mtime: info.mtime,
+          resolve: "keep",
         }),
       });
     }
@@ -1864,6 +1908,10 @@ async function resolveConflictKeep() {
       paintPaper();
     }
     closePaperConflict();
+    if (info.git) {
+      await afterGitChoice(info.kind === "note" ? info.path : ("log/" + info.date + ".md"));
+      if (gitJoin) return;
+    }
     setStatus("Saved", "saved");
     setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
   } catch (e) {
@@ -1871,16 +1919,248 @@ async function resolveConflictKeep() {
   }
 }
 
-function resolveConflictTheirs() {
+async function resolveConflictTheirs() {
   if (!paperConflict) return;
   const info = paperConflict;
-  if (info.kind === "note") {
-    applyRemoteNote({ path: info.path, markdown: info.theirs, mtime: info.mtime });
-  } else {
-    applyRemoteDay({ date: info.date, markdown: info.theirs, mtime: info.mtime });
+  if (!info.git) {
+    if (info.kind === "note") {
+      applyRemoteNote({ path: info.path, markdown: info.theirs, mtime: info.mtime });
+    } else {
+      applyRemoteDay({ date: info.date, markdown: info.theirs, mtime: info.mtime });
+    }
+    closePaperConflict();
+    setStatus("");
+    return;
   }
-  closePaperConflict();
+  try {
+    const payload = { paper: info.theirs, markdown: info.theirs, mtime: info.mtime, resolve: "theirs" };
+    let res;
+    if (info.kind === "note") {
+      res = await fetch("/api/file?path=" + encodeURIComponent(info.path), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, path: info.path }),
+      });
+    } else {
+      res = await fetch("/api/day?date=" + info.date, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, date: info.date }),
+      });
+    }
+    if (res.status === 409) {
+      const body = await res.json().catch(() => ({}));
+      info.theirs = typeof body.markdown === "string" ? body.markdown : "";
+      info.mtime = Number(body.mtime) || 0;
+      const theirsEl = $("conflict-theirs");
+      if (theirsEl) theirsEl.textContent = info.theirs;
+      setStatus("This page changed on disk.");
+      return;
+    }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || res.statusText);
+    }
+    const out = await res.json().catch(() => ({}));
+    const mtime = out && out.mtime != null ? Number(out.mtime) || 0 : info.mtime;
+    if (info.kind === "note") {
+      applyRemoteNote({ path: info.path, markdown: info.theirs, mtime });
+    } else {
+      applyRemoteDay({ date: info.date, markdown: info.theirs, mtime });
+    }
+    closePaperConflict();
+    if (info.git) {
+      await afterGitChoice(info.kind === "note" ? info.path : ("log/" + info.date + ".md"));
+      if (gitJoin) return;
+    }
+    setStatus("");
+  } catch (e) {
+    setStatus(String(e.message), "error");
+  }
+}
+
+async function afterGitChoice(path) {
+  const rel = String(path || "").replace(/\\/g, "/");
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    let data = null;
+    try { data = await api("/api/sync"); } catch { data = null; }
+    if (!data || data.enabled === false) return;
+    const conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
+    const still = conflicts.some((item) => item && String(item.path || "").replace(/\\/g, "/") === rel);
+    if (still) {
+      await new Promise((r) => setTimeout(r, 80));
+      continue;
+    }
+    if (data.join) {
+      openGitJoin();
+      return;
+    }
+    if (conflicts.length) {
+      surfaceGitConflict(data);
+      return;
+    }
+    return;
+  }
+}
+
+function gitConflictForOpenPage(conflicts) {
+  const list = Array.isArray(conflicts) ? conflicts : [];
+  for (const item of list) {
+    const rel = String(item && item.path || "").replace(/\\/g, "/");
+    const date = item && item.date ? String(item.date) : "";
+    if (isNoteDoc()) {
+      if (state.doc && state.doc.path === rel) return item;
+      continue;
+    }
+    if (state.day && (date === state.day.date || rel === "log/" + state.day.date + ".md")) return item;
+  }
+  return null;
+}
+
+function openGitConflict(item) {
+  const path = String(item && item.path || "").replace(/\\/g, "/");
+  const theirs = String(item && item.theirs || "");
+  let mine = String(item && item.mine || "");
+  if (state.dirty) {
+    ensureDumpMatchesPaper();
+    const dump = $("dump");
+    if (dump) mine = cleanPaperMarkdown(dump.value);
+  }
+  if (mine === theirs) return;
+  const mtime = Number(item && item.mtime) || 0;
+  if (
+    paperConflict && paperConflict.git &&
+    paperConflict.path === path &&
+    paperConflict.mine === mine &&
+    paperConflict.theirs === theirs &&
+    paperConflict.mtime === mtime
+  ) return;
+  if (
+    paperConflict && paperConflict.git &&
+    paperConflict.path === path &&
+    document.body.classList.contains("conflict-edit")
+  ) return;
+  openPaperConflict({
+    kind: isNoteDoc() ? "note" : "day",
+    path,
+    date: item && item.date ? String(item.date) : "",
+    mine,
+    theirs,
+    mtime,
+    git: true,
+  });
+}
+
+function openGitJoin() {
+  if (paperConflict) return;
+  gitJoin = true;
+  const sheet = $("conflict-sheet");
+  const kicker = sheet && sheet.querySelector(".conflict-kicker");
+  if (kicker) kicker.textContent = "Your other copy has changes.";
+  const pathEl = $("conflict-path");
+  if (pathEl) pathEl.textContent = "";
+  const joinBtn = $("conflict-join");
+  if (joinBtn) joinBtn.hidden = false;
+  if (sheet) {
+    sheet.hidden = false;
+    sheet.classList.add("is-join");
+    sheet.classList.remove("is-edit");
+  }
+  document.body.classList.remove("has-conflict");
   setStatus("");
+}
+
+function closeGitJoin() {
+  const sheet = $("conflict-sheet");
+  const joinBtn = $("conflict-join");
+  if (joinBtn) joinBtn.hidden = true;
+  if (sheet) sheet.classList.remove("is-join");
+  const kicker = sheet && sheet.querySelector(".conflict-kicker");
+  if (kicker && !paperConflict) kicker.textContent = "This page changed on disk.";
+  if (sheet && !paperConflict) sheet.hidden = true;
+  gitJoin = false;
+}
+
+let gitJoinBusy = false;
+async function resolveGitJoin() {
+  if (gitJoinBusy || paperConflict) return;
+  gitJoinBusy = true;
+  try {
+    const res = await fetch("/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ join: true }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (body && Array.isArray(body.conflicts) && body.conflicts.length) {
+      closeGitJoin();
+      surfaceGitConflict(body);
+      return;
+    }
+    if (body && body.join) {
+      openGitJoin();
+      return;
+    }
+    if (!res.ok) {
+      closeGitJoin();
+      setStatus(String((body && body.error) || res.statusText || "push refused"), "error");
+      return;
+    }
+    closeGitJoin();
+    setStatus("Saved", "saved");
+    setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
+    if (!state.dirty && state.day && state.day.date && !isNoteDoc()) {
+      const day = await api("/api/day?date=" + encodeURIComponent(state.day.date)).catch(() => null);
+      if (day && !paperConflict && !gitJoin) applyRemoteDay(day);
+    }
+  } catch (e) {
+    setStatus(String(e && e.message || e), "error");
+  } finally {
+    gitJoinBusy = false;
+  }
+}
+
+function surfaceGitConflict(data) {
+  if (!data || data.enabled === false) return;
+  const match = gitConflictForOpenPage(data.conflicts);
+  if (match && String(match.mine || "") !== String(match.theirs || "")) {
+    closeGitJoin();
+    openGitConflict(match);
+    return;
+  }
+  if (paperConflict && paperConflict.git && !document.body.classList.contains("conflict-edit")) {
+    const info = paperConflict;
+    closePaperConflict();
+    if (info.kind === "note" && info.path) {
+      api("/api/file?path=" + encodeURIComponent(info.path)).then((body) => {
+        if (!paperConflict) applyRemoteNote(body);
+      }).catch(() => {});
+    } else if (info.date) {
+      api("/api/day?date=" + encodeURIComponent(info.date)).then((day) => {
+        if (!paperConflict && state.day && state.day.date === info.date) applyRemoteDay(day);
+      }).catch(() => {});
+    }
+  }
+  if (data.join && !paperConflict && currentView() === "today") {
+    openGitJoin();
+    return;
+  }
+  if (gitJoin && !data.join) closeGitJoin();
+  if (data.error && !paperConflict && !gitJoin && currentView() === "today") {
+    setStatus(String(data.error), "error");
+    return;
+  }
+  if (data.left && !paperConflict && !gitJoin && !data.join && currentView() === "today") {
+    setStatus(String(data.left));
+  }
+}
+
+async function surfaceOpenGitConflict() {
+  try {
+    const data = await api("/api/sync");
+    surfaceGitConflict(data);
+  } catch (e) {}
 }
 
 function resolveConflictEdit() {
@@ -1900,10 +2180,12 @@ function resolveConflictEdit() {
 
 async function saveDay({ keepalive = false } = {}) {
   const run = async () => {
-    if (paperConflict && !keepalive) {
-      setStatus("This page changed on disk.");
+    const editInfo = paperConflict && document.body.classList.contains("conflict-edit") ? paperConflict : null;
+    if (paperConflict && !editInfo) {
+      if (!keepalive) setStatus("This page changed on disk.");
       return;
     }
+    const resolveBody = editInfo ? { resolve: "edit" } : {};
     const snap = paperSaveSnapshot();
     if (!snap) {
       setStatus("");
@@ -1916,7 +2198,7 @@ async function saveDay({ keepalive = false } = {}) {
         const res = await fetch("/api/file?path=" + encodeURIComponent(path), {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path, paper: markdown, markdown, mtime: snap.mtime }),
+          body: JSON.stringify({ path, paper: markdown, markdown, mtime: snap.mtime, ...resolveBody }),
           keepalive: !!keepalive,
         });
         if (res.status === 409) {
@@ -1934,6 +2216,11 @@ async function saveDay({ keepalive = false } = {}) {
           const dump = $("dump");
           if (dump && dump.value === markdown) state.dirty = false;
         }
+        if (editInfo) {
+          closePaperConflict();
+          if (editInfo.git) await afterGitChoice(editInfo.path);
+          if (gitJoin) return;
+        }
         if (keepalive) return;
         setStatus("Saved", "saved");
         setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
@@ -1950,7 +2237,7 @@ async function saveDay({ keepalive = false } = {}) {
       const res = await fetch("/api/day?date=" + date, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date, paper: markdown, markdown, mtime }),
+        body: JSON.stringify({ date, paper: markdown, markdown, mtime, ...resolveBody }),
         keepalive: !!keepalive,
       });
       if (res.status === 409) {
@@ -1966,6 +2253,11 @@ async function saveDay({ keepalive = false } = {}) {
       if (state.day && state.day.date === date) {
         if (out && out.mtime != null) state.day.mtime = Number(out.mtime) || 0;
         state.dirty = false;
+      }
+      if (editInfo) {
+        closePaperConflict();
+        if (editInfo.git) await afterGitChoice("log/" + editInfo.date + ".md");
+        if (gitJoin) return;
       }
       if (keepalive) return;
       setStatus("Saved", "saved");
@@ -1999,12 +2291,16 @@ function showView(view) {
   const captureOn = isCaptureDoc() || isCaptureHash();
   const mapOn = isMapDoc();
   const stageOn = mapOn && !!state.mapStageId;
+  const keepConflict = !!paperConflict;
+  const keepEdit = document.body.classList.contains("conflict-edit");
   document.body.className = "day-page view-" + view
     + (isNoteDoc() ? " doc-note" : "")
     + (captureOn && isCaptureDoc() ? " doc-capture" : "")
     + (planOn && isPlanDoc() ? " doc-plan" : "")
     + (mapOn ? " doc-map" : "")
     + (stageOn ? " doc-stage" : "");
+  if (keepConflict) document.body.classList.add("has-conflict");
+  if (keepConflict && keepEdit) document.body.classList.add("conflict-edit");
   PAGE_VIEWS.forEach((v) => {
     const el = $("view-" + v);
     if (!el) return;
@@ -2251,6 +2547,7 @@ async function openVaultNote(rel) {
     renderWeek();
   }
   setStatus("");
+  if (noteGen === state.openDayGen) await surfaceOpenGitConflict();
 }
 
 async function openVaultSearchHit(rel, line) {
@@ -5303,8 +5600,10 @@ function syncFmtBarForKeyboard() {
   const take = $("conflict-take");
   const edit = $("conflict-edit");
   if (keep) keep.addEventListener("click", () => { resolveConflictKeep().catch(() => {}); });
-  if (take) take.addEventListener("click", () => resolveConflictTheirs());
+  if (take) take.addEventListener("click", () => { resolveConflictTheirs().catch(() => {}); });
   if (edit) edit.addEventListener("click", () => resolveConflictEdit());
+  const join = $("conflict-join");
+  if (join) join.addEventListener("click", () => { resolveGitJoin().catch(() => {}); });
 })();
 
 if (/^https?:$/.test(location.protocol) && "serviceWorker" in navigator) {

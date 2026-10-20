@@ -3,6 +3,8 @@
  * AidanOS — local by default (127.0.0.1). Set AIDANOS_HOST=0.0.0.0 for LAN/phone.
  * Vault: AIDANOS_VAULT, or sibling vault/ beside this server.
  * Optional git: AIDANOS_VAULT_GIT_URL (+ AIDANOS_VAULT_GIT_TOKEN or GITHUB_TOKEN).
+ * With a remote, fast-forward before each push and about once a minute.
+ * Never merge or rebase on that path. Same-file divergence keeps both copies.
  * If clone/pull cannot populate the checkout, seed the bundled sample vault/
  * (Plan + maps) so the demo still serves. Keep retrying git when possible.
  * On the Mac the vault is the parent (~/Grok/motorunit).
@@ -22,6 +24,14 @@ const GIT_TOKEN = String(process.env.AIDANOS_VAULT_GIT_TOKEN || process.env.GITH
 const GIT_DEBOUNCE_MS = (() => {
   const n = Number(process.env.AIDANOS_VAULT_GIT_DEBOUNCE_MS);
   return Number.isFinite(n) && n >= 50 ? Math.min(n, 10_000) : 1500;
+})();
+const GIT_SYNC_MS = (() => {
+  if (!GIT_URL) return 0;
+  const raw = process.env.AIDANOS_VAULT_GIT_SYNC_MS;
+  if (raw == null || String(raw).trim() === "") return 60_000;
+  if (String(raw).trim() === "0") return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 200 ? Math.min(n, 300_000) : 60_000;
 })();
 function resolveVaultPath() {
   if (process.env.AIDANOS_VAULT) return path.resolve(process.env.AIDANOS_VAULT);
@@ -64,10 +74,15 @@ const vaultGit = {
   enabled: Boolean(GIT_URL),
   ready: false,
   error: "",
+  fetchFailed: false,
   lastPushAt: 0,
   pending: new Set(),
   timer: null,
-  busy: false,
+  syncTimer: null,
+  chain: Promise.resolve(),
+  conflicts: new Map(),
+  notice: "",
+  suppressWatch: 0,
 };
 
 export function authenticatedGitUrl(url, token) {
@@ -140,14 +155,21 @@ function logSafe(...parts) {
 
 function gitHint() {
   if (!vaultGit.enabled) return { enabled: false };
-  const hint = { enabled: true, ok: !vaultGit.error };
+  const open = [...vaultGit.conflicts.values()].filter((item) => !item.resolved);
+  const hint = { enabled: true, ok: !vaultGit.error && open.length === 0 };
   if (vaultGit.error) hint.error = vaultGit.error;
   if (vaultGit.lastPushAt) hint.pushed = true;
+  if (open.length) hint.conflicts = open.map((item) => item.path);
   return hint;
 }
 
 function gitEnv() {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  const env = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_EDITOR: "true",
+    GIT_MERGE_AUTOEDIT: "no",
+  };
   delete env.GIT_ASKPASS;
   return env;
 }
@@ -288,9 +310,9 @@ async function retryVaultGit() {
     if (await isGitRepo(VAULT)) {
       await ensureGitIdentity(VAULT);
       await ensureOrigin(VAULT);
-      await runGit(["-C", VAULT, "pull", "--ff-only", "--no-rebase"], { timeoutMs: 25000 });
-      vaultGit.error = "";
       vaultGit.ready = true;
+      await syncVault(null);
+      if (vaultGit.fetchFailed) await seedBundledVaultIfNeeded("git retry");
       return;
     }
     await fs.mkdir(VAULT, { recursive: true });
@@ -323,16 +345,12 @@ async function initVaultGit() {
     if (await isGitRepo(VAULT)) {
       await ensureGitIdentity(VAULT);
       await ensureOrigin(VAULT);
-      try {
-        await runGit(["-C", VAULT, "pull", "--ff-only", "--no-rebase"], { timeoutMs: 25000 });
-        vaultGit.error = "";
-      } catch (e) {
-        vaultGit.error = sanitizeGitError(e && e.message || "pull failed");
-        console.error("vault git pull:", vaultGit.error);
+      vaultGit.ready = true;
+      await syncVault(null);
+      if (vaultGit.fetchFailed) {
         await seedBundledVaultIfNeeded("pull failed");
         scheduleVaultGitRetry();
       }
-      vaultGit.ready = true;
       return;
     }
     const names = await fs.readdir(VAULT);
@@ -355,6 +373,7 @@ async function initVaultGit() {
       }
       await ensureGitIdentity(VAULT);
       vaultGit.ready = await isGitRepo(VAULT);
+      if (vaultGit.ready) await syncVault(null);
       return;
     }
     vaultGit.error = "vault path is not a git checkout";
@@ -367,58 +386,584 @@ async function initVaultGit() {
   }
 }
 
+function isSafeRel(rel) {
+  const s = String(rel || "").replace(/\\/g, "/");
+  if (!s || s.startsWith("/") || s.includes("..") || s.includes("\0")) return false;
+  return true;
+}
+
+function dayFromRel(rel) {
+  const match = /^log\/(\d{4}-\d{2}-\d{2})\.md$/.exec(String(rel || "").replace(/\\/g, "/"));
+  return match ? match[1] : "";
+}
+
+function setGitError(msg) {
+  const next = msg ? sanitizeGitError(msg) : "";
+  if (next === vaultGit.error) return;
+  vaultGit.error = next;
+  if (next) console.error("vault git:", next);
+}
+
+function enqueueVaultGit(work) {
+  const run = vaultGit.chain.then(work, work);
+  vaultGit.chain = run.then(() => {}, () => {});
+  return run;
+}
+
 function scheduleVaultSync(relPath) {
   if (!vaultGit.enabled || !vaultGit.ready) return;
   const rel = String(relPath || "").replace(/\\/g, "/");
-  if (!rel || rel.startsWith("/") || rel.includes("..")) return;
+  if (!isSafeRel(rel)) return;
   vaultGit.pending.add(rel);
   if (vaultGit.timer) clearTimeout(vaultGit.timer);
   vaultGit.timer = setTimeout(() => {
     vaultGit.timer = null;
-    flushVaultSync().catch((e) => {
-      vaultGit.error = sanitizeGitError(e && e.message);
-      console.error("vault git:", vaultGit.error);
+    const paths = [...vaultGit.pending];
+    vaultGit.pending.clear();
+    enqueueVaultGit(() => syncVault(paths)).catch((e) => {
+      setGitError(e && e.message || "git failed");
+    }).finally(() => {
+      if (vaultGit.pending.size) scheduleVaultSync([...vaultGit.pending][0]);
     });
   }, GIT_DEBOUNCE_MS);
 }
 
-async function flushVaultSync() {
+function startVaultSyncLoop() {
+  if (!GIT_URL || !GIT_SYNC_MS) return;
+  const arm = () => {
+    vaultGit.syncTimer = setTimeout(() => {
+      vaultGit.syncTimer = null;
+      enqueueVaultGit(() => syncVault(null)).catch((e) => {
+        setGitError(e && e.message || "git failed");
+      }).finally(arm);
+    }, GIT_SYNC_MS);
+    if (vaultGit.syncTimer && typeof vaultGit.syncTimer.unref === "function") {
+      vaultGit.syncTimer.unref();
+    }
+  };
+  arm();
+}
+
+function pushWatchSilence() {
+  vaultGit.suppressWatch += 1;
+}
+
+function popWatchSilence() {
+  vaultGit.suppressWatch = Math.max(0, vaultGit.suppressWatch - 1);
+}
+
+function sendWatch(obj) {
+  const payload = `data: ${JSON.stringify(obj)}\n\n`;
+  for (const client of sseClients) {
+    try { client.write(payload); } catch {}
+  }
+}
+
+function publicConflicts() {
+  const out = [];
+  for (const item of vaultGit.conflicts.values()) {
+    if (item.resolved) continue;
+    out.push({
+      path: item.path,
+      date: dayFromRel(item.path),
+      mine: item.mine,
+      theirs: item.theirs,
+      mtime: item.mtime,
+    });
+  }
+  return out;
+}
+
+function finishGitNotice() {
+  const conflicts = publicConflicts();
+  const notice = JSON.stringify({ error: vaultGit.error || "", conflicts });
+  if (notice === vaultGit.notice) return;
+  vaultGit.notice = notice;
+  sendWatch({ type: "git", enabled: true, error: vaultGit.error || "", conflicts });
+}
+
+function hasUnresolved() {
+  for (const item of vaultGit.conflicts.values()) {
+    if (!item.resolved) return true;
+  }
+  return false;
+}
+
+function resolvedChoices() {
+  const out = new Map();
+  for (const item of vaultGit.conflicts.values()) {
+    if (!item.resolved) continue;
+    out.set(item.path, item.choice != null ? item.choice : item.mine);
+  }
+  return out;
+}
+
+async function readRel(rel) {
+  if (!isSafeRel(rel)) return "";
+  const text = await readFileSafe(safeJoin(VAULT, rel));
+  return text == null ? "" : text;
+}
+
+async function writeVaultText(rel, text) {
+  if (!isSafeRel(rel)) throw new Error("bad path");
+  await atomicWriteFile(safeJoin(VAULT, rel), text);
+}
+
+async function gitShow(rev, rel) {
+  try {
+    const shown = await runGit(["-C", VAULT, "show", rev + ":" + rel], { timeoutMs: 8000 });
+    return shown.out;
+  } catch {
+    return "";
+  }
+}
+
+async function listDiff(from, to) {
+  const { out } = await runGit(
+    ["-C", VAULT, "diff", "--name-only", "-z", from, to],
+    { timeoutMs: 8000 },
+  );
+  return out.split("\0").map((item) => item.replace(/\\/g, "/")).filter((item) => isSafeRel(item));
+}
+
+async function dirtySet() {
+  const { out } = await runGit(
+    ["-C", VAULT, "status", "--porcelain", "-z", "-uall"],
+    { timeoutMs: 8000 },
+  );
+  const set = new Set();
+  const parts = out.split("\0");
+  for (let i = 0; i < parts.length; i++) {
+    const rec = parts[i];
+    if (!rec || rec.length < 4) continue;
+    const xy = rec.slice(0, 2);
+    const file = rec.slice(3).replace(/\\/g, "/");
+    if (xy[0] === "R" || xy[0] === "C" || xy[1] === "R" || xy[1] === "C") {
+      const dest = String(parts[i + 1] || "").replace(/\\/g, "/");
+      i += 1;
+      if (isSafeRel(file)) set.add(file);
+      if (isSafeRel(dest)) set.add(dest);
+      continue;
+    }
+    if (isSafeRel(file)) set.add(file);
+  }
+  return set;
+}
+
+async function unmergedFiles() {
+  const { out } = await runGit(
+    ["-C", VAULT, "diff", "--name-only", "-z", "--diff-filter=U"],
+    { timeoutMs: 8000 },
+  );
+  return out.split("\0").map((item) => item.replace(/\\/g, "/")).filter((item) => isSafeRel(item));
+}
+
+async function isMerging() {
+  try {
+    await fs.access(path.join(VAULT, ".git", "MERGE_HEAD"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function revParse(ref) {
+  const { out } = await runGit(["-C", VAULT, "rev-parse", "--verify", ref], { timeoutMs: 4000 });
+  return out.trim();
+}
+
+async function fetchOrigin() {
+  await runGit(["-C", VAULT, "fetch", "origin"], { timeoutMs: 25000 });
+  vaultGit.fetchFailed = false;
+}
+
+async function pushHead() {
+  await runGit(["-C", VAULT, "push", "-u", "origin", "HEAD"], { timeoutMs: 25000 });
+}
+
+async function compareToRemote() {
+  let head = "";
+  try {
+    head = await revParse("HEAD");
+  } catch {
+    return { kind: "none" };
+  }
+  const branch = (await runGit(
+    ["-C", VAULT, "rev-parse", "--abbrev-ref", "HEAD"],
+    { timeoutMs: 4000 },
+  )).out.trim();
+  const candidates = [];
+  if (branch && branch !== "HEAD") candidates.push("origin/" + branch);
+  candidates.push("origin/HEAD", "origin/main", "origin/master");
+  let remote = null;
+  for (const ref of candidates) {
+    try {
+      remote = { ref, rev: await revParse(ref) };
+      break;
+    } catch {}
+  }
+  if (!remote) return { kind: "none", head };
+  if (head === remote.rev) return { kind: "equal", head, ...remote };
+  let base = "";
+  try {
+    base = (await runGit(["-C", VAULT, "merge-base", head, remote.rev], { timeoutMs: 8000 })).out.trim();
+  } catch {
+    try {
+      await runGit(["-C", VAULT, "fetch", "--deepen=200", "origin"], { timeoutMs: 25000 });
+      remote.rev = await revParse(remote.ref);
+      base = (await runGit(["-C", VAULT, "merge-base", head, remote.rev], { timeoutMs: 8000 })).out.trim();
+    } catch {
+      return { kind: "unknown", head, ...remote };
+    }
+  }
+  if (!base) return { kind: "unknown", head, ...remote };
+  if (base === head) return { kind: "behind", head, base, ...remote };
+  if (base === remote.rev) return { kind: "ahead", head, base, ...remote };
+  return { kind: "diverged", head, base, ...remote };
+}
+
+async function detachFile(rel) {
+  if (!isSafeRel(rel)) return;
+  let tracked = true;
+  try {
+    await runGit(["-C", VAULT, "ls-files", "--error-unmatch", "--", rel], { timeoutMs: 4000 });
+  } catch {
+    tracked = false;
+  }
+  if (tracked) {
+    await runGit(["-C", VAULT, "checkout", "HEAD", "--", rel], { timeoutMs: 8000 });
+    return;
+  }
+  await fs.unlink(safeJoin(VAULT, rel)).catch(() => {});
+}
+
+async function fastForward(rev, parkList) {
+  const parked = new Map();
+  pushWatchSilence();
+  try {
+    for (const rel of parkList || []) {
+      if (!isSafeRel(rel) || parked.has(rel)) continue;
+      parked.set(rel, await readRel(rel));
+      await detachFile(rel);
+    }
+    await runGit(["-C", VAULT, "merge", "--ff-only", rev], { timeoutMs: 25000 });
+    for (const [rel, text] of parked) await writeVaultText(rel, text);
+  } catch (e) {
+    for (const [rel, text] of parked) {
+      try { await writeVaultText(rel, text); } catch {}
+    }
+    throw e;
+  } finally {
+    popWatchSilence();
+  }
+}
+
+async function announcePaths(rels) {
+  const seen = new Set();
+  for (const rel of rels) {
+    if (!isSafeRel(rel) || seen.has(rel)) continue;
+    seen.add(rel);
+    let mtime = 0;
+    try { mtime = await fileMtimeMs(safeJoin(VAULT, rel)); } catch { mtime = 0; }
+    const date = dayFromRel(rel);
+    if (date) sendDayWatch(date, mtime);
+    else if (rel.endsWith(".md")) sendWatch({ path: rel, mtime });
+  }
+}
+
+async function recordConflicts(rels, rev) {
+  for (const rel of rels) {
+    if (!isSafeRel(rel) || !rel.endsWith(".md")) continue;
+    const mine = await readRel(rel);
+    const theirs = await gitShow(rev, rel);
+    if (mine === theirs) {
+      vaultGit.conflicts.delete(rel);
+      continue;
+    }
+    const prev = vaultGit.conflicts.get(rel);
+    if (prev && prev.resolved && prev.theirs === theirs) continue;
+    let mtime = 0;
+    try { mtime = await fileMtimeMs(safeJoin(VAULT, rel)); } catch { mtime = 0; }
+    vaultGit.conflicts.set(rel, {
+      path: rel,
+      mine,
+      theirs,
+      mtime,
+      resolved: false,
+      choice: null,
+    });
+  }
+}
+
+async function noteChoices(paths) {
+  for (const rel of paths || []) {
+    const item = vaultGit.conflicts.get(rel);
+    if (!item || !isSafeRel(rel)) continue;
+    const text = await readRel(rel);
+    item.choice = text;
+    item.mine = text;
+    try { item.mtime = await fileMtimeMs(safeJoin(VAULT, rel)); } catch { item.mtime = 0; }
+    item.resolved = true;
+  }
+}
+
+async function noteDivergence(rel) {
+  const localChanged = rel.base ? await listDiff(rel.base, rel.head) : [];
+  const remoteChanged = rel.base ? await listDiff(rel.base, rel.rev) : await listDiff(rel.head, rel.rev);
+  const dirty = await dirtySet();
+  const overlap = [];
+  const seen = new Set();
+  for (const file of localChanged) {
+    if (!remoteChanged.includes(file) || seen.has(file)) continue;
+    seen.add(file);
+    overlap.push(file);
+  }
+  for (const file of remoteChanged) {
+    if (!dirty.has(file) || seen.has(file)) continue;
+    seen.add(file);
+    overlap.push(file);
+  }
+  const blocking = overlap.filter((file) => {
+    const item = vaultGit.conflicts.get(file);
+    return !item || !item.resolved;
+  });
+  if (blocking.length) await recordConflicts(blocking, rel.rev);
+  return { overlap, blocking };
+}
+
+async function stageAndCommit(paths) {
+  const safe = [];
+  for (const rel of paths || []) {
+    if (!isSafeRel(rel) || safe.includes(rel)) continue;
+    safe.push(rel);
+  }
+  if (!safe.length) return false;
+  for (const rel of safe) {
+    if (await pathExists(safeJoin(VAULT, rel))) {
+      await runGit(["-C", VAULT, "add", "--", rel], { timeoutMs: 8000 });
+    } else {
+      await runGit(["-C", VAULT, "add", "-A", "--", rel], { timeoutMs: 8000 });
+    }
+  }
+  const staged = await runGit(["-C", VAULT, "diff", "--cached", "--name-only"], { timeoutMs: 8000 });
+  if (!String(staged.out || "").trim()) return false;
+  await runGit(["-C", VAULT, "commit", "-m", "vault: " + safe.join(", ")], { timeoutMs: 8000 });
+  return true;
+}
+
+async function publishPush() {
+  await pushHead();
+  setGitError("");
+  vaultGit.lastPushAt = Date.now();
+}
+
+async function publishDiverged(rel, choices, extras) {
+  const snapshot = new Map([...extras, ...choices]);
+  pushWatchSilence();
+  try {
+    for (const relPath of snapshot.keys()) await detachFile(relPath);
+    try {
+      await runGit(
+        ["-C", VAULT, "merge", "--no-ff", "--no-commit", rel.rev],
+        { timeoutMs: 25000 },
+      );
+    } catch (e) {
+      if (!(await isMerging())) throw e;
+    }
+    const unmerged = await unmergedFiles();
+    for (const file of unmerged) {
+      if (!choices.has(file)) throw new Error("unexpected merge conflict");
+    }
+    for (const [file, text] of choices) {
+      await writeVaultText(file, text);
+      await runGit(["-C", VAULT, "add", "--", file], { timeoutMs: 8000 });
+    }
+    for (const [file, text] of extras) {
+      if (choices.has(file)) continue;
+      await writeVaultText(file, text);
+      await runGit(["-C", VAULT, "add", "--", file], { timeoutMs: 8000 });
+    }
+    if ((await unmergedFiles()).length) throw new Error("unresolved files remain");
+    if (await isMerging()) {
+      await runGit(
+        ["-C", VAULT, "commit", "-m", "vault: " + [...choices.keys()].join(", ")],
+        { timeoutMs: 8000 },
+      );
+    }
+    await publishPush();
+    vaultGit.conflicts.clear();
+    await announcePaths([...snapshot.keys()]);
+  } catch (e) {
+    if (await isMerging()) await runGit(["-C", VAULT, "merge", "--abort"], { timeoutMs: 8000 }).catch(() => {});
+    for (const [file, text] of snapshot) {
+      try { await writeVaultText(file, text); } catch {}
+    }
+    for (const item of vaultGit.conflicts.values()) item.resolved = false;
+    setGitError(e && e.message || "push refused");
+  } finally {
+    popWatchSilence();
+  }
+}
+
+async function syncVault(commitPaths) {
   if (!vaultGit.enabled || !vaultGit.ready) return;
-  if (vaultGit.busy) {
-    if (vaultGit.pending.size && !vaultGit.timer) {
-      vaultGit.timer = setTimeout(() => {
-        vaultGit.timer = null;
-        flushVaultSync().catch((e) => {
-          vaultGit.error = sanitizeGitError(e && e.message);
-          console.error("vault git:", vaultGit.error);
-        });
-      }, GIT_DEBOUNCE_MS);
+  try {
+    await syncVaultBody(commitPaths);
+  } catch (e) {
+    setGitError(e && e.message || "git failed");
+  } finally {
+    finishGitNotice();
+  }
+}
+
+async function syncVaultBody(commitPaths) {
+  const paths = Array.isArray(commitPaths) ? commitPaths.filter((rel) => isSafeRel(rel)) : null;
+  if (paths) await noteChoices(paths);
+
+  let rel = null;
+  try {
+    await fetchOrigin();
+    rel = await compareToRemote();
+  } catch (e) {
+    vaultGit.fetchFailed = true;
+    setGitError(e && e.message || "fetch failed");
+    if (paths && paths.length && !hasUnresolved()) {
+      try {
+        if (await stageAndCommit(paths)) await publishPush();
+      } catch (pushErr) {
+        setGitError(pushErr && pushErr.message || "push failed");
+      }
     }
     return;
   }
-  const paths = [...vaultGit.pending];
-  if (!paths.length) return;
-  vaultGit.pending.clear();
-  vaultGit.busy = true;
-  try {
-    for (const p of paths) {
-      await runGit(["-C", VAULT, "add", "--", p], { timeoutMs: 8000 });
+
+  if (!rel || rel.kind === "none") {
+    if (paths && paths.length && !hasUnresolved()) {
+      try {
+        if (await stageAndCommit(paths)) await publishPush();
+      } catch (e) {
+        setGitError(e && e.message || "push failed");
+      }
     }
-    const status = await runGit(["-C", VAULT, "status", "--porcelain"], { timeoutMs: 8000 });
-    if (!String(status.out || "").trim()) return;
-    const msg = "vault: " + paths.join(", ");
-    await runGit(["-C", VAULT, "commit", "-m", msg], { timeoutMs: 8000 });
+    return;
+  }
+
+  if (rel.kind === "unknown") {
+    setGitError("push refused");
+    if (paths && paths.length) {
+      try { await stageAndCommit(paths); } catch (e) { setGitError(e && e.message || "git failed"); }
+    }
+    return;
+  }
+
+  if (rel.kind === "behind") {
+    const incoming = await listDiff(rel.head, rel.rev);
+    const dirty = await dirtySet();
+    const overlap = incoming.filter((file) => dirty.has(file));
+    const blocking = overlap.filter((file) => {
+      const item = vaultGit.conflicts.get(file);
+      return !item || !item.resolved;
+    });
+    if (blocking.length) {
+      await recordConflicts(blocking, rel.rev);
+      const still = blocking.filter((file) => {
+        if (!String(file).endsWith(".md")) return true;
+        const item = vaultGit.conflicts.get(file);
+        return item && !item.resolved;
+      });
+      if (still.length) {
+        if (!vaultGit.error) setGitError("push refused");
+        return;
+      }
+    }
+    const choices = resolvedChoices();
+    const park = [];
+    for (const file of choices.keys()) {
+      if (incoming.includes(file) || overlap.includes(file)) park.push(file);
+    }
     try {
-      await runGit(["-C", VAULT, "push", "-u", "origin", "HEAD"], { timeoutMs: 25000 });
-      vaultGit.error = "";
-      vaultGit.lastPushAt = Date.now();
+      await fastForward(rel.rev, park);
     } catch (e) {
-      vaultGit.error = sanitizeGitError(e && e.message || "push failed");
-      console.error("vault git push:", vaultGit.error);
+      await recordConflicts(overlap, rel.rev);
+      setGitError(e && e.message || "push refused");
+      return;
     }
-  } finally {
-    vaultGit.busy = false;
-    if (vaultGit.pending.size) scheduleVaultSync([...vaultGit.pending][0]);
+    await announcePaths(incoming);
+    for (const file of park) vaultGit.conflicts.delete(file);
+    if (!hasUnresolved()) setGitError("");
+  } else if (rel.kind === "diverged") {
+    const { blocking } = await noteDivergence(rel);
+    if (blocking.length || hasUnresolved()) {
+      try {
+        await publishPush();
+      } catch (e) {
+        setGitError(e && e.message || "push refused");
+      }
+      if (hasUnresolved() && !vaultGit.error) setGitError("push refused");
+      return;
+    }
+    const choices = resolvedChoices();
+    if (choices.size) {
+      const dirty = await dirtySet();
+      const extras = new Map();
+      for (const file of dirty) {
+        if (choices.has(file) || !isSafeRel(file)) continue;
+        extras.set(file, await readRel(file));
+      }
+      await publishDiverged(rel, choices, extras);
+      return;
+    }
+    try {
+      await publishPush();
+    } catch (e) {
+      setGitError(e && e.message || "push refused");
+    }
+    return;
+  } else if (!hasUnresolved()) {
+    setGitError("");
+  }
+
+  if (hasUnresolved()) return;
+
+  let committed = false;
+  if (paths && paths.length) {
+    try {
+      committed = await stageAndCommit(paths);
+    } catch (e) {
+      setGitError(e && e.message || "git failed");
+      return;
+    }
+  }
+  let ahead = rel.kind === "ahead";
+  if (committed) {
+    try {
+      const again = await compareToRemote();
+      ahead = !again || again.kind === "ahead" || again.kind === "none" || again.kind === "equal";
+      if (again && (again.kind === "behind" || again.kind === "diverged")) {
+        await syncVaultBody(null);
+        return;
+      }
+    } catch {}
+  }
+  if (committed || ahead) {
+    try {
+      await publishPush();
+    } catch (e) {
+      setGitError(e && e.message || "push failed");
+      try {
+        await fetchOrigin();
+        const again = await compareToRemote();
+        if (again && (again.kind === "diverged" || again.kind === "behind")) {
+          if (again.kind === "diverged") await noteDivergence(again);
+          else {
+            const incoming = await listDiff(again.head, again.rev);
+            const dirty = await dirtySet();
+            await recordConflicts(incoming.filter((file) => dirty.has(file)), again.rev);
+          }
+          if (hasUnresolved() && !vaultGit.error) setGitError("push refused");
+        }
+      } catch {}
+    }
   }
 }
 
@@ -890,6 +1435,7 @@ function startLogWatch() {
       const date = name.slice(0, 10);
       const logPath = path.join(logDir, name);
       fsSync.stat(logPath, (err, st) => {
+        if (vaultGit.suppressWatch) return;
         if (err || !st) return;
         const mtime = Math.trunc(st.mtimeMs);
         if (isSelfWrite(date, mtime)) return;
@@ -941,6 +1487,19 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/health") {
       return json(res, 200, { ok: true, git: gitHint() });
+    }
+
+    if (pathname === "/api/sync" && req.method === "GET") {
+      if (!vaultGit.enabled) {
+        return json(res, 200, { enabled: false, ok: true, error: "", conflicts: [] });
+      }
+      const conflicts = publicConflicts();
+      return json(res, 200, {
+        enabled: true,
+        ok: !vaultGit.error && conflicts.length === 0,
+        error: vaultGit.error || "",
+        conflicts,
+      });
     }
 
     if (pathname === "/api/week" && req.method === "GET") {
@@ -1420,6 +1979,7 @@ const server = http.createServer(async (req, res) => {
 async function boot() {
   await initVaultGit();
   startLogWatch();
+  startVaultSyncLoop();
   server.listen(PORT, HOST, () => {
     console.log(`AidanOS`);
     console.log(`  vault: ${VAULT}`);

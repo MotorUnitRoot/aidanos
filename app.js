@@ -1074,6 +1074,86 @@ function putRawDay(date, markdown, mtime) {
   });
 }
 
+const UNSENT_PREFIX = "aidanos-unsent:";
+
+function notePathFor(snap) {
+  if (!snap) return "";
+  if (snap.kind === "note") return String(snap.path || "").replace(/\\/g, "/");
+  if (snap.date) return "log/" + snap.date + ".md";
+  return "";
+}
+
+function unsentKey(path, base) {
+  return UNSENT_PREFIX + String(path || "").replace(/\\/g, "/") + ":" + String(Number(base) || 0);
+}
+
+function rememberUnsent(snap) {
+  const path = notePathFor(snap);
+  if (!path || !snap) return;
+  const base = Number(snap.mtime) || 0;
+  try {
+    localStorage.setItem(unsentKey(path, base), JSON.stringify({
+      path,
+      base,
+      markdown: String(snap.markdown || ""),
+    }));
+  } catch (e) {}
+}
+
+function forgetUnsent(path) {
+  const prefix = UNSENT_PREFIX + String(path || "").replace(/\\/g, "/") + ":";
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.indexOf(prefix) === 0) keys.push(key);
+    }
+    keys.forEach((key) => localStorage.removeItem(key));
+  } catch (e) {}
+}
+
+function readUnsent(path) {
+  const prefix = UNSENT_PREFIX + String(path || "").replace(/\\/g, "/") + ":";
+  const out = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || key.indexOf(prefix) !== 0) continue;
+      const parsed = JSON.parse(localStorage.getItem(key) || "null");
+      if (parsed && typeof parsed.markdown === "string") out.push(parsed);
+    }
+  } catch (e) {}
+  return out;
+}
+
+function offerUnsent(kind, path, date, diskMarkdown) {
+  if (paperConflict) return;
+  const disk = String(diskMarkdown || "");
+  const hits = readUnsent(path);
+  const mine = hits.find((item) => item.markdown !== disk);
+  if (!mine) {
+    if (hits.length) forgetUnsent(path);
+    return;
+  }
+  const mtime = kind === "note"
+    ? Number(state.doc && state.doc.mtime) || 0
+    : Number(state.day && state.day.mtime) || 0;
+  openPaperConflict({
+    kind,
+    path,
+    date: date || "",
+    mine: mine.markdown,
+    theirs: disk,
+    mtime,
+  });
+}
+
+function conflictPath(info) {
+  if (!info) return "";
+  if (info.kind === "note") return String(info.path || "").replace(/\\/g, "/");
+  return info.date ? "log/" + info.date + ".md" : "";
+}
+
 async function openDay(date, { silent = false, force = false } = {}) {
   if (!force && (isCaptureHash() || isCaptureDoc() || isPlanHash() || isPlanDoc())) return;
   const gen = ++state.openDayGen;
@@ -1087,10 +1167,47 @@ async function openDay(date, { silent = false, force = false } = {}) {
     paperConflict.date === oldDate ||
     String(paperConflict.path || "").replace(/\\/g, "/") === "log/" + oldDate + ".md"
   ));
+  if (leavingDay) {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = null;
+    if (state.day) {
+      const kept = cleanPaperMarkdown(oldMd);
+      state.day.markdown = kept;
+      state.day.paper = kept;
+      if (dump) dump.value = kept;
+    }
+    renderDay();
+  }
   if (isNoteDoc()) {
     if (date === todayIso()) await landMapNextStepsOnToday();
     await leaveCurrentPaper();
     if (gen !== state.openDayGen) return;
+  }
+  if (leavingDay && !conflictOpen && state.dirty) {
+    const leavingMd = dump ? dump.value : cleanPaperMarkdown(oldMd);
+    const leavingSave = putRawDay(oldDate, leavingMd, oldMtime);
+    let res = null;
+    try { res = await leavingSave; } catch (e) { res = null; }
+    if (gen !== state.openDayGen) return;
+    if (!res || !res.ok) {
+      rememberUnsent({ kind: "day", date: oldDate, markdown: leavingMd, mtime: oldMtime });
+      if (res && res.status === 409) {
+        const body = await res.json().catch(() => ({}));
+        openPaperConflict({
+          kind: "day",
+          path: "log/" + oldDate + ".md",
+          date: oldDate,
+          mine: leavingMd,
+          theirs: typeof body.markdown === "string" ? body.markdown : "",
+          mtime: Number(body.mtime) || 0,
+        });
+      }
+      return;
+    }
+    forgetUnsent("log/" + oldDate + ".md");
+    const latest = $("dump");
+    if (latest && latest.value !== leavingMd) return;
+    if (state.day && state.day.date === oldDate) state.dirty = false;
   }
   try {
     const day = await api("/api/day?date=" + date);
@@ -1128,13 +1245,10 @@ async function openDay(date, { silent = false, force = false } = {}) {
       state.monthView = { year: viewed.getFullYear(), month: viewed.getMonth() + 1 };
     }
     await renderMonth();
-    if (leavingDay && !conflictOpen && state.dirty) {
-      clearTimeout(state.saveTimer);
-      state.saveTimer = null;
-      state.dirty = false;
-      putRawDay(oldDate, oldMd, oldMtime).catch(() => {});
-    }
     if (gen === state.openDayGen) await surfaceOpenGitConflict();
+    if (gen === state.openDayGen && state.day && state.day.date === date && !paperConflict) {
+      offerUnsent("day", "log/" + date + ".md", date, dayMarkdown(state.day));
+    }
   } catch (e) {
     if (gen !== state.openDayGen) return;
     if (!silent) setStatus(String(e.message || e), "error");
@@ -1607,13 +1721,30 @@ function ensureDumpMatchesPaper() {
   return dump;
 }
 
+function currentSaveBound() {
+  if (isNoteDoc() && state.doc && state.doc.path) {
+    return { kind: "note", path: String(state.doc.path).replace(/\\/g, "/") };
+  }
+  if (state.day && state.day.date) return { kind: "day", date: state.day.date };
+  return null;
+}
+
+function saveBoundMatches(bound) {
+  if (!bound) return true;
+  if (bound.kind === "note") {
+    return isNoteDoc() && state.doc && String(state.doc.path).replace(/\\/g, "/") === bound.path;
+  }
+  return !isNoteDoc() && state.day && state.day.date === bound.date;
+}
+
 function scheduleSave() {
   if (applyingDragSave) return;
   if (paperConflict) return;
   state.dirty = true;
   setStatus("Saving");
   clearTimeout(state.saveTimer);
-  state.saveTimer = setTimeout(saveDay, 350);
+  const bound = currentSaveBound();
+  state.saveTimer = setTimeout(() => saveDay({ bound }), 350);
 }
 
 function applyRemoteDay(day) {
@@ -1827,6 +1958,7 @@ function closePaperConflict() {
 }
 
 function handleSaveConflict(snap, body, { keepalive = false } = {}) {
+  rememberUnsent(snap);
   if (keepalive) return;
   if (!conflictStillHere(snap)) return;
   openPaperConflict({
@@ -1852,6 +1984,7 @@ function conflictMineNow() {
 async function resolveConflictKeep() {
   if (!paperConflict) return;
   const info = paperConflict;
+  forgetUnsent(conflictPath(info));
   const mine = conflictMineNow();
   try {
     let res;
@@ -1929,6 +2062,7 @@ async function resolveConflictKeep() {
 async function resolveConflictTheirs() {
   if (!paperConflict) return;
   const info = paperConflict;
+  forgetUnsent(conflictPath(info));
   if (!info.git) {
     if (info.kind === "note") {
       applyRemoteNote({ path: info.path, markdown: info.theirs, mtime: info.mtime });
@@ -2172,6 +2306,7 @@ async function surfaceOpenGitConflict() {
 
 function resolveConflictEdit() {
   if (!paperConflict) return;
+  forgetUnsent(conflictPath(paperConflict));
   const mine = paperConflict.mine;
   const dump = $("dump");
   if (dump) dump.value = mine;
@@ -2185,9 +2320,19 @@ function resolveConflictEdit() {
   setStatus("They wrote this too.");
 }
 
-async function saveDay({ keepalive = false } = {}) {
+async function saveDay({ keepalive = false, bound = null } = {}) {
   const run = async () => {
+    if (bound && !saveBoundMatches(bound)) return;
     const editInfo = paperConflict && document.body.classList.contains("conflict-edit") ? paperConflict : null;
+    if (paperConflict && !editInfo && keepalive) {
+      rememberUnsent({
+        kind: paperConflict.kind,
+        path: paperConflict.path,
+        date: paperConflict.date,
+        markdown: conflictMineNow(),
+        mtime: Number(state.day && state.day.mtime) || Number(state.doc && state.doc.mtime) || 0,
+      });
+    }
     if (paperConflict && !editInfo) {
       if (!keepalive) setStatus("This page changed on disk.");
       return;
@@ -2218,6 +2363,7 @@ async function saveDay({ keepalive = false } = {}) {
           throw new Error(err.error || res.statusText);
         }
         const out = await res.json().catch(() => ({}));
+        forgetUnsent(path);
         if (isNoteDoc() && state.doc && state.doc.path === path) {
           if (out && out.mtime != null) state.doc.mtime = Number(out.mtime) || 0;
           const dump = $("dump");
@@ -2232,6 +2378,7 @@ async function saveDay({ keepalive = false } = {}) {
         setStatus("Saved", "saved");
         setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
       } catch (e) {
+        rememberUnsent(snap);
         if (!keepalive) setStatus(String(e.message), "error");
       }
       return;
@@ -2257,9 +2404,11 @@ async function saveDay({ keepalive = false } = {}) {
         throw new Error(err.error || res.statusText);
       }
       const out = await res.json().catch(() => ({}));
+      forgetUnsent("log/" + date + ".md");
       if (state.day && state.day.date === date) {
         if (out && out.mtime != null) state.day.mtime = Number(out.mtime) || 0;
-        state.dirty = false;
+        const dump = $("dump");
+        if (dump && dump.value === markdown) state.dirty = false;
       }
       if (editInfo) {
         closePaperConflict();
@@ -2276,6 +2425,7 @@ async function saveDay({ keepalive = false } = {}) {
       }
       setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
     } catch (e) {
+      rememberUnsent(snap);
       if (!keepalive) setStatus(String(e.message), "error");
     }
   };
@@ -2555,6 +2705,9 @@ async function openVaultNote(rel) {
   }
   setStatus("");
   if (noteGen === state.openDayGen) await surfaceOpenGitConflict();
+  if (noteGen === state.openDayGen && isNoteDoc() && state.doc && !paperConflict) {
+    offerUnsent("note", state.doc.path, "", state.doc.markdown);
+  }
 }
 
 async function openVaultSearchHit(rel, line) {

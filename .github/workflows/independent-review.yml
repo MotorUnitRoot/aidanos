@@ -77,6 +77,7 @@ jobs:
       - name: Self-test
         run: node .github/independent-review.mjs --self-test
       - name: Post independent-review/approved on the PR head
+        # Built-in GITHUB_TOKEN only. No GitHub App key is stored in Actions.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node .github/independent-review.mjs

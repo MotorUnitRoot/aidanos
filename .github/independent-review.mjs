@@ -5,10 +5,11 @@
  * A PASS counts only when all of these are true:
  * - The comment begins with "Independent review: PASS" and the current head SHA.
  * - The comment has not been edited, so a later edit cannot retarget the SHA.
- * - The author has write, maintain, or admin on this repo, from
- *   GET /repos/{owner}/{repo}/collaborators/{username}/permission.
+ * - The author is the motorunit-aidanos-bots GitHub App: login
+ *   motorunit-aidanos-bots[bot] and type Bot. When performed_via_github_app
+ *   is present, its id is 5413571. A user account does not count.
  *
- * A BLOCK from such an author stays in force until a newer qualifying PASS
+ * A BLOCK from that App stays in force until a newer qualifying PASS
  * for this head SHA. The original body and every later version count. The
  * most restrictive version wins, so editing a BLOCK into a PASS does not
  * lift it. If the edit history cannot be read, that comment stays a BLOCK.
@@ -17,14 +18,18 @@
  * pull_request only prints a result and exits. It must not post a status.
  * issue_comment and pull_request_target run this file from the default
  * branch and post the commit status `independent-review/approved` on the
- * PR head. Those runs read the head SHA from the event, never from a
- * checkout of the pull request.
+ * PR head, using the built-in GITHUB_TOKEN. No GitHub App key is read.
+ * Those runs read the head SHA from the event, never from a checkout of
+ * the pull request.
  */
 import fs from "node:fs";
 
 const PASS_PREFIX = "Independent review: PASS";
 const BLOCK_PREFIX = "Independent review: BLOCK";
-const REVIEW_ROLES = new Set(["admin", "maintain", "write"]);
+
+// The independent reviewer posts as this GitHub App. Change these together.
+export const REVIEW_APP_LOGIN = "motorunit-aidanos-bots[bot]";
+export const REVIEW_APP_ID = 5413571;
 
 export const STATUS_CONTEXT = "independent-review/approved";
 
@@ -48,9 +53,12 @@ export function commentKind(body, headSha) {
   return null;
 }
 
-export function hasReviewAccess(record) {
-  if (!record || typeof record !== "object") return false;
-  return REVIEW_ROLES.has(record.permission) || REVIEW_ROLES.has(record.role_name);
+export function isReviewBot(comment) {
+  const user = comment && comment.user;
+  if (!user || user.login !== REVIEW_APP_LOGIN || user.type !== "Bot") return false;
+  const via = comment.performed_via_github_app;
+  if (via == null) return true;
+  return Number(via.id) === REVIEW_APP_ID;
 }
 
 export function commentWasEdited(comment) {
@@ -260,6 +268,7 @@ export function classifyReview(comments, headSha) {
   const pass = [];
   const block = [];
   for (const comment of comments || []) {
+    if (!isReviewBot(comment)) continue;
     const blockAt = blockEffectiveAt(comment, headSha);
     if (blockAt) {
       block.push({ ...comment, blockAt });
@@ -288,7 +297,7 @@ export function summaryFor(result, headSha) {
   const lines = [
     `Head SHA: \`${headSha}\`.`,
     "",
-    "Only an unedited PASS from an author with write, maintain, or admin access counts.",
+    `Only an unedited PASS from ${REVIEW_APP_LOGIN} counts.`,
     "A BLOCK stays in force until a newer PASS for this SHA. Editing a BLOCK does not lift it.",
     `The binding result is the commit status \`${STATUS_CONTEXT}\`, posted only from main.`,
   ];
@@ -306,7 +315,7 @@ export function summaryFor(result, headSha) {
     );
     return lines.join("\n");
   }
-  lines.splice(1, 0, `No qualifying \`${PASS_PREFIX} ${headSha}\` from a write, maintain, or admin author.`);
+  lines.splice(1, 0, `No qualifying \`${PASS_PREFIX} ${headSha}\` from ${REVIEW_APP_LOGIN}.`);
   return lines.join("\n");
 }
 
@@ -314,8 +323,17 @@ function assert(cond, message) {
   if (!cond) throw new Error(message);
 }
 
-function reviewComment(id, body, at) {
-  return { id, body, created_at: at, updated_at: at, versions: [{ body, at }] };
+function reviewComment(id, body, at, extra) {
+  return {
+    id,
+    body,
+    created_at: at,
+    updated_at: at,
+    versions: [{ body, at }],
+    user: { login: REVIEW_APP_LOGIN, type: "Bot" },
+    performed_via_github_app: { id: REVIEW_APP_ID },
+    ...extra,
+  };
 }
 
 export function selfTest() {
@@ -340,14 +358,34 @@ export function selfTest() {
     assert(got === want, `${name}: got ${got}, want ${want}`);
   }
 
-  assert(hasReviewAccess({ permission: "admin", role_name: "admin" }), "admin");
-  assert(hasReviewAccess({ permission: "write", role_name: "write" }), "write");
-  assert(hasReviewAccess({ permission: "write", role_name: "maintain" }), "maintain maps to write");
-  assert(hasReviewAccess({ permission: "maintain", role_name: "maintain" }), "maintain");
-  assert(!hasReviewAccess({ permission: "read", role_name: "read" }), "read");
-  assert(!hasReviewAccess({ permission: "read", role_name: "triage" }), "triage");
-  assert(!hasReviewAccess({ permission: "none", role_name: "" }), "none");
-  assert(!hasReviewAccess(null), "missing record");
+  assert(REVIEW_APP_LOGIN === "motorunit-aidanos-bots[bot]", "app login");
+  assert(REVIEW_APP_ID === 5413571, "app id");
+  assert(isReviewBot(reviewComment(1, "x", "2026-10-18T00:00:00Z")), "app bot");
+  assert(
+    isReviewBot({ user: { login: REVIEW_APP_LOGIN, type: "Bot" }, performed_via_github_app: null }),
+    "app id is optional when the field is absent",
+  );
+  assert(
+    !isReviewBot({
+      user: { login: "MotorUnitRoot", type: "User" },
+      performed_via_github_app: null,
+    }),
+    "user account is not the app",
+  );
+  assert(
+    !isReviewBot({
+      user: { login: REVIEW_APP_LOGIN, type: "User" },
+      performed_via_github_app: { id: REVIEW_APP_ID },
+    }),
+    "look-alike login without type Bot",
+  );
+  assert(
+    !isReviewBot({
+      user: { login: REVIEW_APP_LOGIN, type: "Bot" },
+      performed_via_github_app: { id: 1 },
+    }),
+    "different app id",
+  );
 
   const stamp = "2026-10-18T00:00:00Z";
   assert(!commentWasEdited({ created_at: stamp, updated_at: stamp }), "unedited");
@@ -364,7 +402,7 @@ export function selfTest() {
   const t3 = "2026-10-18T00:00:03Z";
 
   const pass = classifyReview([reviewComment(1, `${PASS_PREFIX} ${sha}`, t0)], sha);
-  assert(pass.conclusion === "success" && pass.reason === "pass", "pass class");
+  assert(pass.conclusion === "success" && pass.reason === "pass", "app bot pass for this sha");
 
   const missing = classifyReview([reviewComment(2, `see ${sha}`, t0)], sha);
   assert(missing.conclusion === "failure" && missing.reason === "missing", "sha mention is not a review");
@@ -393,45 +431,36 @@ export function selfTest() {
   );
   assert(lifted.conclusion === "success" && lifted.reason === "pass", "newer pass lifts an older block");
 
-  const editedBlock = {
-    id: 11,
-    body: `${PASS_PREFIX} ${sha}`,
-    created_at: t0,
+  const editedBlock = reviewComment(11, `${PASS_PREFIX} ${sha}`, t0, {
     updated_at: t1,
     versions: [
       { body: `${BLOCK_PREFIX} ${sha}`, at: t0 },
       { body: `${PASS_PREFIX} ${sha}`, at: t1 },
     ],
-  };
+  });
   const editKeepsBlock = classifyReview([editedBlock], sha);
   assert(editKeepsBlock.conclusion === "failure" && editKeepsBlock.reason === "block", "editing a block into a pass does not lift it");
 
   const editThenNewer = classifyReview([editedBlock, reviewComment(12, `${PASS_PREFIX} ${sha}`, t2)], sha);
   assert(editThenNewer.conclusion === "success", "a newer pass lifts a block that was edited away");
 
-  const retarget = {
-    id: 13,
-    body: `${PASS_PREFIX} ${sha}`,
-    created_at: t0,
+  const retarget = reviewComment(13, `${PASS_PREFIX} ${sha}`, t0, {
     updated_at: t1,
     versions: [
       { body: `${PASS_PREFIX} ${other}`, at: t0 },
       { body: `${PASS_PREFIX} ${sha}`, at: t1 },
     ],
-  };
+  });
   const retargeted = classifyReview([retarget], sha);
   assert(retargeted.conclusion === "failure" && retargeted.reason === "missing", "an edited pass cannot name this sha");
 
-  const becameBlock = {
-    id: 14,
-    body: BLOCK_PREFIX,
-    created_at: t0,
+  const becameBlock = reviewComment(14, BLOCK_PREFIX, t0, {
     updated_at: t2,
     versions: [
       { body: "thanks", at: t0 },
       { body: BLOCK_PREFIX, at: t2 },
     ],
-  };
+  });
   const olderPass = classifyReview([reviewComment(15, `${PASS_PREFIX} ${sha}`, t1), becameBlock], sha);
   assert(olderPass.conclusion === "failure" && olderPass.reason === "block", "a pass older than the blocking edit does not lift it");
   const afterEdit = classifyReview([becameBlock, reviewComment(16, `${PASS_PREFIX} ${sha}`, t3)], sha);
@@ -439,17 +468,45 @@ export function selfTest() {
 
   const unknown = classifyReview(
     [
-      {
-        id: 17,
-        body: "thanks",
-        created_at: t0,
+      reviewComment(17, "thanks", t0, {
         updated_at: t1,
         historyUnavailable: true,
-      },
+      }),
     ],
     sha,
   );
   assert(unknown.conclusion === "failure" && unknown.reason === "block", "unreconstructed edit stays a block");
+  const humanPass = classifyReview(
+    [
+      reviewComment(19, `${PASS_PREFIX} ${sha}`, t0, {
+        user: { login: "MotorUnitRoot", type: "User" },
+        performed_via_github_app: null,
+      }),
+    ],
+    sha,
+  );
+  assert(humanPass.conclusion === "failure" && humanPass.reason === "missing", "a user PASS is ignored");
+  const lookalike = classifyReview(
+    [
+      reviewComment(20, `${PASS_PREFIX} ${sha}`, t0, {
+        user: { login: REVIEW_APP_LOGIN, type: "User" },
+        performed_via_github_app: { id: REVIEW_APP_ID },
+      }),
+    ],
+    sha,
+  );
+  assert(lookalike.conclusion === "failure" && lookalike.reason === "missing", "a look-alike login is ignored");
+  const appBlock = classifyReview(
+    [
+      reviewComment(21, `${BLOCK_PREFIX} ${sha}`, t0),
+      reviewComment(22, `${PASS_PREFIX} ${sha}`, t1, {
+        user: { login: "MotorUnitRoot", type: "User" },
+        performed_via_github_app: null,
+      }),
+    ],
+    sha,
+  );
+  assert(appBlock.conclusion === "failure" && appBlock.reason === "block", "an app BLOCK stays in force");
   const plain = { id: 18, body: `${PASS_PREFIX} ${sha}`, created_at: t0, updated_at: t1 };
   let missingHistory = false;
   try {
@@ -485,7 +542,7 @@ export function selfTest() {
   assert(threw, "deleted edit history fails closed");
 
   const text = summaryFor(pass, sha);
-  assert(text.includes(sha) && text.includes("write, maintain, or admin"), "summary");
+  assert(text.includes(sha) && text.includes(REVIEW_APP_LOGIN), "summary");
   assert(text.includes(STATUS_CONTEXT), "summary names the status");
   console.log("independent-review self-test ok");
 }
@@ -565,32 +622,16 @@ async function listEdits(nodeId) {
   throw new Error("edit history is too long");
 }
 
-async function permissionFor(owner, repo, login, cache) {
-  if (cache.has(login)) return cache.get(login);
-  let record = null;
-  try {
-    record = await gh(`/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`);
-  } catch (error) {
-    console.log(`Permission lookup failed for ${login}: ${error.message}`);
-    record = null;
-  }
-  cache.set(login, record);
-  return record;
-}
-
-async function commentsFromReviewers(owner, repo, comments) {
-  const cache = new Map();
+async function commentsFromReviewers(comments) {
   const accepted = [];
   for (const comment of comments) {
     const login = comment && comment.user && comment.user.login;
-    if (!login) {
-      console.log(`Ignoring comment ${comment && comment.id} with no author.`);
-      continue;
-    }
-    const record = await permissionFor(owner, repo, login, cache);
-    const role = record && (record.role_name || record.permission);
-    if (!hasReviewAccess(record)) {
-      console.log(`Ignoring comment ${comment.id} from ${login} (${role || "no access"}).`);
+    if (!isReviewBot(comment)) {
+      const via = comment && comment.performed_via_github_app;
+      const viaId = via && via.id;
+      console.log(
+        `Ignoring comment ${comment && comment.id} from ${login || "unknown"} (${(comment && comment.user && comment.user.type) || "no type"}${viaId ? `, app ${viaId}` : ""}).`,
+      );
       continue;
     }
     if (commentWasEdited(comment)) {
@@ -668,7 +709,7 @@ async function main() {
     return;
   }
 
-  const comments = await commentsFromReviewers(owner, repo, await listComments(owner, repo, number));
+  const comments = await commentsFromReviewers(await listComments(owner, repo, number));
   const result = classifyReview(comments, headSha);
   const summary = summaryFor(result, headSha);
   console.log(summary);

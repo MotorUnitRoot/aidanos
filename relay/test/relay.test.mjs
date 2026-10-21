@@ -331,6 +331,120 @@ test("too many bad tokens are refused", async () => {
   }
 });
 
+test("an edit while the relay is stopped merges with an offline change", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  const id = noteId("notes/hello.md");
+  const first = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 1000,
+  });
+  assert.equal(await fs.readFile(path.join(vault, ".aidanos", "relay-folder"), "utf8"), "relay\n");
+  assert.equal(await fs.readFile(path.join(data, "relay-folder"), "utf8"), "relay\n");
+  importDoc(first.repo, INDEX_ID, { kind: "index", paths: { "notes/hello.md": id } });
+  importDoc(first.repo, id, { kind: "note", text: "Hello" });
+  await first.mirrorNow();
+  const saved = Automerge.save((await first.repo.find(id)).doc());
+  await first.close();
+
+  await fs.writeFile(path.join(vault, "notes", "hello.md"), "Hello MAC");
+  const second = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 1000,
+  });
+  try {
+    const handle = await second.repo.find(id);
+    assert.equal(handle.doc().text, "Hello MAC");
+    let phone = Automerge.load(saved);
+    phone = Automerge.change(phone, (doc) => {
+      Automerge.splice(doc, ["text"], 5, 0, " PHONE");
+    });
+    handle.update((doc) => Automerge.merge(doc, phone));
+    const text = handle.doc().text;
+    assert.ok(["Hello MAC PHONE", "Hello PHONE MAC"].includes(text), text);
+    await second.mirrorNow();
+    assert.equal(await fs.readFile(path.join(vault, "notes", "hello.md"), "utf8"), text);
+  } finally {
+    await second.close();
+  }
+});
+
+test("a blocked address can try again after the block expires", async () => {
+  const dir = await tempDir();
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    guessLimit: 1,
+    guessBlockMs: 80,
+    mirrorDebounceMs: 1000,
+  });
+  try {
+    assert.equal((await connect(relay.url, "nope")).status, 401);
+    const blocked = await connect(relay.url, TOKEN);
+    assert.equal(blocked.opened, false);
+    assert.equal(blocked.status, 401);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const again = await connect(relay.url, TOKEN);
+    assert.equal(again.opened, true);
+    again.socket.close();
+  } finally {
+    await relay.close();
+  }
+});
+
+test("a two megabyte frame fits under the default cap", async () => {
+  const dir = await tempDir();
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 1000,
+  });
+  try {
+    const result = await new Promise((resolve) => {
+      const ws = new WebSocket(relay.url, { headers: { Authorization: "Bearer " + TOKEN } });
+      ws.on("open", () => {
+        ws.send(Buffer.alloc(2_000_000, 7));
+      });
+      ws.on("close", (code) => resolve({ code }));
+      ws.on("error", () => {});
+      setTimeout(() => {
+        const open = ws.readyState === WebSocket.OPEN;
+        ws.close();
+        resolve({ code: open ? 0 : ws.readyState });
+      }, 800);
+    });
+    assert.notEqual(result.code, 1009);
+    const health = await fetch(relay.healthURL);
+    assert.equal(health.status, 200);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("the try-it guide keeps the token off the command line", async () => {
+  const text = await fs.readFile(new URL("../../docs/native/TRY-IT.md", import.meta.url), "utf8");
+  assert.equal(text.includes("printf"), false);
+  assert.equal(text.includes("AIDANOS_RELAY_TOKEN="), false);
+  assert.equal(text.includes("paste-your-long-token"), false);
+  assert.match(text, /read -s/);
+  assert.match(text, /TextEdit/);
+});
+
 test("an oversized frame does not stop the relay", async () => {
   const dir = await tempDir();
   const relay = await startRelay({

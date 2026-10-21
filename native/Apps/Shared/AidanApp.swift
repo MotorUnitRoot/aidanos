@@ -34,7 +34,7 @@ struct TodayScreen: View {
                     Button("Save edit") { model.saveConflictEdit() }
                 }
             }
-            NoteEditor(text: $model.text) { base, edited in
+            NoteEditor(text: $model.text, editable: model.conflict == nil || model.draftingConflict) { base, edited in
                 model.userEdited(base: base, edited: edited)
             }
         }

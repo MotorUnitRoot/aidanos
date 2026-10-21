@@ -21,6 +21,25 @@ function noteText(doc) {
   return null;
 }
 
+function spliceToward(doc, next) {
+  const current = typeof doc.text === "string" ? doc.text : "";
+  if (current === next) return;
+  let prefix = 0;
+  const limit = Math.min(current.length, next.length);
+  while (prefix < limit && current[prefix] === next[prefix]) prefix += 1;
+  let suffix = 0;
+  while (
+    suffix < current.length - prefix &&
+    suffix < next.length - prefix &&
+    current[current.length - 1 - suffix] === next[next.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+  const del = current.length - prefix - suffix;
+  const insert = next.slice(prefix, next.length - suffix);
+  Automerge.splice(doc, ["text"], prefix, del, insert);
+}
+
 function digest(text) {
   return crypto.createHash("sha256").update(String(text), "utf8").digest("hex");
 }
@@ -101,8 +120,8 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
       }
       try {
         handle.change((doc) => {
-          if (doc.text == null) doc.text = "";
-          Automerge.updateText(doc, ["text"], fileText);
+          if (typeof doc.text !== "string") doc.text = "";
+          spliceToward(doc, fileText);
         });
         lastWritten.set(notePath, fileText);
         known[notePath] = digest(fileText);

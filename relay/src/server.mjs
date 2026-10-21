@@ -10,11 +10,17 @@ import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import { listenHosts } from "./bind.mjs";
 import { backupOnce } from "./git.mjs";
+import { INDEX_ID } from "./ids.mjs";
 import { createMirror } from "./mirror.mjs";
 import { logSafe } from "./redact.mjs";
 
 const DEFAULT_PORT = 3750;
 const MIN_TOKEN_LENGTH = 32;
+// A note's first sync is its whole history. 1 MB was small enough to reject that
+// and leave the device retrying forever. 32 MB covers a large note; anything
+// past it closes the socket with a clear error instead of looping.
+const DEFAULT_MAX_PAYLOAD = 32 * 1024 * 1024;
+const FAILURE_CAP = 1024;
 export const LAN_WARNING =
   "WARNING: --lan sends notes across your home network with no encryption. The token is the only protection.";
 
@@ -156,7 +162,10 @@ export async function startRelay(options = {}) {
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
   await fs.mkdir(vault, { recursive: true });
   await assertNotClientVault(vault);
+  await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
+  await fs.writeFile(path.join(vault, ".aidanos", "relay-folder"), "relay\n");
   await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(path.join(dataDir, "relay-folder"), "relay\n");
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
   const failures = new Map();
@@ -166,15 +175,33 @@ export async function startRelay(options = {}) {
     return (req.socket && req.socket.remoteAddress) || "";
   }
 
+  function pruneFailures(now) {
+    for (const [ip, row] of failures) {
+      const blockOver = row.until && now >= row.until;
+      const attemptStale = !row.until && row.at && now - row.at >= guessBlockMs;
+      if (blockOver || attemptStale) failures.delete(ip);
+    }
+    while (failures.size > FAILURE_CAP) {
+      const oldest = failures.keys().next().value;
+      if (oldest == null) break;
+      failures.delete(oldest);
+    }
+  }
+
   function blocked(ip) {
+    pruneFailures(Date.now());
     const row = failures.get(ip);
     return Boolean(row && row.until && Date.now() < row.until);
   }
 
   function noteFailure(ip) {
-    const row = failures.get(ip) || { count: 0, until: 0 };
+    const now = Date.now();
+    pruneFailures(now);
+    const row = failures.get(ip) || { count: 0, until: 0, at: now };
+    failures.delete(ip);
     row.count += 1;
-    if (row.count >= guessLimit) row.until = Date.now() + guessBlockMs;
+    row.at = now;
+    if (row.count >= guessLimit) row.until = now + guessBlockMs;
     failures.set(ip, row);
   }
 
@@ -197,7 +224,8 @@ export async function startRelay(options = {}) {
       res.writeHead(404, { "content-length": 0 });
       res.end();
     });
-    const wss = new WebSocketServer({ noServer: true, maxPayload: Number(options.maxPayload ?? 1_000_000) });
+    const cap = Number(options.maxPayload ?? process.env.AIDANOS_MAX_PAYLOAD ?? DEFAULT_MAX_PAYLOAD);
+    const wss = new WebSocketServer({ noServer: true, maxPayload: cap });
     const adapter = new NodeWSServerAdapter(wss);
     httpServer.on("upgrade", (req, socket, head) => {
       const ip = clientAddress(req);
@@ -233,6 +261,12 @@ export async function startRelay(options = {}) {
     debounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
     secrets,
   });
+
+  // Fold a file that changed while this process was stopped before any device
+  // can connect. Doing it later lets that device's offline edit arrive first,
+  // and the file then replaces it.
+  await preloadStoredNotes(repo);
+  await mirror.now();
 
   let boundPort = port;
   for (const entry of servers) {
@@ -299,6 +333,21 @@ export async function startRelay(options = {}) {
       if (typeof repo.shutdown === "function") await repo.shutdown();
     },
   };
+}
+
+async function preloadStoredNotes(repo) {
+  const storage = repo.storageSubsystem;
+  if (!storage || typeof storage.loadDoc !== "function") return;
+  const index = await storage.loadDoc(INDEX_ID);
+  if (!index) return;
+  await repo.find(INDEX_ID);
+  const paths = index.paths && typeof index.paths === "object" ? index.paths : {};
+  for (const id of Object.values(paths)) {
+    if (typeof id !== "string" || !id) continue;
+    const stored = await storage.loadDoc(id);
+    if (!stored) continue;
+    await repo.find(id);
+  }
 }
 
 function portFromEnv() {

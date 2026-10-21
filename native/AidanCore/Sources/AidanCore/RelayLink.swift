@@ -129,7 +129,7 @@ final class RelayLink {
                     if let notify {
                         notify(error)
                     } else {
-                        host?.linkClosed()
+                        host?.linkFailed(error)
                     }
                 }
                 return
@@ -275,14 +275,14 @@ final class RelayLink {
         if masked {
             mask = Array(try readExact(4))
         }
-        guard length >= 0, length <= 8_000_000 else {
-            throw AidanError.protocol("The relay sent a note that is too large.")
+        guard length >= 0, length <= Self.maxFrame else {
+            throw AidanError.payloadTooLarge
         }
         var payload = try readExact(length)
         if masked {
             for index in payload.indices { payload[index] ^= mask[index % 4] }
         }
-        if opcode == 0x8 { throw AidanError.protocol("The relay closed the connection.") }
+        if opcode == 0x8 { throw closeError(payload) }
         if opcode == 0x9 {
             try sendPong(payload)
             return nil
@@ -290,6 +290,25 @@ final class RelayLink {
         if opcode == 0xA { return nil }
         if opcode != 0x2 && opcode != 0x0 { return nil }
         return payload
+    }
+
+    /// A frame bigger than this is refused. The relay's own cap is the same size.
+    private static let maxFrame = 32 * 1024 * 1024
+
+    private func closeError(_ payload: Data) -> AidanError {
+        var code = 0
+        var reason = ""
+        if payload.count >= 2 {
+            code = (Int(payload[0]) << 8) | Int(payload[1])
+            if payload.count > 2 {
+                reason = String(data: payload.subdata(in: 2..<payload.count), encoding: .utf8) ?? ""
+            }
+        }
+        let lowered = reason.lowercased()
+        if code == 1009 || lowered.contains("payload") || lowered.contains("too large") {
+            return .payloadTooLarge
+        }
+        return .protocol("The relay closed the connection.")
     }
 
     private func sendPong(_ payload: Data) throws {
@@ -351,6 +370,7 @@ protocol SyncHost: AnyObject {
     func markUnavailable(docId: String)
     func settled(docId: String)
     func linkClosed()
+    func linkFailed(_ error: Error)
 }
 
 private struct RelayAddress {

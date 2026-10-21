@@ -81,6 +81,11 @@ final class TodayModel: ObservableObject {
                     self?.status = state.label
                 }
             }
+            session.onError = { [weak self] message in
+                Task { @MainActor in
+                    self?.status = message
+                }
+            }
         } catch {
             status = String(describing: error)
         }
@@ -102,6 +107,9 @@ final class TodayModel: ObservableObject {
     }
 
     func userEdited(base: String, edited: String) {
+        if conflict != nil && !draftingConflict {
+            return
+        }
         if draftingConflict {
             text = edited
             return

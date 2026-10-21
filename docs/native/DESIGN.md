@@ -151,7 +151,7 @@ automerge-repo-swift, the Swift twin of the relay's library, is not linked in th
 ## Decisions
 
 1. Notes stay in the app's own folder for now. On the Mac that is Application Support (`~/Library/Application Support/AidanOS/vault`). On the iPhone it is the app's documents folder. Pointing it at the existing MotorUnit folder can wait.
-2. The relay folder stays separate from the app's folder, and the relay refuses to start if you point it at an app vault.
+2. The relay folder stays separate from the app's folder. The relay refuses to start if you point it at an app vault, and the app refuses to open the relay's folder.
 3. Still open: the git backup runs every five minutes. A different rhythm, or a backup only when you ask, is not decided.
 4. Edit starts with both versions, one after the other.
 5. Still open: day notes stay at `log/YYYY-MM-DD.md`, matching the web app.

@@ -5,6 +5,7 @@ import UIKit
 
 struct NoteEditor: UIViewRepresentable {
     @Binding var text: String
+    var editable = true
     var onEdit: (String, String) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -14,6 +15,7 @@ struct NoteEditor: UIViewRepresentable {
         view.font = UIFont.preferredFont(forTextStyle: .body)
         view.delegate = context.coordinator
         view.text = text
+        view.isEditable = editable
         view.backgroundColor = .clear
         view.isScrollEnabled = true
         view.alwaysBounceVertical = true
@@ -27,6 +29,8 @@ struct NoteEditor: UIViewRepresentable {
     }
 
     func updateUIView(_ view: UITextView, context: Context) {
+        context.coordinator.parent = self
+        view.isEditable = editable
         if context.coordinator.editing { return }
         if view.text != text {
             let cursor = view.selectedRange
@@ -44,6 +48,7 @@ struct NoteEditor: UIViewRepresentable {
         init(_ parent: NoteEditor) { self.parent = parent }
 
         func textViewDidChange(_ textView: UITextView) {
+            guard parent.editable else { return }
             editing = true
             let edited = textView.text ?? ""
             parent.onEdit(shown, edited)
@@ -63,6 +68,7 @@ import AppKit
 
 struct NoteEditor: NSViewRepresentable {
     @Binding var text: String
+    var editable = true
     var onEdit: (String, String) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -75,7 +81,7 @@ struct NoteEditor: NSViewRepresentable {
         scroll.drawsBackground = false
         let view = NSTextView()
         view.isRichText = false
-        view.isEditable = true
+        view.isEditable = editable
         view.isSelectable = true
         view.font = NSFont.preferredFont(forTextStyle: .body)
         view.delegate = context.coordinator
@@ -97,6 +103,8 @@ struct NoteEditor: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let view = scroll.documentView as? NSTextView else { return }
+        context.coordinator.parent = self
+        view.isEditable = editable
         if context.coordinator.editing { return }
         if view.string != text {
             let cursor = view.selectedRange()
@@ -114,7 +122,7 @@ struct NoteEditor: NSViewRepresentable {
         init(_ parent: NoteEditor) { self.parent = parent }
 
         func textDidChange(_ notification: Notification) {
-            guard let view = notification.object as? NSTextView else { return }
+            guard parent.editable, let view = notification.object as? NSTextView else { return }
             editing = true
             let edited = view.string
             parent.onEdit(shown, edited)
@@ -134,17 +142,35 @@ struct NoteEditor: NSViewRepresentable {
 func mapCursor(_ range: NSRange, from old: String, to new: String) -> NSRange {
     let oldText = old as NSString
     let newText = new as NSString
-    let cursor = range.location
-    let oldCount = oldText.length
-    let newCount = newText.length
+    let start = mapIndex(range.location, from: oldText, to: newText)
+    let end = mapIndex(range.location + range.length, from: oldText, to: newText)
+    let location = min(max(0, start), newText.length)
+    let limit = min(max(location, end), newText.length)
+    return NSRange(location: location, length: limit - location)
+}
+
+/// Maps one end of the selection through a single remote edit. An edit that ends before the index shifts it.
+/// An edit that starts at the index leaves it where it is, so the caret stays in front of remote text that landed there.
+private func mapIndex(_ index: Int, from old: NSString, to new: NSString) -> Int {
+    let oldCount = old.length
+    let newCount = new.length
+    let clamped = min(max(index, 0), oldCount)
     var prefix = 0
-    let limit = min(cursor, min(oldCount, newCount))
-    while prefix < limit && oldText.character(at: prefix) == newText.character(at: prefix) {
+    let prefixLimit = min(oldCount, newCount)
+    while prefix < prefixLimit && old.character(at: prefix) == new.character(at: prefix) {
         prefix += 1
     }
-    if prefix >= cursor {
-        return NSRange(location: min(cursor, newCount), length: 0)
+    var suffix = 0
+    while suffix < oldCount - prefix && suffix < newCount - prefix
+        && old.character(at: oldCount - 1 - suffix) == new.character(at: newCount - 1 - suffix) {
+        suffix += 1
     }
-    let moved = cursor + (newCount - oldCount)
-    return NSRange(location: min(newCount, max(0, moved)), length: 0)
+    let changeEnd = oldCount - suffix
+    if changeEnd < clamped {
+        return min(newCount, max(0, clamped + (newCount - oldCount)))
+    }
+    if clamped <= prefix {
+        return min(clamped, newCount)
+    }
+    return min(newCount, prefix + (newCount - suffix - prefix))
 }

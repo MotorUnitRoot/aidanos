@@ -39,6 +39,7 @@ public final class AidanSession: SyncHost {
     public let vault: URL
     public var onText: ((String, String) -> Void)?
     public var onConnection: ((ConnectionState) -> Void)?
+    public var onError: ((String) -> Void)?
     private var storedConnection: ConnectionState = .disconnected
     public var connection: ConnectionState {
         lock.lock()
@@ -69,6 +70,9 @@ public final class AidanSession: SyncHost {
     private var opening = false
 
     public init(vault: URL) throws {
+        if Self.looksLikeRelayFolder(vault) {
+            throw AidanError.io("This folder belongs to the relay. The app keeps its notes in a different folder.")
+        }
         self.vault = vault
         try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: vault.appendingPathComponent(".aidanos"), withIntermediateDirectories: true)
@@ -115,6 +119,9 @@ public final class AidanSession: SyncHost {
         lock.lock()
         defer { lock.unlock() }
         _ = try ensureNoteLocked(notePath, initial: readIfPresent(notePath) ?? "")
+        if let note = notes[notePath], note.rebuilt {
+            return readIfPresent(notePath) ?? ""
+        }
         if var note = notes[notePath], !note.rebuilt, !conflicted(notePath) {
             if let file = readIfPresent(notePath), writtenHash[notePath] != Self.sha(file) {
                 let current = try note.doc.text(obj: note.textObj)
@@ -138,6 +145,9 @@ public final class AidanSession: SyncHost {
         lock.lock()
         defer { lock.unlock() }
         guard let note = notes[notePath] else { return "" }
+        if note.rebuilt {
+            return readIfPresent(notePath) ?? ""
+        }
         return try note.doc.text(obj: note.textObj)
     }
 
@@ -168,18 +178,41 @@ public final class AidanSession: SyncHost {
             lock.unlock()
         }
         let note = try ensureNoteLocked(notePath, initial: readIfPresent(notePath) ?? "")
+        if conflicted(notePath) {
+            return base
+        }
         let edit = TextDiff.diff(from: base, to: edited)
+        // A rebuilt note's file is the text on screen, including keystrokes typed while waiting.
+        // The sync document is a blank root during a connection attempt, so those keystrokes
+        // stay in the file and are what we compare when the relay answers.
+        if note.rebuilt {
+            let file = readIfPresent(notePath) ?? ""
+            let merged = TextDiff.apply(edit, to: file)
+            if merged != file {
+                try writeFileLocked(notePath, merged)
+            }
+            if !note.awaitingRelay {
+                var updated = note
+                try setText(&updated, merged)
+                notes[notePath] = updated
+                try save(updated)
+                trackAndKick(updated.docId)
+            }
+            return merged
+        }
         if edit.delete != 0 || !edit.insert.isEmpty {
             let current = try note.doc.text(obj: note.textObj)
+            let remote = TextDiff.diff(from: base, to: current)
+            let mapped = TextDiff.map(edit, through: remote)
             let count = Array(current.unicodeScalars).count
-            let start = min(max(edit.start, 0), count)
-            let delete = min(edit.delete, count - start)
-            if delete != 0 || !edit.insert.isEmpty {
+            let start = min(max(mapped.start, 0), count)
+            let delete = min(mapped.delete, count - start)
+            if delete != 0 || !mapped.insert.isEmpty {
                 try note.doc.spliceText(
                     obj: note.textObj,
                     start: UInt64(start),
                     delete: Int64(delete),
-                    value: edit.insert.isEmpty ? nil : edit.insert
+                    value: mapped.insert.isEmpty ? nil : mapped.insert
                 )
                 note.doc.commitWith()
             }
@@ -187,9 +220,7 @@ public final class AidanSession: SyncHost {
         notes[notePath] = note
         try save(note)
         let merged = try note.doc.text(obj: note.textObj)
-        if !note.rebuilt && !conflicted(notePath) {
-            try writeFileLocked(notePath, merged)
-        }
+        try writeFileLocked(notePath, merged)
         trackAndKick(note.docId)
         return merged
     }
@@ -216,6 +247,7 @@ public final class AidanSession: SyncHost {
         var note = try ensureNoteLocked(notePath, initial: chosen)
         try setText(&note, chosen)
         note.rebuilt = false
+        note.awaitingRelay = false
         notes[notePath] = note
         try save(note)
         try writeFileLocked(notePath, chosen)
@@ -237,12 +269,11 @@ public final class AidanSession: SyncHost {
         do {
             try openLink(url: relayURL, token: trimmed)
         } catch AidanError.authRejected {
-            lock.lock()
-            desiredURL = nil
-            desiredToken = nil
-            storedConnection = .disconnected
-            lock.unlock()
+            stopTrying()
             throw AidanError.authRejected
+        } catch AidanError.payloadTooLarge {
+            stopTrying()
+            throw AidanError.payloadTooLarge
         } catch {
             setConnection(.reconnecting)
             scheduleReconnect()
@@ -317,7 +348,9 @@ public final class AidanSession: SyncHost {
                 if !after.isEmpty && after != mine {
                     // The relay's text is here. Compare now, before a later
                     // idle check can upload the file and erase the difference.
+                    // `mine` is the file, including anything typed while waiting.
                     note.rebuilt = false
+                    note.awaitingRelay = false
                     notes[path] = note
                     openConflicts.removeAll { $0.path == path }
                     openConflicts.append(NoteConflict(
@@ -367,6 +400,7 @@ public final class AidanSession: SyncHost {
         let caughtUp = peerCaughtUp(slot, note)
         if remote == mine && (caughtUp || !remote.isEmpty) {
             note.rebuilt = false
+            note.awaitingRelay = false
             notes[path] = note
             openConflicts.removeAll { $0.path == path }
             try? save(note)
@@ -394,6 +428,7 @@ public final class AidanSession: SyncHost {
             }
             try? setText(&note, mine)
             note.rebuilt = false
+            note.awaitingRelay = false
             notes[path] = note
             try? save(note)
             try? writeFileLocked(path, mine)
@@ -410,6 +445,7 @@ public final class AidanSession: SyncHost {
             reason: Self.rebuildConflictReason
         )
         note.rebuilt = false
+        note.awaitingRelay = false
         notes[path] = note
         openConflicts.removeAll { $0.path == path }
         openConflicts.append(conflict)
@@ -422,6 +458,21 @@ public final class AidanSession: SyncHost {
         DispatchQueue.global().async { [weak self] in
             self?.handleDrop()
         }
+    }
+
+    func linkFailed(_ error: Error) {
+        guard Self.isTerminal(error) else {
+            linkClosed()
+            return
+        }
+        lock.lock()
+        desiredURL = nil
+        desiredToken = nil
+        reconnectWork?.cancel()
+        let callback = onError
+        lock.unlock()
+        setConnection(.disconnected)
+        callback?(String(describing: error))
     }
 
     private func openLink(url: String, token: String) throws {
@@ -442,6 +493,7 @@ public final class AidanSession: SyncHost {
                     let fresh = try AidanSession.makeDocument(docId: note.docId, kind: "note", actor: deviceActor)
                     note.doc = fresh.0
                     note.textObj = fresh.1!
+                    note.awaitingRelay = true
                     notes[path] = note
                 }
                 slots[note.docId] = SyncSlot()
@@ -451,6 +503,7 @@ public final class AidanSession: SyncHost {
             }
             try saveMeta()
         } catch {
+            restoreAwaitingLocked()
             opening = false
             lock.unlock()
             throw error
@@ -471,8 +524,59 @@ public final class AidanSession: SyncHost {
             setConnection(.connected)
         } catch {
             next.close()
+            lock.lock()
+            restoreAwaitingLocked()
+            lock.unlock()
             throw error
         }
+    }
+
+    /// A note that is rebuilt from the file keeps that file, including keystrokes, when a connection attempt fails.
+    private func restoreAwaitingLocked() {
+        for path in Array(notes.keys) {
+            guard var note = notes[path], note.awaitingRelay else { continue }
+            let file = readIfPresent(path) ?? ""
+            if let made = try? Self.makeDocument(docId: note.docId, kind: "note", actor: deviceActor), let textObj = made.1 {
+                note.doc = made.0
+                note.textObj = textObj
+            }
+            try? setText(&note, file)
+            note.awaitingRelay = false
+            notes[path] = note
+            try? save(note)
+        }
+    }
+
+    private func stopTrying() {
+        lock.lock()
+        desiredURL = nil
+        desiredToken = nil
+        reconnectWork?.cancel()
+        storedConnection = .disconnected
+        lock.unlock()
+    }
+
+    private static func isTerminal(_ error: Error) -> Bool {
+        if case AidanError.payloadTooLarge = error { return true }
+        if case AidanError.authRejected = error { return true }
+        return false
+    }
+
+    /// The relay's note folder and its data folder are not an app vault.
+    private static func looksLikeRelayFolder(_ vault: URL) -> Bool {
+        let manager = FileManager.default
+        if manager.fileExists(atPath: vault.appendingPathComponent(".aidanos/relay-folder").path) {
+            return true
+        }
+        if manager.fileExists(atPath: vault.appendingPathComponent("relay-folder").path) {
+            return true
+        }
+        var isDirectory: ObjCBool = false
+        let nested = vault.appendingPathComponent(".aidanos/relay").path
+        if manager.fileExists(atPath: nested, isDirectory: &isDirectory), isDirectory.boolValue {
+            return true
+        }
+        return false
     }
 
     private func handleDrop() {
@@ -517,6 +621,13 @@ public final class AidanSession: SyncHost {
             desiredToken = nil
             lock.unlock()
             setConnection(.disconnected)
+        } catch AidanError.payloadTooLarge {
+            stopTrying()
+            setConnection(.disconnected)
+            lock.lock()
+            let callback = onError
+            lock.unlock()
+            callback?(String(describing: AidanError.payloadTooLarge))
         } catch {
             scheduleReconnect()
         }
@@ -878,6 +989,7 @@ private struct NoteState {
     var doc: Document
     var textObj: ObjId
     var rebuilt: Bool
+    var awaitingRelay = false
 }
 
 private struct MetaFile: Codable {

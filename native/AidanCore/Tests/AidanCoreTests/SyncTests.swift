@@ -221,6 +221,179 @@ final class SyncTests: XCTestCase {
         reader.disconnect()
     }
 
+    func testRebuiltTypingSurvivesFailedConnections() throws {
+        let path = "notes/rebuilt-offline.md"
+        let (vault, session) = try rebuiltSession(path: path, text: "Hello")
+        defer { session.disconnect() }
+        let fileURL = vault.appendingPathComponent(path)
+        for attempt in 1...3 {
+            let typed = "Hello" + String(repeating: "!", count: attempt)
+            let stall = try StallServer()
+            let finished = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                try? session.connect(relayURL: stall.url, token: testToken)
+                finished.signal()
+            }
+            XCTAssertTrue(try waitUntil(seconds: 3) {
+                session.connection == .connecting || session.connection == .reconnecting
+            })
+            Thread.sleep(forTimeInterval: 0.2)
+            let shown = try session.text(path)
+            let merged = try session.applyEdit(path, from: shown, to: typed)
+            XCTAssertEqual(merged, typed)
+            stall.stop()
+            XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+            XCTAssertEqual(try session.text(path), typed)
+            XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), typed)
+        }
+    }
+
+    func testRebuiltTypingBeforeRelayAnswers() throws {
+        let relay = try TestRelay.start()
+        defer { relay.stop() }
+        let path = "notes/rebuilt-typing-\(UUID().uuidString).md"
+        let author = try AidanSession(vault: try temporaryVault())
+        try author.connect(relayURL: relay.url, token: relay.token)
+        try author.replace(path, with: "from the relay")
+        let witness = try AidanSession(vault: try temporaryVault())
+        try witness.connect(relayURL: relay.url, token: relay.token)
+        let arrived = try waitUntil(seconds: 20) { (try? witness.text(path)) == "from the relay" }
+        XCTAssertTrue(arrived)
+        if !arrived { return }
+        witness.disconnect()
+        author.disconnect()
+
+        let (vault, reader) = try rebuiltSession(path: path, text: "Hello")
+        defer { reader.disconnect() }
+        let fileURL = vault.appendingPathComponent(path)
+        let stall = try StallServer()
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            try? reader.connect(relayURL: stall.url, token: testToken)
+            finished.signal()
+        }
+        XCTAssertTrue(try waitUntil(seconds: 3) {
+            reader.connection == .connecting || reader.connection == .reconnecting
+        })
+        Thread.sleep(forTimeInterval: 0.2)
+        let typed = try reader.applyEdit(path, from: try reader.text(path), to: "Hello!")
+        XCTAssertEqual(typed, "Hello!")
+        stall.stop()
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(try reader.text(path), "Hello!")
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "Hello!")
+
+        try reader.connect(relayURL: relay.url, token: relay.token)
+        let raised = try waitUntil(seconds: 20) {
+            guard let conflict = reader.conflicts().first(where: { $0.path == path }) else { return false }
+            return conflict.mine == "Hello!" && conflict.theirs == "from the relay"
+        }
+        XCTAssertTrue(raised)
+        let conflict = reader.conflicts().first { $0.path == path }
+        XCTAssertEqual(conflict?.mine, "Hello!")
+        XCTAssertEqual(conflict?.theirs, "from the relay")
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "Hello!")
+        let text = try reader.text(path)
+        XCTAssertTrue(text == "Hello!" || text == "from the relay")
+    }
+
+    func testTypingWhileConflictChoiceIsIgnored() throws {
+        let relay = try TestRelay.start()
+        defer { relay.stop() }
+        let path = "notes/conflict-typing-\(UUID().uuidString).md"
+        let author = try AidanSession(vault: try temporaryVault())
+        try author.connect(relayURL: relay.url, token: relay.token)
+        try author.replace(path, with: "from the relay")
+        let witness = try AidanSession(vault: try temporaryVault())
+        try witness.connect(relayURL: relay.url, token: relay.token)
+        let arrived = try waitUntil(seconds: 20) { (try? witness.text(path)) == "from the relay" }
+        XCTAssertTrue(arrived)
+        if !arrived { return }
+        witness.disconnect()
+        author.disconnect()
+
+        let fileVault = try temporaryVault()
+        let fileURL = fileVault.appendingPathComponent(path)
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "from the file".write(to: fileURL, atomically: true, encoding: .utf8)
+        let reader = try AidanSession(vault: fileVault)
+        defer { reader.disconnect() }
+        try reader.connect(relayURL: relay.url, token: relay.token)
+        let raised = try waitUntil(seconds: 20) {
+            guard let conflict = reader.conflicts().first(where: { $0.path == path }) else { return false }
+            return conflict.mine == "from the file" && conflict.theirs == "from the relay"
+        }
+        XCTAssertTrue(raised)
+        if !raised { return }
+        let shown = try reader.text(path)
+        let afterKey = try reader.applyEdit(path, from: shown, to: shown + "!")
+        XCTAssertEqual(afterKey, shown)
+        XCTAssertEqual(try reader.text(path), shown)
+        let typedFile = try reader.applyEdit(path, from: "from the file", to: "from the file!")
+        XCTAssertEqual(typedFile, "from the file")
+        XCTAssertEqual(try reader.text(path), shown)
+        let conflict = reader.conflicts().first { $0.path == path }
+        XCTAssertEqual(conflict?.mine, "from the file")
+        XCTAssertEqual(conflict?.theirs, "from the relay")
+        XCTAssertEqual(
+            ConflictDraft.bothVersions(mine: conflict?.mine ?? "", theirs: conflict?.theirs ?? ""),
+            "from the file\nfrom the relay"
+        )
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "from the file")
+        try reader.resolve(path, choice: .keepMine)
+        XCTAssertEqual(try reader.text(path), "from the file")
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "from the file")
+    }
+
+    func testInsertMapsThroughRemoteTextBeforeCursor() throws {
+        let vault = try temporaryVault()
+        let session = try AidanSession(vault: vault)
+        let path = "notes/cursor-insert.md"
+        try session.replace(path, with: "Hello")
+        try session.replace(path, with: "XHello")
+        let merged = try session.applyEdit(path, from: "Hello", to: "Hello!")
+        XCTAssertEqual(merged, "XHello!")
+        XCTAssertEqual(try String(contentsOf: vault.appendingPathComponent(path), encoding: .utf8), "XHello!")
+    }
+
+    func testDeleteMapsThroughRemoteTextBeforeCursor() throws {
+        let vault = try temporaryVault()
+        let session = try AidanSession(vault: vault)
+        let path = "notes/cursor-delete.md"
+        try session.replace(path, with: "Hello")
+        try session.replace(path, with: "XHello")
+        let merged = try session.applyEdit(path, from: "Hello", to: "Hell")
+        XCTAssertEqual(merged, "XHell")
+        XCTAssertEqual(try String(contentsOf: vault.appendingPathComponent(path), encoding: .utf8), "XHell")
+    }
+
+    func testOversizedCloseDoesNotRetry() throws {
+        let closer = try ClosingServer(code: 1009, reason: "Max payload size exceeded")
+        defer { closer.stop() }
+        let session = try AidanSession(vault: try temporaryVault())
+        session.reconnectPause = 0.2
+        defer { session.disconnect() }
+        XCTAssertThrowsError(try session.connect(relayURL: closer.url, token: testToken)) { error in
+            XCTAssertEqual(error as? AidanError, .payloadTooLarge)
+        }
+        Thread.sleep(forTimeInterval: 0.7)
+        XCTAssertEqual(session.connection, .disconnected)
+        XCTAssertEqual(closer.accepts, 1)
+    }
+
+    func testAppRefusesTheRelayFolder() throws {
+        let vault = try temporaryVault()
+        try FileManager.default.createDirectory(at: vault.appendingPathComponent(".aidanos"), withIntermediateDirectories: true)
+        try Data("relay\n".utf8).write(to: vault.appendingPathComponent(".aidanos/relay-folder"))
+        XCTAssertThrowsError(try AidanSession(vault: vault))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: vault.appendingPathComponent(".aidanos/actor").path))
+
+        let data = try temporaryVault()
+        try Data("relay\n".utf8).write(to: data.appendingPathComponent("relay-folder"))
+        XCTAssertThrowsError(try AidanSession(vault: data))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: data.appendingPathComponent(".aidanos/actor").path))
+    }
+
     func testCrashBetweenHistoryAndFileDoesNotDuplicate() throws {
         let vault = try temporaryVault()
         let path = "notes/crash.md"
@@ -318,6 +491,18 @@ final class SyncTests: XCTestCase {
         XCTAssertNoThrow(try session.connect(relayURL: relay.url, token: relay.token))
         session.disconnect()
     }
+}
+
+private func rebuiltSession(path: String, text: String) throws -> (URL, AidanSession) {
+    let vault = try temporaryVault()
+    do {
+        let first = try AidanSession(vault: vault)
+        try first.replace(path, with: text)
+    }
+    try FileManager.default.removeItem(at: vault.appendingPathComponent(".aidanos"))
+    let again = try AidanSession(vault: vault)
+    again.reconnectPause = 60
+    return (vault, again)
 }
 
 private func temporaryVault() throws -> URL {
@@ -490,4 +675,215 @@ private final class TestRelay {
         throw AidanError.io("The test relay did not start. \(running.errorText)")
     }
     #endif
+}
+
+private func closeSocket(_ fd: Int32) -> Int32 {
+    #if canImport(Darwin)
+    _ = Darwin.shutdown(fd, Int32(SHUT_RDWR))
+    return Darwin.close(fd)
+    #else
+    _ = Glibc.shutdown(fd, Int32(SHUT_RDWR))
+    return Glibc.close(fd)
+    #endif
+}
+
+private func readSocket(_ fd: Int32, _ buffer: UnsafeMutableRawPointer, _ count: Int) -> Int {
+    #if canImport(Darwin)
+    return Darwin.read(fd, buffer, count)
+    #else
+    return Glibc.read(fd, buffer, count)
+    #endif
+}
+
+private func writeSocket(_ fd: Int32, _ buffer: UnsafeRawPointer, _ count: Int) -> Int {
+    #if canImport(Darwin)
+    return Darwin.write(fd, buffer, count)
+    #else
+    return Glibc.write(fd, buffer, count)
+    #endif
+}
+
+private func acceptSocket(_ fd: Int32) -> Int32 {
+    if fd < 0 { return -1 }
+    #if canImport(Darwin)
+    return Darwin.accept(fd, nil, nil)
+    #else
+    return Glibc.accept(fd, nil, nil)
+    #endif
+}
+
+private enum Loopback {
+    static func listen() throws -> (fd: Int32, port: Int) {
+        #if canImport(Darwin)
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        #else
+        let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        #endif
+        if fd < 0 { throw AidanError.io("Could not open a test socket.") }
+        var yes: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if bound != 0 {
+            _ = closeSocket(fd)
+            throw AidanError.io("Could not bind a test socket.")
+        }
+        #if canImport(Darwin)
+        let listening = Darwin.listen(fd, 16)
+        #else
+        let listening = Glibc.listen(fd, 16)
+        #endif
+        if listening != 0 {
+            _ = closeSocket(fd)
+            throw AidanError.io("Could not listen on a test socket.")
+        }
+        var got = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &got) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fd, $0, &length)
+            }
+        }
+        if named != 0 {
+            _ = closeSocket(fd)
+            throw AidanError.io("Could not read the test port.")
+        }
+        return (fd, Int(UInt16(bigEndian: got.sin_port)))
+    }
+}
+
+/// Accepts a connection and never answers, so a rebuilt note stays in the waiting state.
+private final class StallServer {
+    let url: String
+    private var listenFd: Int32
+    private let lock = NSLock()
+    private var clients: [Int32] = []
+
+    init() throws {
+        let bound = try Loopback.listen()
+        listenFd = bound.fd
+        url = "ws://127.0.0.1:\(bound.port)"
+        DispatchQueue.global().async { [self] in
+            self.acceptLoop()
+        }
+    }
+
+    private func acceptLoop() {
+        while true {
+            let client = acceptSocket(listenFd)
+            if client < 0 { return }
+            lock.lock()
+            clients.append(client)
+            lock.unlock()
+            DispatchQueue.global().async {
+                var buffer = [UInt8](repeating: 0, count: 1024)
+                while true {
+                    let count = buffer.withUnsafeMutableBytes { raw -> Int in
+                        guard let base = raw.baseAddress else { return 0 }
+                        return readSocket(client, base, raw.count)
+                    }
+                    if count <= 0 { return }
+                }
+            }
+        }
+    }
+
+    func stop() {
+        lock.lock()
+        let open = clients
+        clients = []
+        let listen = listenFd
+        listenFd = -1
+        lock.unlock()
+        for fd in open { _ = closeSocket(fd) }
+        if listen >= 0 { _ = closeSocket(listen) }
+    }
+}
+
+/// Completes the WebSocket handshake and then closes with a payload error.
+private final class ClosingServer {
+    let url: String
+    private let code: Int
+    private let reason: String
+    private var listenFd: Int32
+    private let lock = NSLock()
+    private var accepted = 0
+
+    init(code: Int, reason: String) throws {
+        self.code = code
+        self.reason = reason
+        let bound = try Loopback.listen()
+        listenFd = bound.fd
+        url = "ws://127.0.0.1:\(bound.port)"
+        DispatchQueue.global().async { [self] in
+            self.acceptLoop()
+        }
+    }
+
+    var accepts: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return accepted
+    }
+
+    private func acceptLoop() {
+        while true {
+            let client = acceptSocket(listenFd)
+            if client < 0 { return }
+            lock.lock()
+            accepted += 1
+            lock.unlock()
+            reply(client)
+            _ = closeSocket(client)
+        }
+    }
+
+    private func reply(_ fd: Int32) {
+        var header = Data()
+        var buffer = [UInt8](repeating: 0, count: 1)
+        while header.count < 8192 {
+            let count = buffer.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return readSocket(fd, base, 1)
+            }
+            if count <= 0 { return }
+            header.append(buffer[0])
+            if header.suffix(4).elementsEqual(Data([13, 10, 13, 10])) { break }
+        }
+        let switching = Data("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n".utf8)
+        guard writeAll(fd, switching) else { return }
+        let reasonBytes = Array(reason.utf8)
+        var frame = [UInt8](arrayLiteral: 0x88, UInt8(2 + reasonBytes.count), UInt8((code >> 8) & 0xFF), UInt8(code & 0xFF))
+        frame.append(contentsOf: reasonBytes)
+        _ = writeAll(fd, Data(frame))
+    }
+
+    func stop() {
+        lock.lock()
+        let listen = listenFd
+        listenFd = -1
+        lock.unlock()
+        if listen >= 0 { _ = closeSocket(listen) }
+    }
+
+    private func writeAll(_ fd: Int32, _ data: Data) -> Bool {
+        let bytes = [UInt8](data)
+        var offset = 0
+        while offset < bytes.count {
+            let wrote = bytes.withUnsafeBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return writeSocket(fd, base + offset, bytes.count - offset)
+            }
+            if wrote <= 0 { return false }
+            offset += wrote
+        }
+        return true
+    }
 }

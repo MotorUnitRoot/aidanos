@@ -46,24 +46,28 @@ The relay is the small program both apps talk to. It keeps its own folder of not
 
    If you are already inside the project folder, `cd relay` is enough.
 
-3. Pick a token. It is a password you make up, at least 32 characters. An example shape is `correct-horse-battery-staple-and-more`. Do not put it in the command itself.
+3. Pick a token. It is a password you make up, at least 32 characters, several words you can remember. Do not put it in any command. Terminal saves commands in its history, so a token typed into a command would stay on this Mac.
 
-4. Either of these is fine. The first keeps the token in a file only your user can read:
+4. Create the token file in a text editor, so the token is never on a command line.
+
+   Open TextEdit. If a formatting toolbar is showing, choose Format → Make Plain Text. Type the token and nothing else. Save the file as `aidanos-relay-token` in your home folder. Then, in Terminal:
 
    ```
-   umask 077
-   printf '%s' 'paste-your-long-token-here' > "$HOME/.aidanos-relay-token"
-   chmod 600 "$HOME/.aidanos-relay-token"
-   export AIDANOS_RELAY_TOKEN_FILE="$HOME/.aidanos-relay-token"
+   chmod 600 "$HOME/aidanos-relay-token"
+   export AIDANOS_RELAY_TOKEN_FILE="$HOME/aidanos-relay-token"
    node src/server.mjs
    ```
 
-   Or, for one window only, type the token into the environment and start the relay:
+   Or, for one window only, let Terminal ask for the token without showing it and without writing it into history:
 
    ```
-   export AIDANOS_RELAY_TOKEN='paste-your-long-token-here'
+   read -s -p "Relay token: " AIDANOS_RELAY_TOKEN
+   echo
+   export AIDANOS_RELAY_TOKEN
    node src/server.mjs
    ```
+
+   `read -s` hides what you type. The `export` line names the variable and does not contain the token. The file from TextEdit is only readable by your user after `chmod 600`.
 
 5. Leave that window open. It prints `LISTENING 127.0.0.1 3750`. Nothing else on the network can connect. That is the normal way to run it. It does not print the token.
 
@@ -92,7 +96,7 @@ A paid developer account is not required for this test. A free Apple ID installs
 7. On the Mac, stop the relay if it is still running (click the Terminal window and press Control-C), and start it so the phone can see it. Use the same token file or environment variable as before, and add `--lan`:
 
    ```
-   export AIDANOS_RELAY_TOKEN_FILE="$HOME/.aidanos-relay-token"
+   export AIDANOS_RELAY_TOKEN_FILE="$HOME/aidanos-relay-token"
    node src/server.mjs --lan
    ```
 

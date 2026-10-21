@@ -2,46 +2,75 @@
 /**
  * Independent review gate.
  *
- * A comment counts only when all of these are true:
- * - It begins with "Independent review: PASS" or "Independent review: BLOCK".
- * - PASS is followed by the pull request's current head SHA.
- * - The comment has not been edited.
- * - The author has write, maintain, or admin on this repo, from
- *   GET /repos/{owner}/{repo}/collaborators/{username}/permission.
+ * A PASS counts only when all of these are true:
+ * - The first line is exactly "Independent review: PASS <sha>".
+ * - The sha is the pull request's current head. Later lines are not read.
+ * - The comment has not been edited, so a later edit cannot retarget the SHA.
+ * - The author is the motorunit-aidanos-bots GitHub App: login
+ *   motorunit-aidanos-bots[bot] and type Bot. When performed_via_github_app
+ *   is present, its id is 5413571. A user account does not count.
  *
- * The pull_request job only reads. The issue_comment job, whose workflow
- * file comes from the default branch, publishes the check and commit status
- * on the PR head.
+ * A BLOCK from that App stays in force until a newer qualifying PASS
+ * for this head SHA. Each edit-history entry is the full text after that
+ * edit. The most restrictive version wins, so editing a BLOCK into a PASS
+ * does not lift it. The text from before the first edit is not in the
+ * history, so an edited comment stays a BLOCK. If the history cannot be
+ * read, the comment stays a BLOCK. A deleted BLOCK stays a BLOCK.
+ * A bare BLOCK names no SHA and applies to the current head.
+ *
+ * This file only reads. It does not post independent-review/approved.
+ * The binding status is posted by independent-review-post.yml, which runs
+ * tools/post-review-verdict.mjs after the independent-review environment
+ * is approved. No GitHub App key is read here.
  */
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const PASS_PREFIX = "Independent review: PASS";
 const BLOCK_PREFIX = "Independent review: BLOCK";
-const REVIEW_ROLES = new Set(["admin", "maintain", "write"]);
 
-export function commentKind(body, headSha) {
-  const text = String(body || "")
+// The independent reviewer posts as this GitHub App. Change these together.
+export const REVIEW_APP_LOGIN = "motorunit-aidanos-bots[bot]";
+export const REVIEW_APP_ID = 5413571;
+
+export const STATUS_CONTEXT = "independent-review/approved";
+
+export function verdictLine(verdict, sha) {
+  const normalized = String(sha || "").toLowerCase();
+  if (verdict !== "PASS" && verdict !== "BLOCK") throw new Error("verdict must be PASS or BLOCK");
+  if (!/^[0-9a-f]{40}$/.test(normalized)) throw new Error("reviewed sha must be 40 hex characters");
+  return `Independent review: ${verdict} ${normalized}`;
+}
+
+function firstLine(body) {
+  return String(body || "")
     .replace(/^\uFEFF/, "")
     .replace(/\r\n/g, "\n")
-    .trimStart();
+    .trimStart()
+    .split("\n", 1)[0]
+    .trim();
+}
+
+export function commentKind(body, headSha) {
   const sha = String(headSha || "").toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(sha)) return null;
-
-  if (/^Independent review: BLOCK(?:\s|$)/.test(text)) {
-    const named = text.match(/\b[0-9a-f]{40}\b/gi) || [];
-    if (named.length === 0) return "block";
-    if (named.some((item) => item.toLowerCase() === sha)) return "block";
-    return null;
+  const line = firstLine(body);
+  const block = line.match(/^Independent review: BLOCK(?:\s+([0-9a-fA-F]{40}))?$/);
+  if (block) {
+    if (!block[1]) return "block";
+    return block[1].toLowerCase() === sha ? "block" : null;
   }
-
-  const pass = text.match(/^Independent review: PASS\s+([0-9a-fA-F]{40})\b/);
+  const pass = line.match(/^Independent review: PASS\s+([0-9a-fA-F]{40})$/);
   if (pass && pass[1].toLowerCase() === sha) return "pass";
   return null;
 }
 
-export function hasReviewAccess(record) {
-  if (!record || typeof record !== "object") return false;
-  return REVIEW_ROLES.has(record.permission) || REVIEW_ROLES.has(record.role_name);
+export function isReviewBot(comment) {
+  const user = comment && comment.user;
+  if (!user || user.login !== REVIEW_APP_LOGIN || user.type !== "Bot") return false;
+  const via = comment.performed_via_github_app;
+  if (via == null) return true;
+  return Number(via.id) === REVIEW_APP_ID;
 }
 
 export function commentWasEdited(comment) {
@@ -49,28 +78,143 @@ export function commentWasEdited(comment) {
   return comment.created_at !== comment.updated_at;
 }
 
+export function eventPublishesStatus() {
+  return false;
+}
+
+export const COMMENT_PAGE_LIMIT = 1000;
+
+export function commentListComplete(page, batchLength) {
+  if (page > COMMENT_PAGE_LIMIT) throw new Error("comment list is too long");
+  return batchLength < 100;
+}
+
+function timeMs(value) {
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function normalizeNewlines(text) {
+  return String(text ?? "").replace(/\r\n/g, "\n");
+}
+
+export function looksLikeUnifiedDiff(text) {
+  const line = String(text || "").replace(/^\uFEFF/, "").split(/\r?\n/, 1)[0];
+  return line.startsWith("@@ ") || line.startsWith("diff --git ") || line.startsWith("--- ");
+}
+
+export function versionsFromEdits(currentBody, createdAt, edits) {
+  const ordered = [...(edits || [])].sort((a, b) => String(a && a.editedAt).localeCompare(String(b && b.editedAt)));
+  if (ordered.length === 0) throw new Error("edited comment has no edit history");
+  const versions = [];
+  for (const edit of ordered) {
+    if (!edit || edit.deletedAt || typeof edit.diff !== "string" || looksLikeUnifiedDiff(edit.diff)) {
+      throw new Error("edit history is incomplete");
+    }
+    versions.push({ body: edit.diff, at: edit.editedAt || createdAt });
+  }
+  const newest = versions[versions.length - 1].body;
+  if (normalizeNewlines(newest) !== normalizeNewlines(currentBody)) {
+    throw new Error("newest edit does not match the current comment");
+  }
+  return versions;
+}
+
+function versionsFor(comment) {
+  if (comment && Array.isArray(comment.versions) && comment.versions.length) return comment.versions;
+  return [{ body: comment && comment.body, at: comment && comment.created_at }];
+}
+
+export function attachEditHistory(comment, edits) {
+  const list = edits || [];
+  if (list.length === 0) throw new Error("edited comment has no edit history");
+  comment.versions = versionsFromEdits(comment.body, comment.created_at, list);
+  // userContentEdits stores the text after each edit, not the original.
+  comment.originalUnseen = true;
+  return comment;
+}
+
+function latestTime(times) {
+  let best = null;
+  let bestMs = null;
+  for (const at of times) {
+    const ms = timeMs(at);
+    if (ms === null) continue;
+    if (bestMs === null || ms > bestMs) {
+      bestMs = ms;
+      best = at;
+    }
+  }
+  return best || times[0] || null;
+}
+
+export function blockEffectiveAt(comment, headSha) {
+  if (!comment) return null;
+  // Missing history cannot prove the comment was never a BLOCK.
+  if (comment.historyUnavailable) {
+    return comment.deletedBlockAt || comment.updated_at || comment.created_at || "9999-12-31T23:59:59Z";
+  }
+  const times = [];
+  for (const version of versionsFor(comment)) {
+    if (commentKind(version.body, headSha) !== "block") continue;
+    times.push(version.at || "9999-12-31T23:59:59Z");
+  }
+  if (comment.originalUnseen) times.push(comment.created_at || "9999-12-31T23:59:59Z");
+  if (comment.deletedBlockAt && times.length) times.push(comment.deletedBlockAt);
+  if (!times.length) return null;
+  return latestTime(times);
+}
+
+export function deletedCommentForcesBlock(comment, headSha) {
+  if (!isReviewBot(comment)) return false;
+  if (comment.historyUnavailable || comment.originalUnseen || commentWasEdited(comment)) return true;
+  return commentKind(comment.body, headSha) === "block";
+}
+
+export function isQualifyingPass(comment, headSha) {
+  if (!comment || comment.historyUnavailable || commentWasEdited(comment)) return false;
+  if (!comment.created_at || timeMs(comment.created_at) === null) return false;
+  const versions = versionsFor(comment);
+  if (versions.length !== 1) return false;
+  return commentKind(comment.body, headSha) === "pass" && commentKind(versions[0].body, headSha) === "pass";
+}
+
 export function classifyReview(comments, headSha) {
   const pass = [];
   const block = [];
   for (const comment of comments || []) {
-    const kind = commentKind(comment && comment.body, headSha);
-    if (kind === "pass") pass.push(comment);
-    else if (kind === "block") block.push(comment);
+    if (!isReviewBot(comment)) continue;
+    const blockAt = blockEffectiveAt(comment, headSha);
+    if (blockAt) {
+      block.push({ ...comment, blockAt });
+      continue;
+    }
+    if (isQualifyingPass(comment, headSha)) pass.push(comment);
   }
-  if (block.length) {
-    return { conclusion: "failure", reason: "block", pass, block };
+  const inForce = block.filter((item) => {
+    const blockedMs = timeMs(item.blockAt);
+    if (blockedMs === null) return true;
+    return !pass.some((itemPass) => {
+      const passMs = timeMs(itemPass.created_at);
+      return passMs !== null && passMs > blockedMs;
+    });
+  });
+  if (inForce.length) {
+    return { conclusion: "failure", reason: "block", pass, block: inForce };
   }
   if (pass.length) {
-    return { conclusion: "success", reason: "pass", pass, block };
+    return { conclusion: "success", reason: "pass", pass, block: inForce };
   }
-  return { conclusion: "failure", reason: "missing", pass, block };
+  return { conclusion: "failure", reason: "missing", pass, block: inForce };
 }
 
 export function summaryFor(result, headSha) {
   const lines = [
     `Head SHA: \`${headSha}\`.`,
     "",
-    "Only an unedited comment from an author with write, maintain, or admin access counts.",
+    `Only an unedited PASS from ${REVIEW_APP_LOGIN} counts.`,
+    "A BLOCK stays in force until a newer PASS for this SHA. Editing or deleting a BLOCK does not lift it.",
+    `The binding result is the commit status \`${STATUS_CONTEXT}\`, posted by the App outside Actions.`,
   ];
   if (result.reason === "pass") {
     const ids = result.pass.map((comment) => comment.id).filter(Boolean).join(", ");
@@ -79,19 +223,32 @@ export function summaryFor(result, headSha) {
   }
   if (result.reason === "block") {
     const ids = result.block.map((comment) => comment.id).filter(Boolean).join(", ");
-    lines.splice(1, 0, `BLOCK comment${result.block.length === 1 ? "" : "s"}: ${ids || "(no id)"}. A BLOCK for this SHA fails the check even if a PASS is also present. A BLOCK that names no SHA applies to the current head.`);
+    lines.splice(
+      1,
+      0,
+      `BLOCK comment${result.block.length === 1 ? "" : "s"}: ${ids || "(no id)"}. A newer unedited PASS for this SHA is required.`,
+    );
     return lines.join("\n");
   }
-  lines.splice(
-    1,
-    0,
-    `No unedited comment from a write, maintain, or admin author begins with \`${PASS_PREFIX} ${headSha}\`.`,
-  );
+  lines.splice(1, 0, `No qualifying \`${PASS_PREFIX} ${headSha}\` from ${REVIEW_APP_LOGIN}.`);
   return lines.join("\n");
 }
 
 function assert(cond, message) {
   if (!cond) throw new Error(message);
+}
+
+function reviewComment(id, body, at, extra) {
+  return {
+    id,
+    body,
+    created_at: at,
+    updated_at: at,
+    versions: [{ body, at }],
+    user: { login: REVIEW_APP_LOGIN, type: "Bot" },
+    performed_via_github_app: { id: REVIEW_APP_ID },
+    ...extra,
+  };
 }
 
 export function selfTest() {
@@ -100,7 +257,7 @@ export function selfTest() {
   const cases = [
     ["exact pass", `Independent review: PASS ${sha}`, sha, "pass"],
     ["leading space and note", `  Independent review: PASS ${sha}\nlooks good`, sha, "pass"],
-    ["sha on next line", `Independent review: PASS\n${sha}`, sha, "pass"],
+    ["sha on next line", `Independent review: PASS\n${sha}`, sha, null],
     ["uppercase hex", `Independent review: PASS ${sha.toUpperCase()}`, sha, "pass"],
     ["other sha", `Independent review: PASS ${other}`, sha, null],
     ["not at the start", `Note: Independent review: PASS ${sha}`, sha, null],
@@ -116,55 +273,232 @@ export function selfTest() {
     assert(got === want, `${name}: got ${got}, want ${want}`);
   }
 
-  assert(hasReviewAccess({ permission: "admin", role_name: "admin" }), "admin");
-  assert(hasReviewAccess({ permission: "write", role_name: "write" }), "write");
-  assert(hasReviewAccess({ permission: "write", role_name: "maintain" }), "maintain maps to write");
-  assert(hasReviewAccess({ permission: "maintain", role_name: "maintain" }), "maintain");
-  assert(!hasReviewAccess({ permission: "read", role_name: "read" }), "read");
-  assert(!hasReviewAccess({ permission: "read", role_name: "triage" }), "triage");
-  assert(!hasReviewAccess({ permission: "none", role_name: "" }), "none");
-  assert(!hasReviewAccess(null), "missing record");
+  assert(REVIEW_APP_LOGIN === "motorunit-aidanos-bots[bot]", "app login");
+  assert(REVIEW_APP_ID === 5413571, "app id");
+  assert(isReviewBot(reviewComment(1, "x", "2026-10-18T00:00:00Z")), "app bot");
+  assert(
+    isReviewBot({ user: { login: REVIEW_APP_LOGIN, type: "Bot" }, performed_via_github_app: null }),
+    "app id is optional when the field is absent",
+  );
+  assert(
+    !isReviewBot({
+      user: { login: "MotorUnitRoot", type: "User" },
+      performed_via_github_app: null,
+    }),
+    "user account is not the app",
+  );
+  assert(
+    !isReviewBot({
+      user: { login: REVIEW_APP_LOGIN, type: "User" },
+      performed_via_github_app: { id: REVIEW_APP_ID },
+    }),
+    "look-alike login without type Bot",
+  );
+  assert(
+    !isReviewBot({
+      user: { login: REVIEW_APP_LOGIN, type: "Bot" },
+      performed_via_github_app: { id: 1 },
+    }),
+    "different app id",
+  );
 
   const stamp = "2026-10-18T00:00:00Z";
   assert(!commentWasEdited({ created_at: stamp, updated_at: stamp }), "unedited");
   assert(!commentWasEdited({ body: "no timestamps" }), "timestamps absent");
   assert(commentWasEdited({ created_at: stamp, updated_at: "2026-10-18T00:00:01Z" }), "edited");
+  assert(!eventPublishesStatus(), "actions does not publish the status");
+  assert(commentListComplete(1, 100) === false, "full page continues");
+  assert(commentListComplete(2, 3) === true, "short page ends");
+  let tooLong = false;
+  try {
+    commentListComplete(COMMENT_PAGE_LIMIT + 1, 100);
+  } catch {
+    tooLong = true;
+  }
+  assert(tooLong, "comment paging fails closed past the last page");
+  assert(STATUS_CONTEXT === "independent-review/approved", "status context");
 
-  const pass = classifyReview([{ id: 1, body: `${PASS_PREFIX} ${sha}` }], sha);
-  assert(pass.conclusion === "success" && pass.reason === "pass", "pass class");
+  const t0 = "2026-10-18T00:00:00Z";
+  const t1 = "2026-10-18T00:00:01Z";
+  const t2 = "2026-10-18T00:00:02Z";
+  const t3 = "2026-10-18T00:00:03Z";
 
-  const missing = classifyReview([{ id: 2, body: `see ${sha}` }], sha);
+  const pass = classifyReview([reviewComment(1, `${PASS_PREFIX} ${sha}`, t0)], sha);
+  assert(pass.conclusion === "success" && pass.reason === "pass", "app bot pass for this sha");
+
+  const missing = classifyReview([reviewComment(2, `see ${sha}`, t0)], sha);
   assert(missing.conclusion === "failure" && missing.reason === "missing", "sha mention is not a review");
 
   const blocked = classifyReview(
-    [
-      { id: 3, body: `${PASS_PREFIX} ${sha}` },
-      { id: 4, body: `${BLOCK_PREFIX} ${sha}` },
-    ],
+    [reviewComment(3, `${PASS_PREFIX} ${sha}`, t0), reviewComment(4, `${BLOCK_PREFIX} ${sha}`, t0)],
     sha,
   );
-  assert(blocked.conclusion === "failure" && blocked.reason === "block", "block wins");
+  assert(blocked.conclusion === "failure" && blocked.reason === "block", "block wins at the same time");
 
   const staleBlock = classifyReview(
-    [
-      { id: 5, body: `${BLOCK_PREFIX} ${other}` },
-      { id: 6, body: `${PASS_PREFIX} ${sha}` },
-    ],
+    [reviewComment(5, `${BLOCK_PREFIX} ${other}`, t0), reviewComment(6, `${PASS_PREFIX} ${sha}`, t1)],
     sha,
   );
   assert(staleBlock.conclusion === "success", "block for another sha does not fail this head");
 
   const bare = classifyReview(
+    [reviewComment(7, BLOCK_PREFIX, t0), reviewComment(8, `${PASS_PREFIX} ${sha}`, t0)],
+    sha,
+  );
+  assert(bare.conclusion === "failure" && bare.reason === "block", "bare block still fails a pass that is not newer");
+
+  const lifted = classifyReview(
+    [reviewComment(9, `${BLOCK_PREFIX} ${sha}`, t0), reviewComment(10, `${PASS_PREFIX} ${sha}`, t1)],
+    sha,
+  );
+  assert(lifted.conclusion === "success" && lifted.reason === "pass", "newer pass lifts an older block");
+
+  const editedBlock = reviewComment(11, `${PASS_PREFIX} ${sha}`, t0, {
+    updated_at: t1,
+    versions: [
+      { body: `${BLOCK_PREFIX} ${sha}`, at: t0 },
+      { body: `${PASS_PREFIX} ${sha}`, at: t1 },
+    ],
+  });
+  const editKeepsBlock = classifyReview([editedBlock], sha);
+  assert(editKeepsBlock.conclusion === "failure" && editKeepsBlock.reason === "block", "editing a block into a pass does not lift it");
+
+  const editThenNewer = classifyReview([editedBlock, reviewComment(12, `${PASS_PREFIX} ${sha}`, t2)], sha);
+  assert(editThenNewer.conclusion === "success", "a newer pass lifts a block that was edited away");
+
+  const retarget = reviewComment(13, `${PASS_PREFIX} ${sha}`, t0, {
+    updated_at: t1,
+    versions: [
+      { body: `${PASS_PREFIX} ${other}`, at: t0 },
+      { body: `${PASS_PREFIX} ${sha}`, at: t1 },
+    ],
+  });
+  const retargeted = classifyReview([retarget], sha);
+  assert(retargeted.conclusion === "failure" && retargeted.reason === "missing", "an edited pass cannot name this sha");
+  const unseen = classifyReview(
+    [reviewComment(13, `${PASS_PREFIX} ${sha}`, t0, { updated_at: t1, originalUnseen: true })],
+    sha,
+  );
+  assert(unseen.conclusion === "failure" && unseen.reason === "block", "an unseen original stays a block");
+
+  const becameBlock = reviewComment(14, BLOCK_PREFIX, t0, {
+    updated_at: t2,
+    versions: [
+      { body: "thanks", at: t0 },
+      { body: BLOCK_PREFIX, at: t2 },
+    ],
+  });
+  const olderPass = classifyReview([reviewComment(15, `${PASS_PREFIX} ${sha}`, t1), becameBlock], sha);
+  assert(olderPass.conclusion === "failure" && olderPass.reason === "block", "a pass older than the blocking edit does not lift it");
+  const afterEdit = classifyReview([becameBlock, reviewComment(16, `${PASS_PREFIX} ${sha}`, t3)], sha);
+  assert(afterEdit.conclusion === "success", "a pass after the blocking edit lifts it");
+
+  const unknown = classifyReview(
     [
-      { id: 7, body: BLOCK_PREFIX },
-      { id: 8, body: `${PASS_PREFIX} ${sha}` },
+      reviewComment(17, "thanks", t0, {
+        updated_at: t1,
+        historyUnavailable: true,
+      }),
     ],
     sha,
   );
-  assert(bare.conclusion === "failure" && bare.reason === "block", "bare block still fails");
+  assert(unknown.conclusion === "failure" && unknown.reason === "block", "unreconstructed edit stays a block");
+  const humanPass = classifyReview(
+    [
+      reviewComment(19, `${PASS_PREFIX} ${sha}`, t0, {
+        user: { login: "MotorUnitRoot", type: "User" },
+        performed_via_github_app: null,
+      }),
+    ],
+    sha,
+  );
+  assert(humanPass.conclusion === "failure" && humanPass.reason === "missing", "a user PASS is ignored");
+  const lookalike = classifyReview(
+    [
+      reviewComment(20, `${PASS_PREFIX} ${sha}`, t0, {
+        user: { login: REVIEW_APP_LOGIN, type: "User" },
+        performed_via_github_app: { id: REVIEW_APP_ID },
+      }),
+    ],
+    sha,
+  );
+  assert(lookalike.conclusion === "failure" && lookalike.reason === "missing", "a look-alike login is ignored");
+  const appBlock = classifyReview(
+    [
+      reviewComment(21, `${BLOCK_PREFIX} ${sha}`, t0),
+      reviewComment(22, `${PASS_PREFIX} ${sha}`, t1, {
+        user: { login: "MotorUnitRoot", type: "User" },
+        performed_via_github_app: null,
+      }),
+    ],
+    sha,
+  );
+  assert(appBlock.conclusion === "failure" && appBlock.reason === "block", "an app BLOCK stays in force");
+  const plain = { id: 18, body: `${PASS_PREFIX} ${sha}`, created_at: t0, updated_at: t1 };
+  let missingHistory = false;
+  try {
+    attachEditHistory(plain, []);
+  } catch {
+    missingHistory = true;
+  }
+  assert(missingHistory, "edited comment with no history fails closed");
+
+  const below = `Independent review: BLOCK ${sha}\nalso see ${other}`;
+  assert(commentKind(below, sha) === "block", "another sha below does not hide a block");
+  const wrongFirst = `Independent review: BLOCK ${other}\n${sha}`;
+  assert(commentKind(wrongFirst, sha) === null, "the sha is read only from the first line");
+  const bareBelow = `Independent review: BLOCK\nsee ${other}`;
+  assert(commentKind(bareBelow, sha) === "block", "a bare block ignores a later sha");
+  assert(verdictLine("PASS", sha) === `${PASS_PREFIX} ${sha}`, "pass line");
+  assert(commentKind(verdictLine("BLOCK", sha), sha) === "block", "block line");
+
+  const deletedBlock = classifyReview(
+    [
+      reviewComment(23, `${PASS_PREFIX} ${sha}`, t1),
+      reviewComment(24, `${BLOCK_PREFIX} ${sha}`, t0, { deletedBlockAt: t2 }),
+    ],
+    sha,
+  );
+  assert(deletedBlock.reason === "block", "deleting a block keeps the commit blocked");
+  const deletedPass = reviewComment(25, `${PASS_PREFIX} ${sha}`, t0);
+  assert(!deletedCommentForcesBlock(deletedPass, sha), "a deleted pass is not a block");
+  assert(
+    deletedCommentForcesBlock(reviewComment(26, `${BLOCK_PREFIX} ${sha}`, t0), sha),
+    "a deleted block forces a block",
+  );
+
+  const fixtureUrl = new URL("./fixtures/user-content-edit.json", import.meta.url);
+  const fixture = JSON.parse(fs.readFileSync(fileURLToPath(fixtureUrl), "utf8"));
+  assert(fixture.edits[0].diff === fixture.body, "newest recorded edit is the full comment");
+  assert(fixture.edits[1].diff !== fixture.body, "older recorded edit is an earlier full comment");
+  assert(!looksLikeUnifiedDiff(fixture.edits[0].diff), "recorded edit is not a unified diff");
+  const recorded = versionsFromEdits(fixture.body, fixture.createdAt, fixture.edits);
+  assert(recorded[recorded.length - 1].body === fixture.body, "versions keep the full text");
+  assert(recorded[0].body === fixture.edits[1].diff, "older version is the earlier full text");
+  const recordedComment = reviewComment(27, fixture.body, fixture.createdAt, {
+    updated_at: fixture.updatedAt,
+  });
+  attachEditHistory(recordedComment, fixture.edits);
+  assert(recordedComment.originalUnseen === true, "the pre-edit text is unseen");
+  assert(classifyReview([recordedComment], sha).reason === "block", "unseen original fails closed");
+  let patchRejected = false;
+  try {
+    versionsFromEdits("b", t0, [{ editedAt: t1, diff: "@@ -1 +1 @@\n-a\n+b\n" }]);
+  } catch {
+    patchRejected = true;
+  }
+  assert(patchRejected, "a unified diff fails closed");
+  let threw = false;
+  try {
+    versionsFromEdits("b", t0, [{ editedAt: t1, diff: null, deletedAt: t2 }]);
+  } catch {
+    threw = true;
+  }
+  assert(threw, "deleted edit history fails closed");
 
   const text = summaryFor(pass, sha);
-  assert(text.includes(sha) && text.includes("write, maintain, or admin"), "summary");
+  assert(text.includes(sha) && text.includes(REVIEW_APP_LOGIN), "summary");
+  assert(text.includes(STATUS_CONTEXT), "summary names the status");
   console.log("independent-review self-test ok");
 }
 
@@ -195,98 +529,89 @@ async function gh(pathname, { method = "GET", body } = {}) {
   return JSON.parse(text);
 }
 
+async function ghGraphql(query, variables) {
+  const payload = await gh("/graphql", { method: "POST", body: { query, variables } });
+  if (payload.errors && payload.errors.length) {
+    throw new Error(payload.errors.map((error) => error.message).join("; "));
+  }
+  return payload.data;
+}
+
 async function listComments(owner, repo, number) {
   const comments = [];
-  for (let page = 1; page <= 20; page += 1) {
-    const batch = await gh(
-      `/repos/${owner}/${repo}/issues/${number}/comments?per_page=100&page=${page}`,
-    );
+  for (let page = 1; ; page += 1) {
+    const batch = await gh(`/repos/${owner}/${repo}/issues/${number}/comments?per_page=100&page=${page}`);
+    if (!Array.isArray(batch)) throw new Error("comment page is not a list");
     comments.push(...batch);
-    if (batch.length < 100) break;
+    if (commentListComplete(page, batch.length)) return comments;
   }
-  return comments;
 }
 
-async function permissionFor(owner, repo, login, cache) {
-  if (cache.has(login)) return cache.get(login);
-  let record = null;
-  try {
-    record = await gh(
-      `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`,
+async function listEdits(nodeId) {
+  const edits = [];
+  let cursor = null;
+  for (let page = 0; page < 10; page += 1) {
+    const data = await ghGraphql(
+      `query($id: ID!, $cursor: String) {
+        node(id: $id) {
+          ... on IssueComment {
+            userContentEdits(first: 100, after: $cursor) {
+              pageInfo { hasNextPage endCursor }
+              nodes { editedAt diff deletedAt }
+            }
+          }
+        }
+      }`,
+      { id: nodeId, cursor },
     );
-  } catch (error) {
-    console.log(`Permission lookup failed for ${login}: ${error.message}`);
-    record = null;
+    const connection = data && data.node && data.node.userContentEdits;
+    if (!connection) throw new Error("edit history is missing");
+    const nodes = connection.nodes || [];
+    if (
+      nodes.some(
+        (node) => !node || node.deletedAt || typeof node.diff !== "string" || looksLikeUnifiedDiff(node.diff),
+      )
+    ) {
+      throw new Error("edit history is incomplete");
+    }
+    edits.push(...nodes);
+    if (!connection.pageInfo || !connection.pageInfo.hasNextPage) return edits;
+    cursor = connection.pageInfo.endCursor;
   }
-  cache.set(login, record);
-  return record;
+  throw new Error("edit history is too long");
 }
 
-async function commentsFromReviewers(owner, repo, comments) {
-  const cache = new Map();
+async function commentsFromReviewers(comments) {
   const accepted = [];
   for (const comment of comments) {
     const login = comment && comment.user && comment.user.login;
+    if (!isReviewBot(comment)) {
+      const via = comment && comment.performed_via_github_app;
+      const viaId = via && via.id;
+      console.log(
+        `Ignoring comment ${comment && comment.id} from ${login || "unknown"} (${(comment && comment.user && comment.user.type) || "no type"}${viaId ? `, app ${viaId}` : ""}).`,
+      );
+      continue;
+    }
     if (commentWasEdited(comment)) {
-      console.log(`Ignoring edited comment ${comment.id || "?"} from ${login || "unknown"}.`);
-      continue;
-    }
-    if (!login) {
-      console.log(`Ignoring comment ${comment && comment.id} with no author.`);
-      continue;
-    }
-    const record = await permissionFor(owner, repo, login, cache);
-    const role = record && (record.role_name || record.permission);
-    if (!hasReviewAccess(record)) {
-      console.log(`Ignoring comment ${comment.id} from ${login} (${role || "no access"}).`);
-      continue;
+      try {
+        attachEditHistory(comment, await listEdits(comment.node_id));
+      } catch (error) {
+        console.log(`Could not reconstruct comment ${comment.id}: ${error.message}`);
+        comment.historyUnavailable = true;
+      }
+    } else {
+      comment.versions = [{ body: comment.body, at: comment.created_at }];
     }
     accepted.push(comment);
   }
   return accepted;
 }
 
-async function publishCheck(owner, repo, headSha, conclusion, summary) {
-  const server = process.env.GITHUB_SERVER_URL || "https://github.com";
-  const runId = process.env.GITHUB_RUN_ID;
-  const repository = process.env.GITHUB_REPOSITORY;
-  await gh(`/repos/${owner}/${repo}/check-runs`, {
-    method: "POST",
-    body: {
-      name: "independent-review",
-      head_sha: headSha,
-      status: "completed",
-      conclusion,
-      completed_at: new Date().toISOString(),
-      details_url: runId && repository ? `${server}/${repository}/actions/runs/${runId}` : undefined,
-      output: {
-        title: conclusion === "success" ? "Independent review passed" : "Independent review failed",
-        summary,
-      },
-    },
-  });
-}
-
-async function publishStatus(owner, repo, headSha, conclusion, summary) {
-  const server = process.env.GITHUB_SERVER_URL || "https://github.com";
-  const runId = process.env.GITHUB_RUN_ID;
-  const repository = process.env.GITHUB_REPOSITORY;
-  const description = summary.split("\n").find((line) => line.trim()) || "Independent review";
-  await gh(`/repos/${owner}/${repo}/statuses/${headSha}`, {
-    method: "POST",
-    body: {
-      state: conclusion === "success" ? "success" : "failure",
-      context: "independent-review",
-      description: description.slice(0, 140),
-      target_url: runId && repository ? `${server}/${repository}/actions/runs/${runId}` : undefined,
-    },
-  });
-}
-
 function writeStepSummary(summary) {
   const path = process.env.GITHUB_STEP_SUMMARY;
   if (!path) return;
-  fs.appendFileSync(path, summary + "\n");
+  fs.appendFileSync(path, `${summary}\n`);
 }
 
 async function main() {
@@ -300,11 +625,6 @@ async function main() {
   const [owner, repo] = String(process.env.GITHUB_REPOSITORY || "").split("/");
   if (!owner || !repo) throw new Error("GITHUB_REPOSITORY is required");
 
-  if (eventName === "issue_comment" && event.action === "edited") {
-    console.log("Ignoring an edited comment.");
-    return;
-  }
-
   if (eventName === "issue_comment" && !(event.issue && event.issue.pull_request)) {
     console.log("Not a pull request comment. Skipping.");
     return;
@@ -313,7 +633,7 @@ async function main() {
   let number;
   let headSha;
   let baseRef;
-  if (eventName === "pull_request") {
+  if (eventName === "pull_request" || eventName === "pull_request_target") {
     number = event.pull_request.number;
     headSha = event.pull_request.head.sha;
     baseRef = event.pull_request.base.ref;
@@ -332,20 +652,34 @@ async function main() {
     return;
   }
 
-  const comments = await commentsFromReviewers(owner, repo, await listComments(owner, repo, number));
+  const comments = await commentsFromReviewers(await listComments(owner, repo, number));
+  if (eventName === "issue_comment" && event.action === "deleted" && event.comment) {
+    const deleted = event.comment;
+    if (isReviewBot(deleted)) {
+      if (commentWasEdited(deleted)) {
+        try {
+          attachEditHistory(deleted, await listEdits(deleted.node_id));
+        } catch (error) {
+          console.log(`Could not reconstruct deleted comment ${deleted.id}: ${error.message}`);
+          deleted.historyUnavailable = true;
+        }
+      } else {
+        deleted.versions = [{ body: deleted.body, at: deleted.created_at }];
+      }
+      if (deletedCommentForcesBlock(deleted, headSha)) {
+        deleted.deletedBlockAt = new Date().toISOString();
+        comments.push(deleted);
+        console.log(`Deleted review comment ${deleted.id || "?"} stays in force.`);
+      }
+    }
+  }
   const result = classifyReview(comments, headSha);
   const summary = summaryFor(result, headSha);
   console.log(summary);
   writeStepSummary(summary);
 
-  if (eventName === "issue_comment") {
-    // This run uses the workflow on the default branch. Publish onto the PR
-    // head. Do not fail the default-branch commit when the review is missing.
-    await publishCheck(owner, repo, headSha, result.conclusion, summary);
-    await publishStatus(owner, repo, headSha, result.conclusion, summary);
-    return;
-  }
-
+  // No verdict yet is not a failure. Actions does not post the binding status.
+  if (result.reason === "missing") return;
   if (result.conclusion !== "success") process.exitCode = 1;
 }
 

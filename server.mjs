@@ -2214,7 +2214,7 @@ const server = http.createServer(async (req, res) => {
         if (e.code !== "ENOENT") throw e;
       }
       // A shared server's own earlier save is still a newer version.
-      // isSelfWrite only drops the watcher's echo of that save.
+      // The log watcher, not this check, ignores the echo of that save.
       if (
         exists &&
         Number.isFinite(clientMtime) &&

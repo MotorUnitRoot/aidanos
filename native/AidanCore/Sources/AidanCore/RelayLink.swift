@@ -365,8 +365,13 @@ private func encodeSync(type: String, sender: String, target: String, docId: Str
 private func connectTCP(host: String, port: UInt16) throws -> Int32 {
     var hints = addrinfo()
     hints.ai_family = AF_INET
+    #if canImport(Darwin)
+    hints.ai_socktype = SOCK_STREAM
+    hints.ai_protocol = IPPROTO_TCP
+    #else
     hints.ai_socktype = Int32(SOCK_STREAM.rawValue)
     hints.ai_protocol = Int32(IPPROTO_TCP)
+    #endif
     var info: UnsafeMutablePointer<addrinfo>?
     let result = host.withCString { hostPointer in
         String(port).withCString { portPointer in

@@ -74,6 +74,7 @@ jobs:
           -scheme AidanOS-macOS
           -destination platform=macOS
           CODE_SIGNING_ALLOWED=NO
+          CODE_SIGNING_REQUIRED=NO
       - name: Build the iPhone app
         run: >
           xcodebuild build
@@ -81,11 +82,12 @@ jobs:
           -scheme AidanOS-iOS
           -destination "generic/platform=iOS Simulator"
           CODE_SIGNING_ALLOWED=NO
+          CODE_SIGNING_REQUIRED=NO
       - name: AidanCore tests on the iOS simulator
         working-directory: native/AidanCore
         run: |
           set -euo pipefail
-          line=$(xcodebuild -scheme AidanCore -showdestinations 2>/dev/null | awk -F '[{}]' '/platform:iOS Simulator/ && /name:iPhone/ && $0 !~ /placeholder/ { print $2; exit }')
+          line=$(xcodebuild -scheme AidanCore -showdestinations 2>&1 | awk -F '[{}]' '/platform:iOS Simulator/ && /name:iPhone/ && $0 !~ /placeholder/ { print $2; exit }')
           echo "destination:${line}"
           test -n "$line"
-          xcodebuild test -scheme AidanCore -destination "$line" CODE_SIGNING_ALLOWED=NO
+          xcodebuild test -scheme AidanCore -destination "$line" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO

@@ -2,55 +2,85 @@
 
 This is the agreement for notes in AidanOS. The vault, a folder of ordinary markdown files, is the source of truth. Markdown is plain text with a few marks, such as `#` for a heading. The iPhone app, the Mac app, and the self-hosted relay keep those files in step, as the native sync design describes. The private git repository `aidanos-vault` is a backup of the markdown. That design and its try-it guide are in the open draft for native sync. This contract adds one document and leaves the apps, the relay, and the checks as they are.
 
-AidanOS is the memory, the rules, and the approval layer for the agents that work on Colby's day. The agents keep running where they already run. They read and write notes here, they follow the rules stored here, and they wait when a change needs his yes.
+AidanOS is the memory, the rules, and the approval layer for the agents that work on Colby's day. The agents keep running where they already run. They read and write notes here, they follow the rules stored here, and they wait when a change needs his yes. The rules the relay enforces live in the relay's configuration, on the relay machine, outside the vault. A note edit cannot change them. `aidanos/rules.md` is a reading copy the relay publishes from that configuration.
 
 ## Kinds of notes
 
-The web app already sorts paths. The note route, `PUT /api/file`, refuses anything under `log/`, `tasks/`, or `aidanos/`, and it answers `kernel path`. The season plan, `aidanos/active-horse.md`, is the one file under `aidanos/` that it will save. Day files are written only by the day route, `PUT /api/day`, at `log/YYYY-MM-DD.md`. Search skips a file named `TODAY.md` and skips the rest of `aidanos/`. The folder list hides `log`, `tasks`, and `aidanos`. The native relay writes only a relative `.md` path, and it refuses a hidden name, a `..` segment, an absolute path, and a symlink that leaves the vault. The relay will apply the folder rules below at the moment it accepts a write, and it will keep those refusals.
+The web app already sorts paths. The note route, `PUT /api/file`, refuses anything under `log/`, `tasks/`, or `aidanos/`, and it answers `kernel path`. The season plan, `aidanos/active-horse.md`, is the one file under `aidanos/` that it will save. Day files are written only by the day route, `PUT /api/day`, at `log/YYYY-MM-DD.md`. Search skips a file named `TODAY.md` and skips the rest of `aidanos/`. The folder list hides `log`, `tasks`, and `aidanos`. The native relay writes only a relative `.md` path, and it refuses a hidden name, a `..` segment, an absolute path, and a symlink that leaves the vault. Before it applies a path rule, it normalizes the path, as the enforcement section describes.
 
 | Kind | Path | Purpose | Who reads it |
 | --- | --- | --- | --- |
 | Season plan | `aidanos/active-horse.md` | This season: title, why, next steps, and what is waiting | Colby on Plan, and every agent before it acts |
-| Preferences | `aidanos/preferences.md` | How Colby wants the day handled | Agents, before they draft |
-| Team rules | `aidanos/rules.md` | Who may write what | The relay, and every agent |
+| Preferences | `aidanos/preferences.md` | How Colby wants the day handled | Agents, before they draft, and Colby |
+| Team rules | `aidanos/rules.md` | The reading copy of the rules | Agents and Colby. The relay does not obey this file |
 | Progress note | `progress/<slug>.md` | Where one task stopped, so the next session can continue | The next agent session, and Colby |
 | Day note | `log/YYYY-MM-DD.md` | The page for that date | Colby on Today, the week cards, and agents |
-| Agent log | `logs/YYYY-MM-DD.md` | A line added at the end, recording what an agent changed | Colby, and the next session |
+| Agent log | `agent-log/YYYY-MM-DD.md` | A line added at the end, recording what an agent changed | Colby, and the next session |
 | Week file | `aidanos/weeks/<Monday>.md` | Date, role, energy, mission eve, and summary for the week | The week cards on Today |
 | Process map | `maps/<name>.md`, except names starting `the-` | How a kind of work proceeds. Copy the file to take the work | Colby, and an agent doing that work |
 | Last-mile note | `maps/the-<name>.md` | The writing itself, such as the reply or the receipt | Colby |
 | Project note | any other folder, such as `family-room-to-office/*.md` | One job: answers, plan, map, today, and walk | Colby, and the agent on that job |
 | Ordinary note | `notes/<name>.md` | A captured thought that is not a day and not a job | Colby, and search |
 | Proposal | `proposals/YYYY-MM-DD-<slug>.md` | A change waiting for Colby | Today, and Colby |
-| Colby's own subjects | `colby/` | Pricing, contracts, clients, and public positions | Colby |
+| Colby's own subjects | `colby/` | Pricing, contracts, clients, and public positions | Colby. Agent keys are not sent these notes |
 
 `aidanos/skin.css` is his color and type. `family-room-to-office/plan.png` and `walk.png` are pictures he supplies. The relay writes markdown only, so it leaves those files alone. `tasks/` is locked and empty, and it stays unused, so the boxes in the notes remain the task list. The vault root `README.md` says the folder is the disk. Nothing uses the name `TODAY.md`, because search skips it. The hidden `.aidanos` folder is the edit-history cache. Git ignores it.
 
-Standing facts are the season plan, the preferences, and the team rules. A progress note repeats the plan's four parts, then adds the resume fields in the progress section. The plan says what this season is. A progress note says where one task stopped. Day notes live in `log/`. The agent diary lives in `logs/`, off the day route, which matches the web app's refusal to write `log/` from the note route. A project folder is any folder the table does not reserve. The family-room job shows the shape: answers that stand, marks on the drawing, stages, boxes for the day, and what a picture is allowed to claim. Wiki links connect them.
+Standing facts are the season plan, the preferences, and the team rules. A progress note repeats the plan's four parts, then adds the resume fields below. The plan says what this season is. A progress note says where one task stopped. Day notes live in `log/`. The agent diary lives in `agent-log/`, off the day route. A project folder is any folder the table does not reserve. The family-room job shows the shape: answers that stand, marks on the drawing, stages, boxes for the day, and what a picture is allowed to claim. Wiki links connect them.
 
 ## Who may write
 
-Colby alone writes a price, a contract, a client matter, or a public position, under `colby/`. He alone also writes preferences, the team rules, the week file, and the canonical maps in `maps/`. His key is the only key that can save those paths.
+Colby alone writes a price, a contract, a client matter, or a public position, under `colby/`. He alone also writes preferences, the week file, and the canonical maps in `maps/`. His device key is the only key that can save those paths. The reading copy of the rules is published by the relay. His key does not edit it to change what is enforced.
 
-An agent may write on its own when the change can be undone and needs no judgment, because the history can put the words back. On its own it may write a progress note, append a line to its log, create a draft in a project folder or under `notes/` or `maps/the-`, copy a process map into a job folder, tick or untick a box whose words are already written, and append a task line to today's day note. His sentences and the day's front matter stay as he left them. That front matter can hold the date, a role, an energy, mission eve, and a hard stop, and the paper hides it.
+An agent may write on its own when the change can be undone and needs no judgment, because the history can put the words back. On its own it may write a progress note, append a line to its log, create a draft in a project folder or under `notes/` or `maps/the-`, copy a process map into a job folder, and tick or untick a box whose words are already written. It may also append a line under a `## Suggested` heading at the end of today's day note. That line is a suggestion until he accepts it with his device key. The agent cannot write a task anywhere else on the day note, and it cannot change a suggestion after he has touched it.
 
-When a change cannot be undone, the agent prepares a proposal and Colby approves it. Sending, paying, signing, and publishing are that kind of act. The act stays where the agent already runs, and it waits for the yes. Deleting a note is decided the same way. History can restore the bytes, and dropping the work is still his call. Until the relay grows an explicit delete, the yes is the record and he removes the file.
+His sentences stay. An agent edit that deletes words his actor inserted, or words inserted by an edit made directly in the relay folder, is refused. Ticking a box may change the box mark only. The words of the line stay. An agent edit that leaves a note empty, or leaves only whitespace, is refused. The day's front matter stays as he left it. It can hold the date, a role, an energy, mission eve, and a hard stop, and the paper hides it.
 
-A judgment call is a proposal with options, and he picks. The season plan's title, why, and waiting list are judgments. Ticking a next step that is already written is one of the undoable changes above. An answer that stands, such as the family-room `answers.md`, is a judgment. A measurement or a claim about a room stays a draft until it has been checked against a source. A price, a contract term, a client commitment, or a public position stays his even when it would sit inside a day note. The agent may recommend it in a proposal. He writes the words.
+When a change cannot be undone, the agent prepares a proposal and he approves it. Sending, paying, signing, and publishing are that kind of act. The act stays where the agent already runs, and it waits for the yes. A price, a contract, a client, or a public position is never a recommendation. The proposal carries facts only, and he writes any words himself.
+
+A judgment call on any other subject is a proposal with options, and he picks. The season plan's title, why, and waiting list are judgments. Ticking a next step that is already written is one of the undoable changes above. An answer that stands, such as the family-room `answers.md`, is a judgment. A measurement or a claim about a room stays a draft until it has been checked against a source.
+
+## Delete and rename
+
+An agent cannot delete a note and cannot rename one. Both are proposals.
+
+A delete proposal names the path and the fingerprint of the text he would be deleting. On a yes, the relay removes that file and its index entry only when the live text still matches the fingerprint. The old history stays in the backup and in the edit cache until the cache is rebuilt. If the live text has changed, the relay does not delete. Today shows Keep mine and Take theirs. Keep mine leaves the file. Take theirs removes it.
+
+A rename proposal names the old path, the new path, and the fingerprint. On a yes, the relay creates the note at the new path and removes the old path, only when the live text still matches the fingerprint. The new path gets the document id from the fixed recipe for that path. The old history stays under the old id. A new path that normalizes into `colby/`, the rules file, preferences, the week file, or a canonical map is not moved by the relay. He moves those himself. If the live text has changed, Today shows Keep mine and Take theirs, and the relay does not rename until he chooses.
 
 ## Proposals
 
-A proposal is `proposals/YYYY-MM-DD-<slug>.md`. It waits in that folder while `status` is `waiting`. The relay accepts it from an agent key only when these front-matter fields are filled in: `status`, `target` (one note path), `target_hash` (a fingerprint of that file's text), `author` (the key's name), `created`, `source`, `source_date` (when the source was produced), `read_date` (when the agent read it), `verdict` (one line), `confidence` (`high`, `medium`, or `low`), and `stale_after`.
+A proposal is `proposals/YYYY-MM-DD-<slug>.md`. The relay accepts it from an agent key only when the fields below are filled in, then freezes it. After that freeze, an agent key cannot change the file. His device key cannot change it either, except the decision fields named below. The relay may set the status as the source ages, and it may record the apply actor after a yes. Nothing else changes.
 
-The body has a `## Figures` section. A figure is any number, date, price, size, or count the proposal relies on. Each figure is one line: the figure, the word `checked` or `claimed`, and the place in the source. Checked means the agent opened the source and the figure matches. Claimed means the source asserts it, or the agent inferred it, and it was not checked again. Any claimed figure keeps confidence at `medium` or `low`. A missing source or a missing date forces `low`. If there are no figures, the section says `None`. The verdict line carries the confidence, in this shape: `Verdict: leave the desk clearance unchecked until the drawing is measured. Confidence: low.`
+Front matter at creation:
 
-A judgment also has `## Options`. Each option has an id, a one-line label, and the full markdown that would replace the target. A proposal the relay should apply has `## Result`, the full text of the target after the change.
+- `status`, starting as `waiting`
+- `target`, the one note the change would touch
+- `target_hash`, a fingerprint of that file's text
+- `author`, the agent's name, matching its key
+- `created`
+- `source`, and `source_date` for when the source was produced
+- `read_date`, when the agent read it
+- `subject`, one of `ordinary`, `pricing`, `contract`, `client`, or `public`
+- `verdict`, exactly `go ahead`, `hold`, or `needs Colby`
+- `confidence`, `high`, `medium`, or `low`
+- `has_claimed_figures`, `yes` or `no`
+- `stale_after`, which the relay caps as described below
+- `body_hash`, which the relay writes when it freezes the file
 
-His yes or no is written into the same file, and only his key can write it. He sets `decision` to `yes` or `no`, `decided_by` to his name, and `decided_at` to the time. On a judgment he also sets `option` to the id he picked. Those fields, written by his key, are the approval. An agent key that sets them is refused.
+The fingerprint `body_hash` covers the proposal he will read. It leaves out the decision fields, the status, and the later apply record. His yes includes `seen_hash`, the fingerprint of the body he saw. The relay applies a yes only when `seen_hash` equals `body_hash`.
 
-On `no`, the target is unchanged and the file remains with status `no`. On `yes`, the relay applies `## Result`, or the chosen option's text, as one edit under his key, and it writes only `target`. It leaves the file to him when the target is under `colby/`, or is preferences, the rules, the week file, or a canonical map. A yes on a stale proposal changes nothing.
+The body has a `## Figures` section. A figure is any number, date, price, size, or count the proposal relies on. Each figure is one line: the figure, either `checked` or `claimed by` a name, and the place in the source. Checked means the agent opened the source and the figure matches. Claimed means that named person or agent asserted it and it was not checked again. The name is required on every claimed line. The relay sets `has_claimed_figures` from those lines. If the field disagrees with the lines, the relay refuses the message. Any claimed figure keeps confidence at `medium` or `low`. A missing source or a missing date forces `low`. If there are no figures, the section says `None` and `has_claimed_figures` is `no`.
 
-The relay marks a proposal `stale` when `stale_after` passes, or when the target's text no longer matches `target_hash`. It keeps the file and does not apply it. A stale file stays stale. The next attempt is a new proposal, with the evidence read again.
+`go ahead` asks him to apply a `## Result`, the full text of the target after the change. `hold` asks him to wait, and it has no result to apply. `needs Colby` puts the choice in his hands. A judgment of that kind may include `## Options`, each with an id, a one-line label, and the full text of that choice. The options do not mark a favorite.
+
+A proposal whose `subject` is `pricing`, `contract`, `client`, or `public`, and any proposal whose target is under `colby/`, is facts only. The verdict is `needs Colby`. There is no `## Result` and no `## Options`. The body is the source and the figures. The relay refuses any other shape. A yes on that proposal records that he saw the facts. He writes any change himself. The relay does not write `colby/` from a proposal. The agent is not sent the current text of a `colby/` note, so it does not include that text, and `target_hash` on those proposals is `unavailable`.
+
+The age of the source is `source_date`, not the moment the agent wrote the proposal. When the source is over 24 hours old, the relay sets `status` to `stale`. He can still decide a stale proposal until the source is 7 days old. When the source is over 7 days old, the relay sets `status` to `unusable`, and a yes does nothing. The agent may set `stale_after` earlier than 24 hours after `source_date`. If it sets a later time, or leaves the field empty, the relay stores 24 hours after `source_date`. It cannot push the 7-day line later. That line is fixed from `source_date`.
+
+His answer uses only these fields: `decision` (`yes` or `no`), `decided_by`, `decided_at`, `option` when there are options, `seen_hash`, and `apply_choice` (`keep` or `take`) when an apply is in conflict. An agent key that writes them is refused.
+
+On `no`, the target is unchanged. On `yes` for a `go ahead` or a chosen option, the relay writes under a fresh actor created for that proposal and records the actor on the proposal as `apply_actor`. That actor is the relay's, and a device or an agent that presents it is refused. The edit applied is the difference between the fingerprinted target and the result, not a blind replacement of the whole file. His typing outside that difference stays. If that difference overlaps an edit made after the fingerprint, the relay writes nothing and sets `apply` to `conflict`. Today then shows Keep mine and Take theirs. Keep mine leaves the live note. Take theirs replaces the live note with the result, written by the proposal's apply actor. Until he chooses, the note stays as it is.
 
 ## What Today needs
 
@@ -62,55 +92,102 @@ Today will gain a place for waiting proposals. The Designer owns how it looks. T
 | `title` | The first heading |
 | `author` | Who proposed it |
 | `target` | The note that would change |
-| `status` | `waiting`, `yes`, `no`, or `stale` |
-| `verdict` | The one-line verdict |
+| `subject` | `ordinary`, `pricing`, `contract`, `client`, or `public` |
+| `status` | `waiting`, `stale`, `unusable`, `yes`, or `no` |
+| `verdict` | `go ahead`, `hold`, or `needs Colby` |
 | `confidence` | `high`, `medium`, or `low` |
-| `created` | When it was written |
-| `stale_after` | When age makes it stale |
+| `has_claimed_figures` | `yes` or `no` |
+| `source_date` | When the source was produced |
+| `created` | When the proposal was written |
+| `stale_after` | When the source-age rule marks it stale |
 | `options` | Id and label of each option, or empty |
 | `decision` | Blank, `yes`, or `no` |
 | `option` | The id he picked, if he picked one |
+| `seen_hash` | The fingerprint his yes carried |
+| `apply` | Blank, `applied`, or `conflict` |
+| `apply_choice` | Blank, `keep`, or `take` |
 | `decided_at` | When he decided |
 
-Rows with status `waiting` are the ones waiting. The other statuses let a row leave that place when he answers or the proposal goes stale. Figures and the replacement text stay in the file, which opens in the paper Today already uses.
+Rows with status `waiting` or `stale` are the ones still open. `unusable` and `no` leave that place. A row with `apply: conflict` is the Keep mine / Take theirs choice. Figures and the result text stay in the file, which opens in the paper Today already uses.
+
+## Who may read
+
+A device key receives every note, including `colby/`. An agent key receives the other notes and does not receive `colby/`. Those paths are listed in a second index that the relay sends only with a device key. The shared index agents receive has no `colby/` path. A request from an agent key for a `colby/` document, or for that second index, is refused, including when the agent has computed the document id from the path.
+
+## Enforcement
+
+The relay in the native draft passes each sync change through and writes the markdown. It does not yet do the checks in this section. These checks are in place before any agent key is issued. The household secret, while it still exists, stays on his devices and is not an agent key.
+
+Agents write with the agent sync client. That client speaks the same sync protocol as the iPhone and the Mac. It holds one agent key and that key's actor id. It does not hold a device key, the household secret, or a path to the relay folder. The web app is not this client. An agent is never given an account, a mount, or a copy of the relay folder. The sync connection is its only door.
+
+A markdown edit made directly in the relay folder is an outside edit. The relay folds it in, as the native design already does for a file changed on that machine, and the edit counts as Colby's. It is signed by the relay's local actor, which has his write rights. An agent cannot produce that edit.
+
+On each sync message the relay does four things.
+
+1. It decodes every Automerge change in the message. A change is the binary record of edits. Decoding reads the actor on the change and applies the edits to a scratch copy of the note. The scratch copy is kept only when every check below passes.
+2. It matches each change's actor to the key that sent the message. The actor must be the one stored for that key. The relay's apply actor and its local-folder actor are never accepted from a device or an agent.
+3. It compares the note before the scratch edit with the note after, including the path index, against the write rules, the read rules, and the freeze rules.
+4. If any change in the message fails, the relay stores none of the message. It does not keep a passing prefix.
+
+Before the path check, the relay normalizes the path. It puts the characters into one Unicode form, folds capitals to lower case, and folds accented letters to the plain letter. `Colby/Café.md` and `colby/cafe.md` are one path. The stored name and the document id both use that form.
+
+The native design fixes the document id: a fingerprint of the sentence `aidanos.note.v1` plus the path, cut to the first 16 bytes, and written as base58check. This contract runs that recipe on the normalized path. Every path-and-id pair in every index is checked against the recipe. A pair that does not match fails the message. An agent cannot point `aidanos/rules.md`, or any `colby/` path, at a document the agent controls. The same check covers the private index.
+
+The scratch comparison also refuses an agent edit that empties a note, deletes his words, renames, deletes, writes a frozen proposal, sets a decision field, or writes a path the key may not write. A proposal whose claimed figures and `has_claimed_figures` disagree fails the message. A `stale_after` later than 24 hours after `source_date` is shortened by the relay rather than trusted.
+
+When his own device has already stored a change the relay refuses, that note's sync is stuck, because the device would send the same change again. Other notes keep syncing. The screen shows the path, a short reason, and two choices: put the note back, or keep the refused text aside. Putting it back drops the refused change and takes the relay's history for that note. Keeping it aside stores the text on the device only, outside the shared index, and puts the shared note back so sync can move. He chooses one before that note syncs again. The agent sync client does not offer the aside. It puts the note back to the relay's copy and reports the refusal to the agent.
 
 ## Keys
 
-Each device and each agent gets its own key from the relay. A device key is his hands on that iPhone or Mac and carries his write rights. An agent key carries only the rights in the section above. Today the relay checks one shared household secret in the connection header. The native design already requires a separate key per device before the relay is reachable from outside the house. Agent keys arrive at that same step. Until then the shared secret stays on his devices.
+Each device and each agent gets its own key from the relay. A device key is his hands on that iPhone or Mac and carries his write rights. An agent key carries only the agent rights above. The relay stores, with each key, a display name, a role of `colby` or `agent`, and one actor id. A phone or Mac keeps that actor in `.aidanos/actor`. The key stays in the relay's key list, outside the vault, readable only by his user, and it is not in the git backup. The history records the actor, not the key.
 
-The relay stores, with each key, a display name, a role of `colby` or `agent`, and an Automerge actor id. Automerge is the history library the native design uses. The actor id is the name on each edit, and a phone or Mac keeps its own in `.aidanos/actor`. The relay accepts a change only when that actor matches the key that opened the connection. The key itself stays in the relay's list and on the device. The history records the actor.
+He revokes a key by removing it from that list. The next connection that presents it is refused before any note moves. Older edits that were already accepted keep that actor's name.
 
-He revokes a key by removing it from that list. The list lives outside the vault, readable only by his user, and it is not part of the git backup. The next connection with a revoked key is refused before any note moves. Older edits keep that actor's name.
+If a device loses its sync cache, it rebuilds from the markdown, as the native design describes, and it does not upload that rebuilt history over the relay. It asks the relay for the shared history. When the texts differ, he gets Keep mine, Take theirs, and Edit. If the actor file is gone and the key remains, the relay tells the device the actor stored for that key, and the device writes it back. It does not invent a second actor for the same key. If an agent client loses its cache, it takes the relay's text for each note and reports that it did so. It does not upload a rebuilt document and it does not fork one.
 
-On each write the relay checks the role, the path, and the shape of the bytes. It allows an agent the appends, the checkbox ticks, the drafts, and the new proposals described above, and it refuses the rest. A confidence of `high` beside a figure marked `claimed` is refused. An agent setting `decision` is refused. Hidden paths, files that are not markdown, and links that leave the vault are refused for every key. The check looks at the path, the key, and the bytes.
+Rotation issues a new key and a new actor from the relay machine. The old key works until he revokes it. He revokes it after that device has sent every edit it still holds, or he accepts that anything still unsent will be refused. Recovery from a lost device key is a new device key issued on the relay machine. The notes already on the relay stay as they are. The lost key cannot be copied back off the phone.
+
+A revoked device's offline edits never join the shared notes. The connection is refused, so the message is not decoded into the relay. The device shows that the key is revoked and lists the notes with unsent edits. He can discard them, or keep them aside on that device. To put the words into the vault he copies them with a new device key, which is a new edit by him.
+
+## Cutover
+
+The web app syncs through `aidanos-vault`: it fast-forwards, then pushes. The relay, once its git URL is set, also pushes there, and it does not pull. Both must not push in the same stage. If they are already pointed at the same repository, the relay's git URL is turned off before any other step.
+
+Stage 1, now. The live copy is the web vault, the folder `AIDANOS_VAULT` or `vault/`. The backup writer is the web app. The relay's git push is off. There are no agent keys.
+
+Stage 2, devices on the relay. The live copy for the iPhone and the Mac is the relay vault. The live copy for the browser is still the web vault. They are different folders. The backup writer is still the web app. The relay does not push. There are still no agent keys.
+
+Stage 3, one live copy. He copies the web vault's markdown into the relay vault once. Those files are outside edits and count as his. From that copy onward, the live copy is the relay vault. He removes the web app's git URL so it stops pulling and pushing. He sets the relay's git URL to `aidanos-vault`. The backup writer is the relay only. Before any agent key exists, the web app's day route and note route stop accepting writes. Listening on this computer is not the control, because an agent on the same machine could still call those routes. With the routes off, the browser may read. He writes on his devices.
+
+Stage 4, agents. The relay issues agent keys. Agents write only through the agent sync client. They are not given the web app's address, its git token, a vault path, or the relay folder. The web write routes stay off.
 
 ## Progress notes
 
 When an agent stops, it writes `progress/<slug>.md` directly, so a fresh session can continue. The relay requires these headings, in order, and a heading may say `None`: Title, Why, Next steps, Waiting, Task, Outputs, Completed, Decisions, Open issues, and Next action. Task names the work. Outputs names the files or other results this session produced. Completed lists what is finished. Decisions lists choices already made and who made them. Open issues lists what is unresolved. Next action is one concrete step.
 
-A fresh session reads Next action, then Open issues, then Decisions, then the four plan sections. It also reads the season plan, the preferences, and the team rules before it changes anything else. One file is one task. A project note may link to it. Later work updates the same file, and the history keeps the earlier text.
+A fresh session reads Next action, then Open issues, then Decisions, then the four plan sections. It also reads the season plan, the preferences, and the reading copy of the rules before it changes anything else. One file is one task. A project note may link to it. Later work updates the same file, and the history keeps the earlier text.
 
 ## Undo and history
 
-Every accepted write is an Automerge edit kept by the relay, and by each device that still has its `.aidanos` cache. The actor names who made it. Undo is a new edit that restores the earlier words, and the original edit stays. He can undo an agent's edit with his device key. An agent can undo its own direct edit the same way.
+Every accepted write is an Automerge edit kept by the relay, and by each device that still has its `.aidanos` cache. The actor names who made it. Undo is a new edit that restores the earlier words. The original edit stays. He undoes an agent's edit with his device key. An agent undoes its own direct edit the same way, and that undo still may not delete his words or empty the note.
 
-If a device loses `.aidanos`, it rebuilds from the markdown and that device's keystroke history is gone. The relay's copy is the history that still names the actors. If that copy is lost too, the markdown remains.
+If he has typed on top of an agent edit, the undo does not wipe that typing. The relay removes the agent's words where his later edits do not touch the same stretch, and his later words stay. Where the two touch, the relay removes nothing. The screen shows Keep mine and Take theirs. Keep mine is the note as it stands. Take theirs removes the agent's words and keeps his later words beside that gap. He chooses before anything in the overlap is cut.
 
-The relay commits the markdown and pushes it to `aidanos-vault` on a timer. `.aidanos` stays out of the backup. The git step commits and pushes, and pull, rebase, and force-push stay off, so the backup's history is preserved. A failed push leaves sync working. `git log` and `git show` on a path show the snapshots that arrived. Putting an old snapshot back in the vault is an outside edit, and the relay folds that difference into the history. Devices catch up through the relay.
+If a device loses `.aidanos`, the keystroke history on that device is gone. The relay's copy is the history that still names the actors. If that copy is lost too, the markdown remains. The relay commits the markdown and pushes it to `aidanos-vault` on a timer once cutover says the relay is the backup writer. `.aidanos` stays out of the backup. That git step commits and pushes. Pull, rebase, and force-push stay off. A failed push leaves sync working. `git log` and `git show` on a path show the snapshots that arrived. Putting an old snapshot back in the vault is an outside edit, counted as his, and the relay folds the difference into the history. Devices catch up through the relay.
 
-The web app's backup can fast-forward, and it stops when two copies of one file diverge, so he can choose Keep mine, Take theirs, or Edit against the remote copy he was shown. That behavior stays. A correction in the agent log is a later line. His key can still change the file, and the history holds the earlier text.
+The web app's backup can fast-forward, and it stops when two copies of one file diverge, so he can choose Keep mine, Take theirs, or Edit. That behavior stays through stage 2. At stage 3 the web app stops syncing through git. A correction in the agent log is a later line. His key can still change the log. The history holds the earlier text.
 
 ## Open questions
 
-1. How soon is a proposal stale? Default: when the target changes, and also seven days after `created` if the target is untouched.
-2. May an agent append an already decided task to today, with no proposal? Default: yes. The task must already be on the plan, on a map, or in a note he wrote. The relay enforces the append. The "already decided" part is a rule for the agent, because the bytes do not show it.
-3. Where do pricing, contracts, clients, and public positions live? Default: under `colby/`, so a path check can protect them.
-4. Where do preferences and the team rules live, while the web note route still refuses `aidanos/` except the season plan? Default: `aidanos/preferences.md` and `aidanos/rules.md`. Agents read them. He edits them on disk until that route can save them. This contract leaves the route as it is.
-5. On a yes, does the relay apply `## Result`? Default: yes for an ordinary target, under his key. For `colby/`, preferences, rules, the week file, and a canonical map, the yes is only the record and he writes the file.
+1. When is a proposal stale? Default: the relay marks it stale when the source is over 24 hours old, and the proposal cannot be used when the source is over 7 days old. The agent may set an earlier expiry. The relay caps a later one at 24 hours after `source_date`.
+2. How does a task get onto today? Default: the agent appends it under `## Suggested` on the day note, and it counts only after he accepts it with his device key. The other shape is a one-tap proposal whose only change is that line. The agent does not write it into the day's task list.
+3. Where do pricing, contracts, clients, and public positions live? Default: under `colby/`, which agent keys are not sent.
+4. Where do the reading copies live, while the web note route still refuses `aidanos/` except the season plan? Default: `aidanos/preferences.md` and `aidanos/rules.md`. Agents may read both. He writes preferences with his device key once the relay is the live copy. The enforced rules stay in the relay configuration. This contract leaves the web route as it is until cutover turns its writes off.
+5. How is a yes applied? Default: the proposal is frozen at creation, and his yes carries the fingerprint of the body he saw. The relay writes the edit under its own actor linked to that proposal, and only the change measured from the fingerprinted target. If that change overlaps a later edit, he gets Keep mine / Take theirs and the relay does not apply it. For pricing, contracts, clients, and public positions the proposal is facts only, the verdict is `needs Colby`, and there is no result for the relay to write.
 6. One progress file per task, or per project? Default: one file per task, at `progress/<slug>.md`, with a wiki link from the project.
-7. May an agent use the shared household secret before per-key checks exist? Default: no. Agent writes wait for an agent key that the relay checks on the write.
+7. May an agent use the shared household secret before per-key checks exist? Default: no. Agent writes wait for an agent key, and for the checks in the enforcement section.
 8. Should a backup commit name the actor? Default: keep today's message until keys exist, then name the actor and the paths. The key itself stays out of the message.
 
 ## Out of scope
 
-Running the agents, choosing their models, and making a tool for a single task stay where those agents already run. AidanOS holds the shared notes, the rules about what they may change, and Colby's approvals. The look of Today, including the place for waiting proposals, belongs to the Designer.
+Running the agents, choosing their models, and making a tool for a single task stay where those agents already run. AidanOS holds the shared notes, the rules about what they may change, and Colby's approvals. The look of Today, including waiting proposals and the refusal choice, belongs to the Designer.

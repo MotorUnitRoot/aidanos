@@ -110,10 +110,12 @@ export async function startRelay(options = {}) {
     const adapter = new NodeWSServerAdapter(wss);
     httpServer.on("upgrade", (req, socket, head) => {
       if (!tokensMatch(token, bearerToken(req.headers.authorization))) {
+        logSafe(secrets, "rejected a sync connection");
         rejectUpgrade(socket);
         return;
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
+        logSafe(secrets, "accepted a sync connection");
         wss.emit("connection", ws, req);
       });
     });

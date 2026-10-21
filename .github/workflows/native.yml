@@ -57,12 +57,14 @@ jobs:
         working-directory: relay
         run: |
           node src/server.mjs --token aidanos-test-token --port 3757 \
-            --vault "$RUNNER_TEMP/aidanos-vault" --data "$RUNNER_TEMP/aidanos-data" &
+            --vault "$RUNNER_TEMP/aidanos-vault" --data "$RUNNER_TEMP/aidanos-data" \
+            > "$RUNNER_TEMP/relay-ios.log" 2>&1 &
           for _ in $(seq 1 50); do
             curl -sf http://127.0.0.1:3757/health && exit 0
             sleep 0.2
           done
           echo "relay did not start" >&2
+          cat "$RUNNER_TEMP/relay-ios.log" >&2 || true
           exit 1
       - name: AidanCore tests on macOS
         working-directory: native/AidanCore
@@ -91,4 +93,13 @@ jobs:
           sim_id=$(printf '%s' "$line" | sed -n 's/.*id:\([^,]*\).*/\1/p' | tr -d ' ')
           echo "simulator:${sim_id}"
           test -n "$sim_id"
+          curl -sf http://127.0.0.1:3757/health
+          set +e
           xcodebuild test -scheme AidanCore -destination "id=${sim_id}" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          status=$?
+          set -e
+          if [ "$status" != 0 ]; then
+            echo "---- relay log ----"
+            cat "$RUNNER_TEMP/relay-ios.log" || true
+          fi
+          exit "$status"

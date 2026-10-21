@@ -204,11 +204,20 @@ final class RelayLink {
     private func readHTTPHeader(fd: Int32) throws -> String {
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 1)
+        // The socket times out quickly so the sync loop can notice a dead relay.
+        // The first answer from a phone, or from the iOS simulator, can take longer
+        // than that one wait, so keep reading until the header arrives.
+        let deadline = Date().addingTimeInterval(8)
         while data.count < 8192 {
             let count = readFd(fd, &buffer, 1)
             if count == 0 { break }
             if count < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT {
+                    if Date() >= deadline {
+                        throw AidanError.protocol("The relay did not answer.")
+                    }
+                    continue
+                }
                 throw AidanError.protocol("The relay closed the connection.")
             }
             data.append(buffer[0])

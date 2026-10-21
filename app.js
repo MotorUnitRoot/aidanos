@@ -1022,6 +1022,7 @@ async function leaveCurrentPaper() {
     closePaperConflict();
     return;
   }
+  if (!state.dirty) return;
   await saveDay();
 }
 
@@ -1127,7 +1128,12 @@ async function openDay(date, { silent = false, force = false } = {}) {
       state.monthView = { year: viewed.getFullYear(), month: viewed.getMonth() + 1 };
     }
     await renderMonth();
-    if (leavingDay && !conflictOpen) putRawDay(oldDate, oldMd, oldMtime).catch(() => {});
+    if (leavingDay && !conflictOpen && state.dirty) {
+      clearTimeout(state.saveTimer);
+      state.saveTimer = null;
+      state.dirty = false;
+      putRawDay(oldDate, oldMd, oldMtime).catch(() => {});
+    }
     if (gen === state.openDayGen) await surfaceOpenGitConflict();
   } catch (e) {
     if (gen !== state.openDayGen) return;
@@ -1703,6 +1709,7 @@ function flushOnLeave() {
   flushActiveLineToDump();
   clearTimeout(state.saveTimer);
   state.saveTimer = null;
+  if (!state.dirty) return;
   if (!state.day && !isNoteDoc()) return;
   saveDay({ keepalive: true });
 }

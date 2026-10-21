@@ -2005,6 +2005,7 @@ function startLogWatch() {
         if (vaultGit.suppressWatch) return;
         if (err || !st) return;
         const mtime = Math.trunc(st.mtimeMs);
+        // Own writes are already announced by the save. Ignore the echo.
         if (isSelfWrite(date, mtime)) return;
         sendDayWatch(date, mtime);
       });
@@ -2212,11 +2213,12 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         if (e.code !== "ENOENT") throw e;
       }
+      // A shared server's own earlier save is still a newer version.
+      // isSelfWrite only drops the watcher's echo of that save.
       if (
         exists &&
         Number.isFinite(clientMtime) &&
-        diskMtime > clientMtime + MTIME_SKEW_MS &&
-        !isSelfWrite(date, diskMtime)
+        diskMtime > clientMtime + MTIME_SKEW_MS
       ) {
         const raw = await readFileSafe(logPath);
         return json(res, 409, {
@@ -2242,6 +2244,7 @@ const server = http.createServer(async (req, res) => {
         await atomicWriteDay(logPath, markdown);
         const mtime = await fileMtimeMs(logPath);
         lastSelfWrites.set(date, mtime);
+        sendDayWatch(date, mtime);
         if (dayResolve && dayConflict) bindChoice(dayRel, dayConflict);
         scheduleVaultSync(dayRel, Boolean(dayResolve && dayConflict));
         return json(res, 200, { ok: true, date, mtime, git: gitHint() });
@@ -2413,11 +2416,11 @@ const server = http.createServer(async (req, res) => {
         if (e.code !== "ENOENT") throw e;
       }
       const writeKey = "f:" + relPath;
+      // A shared server's own earlier save is still a newer version.
       if (
         exists &&
         Number.isFinite(clientMtime) &&
-        diskMtime > clientMtime + MTIME_SKEW_MS &&
-        !isSelfWrite(writeKey, diskMtime)
+        diskMtime > clientMtime + MTIME_SKEW_MS
       ) {
         const raw = await readFileSafe(abs);
         return json(res, 409, {
@@ -2442,6 +2445,7 @@ const server = http.createServer(async (req, res) => {
         await atomicWriteFile(abs, markdown);
         const mtime = await fileMtimeMs(abs);
         lastSelfWrites.set(writeKey, mtime);
+        sendWatch({ path: relPath, mtime });
         if (fileResolve && fileConflict) bindChoice(relPath, fileConflict);
         scheduleVaultSync(relPath, Boolean(fileResolve && fileConflict));
         return json(res, 200, { ok: true, path: relPath, mtime, git: gitHint() });

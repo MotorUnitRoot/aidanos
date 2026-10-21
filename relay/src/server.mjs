@@ -1,4 +1,5 @@
 import http from "node:http";
+import { writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { timingSafeEqual } from "node:crypto";
@@ -327,8 +328,7 @@ async function main() {
     process.exit(1);
   }
   for (const line of startupLines({ lan: args.lan || Boolean(args.lanAddress), port: relay.port, phone: relay.phone })) {
-    if (line.startsWith("WARNING")) console.error(line);
-    else console.log(line);
+    writeSync(line.startsWith("WARNING") ? 2 : 1, line + "\n");
   }
   const shutdown = () => {
     relay.close().then(() => process.exit(0));

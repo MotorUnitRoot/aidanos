@@ -324,10 +324,25 @@ private func waitUntil(seconds: TimeInterval, _ body: () throws -> Bool) throws 
 
 private final class RunningRelay {
     let process: Process
-    let collected: Collected
-    init(process: Process, collected: Collected) {
+    let log: URL
+    let output: FileHandle
+    init(process: Process, log: URL, output: FileHandle) {
         self.process = process
-        self.collected = collected
+        self.log = log
+        self.output = output
+    }
+
+    var port: Int? {
+        guard let text = try? String(contentsOf: log, encoding: .utf8) else { return nil }
+        for line in text.split(separator: "\n") where line.hasPrefix("LISTENING") {
+            let parts = line.split(separator: " ")
+            if parts.count >= 3, let value = Int(parts[2]) { return value }
+        }
+        return nil
+    }
+
+    var errorText: String {
+        (try? String(contentsOf: log, encoding: .utf8)) ?? ""
     }
 }
 
@@ -437,79 +452,26 @@ private final class TestRelay {
         environment["AIDANOS_VAULT_GIT_URL"] = ""
         process.environment = environment
         process.currentDirectoryURL = server.deletingLastPathComponent().deletingLastPathComponent()
-        let output = Pipe()
-        let errors = Pipe()
-        process.standardOutput = output
-        process.standardError = errors
-        let collected = Collected()
-        output.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if chunk.isEmpty { return }
-            collected.append(chunk)
-        }
-        errors.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if !chunk.isEmpty { collected.appendError(chunk) }
-        }
+        let log = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("aidanos-relay-\(UUID().uuidString).log")
+        FileManager.default.createFile(atPath: log.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: log)
+        process.standardOutput = handle
+        process.standardError = handle
         try process.run()
-        return RunningRelay(process: process, collected: collected)
+        return RunningRelay(process: process, log: log, output: handle)
     }
 
     private static func waitPort(_ running: RunningRelay) throws -> Int {
-        let ready = DispatchSemaphore(value: 0)
-        let timer = DispatchSource.makeTimerSource()
-        timer.schedule(deadline: .now(), repeating: .milliseconds(20))
-        timer.setEventHandler {
-            if running.collected.port != nil { ready.signal() }
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline {
+            if let port = running.port { return port }
+            if !running.process.isRunning { break }
+            Thread.sleep(forTimeInterval: 0.05)
         }
-        timer.resume()
-        let wait = ready.wait(timeout: .now() + 15)
-        timer.cancel()
-        guard wait == .success, let port = running.collected.port else {
-            running.process.terminate()
-            throw AidanError.io("The test relay did not start. \(running.collected.errorText)")
-        }
-        return port
+        if let port = running.port { return port }
+        running.process.terminate()
+        throw AidanError.io("The test relay did not start. \(running.errorText)")
     }
     #endif
-}
-
-private final class Collected {
-    private let lock = NSLock()
-    private var output = ""
-    private var errors = ""
-
-    var text: String {
-        lock.lock()
-        defer { lock.unlock() }
-        return output
-    }
-
-    var errorText: String {
-        lock.lock()
-        defer { lock.unlock() }
-        return errors
-    }
-
-    var port: Int? {
-        lock.lock()
-        defer { lock.unlock() }
-        for line in output.split(separator: "\n") where line.hasPrefix("LISTENING") {
-            let parts = line.split(separator: " ")
-            if parts.count >= 3, let value = Int(parts[2]) { return value }
-        }
-        return nil
-    }
-
-    func append(_ data: Data) {
-        lock.lock()
-        output += String(data: data, encoding: .utf8) ?? ""
-        lock.unlock()
-    }
-
-    func appendError(_ data: Data) {
-        lock.lock()
-        errors += String(data: data, encoding: .utf8) ?? ""
-        lock.unlock()
-    }
 }

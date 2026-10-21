@@ -21,6 +21,66 @@ function noteText(doc) {
   return null;
 }
 
+function changes(before, after) {
+  const oldText = String(before);
+  const newText = String(after);
+  let prefix = 0;
+  const limit = Math.min(oldText.length, newText.length);
+  while (prefix < limit && oldText[prefix] === newText[prefix]) prefix += 1;
+  let suffix = 0;
+  while (
+    suffix < oldText.length - prefix &&
+    suffix < newText.length - prefix &&
+    oldText[oldText.length - 1 - suffix] === newText[newText.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+  const oldMid = oldText.slice(prefix, oldText.length - suffix);
+  const newMid = newText.slice(prefix, newText.length - suffix);
+  if (!oldMid && !newMid) return [];
+  if (oldMid && newMid.includes(oldMid)) {
+    const at = newMid.indexOf(oldMid);
+    const edits = [];
+    if (at > 0) edits.push({ start: prefix, delete: 0, insert: newMid.slice(0, at) });
+    const tail = newMid.slice(at + oldMid.length);
+    if (tail) edits.push({ start: prefix + oldMid.length, delete: 0, insert: tail });
+    return edits;
+  }
+  if (newMid && oldMid.includes(newMid)) {
+    const at = oldMid.indexOf(newMid);
+    const edits = [];
+    if (at > 0) edits.push({ start: prefix, delete: at, insert: "" });
+    const tail = oldMid.length - (at + newMid.length);
+    if (tail > 0) edits.push({ start: prefix + at + newMid.length, delete: tail, insert: "" });
+    return edits;
+  }
+  return [{ start: prefix, delete: oldMid.length, insert: newMid }];
+}
+
+function mapEdit(edit, remotes) {
+  let delta = 0;
+  for (const remote of remotes) {
+    if (remote.start + remote.delete < edit.start) delta += remote.insert.length - remote.delete;
+  }
+  return { start: edit.start + delta, delete: edit.delete, insert: edit.insert };
+}
+
+function sameEdit(left, right) {
+  return left.start === right.start && left.delete === right.delete && left.insert === right.insert;
+}
+
+function applyEdits(text, edits) {
+  let result = text;
+  let shift = 0;
+  for (const edit of edits) {
+    const start = Math.max(0, Math.min(result.length, edit.start + shift));
+    const del = Math.max(0, Math.min(edit.delete, result.length - start));
+    result = result.slice(0, start) + edit.insert + result.slice(start + del);
+    shift += edit.insert.length - del;
+  }
+  return result;
+}
+
 function spliceToward(doc, next) {
   const current = typeof doc.text === "string" ? doc.text : "";
   if (current === next) return;
@@ -46,6 +106,7 @@ function digest(text) {
 
 export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
   const lastWritten = new Map();
+  const incorporated = new Map();
   let records = null;
   let timer = null;
   let chain = Promise.resolve();
@@ -102,11 +163,17 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
       } catch {
         continue;
       }
-      if (known[notePath] === digest(fileText)) {
+      const fileHash = digest(fileText);
+      if (incorporated.get(notePath) === fileHash) continue;
+      if (known[notePath] === fileHash) {
         lastWritten.set(notePath, fileText);
+        incorporated.set(notePath, fileHash);
         continue;
       }
-      if (lastWritten.get(notePath) === fileText) continue;
+      if (lastWritten.get(notePath) === fileText) {
+        incorporated.set(notePath, fileHash);
+        continue;
+      }
       let current;
       try {
         current = noteText(handle.doc());
@@ -115,16 +182,28 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
       }
       if (current == null || current === fileText) {
         lastWritten.set(notePath, fileText);
-        known[notePath] = digest(fileText);
+        known[notePath] = fileHash;
+        incorporated.set(notePath, fileHash);
         continue;
       }
       try {
-        handle.change((doc) => {
-          if (typeof doc.text !== "string") doc.text = "";
-          spliceToward(doc, fileText);
-        });
-        lastWritten.set(notePath, fileText);
-        known[notePath] = digest(fileText);
+        // The file is compared with the last text this relay wrote. Only that
+        // difference is applied, so a device edit that arrived in the same
+        // moment stays in the history instead of being replaced by the file.
+        const baseline = lastWritten.has(notePath) ? lastWritten.get(notePath) : current;
+        const docEdits = changes(baseline, current);
+        const fileEdits = changes(baseline, fileText).filter(
+          (edit) => !docEdits.some((other) => sameEdit(edit, other)),
+        );
+        const merged = applyEdits(current, fileEdits.map((edit) => mapEdit(edit, docEdits)));
+        if (merged !== current) {
+          handle.change((doc) => {
+            if (typeof doc.text !== "string") doc.text = "";
+            spliceToward(doc, merged);
+          });
+        }
+        lastWritten.set(notePath, merged);
+        incorporated.set(notePath, fileHash);
       } catch (error) {
         logSafe(secrets, "fold-in failed for", notePath, error instanceof Error ? error.message : error);
       }

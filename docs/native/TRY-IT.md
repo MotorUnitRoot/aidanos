@@ -48,17 +48,9 @@ The relay is the small program both apps talk to. It keeps its own folder of not
 
 3. Pick a token. It is a password you make up, at least 32 characters, several words you can remember. Do not put it in any command. Terminal saves commands in its history, so a token typed into a command would stay on this Mac.
 
-4. Create the token file in a text editor, so the token is never on a command line.
+4. Give the relay its token without putting the token on a command line. Terminal saves commands in its history.
 
-   Open TextEdit. If a formatting toolbar is showing, choose Format → Make Plain Text. Type the token and nothing else. Save the file as `aidanos-relay-token` in your home folder. Then, in Terminal:
-
-   ```
-   chmod 600 "$HOME/aidanos-relay-token"
-   export AIDANOS_RELAY_TOKEN_FILE="$HOME/aidanos-relay-token"
-   node src/server.mjs
-   ```
-
-   Or, for one window only, let Terminal ask for the token without showing it and without writing it into history:
+   For one window only, let Terminal ask for the token without showing it and without writing it into history:
 
    ```
    read -s -p "Relay token: " AIDANOS_RELAY_TOKEN
@@ -67,7 +59,17 @@ The relay is the small program both apps talk to. It keeps its own folder of not
    node src/server.mjs
    ```
 
-   `read -s` hides what you type. The `export` line names the variable and does not contain the token. The file from TextEdit is only readable by your user after `chmod 600`.
+   `read -s` hides what you type. The `export` line names the variable and does not contain the token.
+
+   To keep the token in a file instead, use TextEdit. Choose Format → Make Plain Text. Open TextEdit’s settings, choose Open and Save, and untick “If no extension is provided, use .txt”. Type the token and nothing else. Save the file as `aidanos-relay-token` in your home folder, with no extension. If TextEdit names it `aidanos-relay-token.txt`, the next command fails and the relay will not start. Then, in Terminal:
+
+   ```
+   chmod 600 "$HOME/aidanos-relay-token"
+   export AIDANOS_RELAY_TOKEN_FILE="$HOME/aidanos-relay-token"
+   node src/server.mjs
+   ```
+
+   The file is only readable by your user after `chmod 600`.
 
 5. Leave that window open. It prints `LISTENING 127.0.0.1 3750`. Nothing else on the network can connect. That is the normal way to run it. It does not print the token.
 

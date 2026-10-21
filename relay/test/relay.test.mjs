@@ -12,7 +12,7 @@ import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
 import { redact } from "../src/redact.mjs";
-import { LAN_WARNING, loadToken, parseArgs, startRelay, startupLines } from "../src/server.mjs";
+import { LAN_WARNING, MAX_PAYLOAD, loadToken, parseArgs, startRelay, startupLines } from "../src/server.mjs";
 
 const TOKEN = "aidanos-test-token-0123456789abcdef";
 
@@ -404,7 +404,42 @@ test("a blocked address can try again after the block expires", async () => {
   }
 });
 
-test("a two megabyte frame fits under the default cap", async () => {
+test("an outside edit keeps a device change that arrived in the same moment", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  const id = noteId("notes/hello.md");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  try {
+    importDoc(relay.repo, INDEX_ID, { kind: "index", paths: { "notes/hello.md": id } });
+    importDoc(relay.repo, id, { kind: "note", text: "Hello" });
+    await relay.mirrorNow();
+    assert.equal(await fs.readFile(path.join(vault, "notes", "hello.md"), "utf8"), "Hello");
+    const handle = await relay.repo.find(id);
+    handle.change((doc) => {
+      Automerge.splice(doc, ["text"], 5, 0, " PHONE3");
+    });
+    assert.equal(handle.doc().text, "Hello PHONE3");
+    await fs.writeFile(path.join(vault, "notes", "hello.md"), "Hello MAC");
+    await relay.mirrorNow();
+    const text = handle.doc().text;
+    assert.equal(text.includes("PHONE3"), true, text);
+    assert.equal(text.includes("MAC"), true, text);
+    assert.equal(await fs.readFile(path.join(vault, "notes", "hello.md"), "utf8"), text);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("the relay message cap is 32 MB", async () => {
+  assert.equal(MAX_PAYLOAD, 32 * 1024 * 1024);
   const dir = await tempDir();
   const relay = await startRelay({
     token: TOKEN,
@@ -441,8 +476,11 @@ test("the try-it guide keeps the token off the command line", async () => {
   assert.equal(text.includes("printf"), false);
   assert.equal(text.includes("AIDANOS_RELAY_TOKEN="), false);
   assert.equal(text.includes("paste-your-long-token"), false);
-  assert.match(text, /read -s/);
-  assert.match(text, /TextEdit/);
+  const readAt = text.indexOf("read -s");
+  const editAt = text.indexOf("TextEdit");
+  assert.equal(readAt >= 0 && editAt > readAt, true);
+  assert.match(text, /Make Plain Text/);
+  assert.match(text, /If no extension is provided, use \.txt/);
 });
 
 test("an oversized frame does not stop the relay", async () => {

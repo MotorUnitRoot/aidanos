@@ -17,9 +17,9 @@ import { logSafe } from "./redact.mjs";
 const DEFAULT_PORT = 3750;
 const MIN_TOKEN_LENGTH = 32;
 // A note's first sync is its whole history. 1 MB was small enough to reject that
-// and leave the device retrying forever. 32 MB covers a large note; anything
-// past it closes the socket with a clear error instead of looping.
-const DEFAULT_MAX_PAYLOAD = 32 * 1024 * 1024;
+// and leave the device retrying forever. The app uses this same 32 MB cap and
+// refuses an oversized note on its own, so the socket stays up for every other note.
+export const MAX_PAYLOAD = 32 * 1024 * 1024;
 const FAILURE_CAP = 1024;
 export const LAN_WARNING =
   "WARNING: --lan sends notes across your home network with no encryption. The token is the only protection.";
@@ -224,7 +224,7 @@ export async function startRelay(options = {}) {
       res.writeHead(404, { "content-length": 0 });
       res.end();
     });
-    const cap = Number(options.maxPayload ?? process.env.AIDANOS_MAX_PAYLOAD ?? DEFAULT_MAX_PAYLOAD);
+    const cap = Number(options.maxPayload ?? process.env.AIDANOS_MAX_PAYLOAD ?? MAX_PAYLOAD);
     const wss = new WebSocketServer({ noServer: true, maxPayload: cap });
     const adapter = new NodeWSServerAdapter(wss);
     httpServer.on("upgrade", (req, socket, head) => {

@@ -140,7 +140,7 @@ The shared pieces are already fixed, independent of Apple:
 - The vault layout and the `.aidanos` cache.
 - The index id recipe and the note id recipe.
 - The blank opening of a note.
-- The automerge-repo sync protocol over a WebSocket: a join message, a peer reply, then request and sync messages whose payload is an Automerge sync blob. The Node relay speaks that protocol. So does the Swift core.
+- The automerge-repo sync protocol over a WebSocket: a join message, a peer reply, then request and sync messages whose payload is an Automerge sync blob. The Node relay speaks that protocol. So does the Swift core. One sync message may be up to 32 MB on both sides. A note larger than that stops syncing by itself and the app shows an error; other notes keep syncing.
 - The token in the connection header.
 - Markdown as the note, git as backup only.
 

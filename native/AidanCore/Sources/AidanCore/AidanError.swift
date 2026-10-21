@@ -1,5 +1,10 @@
 import Foundation
 
+/// The largest sync message the app and the relay accept. Both sides use 32 MB.
+public enum SyncLimits {
+    public static let maxMessageBytes = 32 * 1024 * 1024
+}
+
 public enum AidanError: Error, Equatable, CustomStringConvertible {
     case badPath(String)
     case authRejected

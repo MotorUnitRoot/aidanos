@@ -40,6 +40,21 @@ public final class AidanSession: SyncHost {
     public var onText: ((String, String) -> Void)?
     public var onConnection: ((ConnectionState) -> Void)?
     public var onError: ((String) -> Void)?
+    /// Fires after a relay message raises or updates a conflict. The screen shows the choice on its next turn.
+    public var onConflict: (() -> Void)?
+    /// One sync message larger than this is not sent. Defaults to 32 MB, the relay's cap.
+    public var maxSyncBytes: Int {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return syncByteLimit
+        }
+        set {
+            lock.lock()
+            syncByteLimit = max(1, newValue)
+            lock.unlock()
+        }
+    }
     private var storedConnection: ConnectionState = .disconnected
     public var connection: ConnectionState {
         lock.lock()
@@ -60,6 +75,9 @@ public final class AidanSession: SyncHost {
     private var writtenHash: [String: String] = [:]
     private var suppressWatch = 0
     private var link: RelayLink?
+    private var syncByteLimit = SyncLimits.maxMessageBytes
+    private var oversized: Set<String> = []
+    private var lastOutbound: String?
     private var watcher: DispatchSourceTimer?
     private let peerId: String
     private let storageId: String
@@ -181,13 +199,13 @@ public final class AidanSession: SyncHost {
         if conflicted(notePath) {
             return base
         }
-        let edit = TextDiff.diff(from: base, to: edited)
+        let edits = TextDiff.hunks(from: base, to: edited)
         // A rebuilt note's file is the text on screen, including keystrokes typed while waiting.
         // The sync document is a blank root during a connection attempt, so those keystrokes
         // stay in the file and are what we compare when the relay answers.
         if note.rebuilt {
             let file = readIfPresent(notePath) ?? ""
-            let merged = TextDiff.apply(edit, to: file)
+            let merged = TextDiff.apply(edits, to: file, from: base)
             if merged != file {
                 try writeFileLocked(notePath, merged)
             }
@@ -200,22 +218,30 @@ public final class AidanSession: SyncHost {
             }
             return merged
         }
-        if edit.delete != 0 || !edit.insert.isEmpty {
+        if edits.contains(where: { $0.delete != 0 || !$0.insert.isEmpty }) {
             let current = try note.doc.text(obj: note.textObj)
-            let remote = TextDiff.diff(from: base, to: current)
-            let mapped = TextDiff.map(edit, through: remote)
-            let count = Array(current.unicodeScalars).count
-            let start = min(max(mapped.start, 0), count)
-            let delete = min(mapped.delete, count - start)
-            if delete != 0 || !mapped.insert.isEmpty {
-                try note.doc.spliceText(
-                    obj: note.textObj,
-                    start: UInt64(start),
-                    delete: Int64(delete),
-                    value: mapped.insert.isEmpty ? nil : mapped.insert
-                )
-                note.doc.commitWith()
+            let remote = TextDiff.hunks(from: base, to: current)
+            let mapped = edits.map { TextDiff.map($0, through: remote) }
+            var shift = 0
+            var spliced = false
+            for hunk in mapped {
+                let live = try note.doc.text(obj: note.textObj)
+                let count = Array(live.unicodeScalars).count
+                let start = min(max(hunk.start + shift, 0), count)
+                let delete = min(max(hunk.delete, 0), count - start)
+                let insertCount = hunk.insert.unicodeScalars.count
+                if delete != 0 || insertCount != 0 {
+                    try note.doc.spliceText(
+                        obj: note.textObj,
+                        start: UInt64(start),
+                        delete: Int64(delete),
+                        value: hunk.insert.isEmpty ? nil : hunk.insert
+                    )
+                    spliced = true
+                }
+                shift += insertCount - delete
             }
+            if spliced { note.doc.commitWith() }
         }
         notes[notePath] = note
         try save(note)
@@ -229,6 +255,19 @@ public final class AidanSession: SyncHost {
         lock.lock()
         defer { lock.unlock() }
         return openConflicts
+    }
+
+    /// Folds a keystroke into an open conflict's "mine" before the screen has shown the choice.
+    func includeInMine(_ path: String, from base: String, to edited: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let notePath = try? VaultPaths.check(path),
+              let index = openConflicts.firstIndex(where: { $0.path == notePath }) else { return }
+        let old = openConflicts[index]
+        let edits = TextDiff.hunks(from: base, to: edited)
+        let mine = TextDiff.apply(edits, to: old.mine, from: base)
+        openConflicts[index] = NoteConflict(path: old.path, mine: mine, theirs: old.theirs, reason: old.reason)
+        try? saveMeta()
     }
 
     public func resolve(_ path: String, choice: ConflictChoice) throws {
@@ -285,6 +324,7 @@ public final class AidanSession: SyncHost {
         lock.lock()
         desiredURL = nil
         desiredToken = nil
+        lastOutbound = nil
         reconnectWork?.cancel()
         let current = link
         link = nil
@@ -312,6 +352,7 @@ public final class AidanSession: SyncHost {
         lock.lock()
         defer { lock.unlock() }
         guard let slot = slots[docId], let doc = documentLocked(docId) else { return nil }
+        if oversized.contains(docId) { return nil }
         guard let message = doc.generateSyncMessage(state: slot.state), !message.isEmpty else { return nil }
         let type = slot.requested ? "sync" : "request"
         slot.requested = true
@@ -340,6 +381,7 @@ public final class AidanSession: SyncHost {
         // the note as empty just because an earlier check saw nothing.
         slot.emptyChecks = 0
         var changed: [(String, String)] = []
+        var raisedConflict = false
         if let path, var note = notes[path] {
             let after = (try? note.doc.text(obj: note.textObj)) ?? ""
             try? save(note)
@@ -360,12 +402,14 @@ public final class AidanSession: SyncHost {
                         reason: Self.rebuildConflictReason
                     ))
                     try? saveMeta()
+                    raisedConflict = true
                 }
             } else if blocked, let index = openConflicts.firstIndex(where: { $0.path == path }),
                       !after.isEmpty, openConflicts[index].theirs != after {
                 let old = openConflicts[index]
                 openConflicts[index] = NoteConflict(path: old.path, mine: old.mine, theirs: after, reason: old.reason)
                 try? saveMeta()
+                raisedConflict = true
             } else if !blocked && after != before {
                 try? writeFileLocked(path, after)
                 changed.append((path, after))
@@ -378,8 +422,10 @@ public final class AidanSession: SyncHost {
             changed.append(contentsOf: adoptIndexLocked())
         }
         let callback = onText
+        let conflictCallback = raisedConflict ? onConflict : nil
         lock.unlock()
         for update in changed { callback?(update.0, update.1) }
+        conflictCallback?()
     }
 
     func markUnavailable(docId: String) {
@@ -451,7 +497,25 @@ public final class AidanSession: SyncHost {
         openConflicts.append(conflict)
         try? save(note)
         try? saveMeta()
+        let conflictCallback = onConflict
         lock.unlock()
+        conflictCallback?()
+    }
+
+    func noteSent(docId: String) {
+        lock.lock()
+        lastOutbound = docId
+        lock.unlock()
+    }
+
+    /// The note's sync message does not fit. Sync stops for this note only.
+    func noteTooLarge(docId: String) {
+        lock.lock()
+        let inserted = oversized.insert(docId).inserted
+        let message = Self.tooLargeMessage(path: pathLocked(for: docId) ?? docId, limit: syncByteLimit)
+        let callback = inserted ? onError : nil
+        lock.unlock()
+        callback?(message)
     }
 
     func linkClosed() {
@@ -461,6 +525,21 @@ public final class AidanSession: SyncHost {
     }
 
     func linkFailed(_ error: Error) {
+        if case AidanError.payloadTooLarge = error {
+            lock.lock()
+            let docId = lastOutbound
+            lastOutbound = nil
+            if let docId {
+                let inserted = oversized.insert(docId).inserted
+                let message = Self.tooLargeMessage(path: pathLocked(for: docId) ?? docId, limit: syncByteLimit)
+                let callback = inserted ? onError : nil
+                lock.unlock()
+                callback?(message)
+                linkClosed()
+                return
+            }
+            lock.unlock()
+        }
         guard Self.isTerminal(error) else {
             linkClosed()
             return
@@ -482,6 +561,7 @@ public final class AidanSession: SyncHost {
             return
         }
         opening = true
+        lastOutbound = nil
         let next = RelayLink()
         link?.close()
         link = next
@@ -690,7 +770,7 @@ public final class AidanSession: SyncHost {
 
     private func setText(_ note: inout NoteState, _ newText: String) throws {
         let current = try note.doc.text(obj: note.textObj)
-        let edit = TextDiff.diff(from: current, to: newText)
+        let edit = TextDiff.replacement(from: current, to: newText)
         if edit.delete == 0 && edit.insert.isEmpty { return }
         try note.doc.spliceText(
             obj: note.textObj,
@@ -896,6 +976,10 @@ public final class AidanSession: SyncHost {
         }
         timer.resume()
         watcher = timer
+    }
+
+    private static func tooLargeMessage(path: String, limit: Int) -> String {
+        "\(path) is too large to sync (\(limit) bytes). Other notes keep syncing."
     }
 
     private static func sha(_ text: String) -> String {

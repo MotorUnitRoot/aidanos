@@ -72,11 +72,17 @@ final class RelayLink {
         var sent = 0
         while sent < 16 {
             guard let outgoing = host.takeOutgoing(docId: docId) else { break }
+            let frame = encodeSync(type: outgoing.type, sender: peerId, target: server, docId: docId, data: outgoing.bytes)
+            if frame.count > host.maxSyncBytes {
+                host.noteTooLarge(docId: docId)
+                break
+            }
             do {
-                try send(encodeSync(type: outgoing.type, sender: peerId, target: server, docId: docId, data: outgoing.bytes))
+                try send(frame)
             } catch {
                 return
             }
+            host.noteSent(docId: docId)
             sent += 1
         }
         if sent == 0 {
@@ -292,8 +298,8 @@ final class RelayLink {
         return payload
     }
 
-    /// A frame bigger than this is refused. The relay's own cap is the same size.
-    private static let maxFrame = 32 * 1024 * 1024
+    /// A frame bigger than this is refused. The relay's cap is the same 32 MB.
+    private static let maxFrame = SyncLimits.maxMessageBytes
 
     private func closeError(_ payload: Data) -> AidanError {
         var code = 0
@@ -364,6 +370,7 @@ private final class ErrorBox: @unchecked Sendable {
 }
 
 protocol SyncHost: AnyObject {
+    var maxSyncBytes: Int { get }
     func documentIds() -> [String]
     func takeOutgoing(docId: String) -> (type: String, bytes: Data)?
     func applyIncoming(docId: String, bytes: Data) throws
@@ -371,6 +378,8 @@ protocol SyncHost: AnyObject {
     func settled(docId: String)
     func linkClosed()
     func linkFailed(_ error: Error)
+    func noteTooLarge(docId: String)
+    func noteSent(docId: String)
 }
 
 private struct RelayAddress {

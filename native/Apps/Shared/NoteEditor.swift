@@ -1,3 +1,4 @@
+import AidanCore
 import SwiftUI
 
 #if os(iOS)
@@ -140,37 +141,12 @@ struct NoteEditor: NSViewRepresentable {
 #endif
 
 func mapCursor(_ range: NSRange, from old: String, to new: String) -> NSRange {
-    let oldText = old as NSString
-    let newText = new as NSString
-    let start = mapIndex(range.location, from: oldText, to: newText)
-    let end = mapIndex(range.location + range.length, from: oldText, to: newText)
-    let location = min(max(0, start), newText.length)
-    let limit = min(max(location, end), newText.length)
+    let oldUnits = Array(old.utf16)
+    let newUnits = Array(new.utf16)
+    let changes = TextDiff.hunks(from: oldUnits, to: newUnits)
+    let start = TextDiff.mapIndex(range.location, through: changes, oldCount: oldUnits.count)
+    let end = TextDiff.mapIndex(range.location + range.length, through: changes, oldCount: oldUnits.count)
+    let location = min(max(0, start), newUnits.count)
+    let limit = min(max(location, end), newUnits.count)
     return NSRange(location: location, length: limit - location)
-}
-
-/// Maps one end of the selection through a single remote edit. An edit that ends before the index shifts it.
-/// An edit that starts at the index leaves it where it is, so the caret stays in front of remote text that landed there.
-private func mapIndex(_ index: Int, from old: NSString, to new: NSString) -> Int {
-    let oldCount = old.length
-    let newCount = new.length
-    let clamped = min(max(index, 0), oldCount)
-    var prefix = 0
-    let prefixLimit = min(oldCount, newCount)
-    while prefix < prefixLimit && old.character(at: prefix) == new.character(at: prefix) {
-        prefix += 1
-    }
-    var suffix = 0
-    while suffix < oldCount - prefix && suffix < newCount - prefix
-        && old.character(at: oldCount - 1 - suffix) == new.character(at: newCount - 1 - suffix) {
-        suffix += 1
-    }
-    let changeEnd = oldCount - suffix
-    if changeEnd < clamped {
-        return min(newCount, max(0, clamped + (newCount - oldCount)))
-    }
-    if clamped <= prefix {
-        return min(clamped, newCount)
-    }
-    return min(newCount, prefix + (newCount - suffix - prefix))
 }

@@ -345,6 +345,52 @@ final class SyncTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "from the file")
     }
 
+    func testRelayConflictShowsAndKeepsAPaste() throws {
+        let relay = try TestRelay.start()
+        defer { relay.stop() }
+        let path = "notes/conflict-paste-\(UUID().uuidString).md"
+        let author = try AidanSession(vault: try temporaryVault())
+        try author.connect(relayURL: relay.url, token: relay.token)
+        try author.replace(path, with: "from the relay")
+        let witness = try AidanSession(vault: try temporaryVault())
+        try witness.connect(relayURL: relay.url, token: relay.token)
+        let arrived = try waitUntil(seconds: 20) { (try? witness.text(path)) == "from the relay" }
+        XCTAssertTrue(arrived)
+        if !arrived { return }
+        witness.disconnect()
+        author.disconnect()
+
+        let fileVault = try temporaryVault()
+        let fileURL = fileVault.appendingPathComponent(path)
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "from the file".write(to: fileURL, atomically: true, encoding: .utf8)
+        let reader = try AidanSession(vault: fileVault)
+        defer { reader.disconnect() }
+        let surface = NoteSurface(session: reader, path: path, text: "from the file")
+        XCTAssertNil(surface.conflict)
+        let noticed = Flag()
+        reader.onConflict = { noticed.set() }
+        try reader.connect(relayURL: relay.url, token: relay.token)
+        let raised = try waitUntil(seconds: 20) {
+            noticed.get() && reader.conflicts().contains { $0.path == path && $0.theirs == "from the relay" }
+        }
+        XCTAssertTrue(raised)
+        if !raised { return }
+        XCTAssertNil(surface.conflict)
+        let pasted = "from the file\nA dictated paragraph."
+        _ = surface.userEdited(base: surface.text, edited: pasted)
+        XCTAssertNotNil(surface.conflict)
+        XCTAssertEqual(surface.conflict?.mine, pasted)
+        XCTAssertEqual(surface.conflict?.theirs, "from the relay")
+        XCTAssertEqual(reader.conflicts().first { $0.path == path }?.mine, pasted)
+        _ = surface.userEdited(base: pasted, edited: pasted + " MORE")
+        XCTAssertEqual(surface.conflict?.mine, pasted)
+        XCTAssertEqual(reader.conflicts().first { $0.path == path }?.mine, pasted)
+        try reader.resolve(path, choice: .keepMine)
+        XCTAssertEqual(try reader.text(path), pasted)
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), pasted)
+    }
+
     func testInsertMapsThroughRemoteTextBeforeCursor() throws {
         let vault = try temporaryVault()
         let session = try AidanSession(vault: vault)
@@ -367,6 +413,17 @@ final class SyncTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: vault.appendingPathComponent(path), encoding: .utf8), "XHell")
     }
 
+    func testKeystrokeMapsThroughChangesOnBothSides() throws {
+        let vault = try temporaryVault()
+        let session = try AidanSession(vault: vault)
+        let path = "notes/cursor-both.md"
+        try session.replace(path, with: "Hello world")
+        try session.replace(path, with: "XHello worldY")
+        let merged = try session.applyEdit(path, from: "Hello world", to: "Hello! world")
+        XCTAssertEqual(merged, "XHello! worldY")
+        XCTAssertEqual(try String(contentsOf: vault.appendingPathComponent(path), encoding: .utf8), "XHello! worldY")
+    }
+
     func testOversizedCloseDoesNotRetry() throws {
         let closer = try ClosingServer(code: 1009, reason: "Max payload size exceeded")
         defer { closer.stop() }
@@ -379,6 +436,47 @@ final class SyncTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.7)
         XCTAssertEqual(session.connection, .disconnected)
         XCTAssertEqual(closer.accepts, 1)
+    }
+
+    func testOversizedNoteStopsOnlyThatNote() throws {
+        XCTAssertEqual(SyncLimits.maxMessageBytes, 32 * 1024 * 1024)
+        let relay = try TestRelay.start()
+        defer { relay.stop() }
+        let phone = try AidanSession(vault: try temporaryVault())
+        let mac = try AidanSession(vault: try temporaryVault())
+        phone.maxSyncBytes = 2_000
+        defer {
+            phone.disconnect()
+            mac.disconnect()
+        }
+        try phone.connect(relayURL: relay.url, token: relay.token)
+        try mac.connect(relayURL: relay.url, token: relay.token)
+        let small = "notes/small-\(UUID().uuidString).md"
+        let big = "notes/big-\(UUID().uuidString).md"
+        try phone.replace(small, with: "Hi")
+        let smallArrived = try waitUntil(seconds: 20) { (try? mac.text(small)) == "Hi" }
+        XCTAssertTrue(smallArrived)
+        if !smallArrived { return }
+        let reported = Flag()
+        phone.onError = { message in
+            reported.set(message)
+        }
+        let bigText = (0..<900).map { String(format: "word-%04d ", $0) }.joined()
+        try phone.replace(big, with: bigText)
+        let sawError = try waitUntil(seconds: 20) { reported.get() }
+        XCTAssertTrue(sawError)
+        let reportedText = reported.message()
+        XCTAssertTrue(reportedText.contains(big), reportedText)
+        XCTAssertTrue(reportedText.contains("Other notes keep syncing"), reportedText)
+        XCTAssertTrue(reportedText.contains("2000"), reportedText)
+        XCTAssertEqual(phone.connection, .connected)
+        Thread.sleep(forTimeInterval: 0.5)
+        XCTAssertNotEqual(try mac.text(big), bigText)
+        try phone.applyEdit(small, from: "Hi", to: "Hi!")
+        let edited = try waitUntil(seconds: 20) { (try? mac.text(small)) == "Hi!" }
+        XCTAssertTrue(edited)
+        XCTAssertEqual(phone.connection, .connected)
+        XCTAssertNotEqual(try mac.text(big), bigText)
     }
 
     func testAppRefusesTheRelayFolder() throws {
@@ -503,6 +601,28 @@ private func rebuiltSession(path: String, text: String) throws -> (URL, AidanSes
     let again = try AidanSession(vault: vault)
     again.reconnectPause = 60
     return (vault, again)
+}
+
+private final class Flag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    private var text = ""
+    func set(_ message: String = "") {
+        lock.lock()
+        value = true
+        if !message.isEmpty { text = message }
+        lock.unlock()
+    }
+    func get() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+    func message() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return text
+    }
 }
 
 private func temporaryVault() throws -> URL {

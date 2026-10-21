@@ -47,6 +47,7 @@ final class TodayModel: ObservableObject {
     @Published var draftingConflict = false
 
     private var session: AidanSession?
+    private var surface: NoteSurface?
     private var path: String
     private var applyingRemote = false
     private var dayTimer: Timer?
@@ -67,13 +68,17 @@ final class TodayModel: ObservableObject {
             let session = try AidanSession(vault: TodayModel.vaultURL())
             self.session = session
             text = try session.open(path)
+            let surface = NoteSurface(session: session, path: path, text: text)
+            self.surface = surface
+            conflict = surface.conflict
             session.onText = { [weak self] notePath, value in
                 Task { @MainActor in
                     guard let self, notePath == self.path, !self.draftingConflict else { return }
                     self.applyingRemote = true
                     self.text = value
+                    self.surface?.replaceText(value)
                     self.applyingRemote = false
-                    self.refreshConflict()
+                    self.publishConflict()
                 }
             }
             session.onConnection = { [weak self] state in
@@ -86,10 +91,15 @@ final class TodayModel: ObservableObject {
                     self?.status = message
                 }
             }
+            session.onConflict = { [weak self] in
+                Task { @MainActor in
+                    self?.publishConflict()
+                }
+            }
         } catch {
             status = String(describing: error)
         }
-        refreshConflict()
+        publishConflict()
         dayTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.considerDay() }
         }
@@ -101,31 +111,28 @@ final class TodayModel: ObservableObject {
         draftingConflict = false
         guard let session else { return }
         applyingRemote = true
-        text = (try? session.open(next)) ?? ""
+        let opened = (try? session.open(next)) ?? ""
+        text = opened
+        surface?.focus(path: next, text: opened)
         applyingRemote = false
-        refreshConflict()
+        publishConflict()
     }
 
     func userEdited(base: String, edited: String) {
-        if conflict != nil && !draftingConflict {
-            return
-        }
-        if draftingConflict {
+        guard !applyingRemote, let surface else {
+            if conflict != nil && !draftingConflict { return }
             text = edited
             return
         }
-        guard !applyingRemote, let session else {
-            text = edited
-            return
-        }
-        do {
-            let merged = try session.applyEdit(path, from: base, to: edited)
-            applyingRemote = true
-            text = merged
-            applyingRemote = false
-            refreshConflict()
-        } catch {
-            status = String(describing: error)
+        let merged = surface.userEdited(base: base, edited: edited)
+        applyingRemote = true
+        text = merged
+        applyingRemote = false
+        conflict = surface.conflict
+        draftingConflict = surface.draftingConflict
+        if let message = surface.statusMessage {
+            status = message
+            surface.clearStatus()
         }
     }
 
@@ -142,14 +149,15 @@ final class TodayModel: ObservableObject {
                 status = String(describing: error)
             }
         }
-        refreshConflict()
+        publishConflict()
     }
 
     func beginConflictEdit() {
-        guard let conflict else { return }
+        guard let surface, surface.conflict != nil else { return }
+        surface.beginDraft()
         draftingConflict = true
         applyingRemote = true
-        text = ConflictDraft.bothVersions(mine: conflict.mine, theirs: conflict.theirs)
+        text = surface.text
         applyingRemote = false
     }
 
@@ -157,33 +165,38 @@ final class TodayModel: ObservableObject {
         guard draftingConflict, let session else { return }
         do {
             try session.resolve(path, choice: .edit(text))
+            surface?.clearDraft()
             draftingConflict = false
             applyingRemote = true
             text = try session.text(path)
+            surface?.replaceText(text)
             applyingRemote = false
             status = "Saved"
         } catch {
             status = String(describing: error)
         }
-        refreshConflict()
+        publishConflict()
     }
 
     func choose(_ choice: ConflictChoice) {
         guard let session else { return }
+        surface?.clearDraft()
         draftingConflict = false
         do {
             try session.resolve(path, choice: choice)
             applyingRemote = true
             text = try session.text(path)
+            surface?.replaceText(text)
             applyingRemote = false
         } catch {
             status = String(describing: error)
         }
-        refreshConflict()
+        publishConflict()
     }
 
-    private func refreshConflict() {
-        conflict = session?.conflicts().first { $0.path == path }
+    private func publishConflict() {
+        surface?.showChoiceIfNeeded()
+        conflict = surface?.conflict
     }
 
     private static func vaultURL() -> URL {

@@ -149,9 +149,14 @@ final class RelayLink {
     }
 
     private func send(_ data: Data) throws {
+        try sendFrame(opcode: 0x2, payload: data)
+    }
+
+    /// Clients mask every frame, including the pong that answers the relay's ping.
+    private func sendFrame(opcode: UInt8, payload: Data) throws {
         var header = Data()
-        header.append(0x82)
-        let length = data.count
+        header.append(0x80 | opcode)
+        let length = payload.count
         if length < 126 {
             header.append(UInt8(length) | 0x80)
         } else if length <= Int(UInt16.max) {
@@ -171,11 +176,11 @@ final class RelayLink {
         var mask = [UInt8](repeating: 0, count: 4)
         for index in 0..<4 { mask[index] = UInt8.random(in: 0...255) }
         header.append(contentsOf: mask)
-        var payload = Data(data)
-        for index in payload.indices {
-            payload[index] ^= mask[index % 4]
+        var body = Data(payload)
+        for index in body.indices {
+            body[index] ^= mask[index % 4]
         }
-        header.append(payload)
+        header.append(body)
         try writeAll(header)
     }
 
@@ -269,10 +274,7 @@ final class RelayLink {
     }
 
     private func sendPong(_ payload: Data) throws {
-        var frame = Data([0x8A])
-        frame.append(UInt8(payload.count))
-        frame.append(payload)
-        try writeAll(frame)
+        try sendFrame(opcode: 0xA, payload: payload)
     }
 
     private func readExact(_ count: Int) throws -> Data? {

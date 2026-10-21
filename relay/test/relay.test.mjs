@@ -4,6 +4,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
+import net from "node:net";
 import { promisify } from "node:util";
 import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
@@ -63,6 +65,28 @@ test("relay rejects a bad token and accepts the real one", async () => {
     const refused = await connect(relay.url, "wrong-token");
     assert.equal(refused.opened, false);
     assert.equal(refused.status, 401);
+    const opened = await connect(relay.url, "aidanos-test-token");
+    assert.equal(opened.opened, true);
+    opened.socket.close();
+  } finally {
+    await relay.close();
+  }
+});
+
+test("a bad frame does not stop the relay", async () => {
+  const dir = await tempDir();
+  const relay = await startRelay({
+    token: "aidanos-test-token",
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 1000,
+  });
+  try {
+    await sendUnmaskedPong(relay.port);
+    const health = await fetch("http://127.0.0.1:" + relay.port + "/health");
+    assert.equal(health.status, 200);
     const opened = await connect(relay.url, "aidanos-test-token");
     assert.equal(opened.opened, true);
     opened.socket.close();
@@ -169,6 +193,36 @@ test("a fresh backup pushes to an empty repo", async () => {
 
 function importDoc(repo, docId, value) {
   return repo.import(Automerge.save(Automerge.from(value)), { docId });
+}
+
+function sendUnmaskedPong(port) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, "127.0.0.1");
+    const key = crypto.randomBytes(16).toString("base64");
+    let seenHeader = false;
+    socket.on("error", reject);
+    socket.on("connect", () => {
+      socket.write(
+        "GET / HTTP/1.1\r\n" +
+          "Host: 127.0.0.1:" + port + "\r\n" +
+          "Upgrade: websocket\r\n" +
+          "Connection: Upgrade\r\n" +
+          "Sec-WebSocket-Key: " + key + "\r\n" +
+          "Sec-WebSocket-Version: 13\r\n" +
+          "Authorization: Bearer aidanos-test-token\r\n\r\n",
+      );
+    });
+    socket.on("data", (chunk) => {
+      if (seenHeader) return;
+      if (!chunk.toString("utf8").includes("\r\n\r\n")) return;
+      seenHeader = true;
+      socket.write(Buffer.from([0x8a, 0x00]));
+      setTimeout(() => {
+        socket.destroy();
+        resolve();
+      }, 50);
+    });
+  });
 }
 
 function connect(url, token) {

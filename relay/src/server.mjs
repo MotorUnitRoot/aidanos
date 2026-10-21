@@ -115,6 +115,9 @@ export async function startRelay(options = {}) {
         return;
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
+        ws.on("error", (error) => {
+          logSafe(secrets, "sync connection closed:", error instanceof Error ? error.message : error);
+        });
         logSafe(secrets, "accepted a sync connection");
         wss.emit("connection", ws, req);
       });

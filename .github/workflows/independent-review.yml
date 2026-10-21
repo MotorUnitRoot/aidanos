@@ -2,8 +2,9 @@ name: independent-review
 
 # Advisory signal only. This workflow does not post
 # independent-review/approved and has no statuses or checks write.
-# independent-review-post.yml posts that status after the
-# independent-review environment is approved.
+# independent-review-post.yml posts that status. PASS waits for the
+# independent-review environment. BLOCK uses independent-review-block
+# and does not wait.
 #
 # One run at a time per pull request. cancel-in-progress is off so a
 # slow PASS run cannot finish after a BLOCK run and become the latest

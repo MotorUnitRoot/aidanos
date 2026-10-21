@@ -1,19 +1,16 @@
 name: independent-review-post
 
 # Sets the binding status independent-review/approved. issue_comment runs
-# this file from the default branch, so the environment's main branch rule
-# holds. The parse job has no secrets. The post job waits in the
-# independent-review environment, then mints an installation token from
-# that environment's REVIEW_APP_PRIVATE_KEY. The private key is not printed.
-# Do not add set -x.
+# this file from the default branch, so a deployment branch rule of main
+# holds. The parse job has no secrets. PASS waits in independent-review.
+# BLOCK uses independent-review-block, which has no reviewer, so it starts
+# immediately. Both environments define REVIEW_APP_PRIVATE_KEY. The private
+# key is not printed. Do not add set -x.
 #
-# PASS and BLOCK both wait for approval. A waiting BLOCK is a pending
-# approval. Do not merge while one is waiting.
+# No concurrency on the workflow. Concurrency is only on the post job, keyed
+# by pull request and verdict, with cancel-in-progress off. A later comment
+# that is not that same post job cannot cancel or replace a queued BLOCK.
 run-name: "independent-review #${{ github.event.issue.number }}"
-
-concurrency:
-  group: independent-review-post-${{ github.event.issue.number }}
-  cancel-in-progress: false
 
 on:
   issue_comment:
@@ -35,6 +32,9 @@ jobs:
       sha: ${{ steps.request.outputs.sha }}
       short: ${{ steps.request.outputs.short }}
       pr: ${{ steps.request.outputs.pr }}
+      comment_id: ${{ steps.request.outputs.comment_id }}
+      body_sha256: ${{ steps.request.outputs.body_sha256 }}
+      environment: ${{ steps.request.outputs.environment }}
     steps:
       - name: Checkout default branch
         # v5.1.0 — default branch SHA. issue_comment does not check out the pull request head.
@@ -59,20 +59,32 @@ jobs:
     if: ${{ needs.parse.result == 'success' && (needs.parse.outputs.verdict == 'PASS' || needs.parse.outputs.verdict == 'BLOCK') }}
     name: "#${{ needs.parse.outputs.pr }} ${{ needs.parse.outputs.verdict }} ${{ needs.parse.outputs.short }}"
     runs-on: ubuntu-latest
-    environment: independent-review
+    concurrency:
+      group: independent-review-post-${{ needs.parse.outputs.pr }}-${{ needs.parse.outputs.verdict }}
+      cancel-in-progress: false
+    environment: ${{ needs.parse.outputs.environment }}
     permissions:
       contents: read
     steps:
       - name: Record the verdict
+        env:
+          REVIEW_PR: ${{ needs.parse.outputs.pr }}
+          REVIEW_VERDICT: ${{ needs.parse.outputs.verdict }}
+          REVIEW_SHORT: ${{ needs.parse.outputs.short }}
+          REVIEW_SHA: ${{ needs.parse.outputs.sha }}
         run: |
           {
-            echo "### Independent review #${{ needs.parse.outputs.pr }}"
+            echo "### Independent review #${REVIEW_PR}"
             echo ""
-            echo "**${{ needs.parse.outputs.verdict }}** \`${{ needs.parse.outputs.short }}\`"
+            echo "**${REVIEW_VERDICT}** \`${REVIEW_SHORT}\`"
             echo ""
-            echo "Full commit \`${{ needs.parse.outputs.sha }}\`."
+            echo "Full commit \`${REVIEW_SHA}\`."
             echo ""
-            echo "A waiting BLOCK is a pending approval. Do not merge while one is waiting."
+            if [ "$REVIEW_VERDICT" = "PASS" ]; then
+              echo "PASS waits for approval in independent-review."
+            else
+              echo "BLOCK uses independent-review-block and applies without a reviewer."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Checkout default branch
         # v5.1.0
@@ -99,4 +111,6 @@ jobs:
           REVIEW_PR: ${{ needs.parse.outputs.pr }}
           REVIEW_VERDICT: ${{ needs.parse.outputs.verdict }}
           REVIEW_SHA: ${{ needs.parse.outputs.sha }}
-        run: node tools/post-review-verdict.mjs "$REVIEW_PR" "$REVIEW_VERDICT" "$REVIEW_SHA" --status-only
+          REVIEW_COMMENT_ID: ${{ needs.parse.outputs.comment_id }}
+          REVIEW_BODY_SHA256: ${{ needs.parse.outputs.body_sha256 }}
+        run: node tools/post-review-verdict.mjs "$REVIEW_PR" "$REVIEW_VERDICT" "$REVIEW_SHA" --status-only --comment-id "$REVIEW_COMMENT_ID" --body-sha256 "$REVIEW_BODY_SHA256"

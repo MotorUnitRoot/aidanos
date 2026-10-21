@@ -45,10 +45,15 @@ function check(name, run) {
 check("hide, close, and refresh do not save a clean page", () => {
   const leave = grab(app, "function flushOnLeave(", "function applyRemoteNote(");
   const dirtyAt = leave.indexOf("if (!state.dirty) return;");
-  const saveAt = leave.indexOf("saveDay(");
-  assert(dirtyAt >= 0 && saveAt > dirtyAt, "flushOnLeave returns before saveDay when nothing is unsaved");
+  assert(dirtyAt >= 0, "flushOnLeave returns when nothing is unsaved");
   assert(!leave.slice(0, dirtyAt).includes("fetch("), "the clean return does not fetch");
   assert(!leave.slice(0, dirtyAt).includes("saveDay("), "the clean return does not save");
+  assert(leave.includes("rememberUnsent("), "a close writes the local copy");
+  assert(leave.indexOf("rememberUnsent(") < leave.indexOf("sendKeepaliveSave("), "the local copy is written before the save is sent");
+  assert(!leave.includes("saveDay("), "a close does not wait on the save queue");
+  const send = grab(app, "function sendKeepaliveSave(", "function flushOnLeave(");
+  assert(send.includes("fetch("), "close save is sent");
+  assert(send.includes("keepalive: true"), "close save uses keepalive");
   assert(app.includes('window.addEventListener("pagehide", flushOnLeave)'), "pagehide flushes through the dirty check");
   assert(app.includes('window.addEventListener("beforeunload", flushOnLeave)'), "beforeunload flushes through the dirty check");
   const vis = grab(app, 'document.addEventListener("visibilitychange"', "(function wireRailToggle(");
@@ -66,9 +71,10 @@ check("day switch does not save a clean page", () => {
   const gate = "if (leavingDay && !conflictOpen && state.dirty)";
   assert(fn.includes(gate), "day switch still skips an open conflict and also requires unsaved edits");
   assert(fn.includes("leavingDay && !conflictOpen"), "day switch does not re-save an open conflict");
-  assert(fn.indexOf("putRawDay(") > fn.indexOf(gate), "putRawDay stays inside the dirty check");
-  assert(!/await putRawDay/.test(fn), "day switch still does not wait on the old day");
-  assert(fn.indexOf("renderDay()") < fn.indexOf("putRawDay("), "paint before saving the old day");
+  const saveAt = fn.indexOf("await saveDay()");
+  assert(saveAt > fn.indexOf(gate), "the day switch save waits on the save queue");
+  assert(!fn.includes("putRawDay"), "day switch does not use a side write");
+  assert(fn.indexOf("renderDay()") < saveAt, "paint before saving the old day");
 });
 
 check("a close-time 409 does not open the conflict sheet", () => {
@@ -279,6 +285,112 @@ async function liveTwoClients() {
 }
 
 await check("two clients: stale save is 409, newer text stays, and the other client is told", liveTwoClients);
+
+async function liveSameTextAndLock() {
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-same-"));
+  const date = "2026-10-21";
+  const other = "2026-10-20";
+  const noteRel = "maps/shared.md";
+  const dayPath = path.join(vault, "log", date + ".md");
+  const otherPath = path.join(vault, "log", other + ".md");
+  const notePath = path.join(vault, "maps", "shared.md");
+  fs.mkdirSync(path.join(vault, "log"), { recursive: true });
+  fs.mkdirSync(path.join(vault, "maps"), { recursive: true });
+  fs.writeFileSync(dayPath, "loaded\n", "utf8");
+  fs.writeFileSync(otherPath, "base\n", "utf8");
+  fs.writeFileSync(notePath, "loaded note\n", "utf8");
+
+  const port = 23000 + Math.floor(Math.random() * 2000);
+  const child = spawn(process.execPath, ["server.mjs"], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      AIDANOS_HOST: "127.0.0.1",
+      AIDANOS_VAULT: vault,
+      AIDANOS_VAULT_GIT_URL: "",
+      AIDANOS_VAULT_GIT_TOKEN: "",
+      GITHUB_TOKEN: "",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let errOut = "";
+  child.stderr.on("data", (buf) => { errOut += String(buf); });
+  child.stdout.on("data", (buf) => { errOut += String(buf); });
+  const base = "http://127.0.0.1:" + port;
+  const fail = (msg) => new Error(msg + (errOut ? " :: " + errOut.slice(-400) : ""));
+  const putDay = (day, markdown, mtime) => fetch(base + "/api/day?date=" + day, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ date: day, paper: markdown, markdown, mtime }),
+  });
+  const putNote = (markdown, mtime) => fetch(base + "/api/file?path=" + encodeURIComponent(noteRel), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: noteRel, paper: markdown, markdown, mtime }),
+  });
+
+  try {
+    await waitHealth(base, child);
+    const loaded = await (await fetch(base + "/api/day?date=" + date)).json();
+    const phone = "phone\n";
+    const saved = await putDay(date, phone, loaded.mtime);
+    const savedBody = await saved.json();
+    assert(saved.status === 200, "day save " + saved.status + " " + JSON.stringify(savedBody));
+    const wroteAt = Math.trunc(fs.statSync(dayPath).mtimeMs);
+    assert(wroteAt === savedBody.mtime, "saved mtime matches the file");
+
+    const again = await putDay(date, phone, loaded.mtime);
+    const againBody = await again.json();
+    assert(again.status === 200, "same day text with an old version got " + again.status + " " + JSON.stringify(againBody));
+    assert(againBody.mtime === savedBody.mtime, "same day text did not return the current version");
+    assert(Math.trunc(fs.statSync(dayPath).mtimeMs) === wroteAt, "same day text rewrote the file");
+    assert(fs.readFileSync(dayPath, "utf8") === phone, "same day text changed the file");
+
+    const different = await putDay(date, "other\n", loaded.mtime);
+    const differentBody = await different.json();
+    assert(different.status === 409, "different day text with an old version got " + different.status);
+    assert(differentBody.error === "disk newer", "different day text was not disk newer");
+    assert(fs.readFileSync(dayPath, "utf8") === phone, "different day text overwrote the file");
+
+    const noteLoaded = await (await fetch(base + "/api/file?path=" + encodeURIComponent(noteRel))).json();
+    const notePhone = "phone note\n";
+    const noteSaved = await putNote(notePhone, noteLoaded.mtime);
+    const noteSavedBody = await noteSaved.json();
+    assert(noteSaved.status === 200, "note save " + noteSaved.status);
+    const noteWroteAt = Math.trunc(fs.statSync(notePath).mtimeMs);
+    const noteAgain = await putNote(notePhone, noteLoaded.mtime);
+    const noteAgainBody = await noteAgain.json();
+    assert(noteAgain.status === 200, "same note text with an old version got " + noteAgain.status + " " + JSON.stringify(noteAgainBody));
+    assert(noteAgainBody.mtime === noteSavedBody.mtime, "same note text did not return the current version");
+    assert(Math.trunc(fs.statSync(notePath).mtimeMs) === noteWroteAt, "same note text rewrote the file");
+    assert(fs.readFileSync(notePath, "utf8") === notePhone, "same note text changed the file");
+
+    const baseDay = await (await fetch(base + "/api/day?date=" + other)).json();
+    const aaa = "aaa\n";
+    const bbb = "bbb\n";
+    const [left, right] = await Promise.all([
+      putDay(other, aaa, baseDay.mtime),
+      putDay(other, bbb, baseDay.mtime),
+    ]);
+    const leftBody = await left.json();
+    const rightBody = await right.json();
+    const statuses = [left.status, right.status].slice().sort((a, b) => a - b);
+    assert(statuses[0] === 200 && statuses[1] === 409, "overlapping day writes got " + left.status + " and " + right.status);
+    const winner = left.status === 200 ? aaa : bbb;
+    const loser = left.status === 409 ? leftBody : rightBody;
+    assert(fs.readFileSync(otherPath, "utf8") === winner, "overlapping writes left " + JSON.stringify(fs.readFileSync(otherPath, "utf8")));
+    assert(loser.error === "disk newer", "the losing write was not disk newer");
+    assert(loser.markdown === winner, "the losing write did not see the winning text");
+  } catch (e) {
+    throw fail(e && e.message || String(e));
+  } finally {
+    await stop(child);
+    try { fs.rmSync(vault, { recursive: true, force: true }); } catch {}
+  }
+}
+
+await check("same text with an old version is a no-op, and overlapping writes stay one file", liveSameTextAndLock);
 
 const failed = results.filter((r) => !r.ok);
 console.log("");

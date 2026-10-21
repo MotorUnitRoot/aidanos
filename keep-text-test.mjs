@@ -396,6 +396,194 @@ await check("a pending timer during a day switch never writes to the new day", a
   assert(dump.value === "day b", "the timer replaced the new day");
 });
 
+await check("close with no server reply stores the text and the next load offers it", async () => {
+  const client = boot();
+  const day = "2026-10-21";
+  await loadDay(client, day, "saved line", 100);
+  const dump = client.doc.getElementById("dump");
+  dump.value = "kept across refresh";
+  client.sandbox.scheduleSave();
+  client.sandbox.flushOnLeave();
+  const key = client.storage.keys().find((k) => k.indexOf("log/" + day + ".md") >= 0);
+  assert(key, "the local copy was not written before the server answered (" + client.storage.keys().join(", ") + ")");
+  const held = JSON.parse(client.storage.getItem(key));
+  assert(held.markdown === "kept across refresh", "stored text was " + held.markdown);
+  assert(held.path === "log/" + day + ".md", "stored path was " + held.path);
+  assert(held.base === 100, "stored base was " + held.base);
+  const put = client.requests.find((r) => r.method === "PUT" && r.url.includes(day));
+  assert(put, "the closing save was not sent");
+  assert(put.opts.keepalive === true, "the closing save was not sent with keepalive");
+  assert(JSON.parse(put.opts.body).markdown === "kept across refresh", "the closing save was not the typed text");
+  await loadDay(client, day, "saved line", 100);
+  const sheet = client.doc.getElementById("conflict-sheet");
+  assert(sheet.hidden === false, "the next load did not offer the unanswered text");
+  assert(client.doc.getElementById("conflict-mine").textContent === "kept across refresh", "offered mine is not the stored text");
+  assert(client.doc.getElementById("conflict-theirs").textContent === "saved line", "offered theirs is not the disk text");
+});
+
+await check("close while a save is in flight still sends the closing save", async () => {
+  const client = boot();
+  const day = "2026-10-21";
+  await loadDay(client, day, "saved line", 100);
+  const dump = client.doc.getElementById("dump");
+  dump.value = "first draft";
+  client.sandbox.scheduleSave();
+  client.sandbox.saveDay();
+  await tick();
+  const first = client.requests.find((r) => r.method === "PUT" && r.url.includes(day));
+  assert(first, "the earlier save never started");
+  assert(JSON.parse(first.opts.body).markdown === "first draft", "the earlier save was not the first draft");
+  dump.value = "second draft";
+  client.sandbox.scheduleSave();
+  client.sandbox.flushOnLeave();
+  const puts = client.requests.filter((r) => r.method === "PUT" && r.url.includes(day));
+  assert(puts.length >= 2, "the closing save waited for the earlier one (" + puts.length + " sent)");
+  const closePut = puts.find((r) => r.opts && r.opts.keepalive === true);
+  assert(closePut, "the closing save was not sent while the earlier one was in flight");
+  assert(JSON.parse(closePut.opts.body).markdown === "second draft", "the closing save was not the latest text");
+  const key = client.storage.keys().find((k) => k.indexOf("log/" + day + ".md") >= 0);
+  assert(key, "the local copy was not written while the earlier save was in flight");
+  assert(JSON.parse(client.storage.getItem(key)).markdown === "second draft", "the stored copy was not the latest text");
+});
+
+await check("an in-flight autosave does not make the day switch show a conflict", async () => {
+  const client = boot();
+  const day = "2026-10-21";
+  const next = "2026-10-22";
+  await loadDay(client, day, "saved line", 100);
+  const dump = client.doc.getElementById("dump");
+  dump.value = "typed while saving";
+  client.sandbox.scheduleSave();
+  client.sandbox.saveDay();
+  await tick();
+  const first = take(client.requests, (r) => r.method === "PUT" && r.url.includes(day));
+  assert(first, "the autosave never started");
+  assert(JSON.parse(first.opts.body).markdown === "typed while saving", "the autosave was not the typed text");
+  assert(JSON.parse(first.opts.body).mtime === 100, "the autosave was not based on the loaded version");
+  const leaving = client.sandbox.openDay(next);
+  await tick();
+  assert(
+    !client.requests.some((r) => r.method === "PUT"),
+    "the day switch sent another save before the autosave finished",
+  );
+  first.resolve(jsonRes(200, { ok: true, date: day, mtime: 180 }));
+  await tick();
+  const second = take(client.requests, (r) => r.method === "PUT" && r.url.includes(day));
+  assert(second, "the day switch did not save after the autosave");
+  const sent = JSON.parse(second.opts.body);
+  assert(sent.markdown === "typed while saving", "the follow-up save lost the typed text (" + sent.markdown + ")");
+  assert(sent.mtime === 180, "the follow-up save reused the old version " + sent.mtime);
+  second.resolve(jsonRes(200, { ok: true, date: day, mtime: 180 }));
+  await tick();
+  const got = take(client.requests, (r) => r.method === "GET" && r.url.includes(next));
+  assert(got, "the next day was not loaded");
+  got.resolve(jsonRes(200, { date: next, markdown: "day b", mtime: 50 }));
+  await leaving;
+  await tick();
+  assert(dump.value === "day b", "the next day did not paint (" + dump.value + ")");
+  assert(client.doc.getElementById("conflict-sheet").hidden === true, "the day switch showed a conflict sheet");
+});
+
+await check("two quick day switches do not resend the old version", async () => {
+  const client = boot();
+  const day = "2026-10-21";
+  const mid = "2026-10-22";
+  const next = "2026-10-23";
+  await loadDay(client, day, "saved line", 100);
+  const dump = client.doc.getElementById("dump");
+  dump.value = "typed once";
+  client.sandbox.scheduleSave();
+  const leaveMid = client.sandbox.openDay(mid);
+  await tick();
+  const first = take(client.requests, (r) => r.method === "PUT" && r.url.includes(day));
+  assert(first, "the first day switch did not save the old day");
+  assert(JSON.parse(first.opts.body).markdown === "typed once", "the first save was not the typed text");
+  assert(JSON.parse(first.opts.body).mtime === 100, "the first save was not based on the loaded version");
+  const leaveNext = client.sandbox.openDay(next);
+  await tick();
+  assert(
+    !client.requests.some((r) => r.method === "PUT"),
+    "the second click resent the old day before the first save finished",
+  );
+  first.resolve(jsonRes(200, { ok: true, date: day, mtime: 180 }));
+  await tick();
+  const second = take(client.requests, (r) => r.method === "PUT" && r.url.includes(day));
+  assert(second, "the second day switch did not save after the first");
+  const sent = JSON.parse(second.opts.body);
+  assert(sent.markdown === "typed once", "the second save lost the typed text (" + sent.markdown + ")");
+  assert(sent.mtime === 180, "the second save reused the old version " + sent.mtime);
+  second.resolve(jsonRes(200, { ok: true, date: day, mtime: 190 }));
+  await tick();
+  assert(!client.requests.some((r) => r.url.includes(mid)), "the first click still loaded its day");
+  const got = take(client.requests, (r) => r.method === "GET" && r.url.includes(next));
+  assert(got, "the second day was not loaded");
+  got.resolve(jsonRes(200, { date: next, markdown: "day c", mtime: 70 }));
+  await leaveMid;
+  await leaveNext;
+  await tick();
+  assert(dump.value === "day c", "the second day did not paint (" + dump.value + ")");
+  assert(client.doc.getElementById("conflict-sheet").hidden === true, "the quick switches showed a conflict sheet");
+});
+
+await check("typing during a day switch does not show a conflict or lose the text", async () => {
+  const client = boot();
+  const day = "2026-10-21";
+  const next = "2026-10-22";
+  await loadDay(client, day, "saved line", 100);
+  const dump = client.doc.getElementById("dump");
+  dump.value = "alpha";
+  client.sandbox.scheduleSave();
+  const leaving = client.sandbox.openDay(next);
+  await tick();
+  const first = take(client.requests, (r) => r.method === "PUT" && r.url.includes(day));
+  assert(first, "the day switch did not start saving");
+  assert(JSON.parse(first.opts.body).markdown === "alpha", "the first save was not the text at the click");
+  assert(JSON.parse(first.opts.body).mtime === 100, "the first save was not based on the loaded version");
+  dump.value = "alpha beta";
+  client.sandbox.scheduleSave();
+  assert(!client.requests.some((r) => r.method === "PUT"), "typing sent a second save before the first finished");
+  first.resolve(jsonRes(200, { ok: true, date: day, mtime: 180 }));
+  await tick();
+  const second = take(client.requests, (r) => r.method === "PUT" && r.url.includes(day));
+  assert(second, "the newer text was not saved");
+  const sent = JSON.parse(second.opts.body);
+  assert(sent.markdown === "alpha beta", "the newer text was lost (" + sent.markdown + ")");
+  assert(sent.mtime === 180, "the newer text was saved with the old version " + sent.mtime);
+  second.resolve(jsonRes(200, { ok: true, date: day, mtime: 200 }));
+  await tick();
+  const got = take(client.requests, (r) => r.method === "GET" && r.url.includes(next));
+  assert(got, "the next day was not loaded");
+  got.resolve(jsonRes(200, { date: next, markdown: "day b", mtime: 50 }));
+  await leaving;
+  await tick();
+  assert(dump.value === "day b", "the next day did not paint (" + dump.value + ")");
+  assert(client.doc.getElementById("conflict-sheet").hidden === true, "typing during the switch showed a conflict sheet");
+});
+
+await check("a day switch that cannot reach the server stays on the day", async () => {
+  const client = boot();
+  const day = "2026-10-21";
+  const next = "2026-10-22";
+  await loadDay(client, day, "saved line", 100);
+  const dump = client.doc.getElementById("dump");
+  dump.value = "typed offline";
+  client.sandbox.scheduleSave();
+  const leaving = client.sandbox.openDay(next);
+  await tick();
+  const put = take(client.requests, (r) => r.method === "PUT" && r.url.includes(day));
+  assert(put, "the day switch did not try to save");
+  put.reject(new Error("Failed to fetch"));
+  await leaving;
+  await tick();
+  assert(dump.value === "typed offline", "the failed switch left the page (" + dump.value + ")");
+  assert(client.doc.getElementById("conflict-sheet").hidden === true, "a network failure opened the conflict sheet");
+  assert(client.doc.getElementById("status").textContent === "Failed to fetch", "the status line did not use the fetch error");
+  const key = client.storage.keys().find((k) => k.indexOf("log/" + day + ".md") >= 0);
+  assert(key, "the failed switch did not keep a local copy");
+  assert(JSON.parse(client.storage.getItem(key)).markdown === "typed offline", "the local copy was not the typed text");
+  assert(!client.requests.some((r) => r.url.includes(next)), "the failed switch still loaded the next day");
+});
+
 const failed = results.filter((r) => !r.ok);
 console.log("");
 if (failed.length) {

@@ -17,11 +17,12 @@ assert(next > start, "renderDay after openDay");
 const fn = src.slice(start, next);
 
 assert(!fn.includes("setStatus(\"Loading\")"), "day switch must not show Loading");
-assert(!/await putRawDay/.test(fn), "day-to-day switch does not wait on the old day write");
-assert(fn.includes("putRawDay"), "old day is still written");
+const saveAt = fn.indexOf("await saveDay()");
+assert(saveAt > fn.indexOf("if (leavingDay && !conflictOpen && state.dirty)"), "day switch waits on the save queue");
+assert(!fn.includes("putRawDay"), "day switch does not use a side write");
 assert(/api\("\/api\/day\?date="/.test(fn), "openDay still GET /api/day");
 assert(fn.includes("renderDay()"), "openDay paints the day");
-assert(fn.indexOf("renderDay()") < fn.indexOf("putRawDay"), "paint before saving the old day");
+assert(fn.indexOf("renderDay()") < saveAt, "paint before saving the old day");
 assert(fn.indexOf("renderDay()") < fn.indexOf("await renderMonth()"), "paper paints before month");
 assert(fn.includes("openDayGen"), "stale openDay must not clobber");
 assert(/catch \(e\)/.test(fn), "a failed switch is caught");

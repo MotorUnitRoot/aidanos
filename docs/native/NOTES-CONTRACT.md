@@ -165,6 +165,7 @@ The app build includes these behaviors.
 
 - New `colby/` notes go in the private index.
 - When a note is deleted or renamed, the app removes the local file and does not pick that path up again from its cache.
+- Devices store the retired-path markers, so a phone that was offline during a delete or rename doesn't recreate the old document when it reconnects.
 - A refused change offers to put the note back, or to keep the text aside on the device.
 - Filenames stay exactly as he wrote them.
 

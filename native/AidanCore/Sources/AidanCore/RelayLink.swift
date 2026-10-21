@@ -41,7 +41,7 @@ final class RelayLink {
             self?.readLoop()
         }
         try send(encodeJoin(senderId: peerId, storageId: storageId))
-        let wait = joined.wait(timeout: .now() + 5)
+        let wait = joined.wait(timeout: .now() + 15)
         if wait == .timedOut {
             close()
             throw AidanError.protocol("The relay did not answer.")
@@ -229,7 +229,7 @@ final class RelayLink {
         // The socket times out quickly so the sync loop can notice a dead relay.
         // The first answer from a phone, or from the iOS simulator, can take longer
         // than that one wait, so keep reading until the header arrives.
-        let deadline = Date().addingTimeInterval(8)
+        let deadline = Date().addingTimeInterval(15)
         while data.count < 8192 {
             let count = readFd(fd, &buffer, 1)
             if count == 0 { break }

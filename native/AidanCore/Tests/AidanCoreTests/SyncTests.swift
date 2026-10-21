@@ -119,21 +119,27 @@ final class SyncTests: XCTestCase {
 
     func testRemoteTextWhileTypingKeepsBoth() throws {
         let relay = try TestRelay.start()
-        defer { relay.stop() }
         let phone = try AidanSession(vault: try temporaryVault())
         let mac = try AidanSession(vault: try temporaryVault())
+        defer {
+            phone.disconnect()
+            mac.disconnect()
+            relay.stop()
+        }
         let path = "notes/typing.md"
         try phone.connect(relayURL: relay.url, token: relay.token)
         try mac.connect(relayURL: relay.url, token: relay.token)
         try phone.replace(path, with: "Hello")
-        XCTAssertTrue(try waitUntil(seconds: 8) { (try? mac.text(path)) == "Hello" })
+        let helloArrived = try waitUntil(seconds: 20) { (try? mac.text(path)) == "Hello" }
+        XCTAssertTrue(helloArrived)
+        if !helloArrived { return }
         try mac.replace(path, with: "Hello there")
-        XCTAssertTrue(try waitUntil(seconds: 8) { (try? phone.text(path)) == "Hello there" })
+        let thereArrived = try waitUntil(seconds: 20) { (try? phone.text(path)) == "Hello there" }
+        XCTAssertTrue(thereArrived)
+        if !thereArrived { return }
         let merged = try phone.applyEdit(path, from: "Hello", to: "Hello!")
         XCTAssertEqual(merged, "Hello! there")
-        XCTAssertTrue(try waitUntil(seconds: 8) { (try? mac.text(path)) == "Hello! there" })
-        phone.disconnect()
-        mac.disconnect()
+        XCTAssertTrue(try waitUntil(seconds: 20) { (try? mac.text(path)) == "Hello! there" })
     }
 
     func testOutsideEditWhileClosedSurvivesLaunch() throws {

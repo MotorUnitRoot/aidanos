@@ -5,8 +5,8 @@ name: independent-review-post
 # holds. The parse job has no secrets. post-pass waits in the fixed
 # environment independent-review. post-block uses the fixed environment
 # independent-review-block, which has no reviewer, so it starts immediately.
-# Both environments define REVIEW_APP_PRIVATE_KEY. The private key is not
-# printed. Do not add set -x.
+# Both environments define REVIEW_APP_PRIVATE_KEY and the environment
+# variable REVIEW_APP_ID. The private key is not printed. Do not add set -x.
 #
 # No concurrency on the workflow. Each post job has its own group, keyed by
 # pull request and verdict, with cancel-in-progress off. A PASS job cannot
@@ -97,15 +97,16 @@ jobs:
           node-version: "22"
       - name: Mint the review App token
         id: app-token
-        # v3.3.0. Statuses to write the gate. Pull requests and issues to
-        # re-read the head and the verdict comment. No checks permission.
+        # v3.3.0. Statuses to write the gate. Pull requests to re-read the
+        # head and the verdict comment. Conversation comments work with
+        # pull requests read. REVIEW_APP_ID is an environment variable on
+        # independent-review. This token does not request checks.
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
         with:
           app-id: ${{ vars.REVIEW_APP_ID }}
           private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
           permission-statuses: write
           permission-pull-requests: read
-          permission-issues: read
       - name: Set independent-review/approved
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -158,14 +159,15 @@ jobs:
           node-version: "22"
       - name: Mint the review App token
         id: app-token
-        # v3.3.0. Statuses to write the failure. Checks to fail an existing
-        # check run of the same name. Pull requests to re-read the head.
+        # v3.3.0. Statuses to write the failure. Pull requests to re-read
+        # the head. REVIEW_APP_ID is an environment variable on
+        # independent-review-block. A BLOCK does not call the checks API,
+        # so this token does not request checks.
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
         with:
           app-id: ${{ vars.REVIEW_APP_ID }}
           private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
           permission-statuses: write
-          permission-checks: write
           permission-pull-requests: read
       - name: Set independent-review/approved
         env:

@@ -2,9 +2,9 @@
 
 The binding gate is the commit status `independent-review/approved`. A PASS is set only by the `post-pass` job, after Colby approves the `independent-review` environment. A BLOCK is set by the `post-block` job in `independent-review-block`, which has no reviewer, so it applies as soon as the job starts. A BLOCK on a commit stays failure. A later PASS for that same commit is refused. Only a new push, which is a new commit with no status, clears it.
 
-Both jobs mint an installation token for the GitHub App `motorunit-aidanos-bots` (App ID 5413571) and run `tools/post-review-verdict.mjs --status-only`. The PASS token can write statuses and read pull requests and issue comments. The BLOCK token can write statuses, write checks, and read pull requests. `REVIEW_MODE` is `status`, so only BLOCK asks for checks, and only because a BLOCK fails an existing check run of the same name.
+Both jobs mint an installation token for the GitHub App `motorunit-aidanos-bots` (App ID 5413571) and run `tools/post-review-verdict.mjs --status-only`. Each token requests only statuses write and pull requests read. Reading a pull request conversation comment works with pull requests read. Neither token requests checks or issues. A BLOCK never calls the checks API. The App cannot create or update a check run. `REVIEW_MODE` is `status`. The status-mode PASS path does not call checks either.
 
-Each environment has its own secret named `REVIEW_APP_PRIVATE_KEY`. Colby pastes the App private key into both before this merges. The repo does not store a copy. The App's permissions, including checks read, belong to the App. A new private key does not change them. The PASS environment also has a variable `REVIEW_GATE_PASS_ENV` set to `1`. The script refuses a PASS without that variable. Do not set it on `independent-review-block` or as a repository variable. A repository variable would be visible to the BLOCK job too.
+Each environment has its own secret named `REVIEW_APP_PRIVATE_KEY`. Colby pastes the App private key into both before this merges. The repo does not store a copy. The App's permissions belong to the App. A new private key does not change them. Both environments also define `REVIEW_APP_ID` as an environment variable. The PASS environment also has a variable `REVIEW_GATE_PASS_ENV` set to `1`. The script refuses a PASS without that variable. Do not set it on `independent-review-block` or as a repository variable. A repository variable would be visible to the BLOCK job too.
 
 The advisory workflow reads comments. It does not post the status.
 
@@ -27,9 +27,9 @@ The workflow has no concurrency group of its own. Each post job has its own grou
 
 Before `post-pass` writes success, it fetches the PASS comment again. If that comment was edited or deleted, it writes nothing. It also writes nothing when the pull request head has moved, when `independent-review/approved` on that commit is already failure, or when any BLOCK for that commit exists from `MotorUnitRoot` or `motorunit-aidanos-bots[bot]`. The BLOCK can have been posted before the PASS, or an older comment can have been edited into a BLOCK. A BLOCK line from any other login does not count. `post-block` still writes the failure if its own comment was edited or deleted after parse. After that write it reads the status again and writes failure once more if a success landed in between.
 
-The jobs do not post a second comment. `--status-only` only writes the status. On a BLOCK it still fails an existing `independent-review/approved` check run before it writes the failure status, and it still writes nothing if those failure writes do not succeed. An earlier PASS stays green until a BLOCK write succeeds. Once that failure is on the commit, it stays. A PASS will not clear it.
+The jobs do not post a second comment. `--status-only` only writes the commit status. A BLOCK does not read or write check runs. It writes the failure status, reads that status again, and writes failure once more if a success landed in between. It still writes nothing if that failure write does not succeed. An earlier PASS stays green until a BLOCK write succeeds. Once that failure is on the commit, it stays. A PASS will not clear it.
 
-`REVIEW_MODE` in `tools/post-review-verdict.mjs` is `status`. Switching to `check-run` is a change to that constant.
+`REVIEW_MODE` in `tools/post-review-verdict.mjs` is `status`. Switching to `check-run` is a change to that constant. The installed App has no checks write, so that mode cannot post a check run with this token. A BLOCK writes the commit status either way and never calls the checks API.
 
 ## If a BLOCK fails
 
@@ -37,9 +37,9 @@ A failed BLOCK does not post a success and does not clear an earlier PASS. Retry
 
 ## What can be tested before merge
 
-`issue_comment` runs `.github/workflows/independent-review-post.yml` from `main`, not from the pull request. This pull request cannot start the post jobs. Both environments, both copies of the key, and `REVIEW_GATE_PASS_ENV=1` on `independent-review` only, have to exist before merge.
+`issue_comment` runs `.github/workflows/independent-review-post.yml` from `main`, not from the pull request. This pull request cannot start the post jobs. Both environments, both copies of the key, `REVIEW_APP_ID=5413571` on both environments, and `REVIEW_GATE_PASS_ENV=1` on `independent-review` only, have to exist before merge.
 
-The pull request checks do run the script's self-test, including the allowlist, the moved-head refusal, the comment re-check, a BLOCK that outranks any PASS on that commit, the gate variable, `--status-only`, the `check_name` lookup, and the rate-limit versus permission errors.
+The pull request checks do run the script's self-test, including the allowlist, the moved-head refusal, the comment re-check, a BLOCK that outranks any PASS on that commit, the gate variable, `--status-only`, and a BLOCK that still writes the failure status when every checks request returns 403. Status-write errors still distinguish a rate limit from a plain permission failure.
 
 ## After merge, live
 
@@ -52,7 +52,7 @@ On a throwaway pull request, after the environments exist:
 
 ## Walkthrough
 
-Create both environments before merging. The API calls from this session were refused with 403 (`administration=write` for environments, `actions_variables=write` for the variable). Do not put the private key anywhere except the two environment secrets.
+Create both environments before merging. The API calls from this session were refused with 403 (`administration=write` for environments, `actions_variables=write` for a repository variable). Do not put the private key anywhere except the two environment secrets. `REVIEW_APP_ID` belongs on both environments, not only as a repository variable.
 
 1. Create `independent-review` for PASS. Required reviewer: MotorUnitRoot (user id 146015017), until Colby chooses a different approval account. Leave "Prevent self-review" off, because the verdict comment may be posted as MotorUnitRoot and that same login approves the deployment. Until a separate approval-only account is the only required reviewer, an agent that has MotorUnitRoot's credentials can both post a PASS and approve it. Which account is the required reviewer is Colby's decision. Deployment branches: selected branches, only `main`.
 
@@ -108,12 +108,13 @@ POST /repos/MotorUnitRoot/aidanos/environments/independent-review-block/deployme
 
 On `independent-review` only, add an environment variable `REVIEW_GATE_PASS_ENV` with the value `1`. Not a secret. Not on `independent-review-block`. Not a repository or organization variable.
 
-The App's permissions stay on the App. That includes checks read, and checks write for the BLOCK token's check-run update. Pasting a new key, or rotating the key, does not grant or remove those permissions.
+The App installation's permissions, read from GitHub on 2026-10-21, are checks: read, actions: read, contents: read, metadata: read, statuses: write, and pull_requests: write. There is no issues permission and no checks write. The post jobs request only statuses write and pull requests read. `actions/create-github-app-token` fails if it is asked for a permission the installation does not have. Pasting a new key, or rotating the key, does not grant or remove those permissions. A BLOCK does not read or write check runs, because the App could not fail one anyway.
 
-4. Repository variable, not a secret:
+4. On each environment, add an environment variable `REVIEW_APP_ID` with the value `5413571`. Both post jobs set `environment:` and read `vars.REVIEW_APP_ID`, which is the variable from that job's environment. The BLOCK job runs in `independent-review-block` and needs the variable there too. Do not set `REVIEW_APP_ID` only as a repository variable.
 
 ```
-POST /repos/MotorUnitRoot/aidanos/actions/variables
+POST /repos/MotorUnitRoot/aidanos/environments/independent-review/variables
+POST /repos/MotorUnitRoot/aidanos/environments/independent-review-block/variables
 ```
 
 ```json
@@ -133,5 +134,7 @@ The ruleset UI lists apps that have recently submitted a check. The REST field i
 ## What the gate does not do
 
 MotorUnitRoot owns the App and could create a new key for it. The gate keeps the bots honest. It does not protect against the owner.
+
+`REVIEW_GATE_PASS_ENV` only guards against a code mistake that would run PASS from the BLOCK job. It does not stop deliberate misuse. The real protection is review of what reaches main.
 
 Until a separate approval-only account is the only required reviewer on `independent-review`, an agent with MotorUnitRoot's credentials can both post a PASS and approve that deployment. The approval account is Colby's decision. BLOCK does not wait for that approval. A BLOCK that has been written is permanent for that commit, and only a new push clears it.

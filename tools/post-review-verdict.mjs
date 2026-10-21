@@ -9,6 +9,8 @@
  * set only on the independent-review environment. A PASS fetches its
  * comment again and writes nothing if that comment changed or a BLOCK for
  * the same commit exists. A BLOCK still writes if its comment changed.
+ * A BLOCK never calls the checks API. The status-mode PASS path does not
+ * either. The minted token can write statuses and read pull requests only.
  *
  *   GITHUB_TOKEN=... GITHUB_REPOSITORY=owner/repo \
  *     node tools/post-review-verdict.mjs <pr> PASS <head-sha>
@@ -18,10 +20,14 @@
  * request. The script refuses if the pull request's current head is not
  * that SHA. On PASS it posts the comment first, then sets success, so a
  * failed comment never turns the commit green. On BLOCK it writes the
- * failure signals first, then posts the comment. A failed BLOCK posts no
- * comment, so an earlier PASS stays green until the BLOCK is retried.
+ * failure status first, then posts the comment. It does not read or write
+ * check runs. A failed BLOCK posts no comment, so an earlier PASS stays
+ * green until the BLOCK is retried.
  *
  * REVIEW_MODE is "status" or "check-run". Changing it is a code change.
+ * "check-run" is a PASS-only alternate. The installed App has no checks
+ * write, and the workflow token does not request checks, so the live path
+ * stays on "status". A BLOCK writes the commit status in either mode.
  * --parse-request reads an issue_comment event and accepts a verdict only
  * from VERDICT_AUTHORS, and only when the SHA is still the pull request head.
  */
@@ -30,22 +36,17 @@ import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { REVIEW_APP_ID, STATUS_CONTEXT, verdictLine } from "../.github/independent-review.mjs";
 
-// "status" posts the commit status. "check-run" posts the check run.
-// A BLOCK in either mode also fails the other signal when one is already
-// on the commit. Change this constant to switch; there is no runtime flag.
+// "status" posts the commit status. "check-run" posts a check run on PASS
+// only. A BLOCK never calls the checks API: the App has no checks write,
+// and a checks 403 must not stop the failure status. Change this constant
+// to switch PASS; there is no runtime flag.
 export const REVIEW_MODE = "status";
 
 export const BLOCK_STATUS_FAILED_MESSAGE =
   "Could not set independent-review/approved to failure. BLOCK was not posted, and an earlier PASS stays green until this BLOCK is retried.";
 
-export const BLOCK_CHECK_PERMISSION_MESSAGE =
-  "Cannot write a failing independent-review/approved check run. The App does not have permission to write checks. BLOCK was not posted, and an earlier PASS stays green until this BLOCK is retried.";
-
 export const BLOCK_CHECK_RATE_LIMIT_MESSAGE =
   "GitHub rate limited independent-review/approved. BLOCK was not posted, and an earlier PASS stays green until this BLOCK is retried.";
-
-const BLOCK_CHECK_LIST_MESSAGE =
-  "Cannot list check runs named independent-review/approved, so a BLOCK cannot see an earlier check run. BLOCK was not posted, and an earlier PASS stays green until this BLOCK is retried.";
 
 // Comments that may start the gated status job. One list of login names, checked in one place.
 // This is not GitHub's author association.
@@ -129,14 +130,6 @@ export function classifyCommentRequest({ login, body, headSha }) {
   const head = String(headSha || "").toLowerCase();
   if (head !== parsed.sha) return { action: "refuse", verdict: parsed.verdict, sha: parsed.sha, head };
   return { action: "accept", verdict: parsed.verdict, sha: parsed.sha };
-}
-
-function isOurCheckRun(run) {
-  if (!run || run.name !== STATUS_CONTEXT) return false;
-  const app = run.app;
-  if (!app) return true;
-  if (Number(app.id) === REVIEW_APP_ID) return true;
-  return app.slug === "motorunit-aidanos-bots";
 }
 
 export function blockFailureKeptPass({ exitCode, message, comments, statuses }) {
@@ -263,34 +256,6 @@ export async function postReviewVerdict({
       },
     });
 
-  const failCheckStep = (error, step) => {
-    const kind = apiFailureKind(error);
-    if (kind === "rate-limit") throw new Error(BLOCK_CHECK_RATE_LIMIT_MESSAGE);
-    if (kind === "permission") {
-      throw new Error(step === "list" ? BLOCK_CHECK_LIST_MESSAGE : BLOCK_CHECK_PERMISSION_MESSAGE);
-    }
-    const what = step === "list" ? `list check runs named ${STATUS_CONTEXT}` : "write the failing check run";
-    throw new Error(`Could not ${what}. BLOCK was not posted. (${scrubToken(error.message, token)})`);
-  };
-
-  const failExistingCheckRuns = async () => {
-    let listed;
-    try {
-      listed = await call(
-        `/repos/${owner}/${repo}/commits/${encodeURIComponent(head)}/check-runs?check_name=${encodeURIComponent(STATUS_CONTEXT)}&per_page=100`,
-      );
-    } catch (error) {
-      failCheckStep(error, "list");
-    }
-    const runs = (listed && listed.check_runs) || [];
-    if (!runs.some(isOurCheckRun)) return;
-    try {
-      await postCheckRun();
-    } catch (error) {
-      failCheckStep(error, "write");
-    }
-  };
-
   const failStatus = async () => {
     try {
       await postStatus();
@@ -315,17 +280,7 @@ export async function postReviewVerdict({
     if (latest && latest.state === "success") await failStatus();
   };
 
-  if (verdict === "BLOCK" && reviewMode === "status") {
-    await failExistingCheckRuns();
-    await failStatus();
-    await rewriteFailureIfPassed();
-    await writeComment();
-  } else if (verdict === "BLOCK") {
-    try {
-      await postCheckRun();
-    } catch (error) {
-      failCheckStep(error, "write");
-    }
+  if (verdict === "BLOCK") {
     await failStatus();
     await rewriteFailureIfPassed();
     await writeComment();
@@ -511,22 +466,21 @@ export function selfTest() {
     assert(passApi.calls[3].body.body === `Independent review: PASS ${sha}`, "comment body");
     assert(passApi.calls[4].body.state === "success", "success state");
     assert(passApi.calls[4].body.context === "independent-review/approved", "status context");
+    assert(
+      !passApi.calls.some((call) => call.pathname.includes("/check-runs") || call.pathname.includes("/checks")),
+      "status mode PASS does not call the checks API",
+    );
 
     assert(REVIEW_MODE === "status", "the default mode is status");
     assert(blockResult.status === "fulfilled", "block posts");
     assert(blockResult.value.line === `Independent review: BLOCK ${sha}`, "block first line");
-    assert(blockApi.calls[1].pathname.includes("/check-runs"), "block looks for an earlier check run");
+    assert(blockApi.calls[1].pathname.includes("/statuses/"), "block sets status before the comment");
+    assert(blockApi.calls[1].body.state === "failure", "block status");
+    assert(blockApi.calls[2].pathname.endsWith("/status"), "block reads the status again after writing failure");
+    assert(blockApi.calls[3].body.body === `Independent review: BLOCK ${sha}`, "block comment after the failure writes");
     assert(
-      blockApi.calls[1].pathname.includes(`check_name=${encodeURIComponent(STATUS_CONTEXT)}`),
-      "check-run lookup is filtered by check_name",
-    );
-    assert(blockApi.calls[2].pathname.includes("/statuses/"), "block sets status before the comment");
-    assert(blockApi.calls[2].body.state === "failure", "block status");
-    assert(blockApi.calls[3].pathname.endsWith("/status"), "block reads the status again after writing failure");
-    assert(blockApi.calls[4].body.body === `Independent review: BLOCK ${sha}`, "block comment after the failure writes");
-    assert(
-      !blockApi.calls.some((call) => call.method === "POST" && call.pathname.endsWith("/check-runs")),
-      "status mode does not create a check run when none exists",
+      !blockApi.calls.some((call) => call.pathname.includes("/check-runs") || call.pathname.includes("/checks")),
+      "BLOCK does not call the checks API",
     );
 
     assert(staleResult.status === "rejected", "stale head is refused");
@@ -598,16 +552,16 @@ export function selfTest() {
       log: () => {},
     });
     const priorPosts = priorCheck.posts();
-    assert(priorPosts[0].kind === "check-run" && priorPosts[0].conclusion === "failure", "status mode fails an earlier check run");
-    assert(priorPosts[1].kind === "status" && priorPosts[1].state === "failure", "status mode then fails the status");
-    assert(priorPosts[2].kind === "comment", "status mode comments only after both failure writes");
+    assert(priorPosts[0].kind === "status" && priorPosts[0].state === "failure", "BLOCK writes the failure status and leaves check runs alone");
+    assert(priorPosts[1].kind === "comment", "BLOCK comments after the failure status");
+    assert(!priorPosts.some((post) => post.kind === "check-run"), "BLOCK does not write a check run");
+    assert(priorCheck.lookups.length === 0, "BLOCK does not read check runs");
 
-    const denied = memoryApi(sha, token, {
+    const noChecksAccess = memoryApi(sha, token, {
       statuses: [{ state: "success", context: STATUS_CONTEXT, source: "earlier-pass" }],
-      checkRuns: [{ name: STATUS_CONTEXT, conclusion: "success", app: { id: REVIEW_APP_ID } }],
-      denyCheckWrite: true,
+      denyChecks: true,
     });
-    const deniedError = await postReviewVerdict({
+    const noChecksError = await postReviewVerdict({
       token,
       owner: "MotorUnitRoot",
       repo: "aidanos",
@@ -615,18 +569,47 @@ export function selfTest() {
       verdict: "BLOCK",
       sha,
       mode: "status",
-      request: denied.request,
+      request: noChecksAccess.request,
       log: () => {},
     }).then(
       () => null,
       (error) => error,
     );
-    assert(deniedError instanceof Error && deniedError.message === BLOCK_CHECK_PERMISSION_MESSAGE, "missing check permission is explicit");
-    assert(denied.comments.length === 0, "missing check permission posts no comment");
-    assert(denied.statuses.length === 1 && denied.statuses[0].state === "success", "missing check permission leaves the PASS");
+    assert(noChecksError == null, "a checks 403 does not refuse BLOCK");
+    assert(
+      noChecksAccess.posts().some((post) => post.kind === "status" && post.state === "failure"),
+      "a BLOCK with no checks access still writes the failure status",
+    );
+    assert(!noChecksAccess.posts().some((post) => post.kind === "check-run"), "a BLOCK with no checks access writes no check run");
+    assert(
+      noChecksAccess.statuses.some((item) => item.state === "failure" && item.source === "write"),
+      "the failure status is recorded when checks are forbidden",
+    );
 
-    const checkModeBlock = memoryApi(sha, token);
-    await postReviewVerdict({
+    const passNoChecks = memoryApi(sha, token, { denyChecks: true });
+    const passNoChecksError = await postReviewVerdict({
+      token,
+      owner: "MotorUnitRoot",
+      repo: "aidanos",
+      number: 40,
+      verdict: "PASS",
+      sha,
+      mode: "status",
+      request: passNoChecks.request,
+      log: () => {},
+    }).then(
+      () => null,
+      (error) => error,
+    );
+    assert(passNoChecksError == null, "status mode PASS does not depend on checks access");
+    assert(
+      passNoChecks.posts().some((post) => post.kind === "status" && post.state === "success"),
+      "status mode PASS still writes success when checks are forbidden",
+    );
+    assert(passNoChecks.lookups.length === 0, "status mode PASS does not call the checks API");
+
+    const checkModeBlock = memoryApi(sha, token, { denyChecks: true });
+    const checkModeBlockError = await postReviewVerdict({
       token,
       owner: "MotorUnitRoot",
       repo: "aidanos",
@@ -636,11 +619,15 @@ export function selfTest() {
       mode: "check-run",
       request: checkModeBlock.request,
       log: () => {},
-    });
+    }).then(
+      () => null,
+      (error) => error,
+    );
+    assert(checkModeBlockError == null, "check-run mode BLOCK does not call checks");
     const checkPosts = checkModeBlock.posts();
-    assert(checkPosts[0].kind === "check-run" && checkPosts[0].conclusion === "failure", "check-run mode fails the check run first");
-    assert(checkPosts[1].kind === "status" && checkPosts[1].state === "failure", "check-run mode also fails the status");
-    assert(checkPosts[2].kind === "comment", "check-run mode comments after the failure writes");
+    assert(checkPosts[0].kind === "status" && checkPosts[0].state === "failure", "check-run mode BLOCK still writes the failure status");
+    assert(checkPosts[1].kind === "comment", "check-run mode BLOCK comments after the status");
+    assert(!checkPosts.some((post) => post.kind === "check-run"), "check-run mode BLOCK writes no check run");
 
     const checkModePass = memoryApi(sha, token);
     await postReviewVerdict({
@@ -768,6 +755,7 @@ export function selfTest() {
 
     const statusOnlyBlock = memoryApi(sha, token, {
       checkRuns: [{ name: STATUS_CONTEXT, conclusion: "success", app: { id: REVIEW_APP_ID } }],
+      denyChecks: true,
     });
     await postReviewVerdict({
       token,
@@ -781,8 +769,12 @@ export function selfTest() {
       log: () => {},
     });
     const statusOnlyBlockPosts = statusOnlyBlock.posts();
-    assert(statusOnlyBlockPosts[0].kind === "check-run" && statusOnlyBlockPosts[0].conclusion === "failure", "status-only BLOCK still fails an earlier check run");
-    assert(statusOnlyBlockPosts[1].kind === "status" && statusOnlyBlockPosts[1].state === "failure", "status-only BLOCK sets the failure status");
+    assert(
+      statusOnlyBlockPosts.length === 1 &&
+        statusOnlyBlockPosts[0].kind === "status" &&
+        statusOnlyBlockPosts[0].state === "failure",
+      "status-only BLOCK sets the failure status and does not touch check runs",
+    );
     assert(!statusOnlyBlockPosts.some((post) => post.kind === "comment"), "status-only BLOCK does not post a comment");
 
     const statusOnlyPass = memoryApi(sha, token);
@@ -803,75 +795,32 @@ export function selfTest() {
     );
     assert(statusOnlyPass.comments.length === 0, "status-only PASS does not post a comment");
 
-    const rateLimitedList = memoryApi(sha, token, {
+    const rateLimitedStatus = memoryApi(sha, token, {
       statuses: [{ state: "success", context: STATUS_CONTEXT, source: "earlier-pass" }],
-      checkRuns: [{ name: STATUS_CONTEXT, conclusion: "success", app: { id: REVIEW_APP_ID } }],
-      listError: httpError(403, "403 API rate limit exceeded", { "x-ratelimit-remaining": "0" }),
+      statusWriteError: httpError(403, "403 API rate limit exceeded", { "x-ratelimit-remaining": "0" }),
     });
-    const rateLimitedListError = await postReviewVerdict({
+    const rateLimitedStatusError = await postReviewVerdict({
       token,
       owner: "MotorUnitRoot",
       repo: "aidanos",
       number: 40,
       verdict: "BLOCK",
       sha,
-      request: rateLimitedList.request,
-      log: () => {},
-    }).then(
-      () => null,
-      (error) => error,
-    );
-    assert(rateLimitedListError instanceof Error && rateLimitedListError.message === BLOCK_CHECK_RATE_LIMIT_MESSAGE, "a 403 with no remaining quota is rate limiting");
-    assert(rateLimitedList.comments.length === 0, "a rate-limited list posts no comment");
-    assert(rateLimitedList.statuses.length === 1 && rateLimitedList.statuses[0].state === "success", "a rate-limited list leaves the PASS");
-    assert(
-      rateLimitedList.lookups[0].includes(`check_name=${encodeURIComponent(STATUS_CONTEXT)}`),
-      "the rate-limited lookup was still filtered by name",
-    );
-
-    const retryAfter = memoryApi(sha, token, {
-      listError: httpError(429, "429 too many requests", { "retry-after": "60" }),
-    });
-    const retryAfterError = await postReviewVerdict({
-      token,
-      owner: "MotorUnitRoot",
-      repo: "aidanos",
-      number: 40,
-      verdict: "BLOCK",
-      sha,
-      request: retryAfter.request,
-      log: () => {},
-    }).then(
-      () => null,
-      (error) => error,
-    );
-    assert(retryAfterError instanceof Error && retryAfterError.message === BLOCK_CHECK_RATE_LIMIT_MESSAGE, "a 429 with retry-after is rate limiting");
-
-    const rateLimitedWrite = memoryApi(sha, token, {
-      statuses: [{ state: "success", context: STATUS_CONTEXT, source: "earlier-pass" }],
-      checkRuns: [{ name: STATUS_CONTEXT, conclusion: "success", app: { id: REVIEW_APP_ID } }],
-      checkWriteError: httpError(403, "secondary rate limit", { "x-ratelimit-remaining": "4", "retry-after": "8" }),
-    });
-    const rateLimitedWriteError = await postReviewVerdict({
-      token,
-      owner: "MotorUnitRoot",
-      repo: "aidanos",
-      number: 40,
-      verdict: "BLOCK",
-      sha,
-      request: rateLimitedWrite.request,
+      request: rateLimitedStatus.request,
       log: () => {},
     }).then(
       () => null,
       (error) => error,
     );
     assert(
-      rateLimitedWriteError instanceof Error && rateLimitedWriteError.message === BLOCK_CHECK_RATE_LIMIT_MESSAGE,
-      "a rate-limited check write is not a permission error",
+      rateLimitedStatusError instanceof Error && rateLimitedStatusError.message.startsWith(BLOCK_CHECK_RATE_LIMIT_MESSAGE),
+      "a rate-limited status write is reported as rate limiting",
     );
-    assert(rateLimitedWriteError.message !== BLOCK_CHECK_PERMISSION_MESSAGE, "rate limiting stays distinct from permission");
-    assert(rateLimitedWrite.comments.length === 0, "a rate-limited check write posts no comment");
-    assert(rateLimitedWrite.statuses[0].state === "success", "a rate-limited check write leaves the PASS");
+    assert(rateLimitedStatus.comments.length === 0, "a rate-limited status write posts no comment");
+    assert(
+      rateLimitedStatus.statuses.length === 1 && rateLimitedStatus.statuses[0].state === "success",
+      "a rate-limited status write leaves the PASS",
+    );
 
     assert(apiFailureKind(httpError(403, "403 Resource not accessible by integration", {})) === "permission", "a plain 403 is permissions");
     assert(
@@ -911,7 +860,6 @@ export function selfTest() {
           if (options.method === "GET" && pathname.endsWith("/status")) {
             return { statuses: statusState ? [{ context: STATUS_CONTEXT, state: statusState }] : [] };
           }
-          if (options.method === "GET" && pathname.includes("/check-runs")) return { check_runs: [] };
           if (options.method === "POST" && pathname.includes("/statuses/")) {
             posts.push(options.body.state);
             return {};
@@ -1009,7 +957,6 @@ export function selfTest() {
       postComment: false,
       request: async (pathname, options) => {
         if (options.method === "GET" && pathname.includes("/pulls/")) return { head: { sha } };
-        if (options.method === "GET" && pathname.includes("/check-runs")) return { check_runs: [] };
         if (options.method === "GET" && pathname.endsWith("/status")) {
           return { statuses: [{ context: STATUS_CONTEXT, state: "success" }] };
         }
@@ -1044,13 +991,23 @@ export function selfTest() {
     assert(passJob.includes("REVIEW_GATE_PASS_ENV: ${{ vars.REVIEW_GATE_PASS_ENV }}"), "PASS reads the gate variable");
     assert(passJob.includes("permission-statuses: write"), "PASS token can write statuses");
     assert(passJob.includes("permission-pull-requests: read"), "PASS token can read the pull request");
-    assert(passJob.includes("permission-issues: read"), "PASS token can re-read the comment");
+    assert(passJob.includes("app-id: ${{ vars.REVIEW_APP_ID }}"), "PASS reads REVIEW_APP_ID from its environment");
+    assert(!passJob.includes("permission-issues:"), "PASS token does not request issues");
     assert(!passJob.includes("permission-checks:"), "PASS token does not request checks");
     assert(blockJob.includes('"$REVIEW_PR" BLOCK "$REVIEW_SHA"'), "the BLOCK job hard-codes BLOCK");
     assert(!blockJob.includes("REVIEW_GATE_PASS_ENV"), "BLOCK does not receive the PASS gate variable");
     assert(blockJob.includes("permission-statuses: write"), "BLOCK token can write statuses");
-    assert(blockJob.includes("permission-checks: write"), "BLOCK token can fail an existing check run");
     assert(blockJob.includes("permission-pull-requests: read"), "BLOCK token can read the pull request");
+    assert(blockJob.includes("app-id: ${{ vars.REVIEW_APP_ID }}"), "BLOCK reads REVIEW_APP_ID from its environment");
+    assert(!blockJob.includes("permission-checks:"), "BLOCK token does not request checks");
+    assert(!blockJob.includes("permission-issues:"), "BLOCK token does not request issues");
+    for (const job of [passJob, blockJob]) {
+      const requested = job.match(/permission-[a-z-]+:/g) || [];
+      assert(
+        requested.length === 2 && requested.includes("permission-statuses:") && requested.includes("permission-pull-requests:"),
+        "each post token requests only statuses write and pull requests read",
+      );
+    }
     const summaries = workflow.split("- name: Record the verdict").slice(1);
     assert(summaries.length === 2, "both post jobs record a summary");
     for (const summary of summaries) {
@@ -1072,7 +1029,11 @@ function httpError(status, message, headers) {
   return error;
 }
 
-function memoryApi(head, token, { statuses = [], checkRuns = [], denyCheckWrite = false, listError = null, checkWriteError = null } = {}) {
+function memoryApi(
+  head,
+  token,
+  { statuses = [], checkRuns = [], denyCheckWrite = false, denyChecks = false, listError = null, checkWriteError = null, statusWriteError = null } = {},
+) {
   const state = {
     statuses: statuses.map((item) => ({ ...item })),
     checkRuns: checkRuns.map((item) => ({ ...item })),
@@ -1080,11 +1041,15 @@ function memoryApi(head, token, { statuses = [], checkRuns = [], denyCheckWrite 
     posts: [],
     lookups: [],
   };
+  const checksRequest = (pathname) => pathname.includes("/check-runs") || pathname.includes("/checks");
   const request = async (pathname, options) => {
     if (String(options.token) !== token) throw new Error("missing token");
+    if (checksRequest(pathname)) {
+      state.lookups.push(pathname);
+      if (denyChecks) throw httpError(403, "403 Resource not accessible by integration", {});
+    }
     if (options.method === "GET" && pathname.includes("/pulls/")) return { head: { sha: head } };
     if (options.method === "GET" && pathname.includes("/check-runs")) {
-      state.lookups.push(pathname);
       if (listError) throw listError;
       return { check_runs: state.checkRuns };
     }
@@ -1102,6 +1067,7 @@ function memoryApi(head, token, { statuses = [], checkRuns = [], denyCheckWrite 
       return run;
     }
     if (options.method === "POST" && pathname.includes("/statuses/")) {
+      if (statusWriteError) throw statusWriteError;
       state.statuses.push({ state: options.body.state, context: options.body.context, source: "write" });
       state.posts.push({ kind: "status", state: options.body.state });
       return {};
@@ -1149,7 +1115,6 @@ function blockStatusFailsSource(token, sha) {
         sha,
         request: async (pathname, options) => {
           if (options.method === "GET" && pathname.includes("/pulls/")) return { head: { sha } };
-          if (options.method === "GET" && pathname.includes("/check-runs")) return { check_runs: [] };
           if (options.method === "POST" && pathname.includes("/statuses/")) {
             throw new Error("status write failed");
           }

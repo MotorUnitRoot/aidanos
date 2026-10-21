@@ -764,7 +764,7 @@ async function strayFileLeftAlone() {
       const body = await (await fetch(baseB + "/api/sync")).json();
       return body.join === true ? body : "";
     }, 5000, "drift offers Bring them in");
-    assert(sync.left === "Left an unrelated file alone.", "the save says the stray file was left alone " + JSON.stringify(sync));
+    assert(sync.left === "", "the save does not say the stray file was left alone " + JSON.stringify(sync));
     assert(!trackedNames(vaultB).includes("private-scratch.txt"), "save did not stage the stray file");
     assert(!historyNames(vaultB).includes("private-scratch.txt"), "save did not commit the stray file");
     assert(git(["show", "HEAD:README.md"], vaultB) === "vault\n", "save did not commit the unrelated edit");
@@ -776,7 +776,7 @@ async function strayFileLeftAlone() {
     });
     const joinedBody = await joined.json();
     assert(joined.ok, "Bring them in " + joined.status + " " + JSON.stringify(joinedBody) + " " + childB._log().slice(-500));
-    assert(joinedBody.left === "Left an unrelated file alone.", "Bring them in says the stray file was left alone");
+    assert(joinedBody.left === "", "Bring them in does not say the stray file was left alone");
     assert(git(["show", "main:log/" + dayX + ".md"], bare) === textX, "A's day was brought in");
     assert(git(["show", "main:log/" + dayY + ".md"], bare) === textY, "B's day was pushed");
     assert(git(["show", "main:log/" + dayW + ".md"], bare) === textW, "the save was pushed");

@@ -27,10 +27,13 @@ function grab(name, nextName) {
 const sandbox = {};
 new Function(
   "sandbox",
-  grab("isWorkMapPath", "isMapDoc") +
+  grab("familyQuestionText", "formatOneLine") +
+    grab("isWorkMapPath", "isMapDoc") +
     grab("parseTaskLine", "parseBlocks") +
     grab("stageGateText", "mapNextStepLines") +
     grab("mapNextStepLines", "taskLineKey") +
+    grab("taskLineKey", "appendMapTasks") +
+    grab("appendMapTasks", "appendDoorTasks") +
     grab("appendDoorTasks", "hideDoorProposals") +
     grab("mapRowJoinPath", "mapCanvasRows") +
     grab("mapCanvasRows", "paintStagePaper") +
@@ -38,11 +41,15 @@ new Function(
     " sandbox.parseProcessMap = parseProcessMap;" +
     " sandbox.stageNextStepLines = stageNextStepLines;" +
     " sandbox.familyRoomStops = familyRoomStops;" +
+    " sandbox.appendMapTasks = appendMapTasks;" +
     " sandbox.linesToAddToday = linesToAddToday;" +
+    " sandbox.boxesOnToday = boxesOnToday;" +
     " sandbox.planMarkdownFromChecks = planMarkdownFromChecks;" +
     " sandbox.placeStopsFirst = placeStopsFirst;" +
     " sandbox.ensureFamilySeason = ensureFamilySeason;" +
     " sandbox.familyRoomSeed = familyRoomSeed;" +
+    " sandbox.repairQuestionLine = repairQuestionLine;" +
+    " sandbox.familyAnswerMap = familyAnswerMap;" +
     " sandbox.mapRowJoinPath = mapRowJoinPath;" +
     " sandbox.mapCanvasRows = mapCanvasRows;"
 )(sandbox);
@@ -52,11 +59,15 @@ const {
   parseProcessMap,
   stageNextStepLines,
   familyRoomStops,
+  appendMapTasks,
   linesToAddToday,
+  boxesOnToday,
   planMarkdownFromChecks,
   placeStopsFirst,
   ensureFamilySeason,
   familyRoomSeed,
+  repairQuestionLine,
+  familyAnswerMap,
   mapRowJoinPath,
   mapCanvasRows,
 } = sandbox;
@@ -215,6 +226,120 @@ check("a stop blocks the next cut", () => {
   assert(chrome.includes("family-room-to-office/walk.md"), "walk uses the day chrome");
   assert(chrome.includes("family-room-to-office/today.md"), "today note uses the day chrome");
   assert(planMarkdownFromChecks([]).startsWith("# The room as it is\n"), "the paper keeps the one heading");
+});
+
+check("line 8 is not called unless it reports what the town said", () => {
+  const ask = (phrase) => familyRoomStops(answersMd.replace(
+    "8. What did the building department say?",
+    "8. What did the building department say? " + phrase
+  ), planMd);
+  const town = (stops) => stops.some((s) => /building department/i.test(s));
+  for (const phrase of ["Not asked yet", "not asked", "not yet", "no", "TBD", "Not called yet", ""]) {
+    assert(town(ask(phrase)), JSON.stringify(phrase) + " is not a town answer");
+  }
+  for (const phrase of ["No permit needed", "The town said no", "Called Maria on October 19"]) {
+    assert(!town(ask(phrase)), JSON.stringify(phrase) + " is what the town said");
+  }
+});
+
+check("no walls change never offers Cut the wall", () => {
+  const walls = answersMd
+    .replace(
+      "3. Will any wall or opening change?",
+      "3. Will any wall or opening change? No walls change"
+    )
+    .replace(
+      "8. What did the building department say?",
+      "8. What did the building department say? No permit needed"
+    );
+  const stops = familyRoomStops(walls, planMd);
+  assert(!stops.some((s) => /building department/i.test(s)), "the permit answer is not a town stop");
+  assert(stops.some((s) => /wall stays closed/i.test(s)), "no walls change keeps the wall closed");
+  const rough = parseProcessMap(mapMd).stages.find((s) => s.title === "Rough");
+  const roughSteps = stageNextStepLines(rough);
+  const offered = linesToAddToday(roughSteps, stops, walls);
+  assert(!offered.some((s) => /Cut the wall/i.test(s)), "cut stays off: " + offered.join(" | "));
+  assert(offered.some((s) => /rough inspection/i.test(s)), "the inspection still lands");
+  const fromAnswer = linesToAddToday(roughSteps, [], walls);
+  assert(!fromAnswer.some((s) => /Cut the wall/i.test(s)), "the answer blocks the cut with no other stop");
+  const changing = answersMd
+    .replace(
+      "3. Will any wall or opening change?",
+      "3. Will any wall or opening change? The north wall will change"
+    )
+    .replace(
+      "8. What did the building department say?",
+      "8. What did the building department say? No permit needed"
+    );
+  const openStops = familyRoomStops(changing, planMd);
+  const openOffer = linesToAddToday(roughSteps, openStops, changing);
+  assert(openOffer.some((s) => /Cut the wall/i.test(s)), "a wall that changes can still be cut");
+});
+
+check("a click on a numbered line does not land inside the first word", () => {
+  const start = src.indexOf("function sourceCaretFromRendered(");
+  const end = src.indexOf("\nfunction activateLine(", start);
+  assert(start >= 0 && end > start, "caret mapper is in the paper");
+  const box = {};
+  new Function("box", src.slice(start, end) + "\nbox.sourceCaretFromRendered = sourceCaretFromRendered;")(box);
+  const md = "1. Which room, and will anyone sleep there?";
+  const body = "Which room, and will anyone sleep there?";
+  const marker = "1.".length;
+  assert(box.sourceCaretFromRendered(md, body, marker, marker) === 3, "the number click is the start of the question");
+  assert(box.sourceCaretFromRendered(md, body, marker + 1, marker) === 4, "the first letter stays the first letter");
+  assert(md.slice(box.sourceCaretFromRendered(md, body, marker, marker)).startsWith("Which"), "the tail is not hich room");
+  assert(box.sourceCaretFromRendered(md, body, marker + body.length, marker) === md.length, "the end of the question stays the end");
+});
+
+check("a corrupted question keeps the canonical wording and the typed answer", () => {
+  const line = "1. WFahich room, and will anyone sleep there?mily room, nobody sleeps there";
+  const fixed = repairQuestionLine(line);
+  assert(fixed === "1. Which room, and will anyone sleep there?Family room, nobody sleeps there", fixed);
+  const shelves = repairQuestionLine("2. W The built-in shelveshat must stay?X");
+  assert(shelves === "2. What must stay? The built-in shelvesX", shelves);
+  const kept = repairQuestionLine("8. What did the building department say? Not asked yet");
+  assert(kept === "8. What did the building department say? Not asked yet", kept);
+  const corrupted = answersMd
+    .replace(
+      "3. Will any wall or opening change?",
+      "3. No walls changeWill any wall or opening change?"
+    )
+    .replace(
+      "8. What did the building department say?",
+      "8. Not asked yetWhat did the building department say?"
+    );
+  assert(familyAnswerMap(corrupted)[3] === "No walls change", familyAnswerMap(corrupted)[3]);
+  assert(familyAnswerMap(corrupted)[8] === "Not asked yet", familyAnswerMap(corrupted)[8]);
+  assert(!/sleep there/.test(familyAnswerMap(answersMd)[1] || ""), "the question is not the answer");
+  const stops = familyRoomStops(corrupted, planMd);
+  assert(stops.some((s) => /building department/i.test(s)), "the town stop reads the answer");
+  assert(stops.some((s) => /wall stays closed/i.test(s)), "no walls change is read from the answer");
+  const rough = parseProcessMap(mapMd).stages.find((s) => s.title === "Rough");
+  const offered = linesToAddToday(stageNextStepLines(rough), stops, corrupted);
+  assert(!offered.some((s) => /Cut the wall/i.test(s)), "the answer still blocks the cut");
+});
+
+check("a second add does not duplicate, and a removal brings the button back", () => {
+  const lines = [
+    "- [ ] Rough work before drywall",
+    "- [ ] The rough inspection before drywall",
+  ];
+  const once = appendMapTasks("# Monday\n", lines);
+  const twice = appendMapTasks(once, lines);
+  assert(twice === once, "a second add writes nothing new");
+  assert((twice.match(/Rough work before drywall/g) || []).length === 1, "the rough line is once");
+  assert((twice.match(/rough inspection/g) || []).length === 1, "the inspection is once");
+  assert(boxesOnToday(lines, once) === true, "every offered box is on today");
+  const removed = once.split("\n").filter((line) => !/Rough work before drywall/.test(line)).join("\n");
+  assert(boxesOnToday(lines, removed) === false, "removing one box is not On today");
+  assert(boxesOnToday([], once) === false, "a stage with nothing to add is not On today");
+  const paint = src.slice(src.indexOf("function paintAddTodayButton("), src.indexOf("let stageAddGen"));
+  assert(paint.includes('"On today"'), "the same button reads On today");
+  assert(paint.includes("disabled"), "On today stops responding");
+  const sync = src.slice(src.indexOf("async function syncStageAddButton("), src.indexOf("const stageAdd"));
+  assert(sync.includes("boxesOnToday"), "the label is read from today's paper");
+  assert(sync.includes("/api/day?date="), "today's paper is the day");
+  assert(!/wasAdded|addFlag|alreadyAdded/.test(paint + sync), "there is no click flag");
 });
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";

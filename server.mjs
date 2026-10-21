@@ -3,6 +3,17 @@
  * AidanOS — local by default (127.0.0.1). Set AIDANOS_HOST=0.0.0.0 for LAN/phone.
  * Vault: AIDANOS_VAULT, or sibling vault/ beside this server.
  * Optional git: AIDANOS_VAULT_GIT_URL (+ AIDANOS_VAULT_GIT_TOKEN or GITHUB_TOKEN).
+ * With a remote, fast-forward before each push and about once a minute.
+ * Never rebase, never force-push, and never combine two copies of a file.
+ * Same-file divergence keeps both copies until an explicit Keep mine,
+ * Take theirs, or Edit. An ordinary save does not resolve that conflict.
+ * A choice applies only to the remote blob it was made against. A later
+ * edit of that note drops the choice and reopens the conflict.
+ * Sync stages only the note paths this app wrote. Those paths stay pending
+ * until the push that contains them succeeds, including across a restart.
+ * Histories that diverge
+ * with no shared file wait for an explicit join. That join re-checks there
+ * is still no overlap, then makes a normal merge commit and pushes.
  * If clone/pull cannot populate the checkout, seed the bundled sample vault/
  * (Plan + maps) so the demo still serves. Keep retrying git when possible.
  * On the Mac the vault is the parent (~/Grok/motorunit).
@@ -22,6 +33,14 @@ const GIT_TOKEN = String(process.env.AIDANOS_VAULT_GIT_TOKEN || process.env.GITH
 const GIT_DEBOUNCE_MS = (() => {
   const n = Number(process.env.AIDANOS_VAULT_GIT_DEBOUNCE_MS);
   return Number.isFinite(n) && n >= 50 ? Math.min(n, 10_000) : 1500;
+})();
+const GIT_SYNC_MS = (() => {
+  if (!GIT_URL) return 0;
+  const raw = process.env.AIDANOS_VAULT_GIT_SYNC_MS;
+  if (raw == null || String(raw).trim() === "") return 60_000;
+  if (String(raw).trim() === "0") return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 200 ? Math.min(n, 300_000) : 60_000;
 })();
 function resolveVaultPath() {
   if (process.env.AIDANOS_VAULT) return path.resolve(process.env.AIDANOS_VAULT);
@@ -64,10 +83,20 @@ const vaultGit = {
   enabled: Boolean(GIT_URL),
   ready: false,
   error: "",
+  fetchFailed: false,
   lastPushAt: 0,
   pending: new Set(),
   timer: null,
-  busy: false,
+  syncTimer: null,
+  chain: Promise.resolve(),
+  conflicts: new Map(),
+  notice: "",
+  suppressWatch: 0,
+  join: false,
+  resolvePending: new Set(),
+  hold: new Set(),
+  choiceAgainst: new Map(),
+  left: "",
 };
 
 export function authenticatedGitUrl(url, token) {
@@ -140,14 +169,21 @@ function logSafe(...parts) {
 
 function gitHint() {
   if (!vaultGit.enabled) return { enabled: false };
-  const hint = { enabled: true, ok: !vaultGit.error };
+  const open = [...vaultGit.conflicts.values()].filter((item) => !item.resolved);
+  const hint = { enabled: true, ok: !vaultGit.error && open.length === 0 };
   if (vaultGit.error) hint.error = vaultGit.error;
   if (vaultGit.lastPushAt) hint.pushed = true;
+  if (open.length) hint.conflicts = open.map((item) => item.path);
   return hint;
 }
 
 function gitEnv() {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  const env = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_EDITOR: "true",
+    GIT_MERGE_AUTOEDIT: "no",
+  };
   delete env.GIT_ASKPASS;
   return env;
 }
@@ -270,7 +306,7 @@ async function seedBundledVaultIfNeeded(reason) {
 function scheduleVaultGitRetry() {
   if (!GIT_URL || !GIT_RETRY_MS) return;
   setTimeout(() => {
-    retryVaultGit().catch((e) => {
+    enqueueVaultGit(() => retryVaultGit()).catch((e) => {
       vaultGit.error = sanitizeGitError(e && e.message || "retry failed");
       console.error("vault git retry:", vaultGit.error);
     });
@@ -288,9 +324,10 @@ async function retryVaultGit() {
     if (await isGitRepo(VAULT)) {
       await ensureGitIdentity(VAULT);
       await ensureOrigin(VAULT);
-      await runGit(["-C", VAULT, "pull", "--ff-only", "--no-rebase"], { timeoutMs: 25000 });
-      vaultGit.error = "";
       vaultGit.ready = true;
+      loadPending();
+      await syncVault(null);
+      if (vaultGit.fetchFailed) await seedBundledVaultIfNeeded("git retry");
       return;
     }
     await fs.mkdir(VAULT, { recursive: true });
@@ -323,16 +360,13 @@ async function initVaultGit() {
     if (await isGitRepo(VAULT)) {
       await ensureGitIdentity(VAULT);
       await ensureOrigin(VAULT);
-      try {
-        await runGit(["-C", VAULT, "pull", "--ff-only", "--no-rebase"], { timeoutMs: 25000 });
-        vaultGit.error = "";
-      } catch (e) {
-        vaultGit.error = sanitizeGitError(e && e.message || "pull failed");
-        console.error("vault git pull:", vaultGit.error);
+      vaultGit.ready = true;
+      loadPending();
+      await syncVault(null);
+      if (vaultGit.fetchFailed) {
         await seedBundledVaultIfNeeded("pull failed");
         scheduleVaultGitRetry();
       }
-      vaultGit.ready = true;
       return;
     }
     const names = await fs.readdir(VAULT);
@@ -355,6 +389,10 @@ async function initVaultGit() {
       }
       await ensureGitIdentity(VAULT);
       vaultGit.ready = await isGitRepo(VAULT);
+      if (vaultGit.ready) {
+        loadPending();
+        await syncVault(null);
+      }
       return;
     }
     vaultGit.error = "vault path is not a git checkout";
@@ -367,58 +405,1118 @@ async function initVaultGit() {
   }
 }
 
-function scheduleVaultSync(relPath) {
+function isSafeRel(rel) {
+  const s = String(rel || "").replace(/\\/g, "/");
+  if (!s || s.startsWith("/") || s.includes("..") || s.includes("\0")) return false;
+  return true;
+}
+
+function dayFromRel(rel) {
+  const match = /^log\/(\d{4}-\d{2}-\d{2})\.md$/.exec(String(rel || "").replace(/\\/g, "/"));
+  return match ? match[1] : "";
+}
+
+function setGitError(msg) {
+  const next = msg ? sanitizeGitError(msg) : "";
+  if (next === vaultGit.error) return;
+  vaultGit.error = next;
+  if (next) console.error("vault git:", next);
+}
+
+function enqueueVaultGit(work) {
+  const run = vaultGit.chain.then(work, work);
+  vaultGit.chain = run.then(() => {}, () => {});
+  return run;
+}
+
+function pendingFilePath() {
+  return path.join(VAULT, ".git", "aidanos-pending");
+}
+
+function persistPending() {
+  if (!vaultGit.ready) return;
+  try {
+    const file = pendingFilePath();
+    const body = JSON.stringify({
+      paths: [...vaultGit.pending],
+      resolve: [...vaultGit.resolvePending],
+      hold: [...vaultGit.hold],
+      against: Object.fromEntries(vaultGit.choiceAgainst),
+    });
+    fsSync.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = file + ".tmp";
+    fsSync.writeFileSync(tmp, body, { encoding: "utf8", flag: "w" });
+    fsSync.renameSync(tmp, file);
+  } catch (e) {
+    console.error("vault pending:", sanitizeGitError(e && e.message || "save failed"));
+  }
+}
+
+function loadPending() {
+  let raw = "";
+  try {
+    raw = fsSync.readFileSync(pendingFilePath(), "utf8");
+  } catch {
+    return;
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  vaultGit.pending.clear();
+  vaultGit.resolvePending.clear();
+  vaultGit.hold.clear();
+  vaultGit.choiceAgainst.clear();
+  const paths = data && Array.isArray(data.paths) ? data.paths : [];
+  const resolving = data && Array.isArray(data.resolve) ? data.resolve : [];
+  const held = data && Array.isArray(data.hold) ? data.hold : [];
+  const against = data && data.against && typeof data.against === "object" ? data.against : {};
+  for (const rel of paths) {
+    if (isAppNotePath(rel)) vaultGit.pending.add(rel);
+  }
+  for (const rel of resolving) {
+    if (isAppNotePath(rel) && vaultGit.pending.has(rel)) vaultGit.resolvePending.add(rel);
+  }
+  for (const rel of held) {
+    if (isAppNotePath(rel)) vaultGit.hold.add(rel);
+  }
+  for (const [rel, blob] of Object.entries(against)) {
+    if (!isAppNotePath(rel) || typeof blob !== "string" || !blob) continue;
+    vaultGit.choiceAgainst.set(rel, blob);
+  }
+}
+
+function refreshHold() {
+  const next = new Set();
+  for (const [rel, item] of vaultGit.conflicts) {
+    if (!item.resolved) next.add(rel);
+  }
+  let changed = next.size !== vaultGit.hold.size;
+  if (!changed) {
+    for (const rel of next) {
+      if (!vaultGit.hold.has(rel)) changed = true;
+    }
+  }
+  vaultGit.hold = next;
+  if (changed) persistPending();
+}
+
+function scheduleVaultSync(relPath, resolve) {
   if (!vaultGit.enabled || !vaultGit.ready) return;
   const rel = String(relPath || "").replace(/\\/g, "/");
-  if (!rel || rel.startsWith("/") || rel.includes("..")) return;
+  if (!isAppNotePath(rel)) return;
   vaultGit.pending.add(rel);
+  if (resolve) vaultGit.resolvePending.add(rel);
+  persistPending();
   if (vaultGit.timer) clearTimeout(vaultGit.timer);
+  const started = new Set(vaultGit.pending);
   vaultGit.timer = setTimeout(() => {
     vaultGit.timer = null;
-    flushVaultSync().catch((e) => {
-      vaultGit.error = sanitizeGitError(e && e.message);
-      console.error("vault git:", vaultGit.error);
+    enqueueVaultGit(() => syncVault(null)).catch((e) => {
+      setGitError(e && e.message || "git failed");
+    }).finally(() => {
+      for (const extra of vaultGit.pending) {
+        if (started.has(extra)) continue;
+        scheduleVaultSync(extra, vaultGit.resolvePending.has(extra));
+        return;
+      }
     });
   }, GIT_DEBOUNCE_MS);
 }
 
-async function flushVaultSync() {
+function startVaultSyncLoop() {
+  if (!GIT_URL || !GIT_SYNC_MS) return;
+  const arm = () => {
+    vaultGit.syncTimer = setTimeout(() => {
+      vaultGit.syncTimer = null;
+      enqueueVaultGit(() => syncVault(null)).catch((e) => {
+        setGitError(e && e.message || "git failed");
+      }).finally(arm);
+    }, GIT_SYNC_MS);
+    if (vaultGit.syncTimer && typeof vaultGit.syncTimer.unref === "function") {
+      vaultGit.syncTimer.unref();
+    }
+  };
+  arm();
+}
+
+function pushWatchSilence() {
+  vaultGit.suppressWatch += 1;
+}
+
+function popWatchSilence() {
+  vaultGit.suppressWatch = Math.max(0, vaultGit.suppressWatch - 1);
+}
+
+function sendWatch(obj) {
+  const payload = `data: ${JSON.stringify(obj)}\n\n`;
+  for (const client of sseClients) {
+    try { client.write(payload); } catch {}
+  }
+}
+
+function publicConflicts() {
+  const out = [];
+  for (const item of vaultGit.conflicts.values()) {
+    if (item.resolved) continue;
+    out.push({
+      path: item.path,
+      date: dayFromRel(item.path),
+      mine: item.mine,
+      theirs: item.theirs,
+      mtime: item.mtime,
+    });
+  }
+  return out;
+}
+
+function syncStatus() {
+  if (!vaultGit.enabled) {
+    return { enabled: false, ok: true, error: "", conflicts: [], join: false, left: "" };
+  }
+  const conflicts = publicConflicts();
+  const join = Boolean(vaultGit.join) && conflicts.length === 0;
+  const error = vaultGit.error || "";
+  return {
+    enabled: true,
+    ok: !error && conflicts.length === 0 && !join,
+    error,
+    conflicts,
+    join,
+    left: vaultGit.left || "",
+  };
+}
+
+function finishGitNotice() {
+  const status = syncStatus();
+  const notice = JSON.stringify({
+    error: status.error,
+    conflicts: status.conflicts,
+    join: status.join,
+    left: status.left,
+  });
+  if (notice === vaultGit.notice) return;
+  vaultGit.notice = notice;
+  if (!status.enabled) return;
+  sendWatch({
+    type: "git",
+    enabled: true,
+    error: status.error,
+    conflicts: status.conflicts,
+    join: status.join,
+    left: status.left,
+  });
+}
+
+function hasUnresolved() {
+  for (const item of vaultGit.conflicts.values()) {
+    if (!item.resolved) return true;
+  }
+  return false;
+}
+
+function resolvedChoices() {
+  const out = new Map();
+  for (const item of vaultGit.conflicts.values()) {
+    if (!item.resolved) continue;
+    out.set(item.path, item.choice != null ? item.choice : item.mine);
+  }
+  return out;
+}
+
+async function readRel(rel) {
+  if (!isSafeRel(rel)) return "";
+  const text = await readFileSafe(safeJoin(VAULT, rel));
+  return text == null ? "" : text;
+}
+
+async function writeVaultText(rel, text) {
+  if (!isSafeRel(rel)) throw new Error("bad path");
+  await atomicWriteFile(safeJoin(VAULT, rel), text);
+}
+
+async function gitShow(rev, rel) {
+  try {
+    const shown = await runGit(["-C", VAULT, "show", rev + ":" + rel], { timeoutMs: 8000 });
+    return shown.out;
+  } catch {
+    return "";
+  }
+}
+
+async function gitBlob(rev, rel) {
+  if (!rev || !isSafeRel(rel)) return "missing";
+  try {
+    const shown = await runGit(
+      ["-C", VAULT, "rev-parse", "--verify", "--end-of-options", rev + ":" + rel],
+      { timeoutMs: 8000 },
+    );
+    const oid = String(shown.out || "").trim();
+    return /^[0-9a-f]{7,64}$/i.test(oid) ? oid : "missing";
+  } catch {
+    return "missing";
+  }
+}
+
+function bindChoice(rel, item) {
+  const blob = item && item.theirsBlob ? String(item.theirsBlob) : "";
+  if (blob) vaultGit.choiceAgainst.set(rel, blob);
+  else vaultGit.choiceAgainst.delete(rel);
+}
+
+function forgetChoice(rel) {
+  const pending = vaultGit.resolvePending.delete(rel);
+  const bound = vaultGit.choiceAgainst.delete(rel);
+  return pending || bound;
+}
+
+async function listDiff(from, to) {
+  const { out } = await runGit(
+    ["-C", VAULT, "diff", "--name-only", "-z", from, to],
+    { timeoutMs: 8000 },
+  );
+  return out.split("\0").map((item) => item.replace(/\\/g, "/")).filter((item) => isSafeRel(item));
+}
+
+async function dirtySet() {
+  const { out } = await runGit(
+    ["-C", VAULT, "status", "--porcelain", "-z", "-uall"],
+    { timeoutMs: 8000 },
+  );
+  const set = new Set();
+  const parts = out.split("\0");
+  for (let i = 0; i < parts.length; i++) {
+    const rec = parts[i];
+    if (!rec || rec.length < 4) continue;
+    const xy = rec.slice(0, 2);
+    const file = rec.slice(3).replace(/\\/g, "/");
+    if (xy[0] === "R" || xy[0] === "C" || xy[1] === "R" || xy[1] === "C") {
+      const dest = String(parts[i + 1] || "").replace(/\\/g, "/");
+      i += 1;
+      if (isSafeRel(file)) set.add(file);
+      if (isSafeRel(dest)) set.add(dest);
+      continue;
+    }
+    if (isSafeRel(file)) set.add(file);
+  }
+  return set;
+}
+
+async function unmergedFiles() {
+  const { out } = await runGit(
+    ["-C", VAULT, "diff", "--name-only", "-z", "--diff-filter=U"],
+    { timeoutMs: 8000 },
+  );
+  return out.split("\0").map((item) => item.replace(/\\/g, "/")).filter((item) => isSafeRel(item));
+}
+
+async function isMerging() {
+  try {
+    await fs.access(path.join(VAULT, ".git", "MERGE_HEAD"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function revParse(ref) {
+  const { out } = await runGit(["-C", VAULT, "rev-parse", "--verify", ref], { timeoutMs: 4000 });
+  return out.trim();
+}
+
+async function fetchOrigin() {
+  await runGit(["-C", VAULT, "fetch", "origin"], { timeoutMs: 25000 });
+  vaultGit.fetchFailed = false;
+}
+
+async function pushHead() {
+  await runGit(["-C", VAULT, "push", "-u", "origin", "HEAD"], { timeoutMs: 25000 });
+}
+
+async function compareToRemote() {
+  let head = "";
+  try {
+    head = await revParse("HEAD");
+  } catch {
+    return { kind: "none" };
+  }
+  const branch = (await runGit(
+    ["-C", VAULT, "rev-parse", "--abbrev-ref", "HEAD"],
+    { timeoutMs: 4000 },
+  )).out.trim();
+  const candidates = [];
+  if (branch && branch !== "HEAD") candidates.push("origin/" + branch);
+  candidates.push("origin/HEAD", "origin/main", "origin/master");
+  let remote = null;
+  for (const ref of candidates) {
+    try {
+      remote = { ref, rev: await revParse(ref) };
+      break;
+    } catch {}
+  }
+  if (!remote) return { kind: "none", head };
+  if (head === remote.rev) return { kind: "equal", head, ...remote };
+  let base = "";
+  try {
+    base = (await runGit(["-C", VAULT, "merge-base", head, remote.rev], { timeoutMs: 8000 })).out.trim();
+  } catch {
+    try {
+      await runGit(["-C", VAULT, "fetch", "--deepen=200", "origin"], { timeoutMs: 25000 });
+      remote.rev = await revParse(remote.ref);
+      base = (await runGit(["-C", VAULT, "merge-base", head, remote.rev], { timeoutMs: 8000 })).out.trim();
+    } catch {
+      return { kind: "unknown", head, ...remote };
+    }
+  }
+  if (!base) return { kind: "unknown", head, ...remote };
+  if (base === head) return { kind: "behind", head, base, ...remote };
+  if (base === remote.rev) return { kind: "ahead", head, base, ...remote };
+  return { kind: "diverged", head, base, ...remote };
+}
+
+async function detachFile(rel) {
+  if (!isSafeRel(rel)) return;
+  let tracked = true;
+  try {
+    await runGit(["-C", VAULT, "ls-files", "--error-unmatch", "--", rel], { timeoutMs: 4000 });
+  } catch {
+    tracked = false;
+  }
+  if (tracked) {
+    await runGit(["-C", VAULT, "checkout", "HEAD", "--", rel], { timeoutMs: 8000 });
+    return;
+  }
+  await fs.unlink(safeJoin(VAULT, rel)).catch(() => {});
+}
+
+async function fastForward(rev, parkList) {
+  const parked = new Map();
+  pushWatchSilence();
+  try {
+    for (const rel of parkList || []) {
+      if (!isSafeRel(rel) || parked.has(rel)) continue;
+      parked.set(rel, await readRel(rel));
+      await detachFile(rel);
+    }
+    await runGit(["-C", VAULT, "merge", "--ff-only", rev], { timeoutMs: 25000 });
+    for (const [rel, text] of parked) await writeVaultText(rel, text);
+  } catch (e) {
+    for (const [rel, text] of parked) {
+      try { await writeVaultText(rel, text); } catch {}
+    }
+    throw e;
+  } finally {
+    popWatchSilence();
+  }
+}
+
+async function announcePaths(rels) {
+  const seen = new Set();
+  for (const rel of rels) {
+    if (!isSafeRel(rel) || seen.has(rel)) continue;
+    seen.add(rel);
+    let mtime = 0;
+    try { mtime = await fileMtimeMs(safeJoin(VAULT, rel)); } catch { mtime = 0; }
+    const date = dayFromRel(rel);
+    if (date) sendDayWatch(date, mtime);
+    else if (rel.endsWith(".md")) sendWatch({ path: rel, mtime });
+  }
+}
+
+async function recordConflicts(rels, rev) {
+  let forgot = false;
+  for (const rel of rels) {
+    if (!isSafeRel(rel) || !rel.endsWith(".md")) continue;
+    const mine = await readRel(rel);
+    const theirs = await gitShow(rev, rel);
+    const blob = await gitBlob(rev, rel);
+    if (mine === theirs) {
+      if (forgetChoice(rel)) forgot = true;
+      vaultGit.conflicts.delete(rel);
+      continue;
+    }
+    const prev = vaultGit.conflicts.get(rel);
+    if (prev && prev.resolved && prev.against && prev.against === blob) {
+      prev.theirsBlob = blob;
+      continue;
+    }
+    if (prev && prev.resolved) {
+      forgetChoice(rel);
+      forgot = true;
+    }
+    let mtime = 0;
+    try { mtime = await fileMtimeMs(safeJoin(VAULT, rel)); } catch { mtime = 0; }
+    vaultGit.conflicts.set(rel, {
+      path: rel,
+      mine,
+      theirs,
+      mtime,
+      resolved: false,
+      choice: null,
+      theirsBlob: blob,
+      against: "",
+    });
+  }
+  if (forgot) persistPending();
+}
+
+function explicitResolve(body) {
+  if (!body || typeof body !== "object") return "";
+  const kind = String(body.resolve || "");
+  if (kind === "keep" || kind === "theirs" || kind === "edit") return kind;
+  return "";
+}
+
+function isAppNotePath(rel) {
+  const s = String(rel || "").replace(/\\/g, "/");
+  if (!isSafeRel(s)) return false;
+  if (s.split("/").some((part) => !part || part === "." || part === ".." || part.startsWith("."))) return false;
+  let abs;
+  try { abs = safeJoin(VAULT, s); } catch { return false; }
+  if (!contained(abs, VAULT)) return false;
+  if (/^log\/\d{4}-\d{2}-\d{2}\.md$/.test(s)) return true;
+  if (s === "aidanos/active-horse.md") return true;
+  if (familyRoomPngPath(s)) return true;
+  if (!s.endsWith(".md")) return false;
+  if (kernelRel(s)) return false;
+  return true;
+}
+
+function openConflict(rel) {
+  const item = vaultGit.conflicts.get(String(rel || "").replace(/\\/g, "/"));
+  if (!item || item.resolved) return null;
+  return item;
+}
+
+async function noteChoices(paths) {
+  let changed = false;
+  for (const rel of paths || []) {
+    if (!isAppNotePath(rel)) continue;
+    const item = vaultGit.conflicts.get(rel);
+    if (!item || item.resolved) continue;
+    const bound = vaultGit.choiceAgainst.get(rel) || "";
+    if (bound && item.theirsBlob && bound !== item.theirsBlob) {
+      forgetChoice(rel);
+      changed = true;
+      continue;
+    }
+    const text = await readRel(rel);
+    item.choice = text;
+    item.mine = text;
+    try { item.mtime = await fileMtimeMs(safeJoin(VAULT, rel)); } catch { item.mtime = 0; }
+    item.against = bound || item.theirsBlob || "";
+    if (item.against) vaultGit.choiceAgainst.set(rel, item.against);
+    item.theirsBlob = item.theirsBlob || item.against;
+    item.resolved = true;
+    changed = true;
+  }
+  if (changed) persistPending();
+}
+
+async function dropStaleChoices(rev) {
+  if (!rev) return [];
+  const reopened = [];
+  let changed = false;
+  for (const item of [...vaultGit.conflicts.values()]) {
+    if (!item || !item.resolved) continue;
+    const current = await gitBlob(rev, item.path);
+    const bound = item.against || vaultGit.choiceAgainst.get(item.path) || "";
+    if (bound && bound === current) {
+      item.against = bound;
+      item.theirsBlob = current;
+      continue;
+    }
+    const theirs = await gitShow(rev, item.path);
+    const mine = await readRel(item.path);
+    if (forgetChoice(item.path)) changed = true;
+    if (mine === theirs) {
+      vaultGit.conflicts.delete(item.path);
+      changed = true;
+      continue;
+    }
+    let mtime = 0;
+    try { mtime = await fileMtimeMs(safeJoin(VAULT, item.path)); } catch { mtime = 0; }
+    vaultGit.conflicts.set(item.path, {
+      path: item.path,
+      mine,
+      theirs,
+      mtime,
+      resolved: false,
+      choice: null,
+      theirsBlob: current,
+      against: "",
+    });
+    reopened.push(item.path);
+    changed = true;
+  }
+  if (changed) persistPending();
+  return reopened;
+}
+
+async function noteDivergence(rel) {
+  const localChanged = rel.base ? await listDiff(rel.base, rel.head) : [];
+  const remoteChanged = rel.base ? await listDiff(rel.base, rel.rev) : await listDiff(rel.head, rel.rev);
+  const dirty = await dirtySet();
+  const overlap = [];
+  const seen = new Set();
+  for (const file of localChanged) {
+    if (!remoteChanged.includes(file) || seen.has(file)) continue;
+    seen.add(file);
+    overlap.push(file);
+  }
+  for (const file of remoteChanged) {
+    if (!dirty.has(file) || seen.has(file)) continue;
+    seen.add(file);
+    overlap.push(file);
+  }
+  await recordConflicts(overlap.filter((file) => String(file).endsWith(".md")), rel.rev);
+  const open = overlap.filter((file) => {
+    const item = vaultGit.conflicts.get(file);
+    if (item) return !item.resolved;
+    return !String(file).endsWith(".md");
+  });
+  return { overlap: open, blocking: open };
+}
+
+async function stageAndCommit(paths) {
+  const safe = [];
+  for (const rel of paths || []) {
+    if (!isAppNotePath(rel) || safe.includes(rel)) continue;
+    safe.push(rel);
+  }
+  if (!safe.length) return false;
+  let stagedAny = false;
+  for (const rel of safe) {
+    if (await pathExists(safeJoin(VAULT, rel))) {
+      await runGit(["-C", VAULT, "add", "--", rel], { timeoutMs: 8000 });
+      stagedAny = true;
+    } else {
+      try {
+        await runGit(["-C", VAULT, "rm", "--", rel], { timeoutMs: 8000 });
+        stagedAny = true;
+      } catch {
+        // This one path was never tracked.
+      }
+    }
+  }
+  if (!stagedAny) return false;
+  const staged = await runGit(
+    ["-C", VAULT, "diff", "--cached", "--name-only", "--", ...safe],
+    { timeoutMs: 8000 },
+  );
+  if (!String(staged.out || "").trim()) return false;
+  await runGit(
+    ["-C", VAULT, "commit", "-m", "vault: " + safe.join(", "), "--", ...safe],
+    { timeoutMs: 8000 },
+  );
+  return true;
+}
+
+async function commitAppPaths(paths, blocked) {
+  const list = [];
+  for (const rel of paths || []) {
+    if (!isAppNotePath(rel) || list.includes(rel)) continue;
+    if (blocked && blocked.has(rel)) continue;
+    if (vaultGit.conflicts.has(rel)) continue;
+    list.push(rel);
+  }
+  if (!list.length) return false;
+  return stageAndCommit(list);
+}
+
+function pendingList() {
+  return [...vaultGit.pending].filter((rel) => isAppNotePath(rel));
+}
+
+function committablePending() {
+  const list = [];
+  for (const rel of pendingList()) {
+    if (vaultGit.hold.has(rel)) continue;
+    const item = vaultGit.conflicts.get(rel);
+    if (item && !item.resolved) continue;
+    list.push(rel);
+  }
+  return list;
+}
+
+async function commitPendingNotes(blocked) {
+  return commitAppPaths(pendingList(), blocked);
+}
+
+async function releaseCleanPending() {
+  let dirty;
+  try {
+    dirty = await dirtySet();
+  } catch {
+    return;
+  }
+  let changed = false;
+  for (const rel of [...vaultGit.pending]) {
+    if (dirty.has(rel)) continue;
+    const item = vaultGit.conflicts.get(rel);
+    if (item && !item.resolved) continue;
+    vaultGit.pending.delete(rel);
+    vaultGit.resolvePending.delete(rel);
+    if (vaultGit.choiceAgainst.delete(rel)) changed = true;
+    changed = true;
+  }
+  if (changed) persistPending();
+}
+
+async function noteUnrelated() {
   if (!vaultGit.enabled || !vaultGit.ready) return;
-  if (vaultGit.busy) {
-    if (vaultGit.pending.size && !vaultGit.timer) {
-      vaultGit.timer = setTimeout(() => {
-        vaultGit.timer = null;
-        flushVaultSync().catch((e) => {
-          vaultGit.error = sanitizeGitError(e && e.message);
-          console.error("vault git:", vaultGit.error);
-        });
-      }, GIT_DEBOUNCE_MS);
+  vaultGit.left = "";
+}
+
+async function publishPush() {
+  await pushHead();
+  setGitError("");
+  vaultGit.lastPushAt = Date.now();
+  vaultGit.join = false;
+  await releaseCleanPending();
+}
+
+async function publishDiverged(rel) {
+  let useRel = rel;
+  try {
+    await fetchOrigin();
+    const again = await compareToRemote();
+    if (again && again.rev) {
+      useRel = again;
+      await dropStaleChoices(again.rev);
+    }
+  } catch (e) {
+    setGitError(e && e.message || "fetch failed");
+    vaultGit.join = false;
+    return;
+  }
+  if (hasUnresolved()) {
+    vaultGit.join = false;
+    if (!vaultGit.error) setGitError("push refused");
+    return;
+  }
+  if (!useRel || useRel.kind === "none" || useRel.kind === "equal") {
+    vaultGit.join = false;
+    setGitError("");
+    return;
+  }
+  if (useRel.kind === "ahead") {
+    try { await publishPush(); } catch (e) { setGitError(e && e.message || "push failed"); }
+    return;
+  }
+  if (useRel.kind !== "diverged") {
+    vaultGit.join = false;
+    if (!vaultGit.error) setGitError("push refused");
+    return;
+  }
+  const live = resolvedChoices();
+  if (!live.size) {
+    vaultGit.join = true;
+    if (!vaultGit.error) setGitError("push refused");
+    return;
+  }
+  const snapshot = new Map(live);
+  pushWatchSilence();
+  try {
+    for (const relPath of snapshot.keys()) await detachFile(relPath);
+    try {
+      await runGit(
+        ["-C", VAULT, "merge", "--no-ff", "--no-commit", useRel.rev],
+        { timeoutMs: 25000 },
+      );
+    } catch (e) {
+      if (!(await isMerging())) throw e;
+    }
+    const unmerged = await unmergedFiles();
+    for (const file of unmerged) {
+      if (!snapshot.has(file)) throw new Error("unexpected merge conflict");
+    }
+    for (const [file, text] of snapshot) {
+      if (!isAppNotePath(file)) continue;
+      await writeVaultText(file, text);
+      await runGit(["-C", VAULT, "add", "--", file], { timeoutMs: 8000 });
+    }
+    if ((await unmergedFiles()).length) throw new Error("unresolved files remain");
+    if (await isMerging()) {
+      await runGit(
+        ["-C", VAULT, "commit", "-m", "vault: " + [...snapshot.keys()].join(", ")],
+        { timeoutMs: 8000 },
+      );
+    }
+    await publishPush();
+    vaultGit.conflicts.clear();
+    vaultGit.choiceAgainst.clear();
+    persistPending();
+    let brought = [];
+    try {
+      brought = await listDiff(await revParse("HEAD^1"), await revParse("HEAD"));
+    } catch {}
+    await announcePaths([...snapshot.keys(), ...brought]);
+  } catch (e) {
+    if (await isMerging()) await runGit(["-C", VAULT, "merge", "--abort"], { timeoutMs: 8000 }).catch(() => {});
+    for (const [file, text] of snapshot) {
+      try { await writeVaultText(file, text); } catch {}
+    }
+    for (const item of vaultGit.conflicts.values()) item.resolved = false;
+    setGitError(e && e.message || "push refused");
+  } finally {
+    popWatchSilence();
+  }
+}
+
+async function refuseJoin(rel) {
+  vaultGit.join = false;
+  if (rel && rel.rev) {
+    await dropStaleChoices(rel.rev);
+    const noted = await noteDivergence(rel);
+    if (noted.blocking.length) await recordConflicts(noted.blocking, rel.rev);
+  }
+  if (!vaultGit.error) setGitError("push refused");
+  return { status: 409, body: syncStatus() };
+}
+
+async function joinVault() {
+  await fetchOrigin();
+  let rel = await compareToRemote();
+  if (rel && rel.rev) await dropStaleChoices(rel.rev);
+  if (!rel || rel.kind === "none" || rel.kind === "equal") {
+    vaultGit.join = false;
+    setGitError("");
+    return { status: 200, body: syncStatus() };
+  }
+  if (rel.kind === "ahead") {
+    await publishPush();
+    return { status: 200, body: syncStatus() };
+  }
+  if (rel.kind === "unknown") return refuseJoin(rel);
+  if (rel.kind === "behind") {
+    const incoming = await listDiff(rel.head, rel.rev);
+    const dirty = await dirtySet();
+    const overlap = incoming.filter((file) => dirty.has(file));
+    if (overlap.length || hasUnresolved()) {
+      if (overlap.length) await recordConflicts(overlap, rel.rev);
+      return refuseJoin(null);
+    }
+    await fastForward(rel.rev, []);
+    vaultGit.join = false;
+    setGitError("");
+    await announcePaths(incoming);
+    return { status: 200, body: syncStatus() };
+  }
+  const blocked = new Set();
+  const first = await noteDivergence(rel);
+  for (const file of first.overlap) blocked.add(file);
+  try {
+    await commitPendingNotes(blocked);
+  } catch (e) {
+    setGitError(e && e.message || "git failed");
+  }
+  await fetchOrigin();
+  rel = await compareToRemote();
+  if (rel && rel.rev) await dropStaleChoices(rel.rev);
+  if (!rel || rel.kind === "none" || rel.kind === "equal") {
+    vaultGit.join = false;
+    setGitError("");
+    return { status: 200, body: syncStatus() };
+  }
+  if (rel.kind === "ahead") {
+    await publishPush();
+    return { status: 200, body: syncStatus() };
+  }
+  if (rel.kind !== "diverged") return refuseJoin(rel);
+  const noted = await noteDivergence(rel);
+  if (noted.blocking.length || hasUnresolved()) return refuseJoin(null);
+  const choices = resolvedChoices();
+  if (choices.size) {
+    await publishDiverged(rel);
+    const status = syncStatus();
+    return { status: status.ok ? 200 : 409, body: status };
+  }
+  try {
+    await fetchOrigin();
+    const again = await compareToRemote();
+    if (again && again.rev) {
+      rel = again;
+      await dropStaleChoices(again.rev);
+    }
+  } catch (e) {
+    setGitError(e && e.message || "fetch failed");
+    vaultGit.join = false;
+    return { status: 409, body: syncStatus() };
+  }
+  if (hasUnresolved()) {
+    vaultGit.join = false;
+    if (!vaultGit.error) setGitError("push refused");
+    return { status: 409, body: syncStatus() };
+  }
+  if (!rel || rel.kind === "none" || rel.kind === "equal") {
+    vaultGit.join = false;
+    setGitError("");
+    return { status: 200, body: syncStatus() };
+  }
+  if (rel.kind === "ahead") {
+    try { await publishPush(); } catch (e) { setGitError(e && e.message || "push failed"); }
+    const status = syncStatus();
+    return { status: status.ok ? 200 : 409, body: status };
+  }
+  if (rel.kind !== "diverged") return refuseJoin(rel);
+  const late = resolvedChoices();
+  if (late.size) {
+    await publishDiverged(rel);
+    const status = syncStatus();
+    return { status: status.ok ? 200 : 409, body: status };
+  }
+  const incoming = await listDiff(rel.head, rel.rev);
+  pushWatchSilence();
+  try {
+    try {
+      await runGit(
+        ["-C", VAULT, "merge", "--no-ff", "--no-commit", rel.rev],
+        { timeoutMs: 25000 },
+      );
+    } catch (e) {
+      if (!(await isMerging())) throw e;
+    }
+    const unmerged = await unmergedFiles();
+    if (unmerged.length) {
+      await runGit(["-C", VAULT, "merge", "--abort"], { timeoutMs: 8000 }).catch(() => {});
+      await recordConflicts(unmerged, rel.rev);
+      vaultGit.join = false;
+      setGitError("push refused");
+      return { status: 409, body: syncStatus() };
+    }
+    if (!(await isMerging())) {
+      vaultGit.join = false;
+      setGitError("");
+      return { status: 200, body: syncStatus() };
+    }
+    const label = incoming.length ? incoming.join(", ") : "merge";
+    await runGit(["-C", VAULT, "commit", "-m", "vault: " + label], { timeoutMs: 8000 });
+    await publishPush();
+    await announcePaths(incoming);
+    return { status: 200, body: syncStatus() };
+  } catch (e) {
+    if (await isMerging()) await runGit(["-C", VAULT, "merge", "--abort"], { timeoutMs: 8000 }).catch(() => {});
+    setGitError(e && e.message || "push refused");
+    vaultGit.join = true;
+    return { status: 409, body: syncStatus() };
+  } finally {
+    popWatchSilence();
+  }
+}
+
+async function syncVault(commitPaths, resolvePaths) {
+  if (!vaultGit.enabled || !vaultGit.ready) return;
+  if (Array.isArray(commitPaths)) {
+    let changed = false;
+    for (const rel of commitPaths) {
+      if (!isAppNotePath(rel) || vaultGit.pending.has(rel)) continue;
+      vaultGit.pending.add(rel);
+      changed = true;
+    }
+    if (Array.isArray(resolvePaths)) {
+      for (const rel of resolvePaths) {
+        if (!isAppNotePath(rel)) continue;
+        vaultGit.pending.add(rel);
+        if (!vaultGit.resolvePending.has(rel)) changed = true;
+        vaultGit.resolvePending.add(rel);
+      }
+    }
+    if (changed) persistPending();
+  }
+  try {
+    await syncVaultBody();
+  } catch (e) {
+    setGitError(e && e.message || "git failed");
+  } finally {
+    if (!vaultGit.fetchFailed) refreshHold();
+    await noteUnrelated().catch(() => {});
+    finishGitNotice();
+  }
+}
+
+async function commitPendingNow() {
+  if (!vaultGit.fetchFailed) refreshHold();
+  const ready = committablePending();
+  if (!ready.length) return false;
+  return stageAndCommit(ready);
+}
+
+async function syncVaultBody() {
+  const resolving = [...vaultGit.resolvePending].filter((rel) => isAppNotePath(rel));
+  if (resolving.length) await noteChoices(resolving);
+
+  let rel = null;
+  try {
+    await fetchOrigin();
+    rel = await compareToRemote();
+  } catch (e) {
+    vaultGit.fetchFailed = true;
+    setGitError(e && e.message || "fetch failed");
+    try {
+      if (await commitPendingNow()) await publishPush();
+    } catch (pushErr) {
+      setGitError(pushErr && pushErr.message || "push failed");
     }
     return;
   }
-  const paths = [...vaultGit.pending];
-  if (!paths.length) return;
-  vaultGit.pending.clear();
-  vaultGit.busy = true;
-  try {
-    for (const p of paths) {
-      await runGit(["-C", VAULT, "add", "--", p], { timeoutMs: 8000 });
-    }
-    const status = await runGit(["-C", VAULT, "status", "--porcelain"], { timeoutMs: 8000 });
-    if (!String(status.out || "").trim()) return;
-    const msg = "vault: " + paths.join(", ");
-    await runGit(["-C", VAULT, "commit", "-m", msg], { timeoutMs: 8000 });
+
+  if (!rel || rel.kind === "none") {
     try {
-      await runGit(["-C", VAULT, "push", "-u", "origin", "HEAD"], { timeoutMs: 25000 });
-      vaultGit.error = "";
-      vaultGit.lastPushAt = Date.now();
+      if (await commitPendingNow()) await publishPush();
     } catch (e) {
-      vaultGit.error = sanitizeGitError(e && e.message || "push failed");
-      console.error("vault git push:", vaultGit.error);
+      setGitError(e && e.message || "push failed");
     }
-  } finally {
-    vaultGit.busy = false;
-    if (vaultGit.pending.size) scheduleVaultSync([...vaultGit.pending][0]);
+    return;
+  }
+
+  if (rel.kind === "unknown") {
+    setGitError("push refused");
+    try { await commitPendingNow(); } catch (e) { setGitError(e && e.message || "git failed"); }
+    return;
+  }
+
+  if (rel.kind === "behind") {
+    if (rel.rev) await dropStaleChoices(rel.rev);
+    const incoming = await listDiff(rel.head, rel.rev);
+    const dirty = await dirtySet();
+    const overlap = incoming.filter((file) => dirty.has(file));
+    await recordConflicts(overlap.filter((file) => String(file).endsWith(".md")), rel.rev);
+    const still = overlap.filter((file) => {
+      if (!String(file).endsWith(".md")) return true;
+      const item = vaultGit.conflicts.get(file);
+      return item && !item.resolved;
+    });
+    if (still.length) {
+      if (!vaultGit.error) setGitError("push refused");
+      return;
+    }
+    const choices = resolvedChoices();
+    const park = [];
+    for (const file of choices.keys()) {
+      if (incoming.includes(file) || overlap.includes(file)) park.push(file);
+    }
+    try {
+      await fastForward(rel.rev, park);
+    } catch (e) {
+      await recordConflicts(overlap, rel.rev);
+      setGitError(e && e.message || "push refused");
+      return;
+    }
+    await announcePaths(incoming);
+    for (const file of park) vaultGit.conflicts.delete(file);
+    if (!hasUnresolved()) {
+      setGitError("");
+      vaultGit.join = false;
+    }
+  } else if (rel.kind === "diverged") {
+    if (rel.rev) await dropStaleChoices(rel.rev);
+    const noted = await noteDivergence(rel);
+    const blocked = new Set(noted.overlap || []);
+    for (const item of vaultGit.conflicts.values()) {
+      if (!item.resolved) blocked.add(item.path);
+    }
+    try {
+      await commitAppPaths(pendingList(), blocked);
+    } catch (e) {
+      setGitError(e && e.message || "git failed");
+    }
+    if (noted.blocking.length || hasUnresolved()) {
+      vaultGit.join = false;
+      try {
+        await publishPush();
+      } catch (e) {
+        setGitError(e && e.message || "push refused");
+      }
+      if ((noted.blocking.length || hasUnresolved()) && !vaultGit.error) setGitError("push refused");
+      return;
+    }
+    const choices = resolvedChoices();
+    if (choices.size) {
+      const remoteChanged = rel.base ? await listDiff(rel.base, rel.rev) : [];
+      const waiting = remoteChanged.filter((file) => !choices.has(file));
+      if (waiting.length) {
+        vaultGit.join = true;
+        try {
+          await publishPush();
+        } catch (e) {
+          setGitError(e && e.message || "push refused");
+          vaultGit.join = true;
+        }
+        if (vaultGit.join && !vaultGit.error) setGitError("push refused");
+        return;
+      }
+      vaultGit.join = false;
+      await publishDiverged(rel);
+      return;
+    }
+    vaultGit.join = true;
+    try {
+      await publishPush();
+    } catch (e) {
+      setGitError(e && e.message || "push refused");
+      vaultGit.join = true;
+    }
+    if (vaultGit.join && !vaultGit.error) setGitError("push refused");
+    return;
+  } else if (!hasUnresolved()) {
+    setGitError("");
+    vaultGit.join = false;
+  }
+
+  let committed = false;
+  try {
+    committed = await commitPendingNow();
+  } catch (e) {
+    setGitError(e && e.message || "git failed");
+    return;
+  }
+  let ahead = rel.kind === "ahead";
+  if (committed) {
+    try {
+      const again = await compareToRemote();
+      ahead = !again || again.kind === "ahead" || again.kind === "none" || again.kind === "equal";
+      if (again && (again.kind === "behind" || again.kind === "diverged")) {
+        await syncVaultBody();
+        return;
+      }
+    } catch {}
+  }
+  if (committed || ahead) {
+    try {
+      await publishPush();
+    } catch (e) {
+      setGitError(e && e.message || "push failed");
+      try {
+        await fetchOrigin();
+        const again = await compareToRemote();
+        if (again && (again.kind === "diverged" || again.kind === "behind")) {
+          if (again.rev) await dropStaleChoices(again.rev);
+          if (again.kind === "diverged") {
+            const noted = await noteDivergence(again);
+            try {
+              await commitAppPaths(pendingList(), new Set(noted.overlap || []));
+            } catch (commitErr) {
+              setGitError(commitErr && commitErr.message || "git failed");
+            }
+            if (!noted.blocking.length && !hasUnresolved()) {
+              vaultGit.join = true;
+              if (!vaultGit.error) setGitError("push refused");
+            } else {
+              vaultGit.join = false;
+            }
+          } else {
+            const incoming = await listDiff(again.head, again.rev);
+            const dirty = await dirtySet();
+            await recordConflicts(incoming.filter((file) => dirty.has(file)), again.rev);
+            vaultGit.join = false;
+          }
+          if (hasUnresolved() && !vaultGit.error) setGitError("push refused");
+        }
+      } catch {}
+    }
   }
 }
 
@@ -738,6 +1836,29 @@ function isSelfWrite(date, diskMtime) {
   return diskMtime <= own + MTIME_SKEW_MS;
 }
 
+const pathWriteChains = new Map();
+
+function enqueuePathWrite(key, fn) {
+  const prev = pathWriteChains.get(key) || Promise.resolve();
+  const run = prev.then(fn, fn);
+  pathWriteChains.set(key, run);
+  run.then(
+    () => {
+      if (pathWriteChains.get(key) === run) pathWriteChains.delete(key);
+    },
+    () => {
+      if (pathWriteChains.get(key) === run) pathWriteChains.delete(key);
+    },
+  );
+  return run;
+}
+
+function sameTextAlreadyStored(exists, raw, markdown, conflict, resolve) {
+  if (!exists || typeof raw !== "string" || raw !== markdown) return false;
+  if (conflict || resolve) return false;
+  return true;
+}
+
 async function atomicWriteFile(filePath, markdown) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
@@ -890,8 +2011,10 @@ function startLogWatch() {
       const date = name.slice(0, 10);
       const logPath = path.join(logDir, name);
       fsSync.stat(logPath, (err, st) => {
+        if (vaultGit.suppressWatch) return;
         if (err || !st) return;
         const mtime = Math.trunc(st.mtimeMs);
+        // Own writes are already announced by the save. Ignore the echo.
         if (isSelfWrite(date, mtime)) return;
         sendDayWatch(date, mtime);
       });
@@ -941,6 +2064,40 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/health") {
       return json(res, 200, { ok: true, git: gitHint() });
+    }
+
+    if (pathname === "/api/sync" && req.method === "GET") {
+      return json(res, 200, syncStatus());
+    }
+
+    if (pathname === "/api/sync" && req.method === "POST") {
+      if (!vaultGit.enabled || !vaultGit.ready) {
+        return json(res, 409, syncStatus());
+      }
+      let body = {};
+      try {
+        body = JSON.parse((await readBody(req)) || "{}");
+      } catch {
+        body = {};
+      }
+      if (!body || body.join !== true) return json(res, 400, { error: "join required" });
+      let status = 200;
+      let payload = null;
+      try {
+        await enqueueVaultGit(async () => {
+          const result = await joinVault();
+          await noteUnrelated().catch(() => {});
+          status = result.status;
+          payload = syncStatus();
+        });
+      } catch (e) {
+        setGitError(e && e.message || "push refused");
+        if (!hasUnresolved()) vaultGit.join = true;
+        status = 409;
+        payload = syncStatus();
+      }
+      finishGitNotice();
+      return json(res, status, payload || syncStatus());
     }
 
     if (pathname === "/api/week" && req.method === "GET") {
@@ -1056,39 +2213,59 @@ const server = http.createServer(async (req, res) => {
         ? Number(body.mtime)
         : NaN;
       const logPath = path.join(VAULT, "log", `${date}.md`);
-      let diskMtime = 0;
-      let exists = false;
-      try {
-        const st = await fs.stat(logPath);
-        exists = st.isFile();
-        diskMtime = Math.trunc(st.mtimeMs);
-      } catch (e) {
-        if (e.code !== "ENOENT") throw e;
-      }
-      if (
-        exists &&
-        Number.isFinite(clientMtime) &&
-        diskMtime > clientMtime + MTIME_SKEW_MS &&
-        !isSelfWrite(date, diskMtime)
-      ) {
-        const raw = await readFileSafe(logPath);
-        return json(res, 409, {
-          error: "disk newer",
-          date,
-          markdown: raw == null ? "" : raw,
-          mtime: diskMtime,
-        });
-      }
-      pendingSelfWrites.add(date);
-      try {
-        await atomicWriteDay(logPath, markdown);
-        const mtime = await fileMtimeMs(logPath);
-        lastSelfWrites.set(date, mtime);
-        scheduleVaultSync(`log/${date}.md`);
-        return json(res, 200, { ok: true, date, mtime, git: gitHint() });
-      } finally {
-        pendingSelfWrites.delete(date);
-      }
+      const dayRel = `log/${date}.md`;
+      return enqueuePathWrite(dayRel, async () => {
+        let diskMtime = 0;
+        let exists = false;
+        try {
+          const st = await fs.stat(logPath);
+          exists = st.isFile();
+          diskMtime = Math.trunc(st.mtimeMs);
+        } catch (e) {
+          if (e.code !== "ENOENT") throw e;
+        }
+        const raw = exists ? await readFileSafe(logPath) : null;
+        const dayResolve = explicitResolve(body);
+        const dayConflict = openConflict(dayRel);
+        if (sameTextAlreadyStored(exists, raw, markdown, dayConflict, dayResolve)) {
+          scheduleVaultSync(dayRel, false);
+          return json(res, 200, { ok: true, date, mtime: diskMtime, git: gitHint() });
+        }
+        // A shared server's own earlier save is still a newer version.
+        // The log watcher, not this check, ignores the echo of that save.
+        if (
+          exists &&
+          Number.isFinite(clientMtime) &&
+          diskMtime > clientMtime + MTIME_SKEW_MS
+        ) {
+          return json(res, 409, {
+            error: "disk newer",
+            date,
+            markdown: raw == null ? "" : raw,
+            mtime: diskMtime,
+          });
+        }
+        if (dayConflict && !dayResolve) {
+          return json(res, 409, {
+            error: "still conflicted",
+            date,
+            markdown: dayConflict.theirs,
+            mtime: dayConflict.mtime,
+          });
+        }
+        pendingSelfWrites.add(date);
+        try {
+          await atomicWriteDay(logPath, markdown);
+          const mtime = await fileMtimeMs(logPath);
+          lastSelfWrites.set(date, mtime);
+          sendDayWatch(date, mtime);
+          if (dayResolve && dayConflict) bindChoice(dayRel, dayConflict);
+          scheduleVaultSync(dayRel, Boolean(dayResolve && dayConflict));
+          return json(res, 200, { ok: true, date, mtime, git: gitHint() });
+        } finally {
+          pendingSelfWrites.delete(date);
+        }
+      });
     }
 
     if (pathname === "/api/plan" && req.method === "GET") {
@@ -1206,16 +2383,19 @@ const server = http.createServer(async (req, res) => {
         if (!isPngBuffer(buf)) {
           return json(res, 400, { error: "bad png" });
         }
-        pendingSelfWrites.add("f:" + relPath);
-        try {
-          await atomicWriteBuffer(real, buf);
-          const mtime = await fileMtimeMs(real);
-          lastSelfWrites.set("f:" + relPath, mtime);
-          scheduleVaultSync(relPath);
-          return json(res, 200, { ok: true, path: relPath, mtime, git: gitHint() });
-        } finally {
-          pendingSelfWrites.delete("f:" + relPath);
-        }
+        const pngKey = "f:" + relPath;
+        return enqueuePathWrite(pngKey, async () => {
+          pendingSelfWrites.add(pngKey);
+          try {
+            await atomicWriteBuffer(real, buf);
+            const mtime = await fileMtimeMs(real);
+            lastSelfWrites.set(pngKey, mtime);
+            scheduleVaultSync(relPath);
+            return json(res, 200, { ok: true, path: relPath, mtime, git: gitHint() });
+          } finally {
+            pendingSelfWrites.delete(pngKey);
+          }
+        });
       }
       try {
         await resolveInside(VAULT, abs);
@@ -1243,41 +2423,59 @@ const server = http.createServer(async (req, res) => {
       const clientMtime = body && typeof body === "object" && body.mtime != null
         ? Number(body.mtime)
         : NaN;
-      let diskMtime = 0;
-      let exists = false;
-      try {
-        const st = await fs.stat(abs);
-        if (st.isDirectory()) return json(res, 400, { error: "not a file" });
-        exists = st.isFile();
-        diskMtime = Math.trunc(st.mtimeMs);
-      } catch (e) {
-        if (e.code !== "ENOENT") throw e;
-      }
       const writeKey = "f:" + relPath;
-      if (
-        exists &&
-        Number.isFinite(clientMtime) &&
-        diskMtime > clientMtime + MTIME_SKEW_MS &&
-        !isSelfWrite(writeKey, diskMtime)
-      ) {
-        const raw = await readFileSafe(abs);
-        return json(res, 409, {
-          error: "disk newer",
-          path: relPath,
-          markdown: raw == null ? "" : raw,
-          mtime: diskMtime,
-        });
-      }
-      pendingSelfWrites.add(writeKey);
-      try {
-        await atomicWriteFile(abs, markdown);
-        const mtime = await fileMtimeMs(abs);
-        lastSelfWrites.set(writeKey, mtime);
-        scheduleVaultSync(relPath);
-        return json(res, 200, { ok: true, path: relPath, mtime, git: gitHint() });
-      } finally {
-        pendingSelfWrites.delete(writeKey);
-      }
+      return enqueuePathWrite(writeKey, async () => {
+        let diskMtime = 0;
+        let exists = false;
+        try {
+          const st = await fs.stat(abs);
+          if (st.isDirectory()) return json(res, 400, { error: "not a file" });
+          exists = st.isFile();
+          diskMtime = Math.trunc(st.mtimeMs);
+        } catch (e) {
+          if (e.code !== "ENOENT") throw e;
+        }
+        const raw = exists ? await readFileSafe(abs) : null;
+        const fileResolve = explicitResolve(body);
+        const fileConflict = openConflict(relPath);
+        if (sameTextAlreadyStored(exists, raw, markdown, fileConflict, fileResolve)) {
+          scheduleVaultSync(relPath, false);
+          return json(res, 200, { ok: true, path: relPath, mtime: diskMtime, git: gitHint() });
+        }
+        // A shared server's own earlier save is still a newer version.
+        if (
+          exists &&
+          Number.isFinite(clientMtime) &&
+          diskMtime > clientMtime + MTIME_SKEW_MS
+        ) {
+          return json(res, 409, {
+            error: "disk newer",
+            path: relPath,
+            markdown: raw == null ? "" : raw,
+            mtime: diskMtime,
+          });
+        }
+        if (fileConflict && !fileResolve) {
+          return json(res, 409, {
+            error: "still conflicted",
+            path: relPath,
+            markdown: fileConflict.theirs,
+            mtime: fileConflict.mtime,
+          });
+        }
+        pendingSelfWrites.add(writeKey);
+        try {
+          await atomicWriteFile(abs, markdown);
+          const mtime = await fileMtimeMs(abs);
+          lastSelfWrites.set(writeKey, mtime);
+          sendWatch({ path: relPath, mtime });
+          if (fileResolve && fileConflict) bindChoice(relPath, fileConflict);
+          scheduleVaultSync(relPath, Boolean(fileResolve && fileConflict));
+          return json(res, 200, { ok: true, path: relPath, mtime, git: gitHint() });
+        } finally {
+          pendingSelfWrites.delete(writeKey);
+        }
+      });
     }
 
     if (pathname === "/api/tree" && req.method === "GET") {
@@ -1420,6 +2618,7 @@ const server = http.createServer(async (req, res) => {
 async function boot() {
   await initVaultGit();
   startLogWatch();
+  startVaultSyncLoop();
   server.listen(PORT, HOST, () => {
     console.log(`AidanOS`);
     console.log(`  vault: ${VAULT}`);

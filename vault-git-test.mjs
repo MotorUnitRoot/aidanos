@@ -342,12 +342,83 @@ async function bundledSeedWhenCloneFails() {
   }
 }
 
+async function seededNotesStayUntracked() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-seed-untracked-"));
+  const vault = path.join(tmp, "vault");
+  fs.mkdirSync(vault, { recursive: true });
+  const port = 25000 + Math.floor(Math.random() * 2000);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "https://127.0.0.1:1/MotorUnitRoot/aidanos-vault.git",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+    AIDANOS_VAULT_GIT_DEBOUNCE_MS: "80",
+    AIDANOS_VAULT_GIT_SYNC_MS: "0",
+    AIDANOS_VAULT_GIT_RETRY_MS: "0",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    await new Promise((r) => setTimeout(r, 400));
+    assert(
+      fs.existsSync(path.join(vault, "aidanos", "active-horse.md")),
+      "offline start still seeds Plan"
+    );
+    assert(
+      fs.existsSync(path.join(vault, "maps", "reply-to-a-letter.md")),
+      "offline start still seeds the letter map"
+    );
+    const before = git(["ls-files"], vault);
+    assert(!before.includes("active-horse.md"), "seeded Plan is not committed at startup");
+    assert(!before.includes("reply-to-a-letter.md"), "seeded letter map is not committed at startup");
+    assert(!historyNames(vault).includes("active-horse.md"), "seeded Plan is not in history at startup");
+    const put = await fetch(base + "/api/day?date=2026-09-08", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ date: "2026-09-08", markdown: "demo write\n", paper: "demo write\n" }),
+    });
+    assert(put.ok, "saving one day " + put.status);
+    await waitFor(() => historyNames(vault).includes("log/2026-09-08.md"), 5000, "the saved day is committed");
+    const afterDay = git(["ls-files"], vault);
+    assert(afterDay.includes("log/2026-09-08.md"), "the saved day is tracked");
+    assert(!afterDay.includes("active-horse.md"), "saving a day does not commit seeded Plan");
+    assert(!afterDay.includes("reply-to-a-letter.md"), "saving a day does not commit the seeded map");
+    const mapRes = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/reply-to-a-letter.md"));
+    const map = await mapRes.json();
+    const mapPut = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/reply-to-a-letter.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: map.markdown, paper: map.markdown, mtime: map.mtime }),
+    });
+    assert(mapPut.ok, "saving the seeded map through the app " + mapPut.status);
+    await waitFor(() => historyNames(vault).includes("maps/reply-to-a-letter.md"), 5000, "a saved map is committed");
+    const afterMap = git(["ls-files"], vault);
+    assert(afterMap.includes("maps/reply-to-a-letter.md"), "the map the user saved is tracked");
+    assert(!afterMap.includes("active-horse.md"), "the unsaved seeded Plan stays untracked");
+    assert(!historyNames(vault).includes("active-horse.md"), "the unsaved seeded Plan stays out of history");
+  } finally {
+    await stop(child);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function historyNames(cwd) {
+  try {
+    return git(["log", "--all", "--name-only", "--pretty=format:"], cwd);
+  } catch {
+    return "";
+  }
+}
+
 try {
   authUrlShaping();
   await seedDoesNotOverwrite();
   await liveGitSync();
   await authOriginIsEmbedded();
   await bundledSeedWhenCloneFails();
+  await seededNotesStayUntracked();
   console.log("vault-git-test ok");
 } catch (err) {
   console.error("FAIL  vault-git-test  " + err.message);

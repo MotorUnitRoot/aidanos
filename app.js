@@ -188,7 +188,65 @@ function paintTaskBodyHtml(body, asSource) {
   return html || "<br>";
 }
 
+function familyQuestionText(n) {
+  const qs = [
+    "Which room, and will anyone sleep there?",
+    "What must stay?",
+    "Will any wall or opening change?",
+    "Where does the desk go, and which way does the door swing?",
+    "What has to be plugged in, and where is the panel?",
+    "Supply, return, and will a new door close the room?",
+    "When was the house built?",
+    "What did the building department say?",
+  ];
+  const i = Number(n) - 1;
+  if (!Number.isInteger(i) || i < 0 || i >= qs.length) return "";
+  return qs[i];
+}
+
+function answersNoteOpen() {
+  try {
+    if (typeof isNoteDoc !== "function" || !isNoteDoc()) return false;
+    const path = String(state.doc && state.doc.path || "").replace(/\\/g, "/");
+    return path === "family-room-to-office/answers.md";
+  } catch (e) {
+    return false;
+  }
+}
+
+function familyQuestionLine(line) {
+  const m = String(line ?? "").match(/^(\s*)(\d+)([.)])(\s+)([\s\S]*)$/);
+  if (!m) return null;
+  const question = familyQuestionText(m[2]);
+  if (!question) return null;
+  const rest = m[5];
+  if (rest !== question && !rest.startsWith(question)) return null;
+  return {
+    indent: m[1],
+    num: m[2] + m[3],
+    question: question,
+    answer: rest.slice(question.length),
+  };
+}
+
+function formatQuestionLine(line, asSource, hidden) {
+  if (!answersNoteOpen()) return "";
+  const parts = familyQuestionLine(line);
+  if (!parts) return "";
+  const front = hidden ? " md-front" : "";
+  const src = asSource ? " is-source" : "";
+  const nest = parts.indent ? " nest" : "";
+  const answer = parts.answer ? escapeHtml(parts.answer) : "\u200b";
+  return '<div draggable="true" class="md-line' + src + front + " ol" + nest + '" data-kind="ol" data-src="' + attr(line) +
+    '" data-indent="' + attr(parts.indent) + '" data-num="' + attr(parts.num) + '" style="' + indentPad(parts.indent) +
+    '"><span class="md-num" contenteditable="false">' + escapeHtml(parts.num) +
+    '</span><span class="md-q" contenteditable="false">' + escapeHtml(parts.question) +
+    '</span><span class="md-body">' + answer + "</span></div>";
+}
+
 function formatOneLine(line, asSource, hidden) {
+  const questionHtml = formatQuestionLine(line, asSource, hidden);
+  if (questionHtml) return questionHtml;
   if (asSource) {
     let cls = "md-line is-source";
     if (hidden) cls += " md-front";
@@ -396,7 +454,20 @@ function sourceTaskMarkdown(el) {
   return paperTaskSrc(indent, mark, done, body);
 }
 
+function lockedQuestionMarkdown(el) {
+  if (!el || !el.querySelector) return "";
+  const q = el.querySelector(".md-q");
+  if (!q) return "";
+  const num = (el.dataset && el.dataset.num) || "";
+  const indent = (el.dataset && el.dataset.indent) || "";
+  const question = String(q.textContent || "");
+  const answer = lineBody(el).replace(/\u200b/g, "");
+  return indent + num + " " + question + answer;
+}
+
 function serializeLine(n) {
+  const locked = lockedQuestionMarkdown(n);
+  if (locked) return locked;
   if (n.classList && n.classList.contains("is-source")) {
     if (n.dataset && n.dataset.kind === "h") return lineMarkdown(n);
     if (n.dataset && n.dataset.kind === "task") return sourceTaskMarkdown(n);
@@ -505,6 +576,22 @@ function ensurePaperBodyCaret(host) {
 }
 
 function placeCaret(root, offset) {
+  const line = root && root.closest
+    ? (root.classList && root.classList.contains("md-line") ? root : root.closest(".md-line"))
+    : null;
+  const q = line && line.querySelector && line.querySelector(".md-q");
+  const answerBody = q && line.querySelector(".md-body");
+  if (q && answerBody && root !== answerBody && !(root.classList && root.classList.contains("md-body"))) {
+    let locked = 0;
+    try {
+      const pre = document.createRange();
+      pre.setStart(line, 0);
+      pre.setEndBefore(answerBody);
+      locked = pre.toString().length;
+    } catch (e) {}
+    placeCaret(answerBody, Math.max(0, (Number(offset) || 0) - locked));
+    return;
+  }
   const host = ensurePaperBodyCaret(paperCaretHost(root));
   const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
   let n, count = 0;
@@ -556,6 +643,8 @@ function lineIndexOfCaret() {
 
 function lineMarkdown(el) {
   if (!el) return "";
+  const locked = lockedQuestionMarkdown(el);
+  if (locked) return locked;
   const dump = $("dump");
   const idx = paperLines().indexOf(el);
   const dumpLine = (dump && idx >= 0) ? dump.value.split("\n")[idx] : null;
@@ -592,7 +681,9 @@ function writeDumpLine(idx, text) {
   if (!dump || idx == null || idx < 0) return dump;
   const lines = dump.value.split("\n");
   while (lines.length <= idx) lines.push("");
-  lines[idx] = stripAccidentalBulletSpace(String(text ?? "").replace(/\r\n/g, "\n").replace(/\n/g, ""));
+  let nextLine = stripAccidentalBulletSpace(String(text ?? "").replace(/\r\n/g, "\n").replace(/\n/g, ""));
+  if (answersNoteOpen()) nextLine = repairQuestionLine(nextLine);
+  lines[idx] = nextLine;
   dump.value = lines.join("\n");
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
   return dump;
@@ -677,6 +768,39 @@ function paintPaperAt(activeIndex, caretInLine) {
   setTimeout(() => { if (gen === keepPaperFocusGen) keepPaperFocus = false; }, 0);
 }
 
+function renderedMarkerLen(el) {
+  if (!el || !el.querySelector) return 0;
+  const body = el.querySelector(".md-body");
+  if (!body || typeof document === "undefined" || !document.createRange) return 0;
+  try {
+    const pre = document.createRange();
+    pre.setStart(el, 0);
+    pre.setEndBefore(body);
+    return pre.toString().length;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// caretInLine is the offset in the rendered line, which already includes the
+// marker ("1."). The markdown prefix ("1. ") is a different length. Subtract
+// the marker once so a click on the number or the first letter does not land
+// inside the word.
+function sourceCaretFromRendered(md, body, caretInLine, markerLen) {
+  const text = String(md ?? "");
+  if (caretInLine == null) return text.length;
+  const words = String(body ?? "");
+  let prefix = 0;
+  if (words && text.indexOf(words) >= 0) prefix = text.indexOf(words);
+  const mark = Math.max(0, Number(markerLen) || 0);
+  const caret = Math.max(0, Number(caretInLine) || 0);
+  const into = Math.max(0, caret - mark);
+  const pos = prefix + into;
+  if (pos < 0) return 0;
+  if (pos > text.length) return text.length;
+  return pos;
+}
+
 function activateLine(idx, caretInVisible) {
   if (idx == null || idx < 0) return;
   const paper = $("paper");
@@ -699,19 +823,34 @@ function activateLine(idx, caretInVisible) {
     if (!el) { state.activeLine = -1; return; }
     if (!el.classList.contains("is-source")) {
       const body = lineBody(el);
+      const markerLen = renderedMarkerLen(el);
       const dumpLines = $("dump") ? $("dump").value.split("\n") : [];
       const md = dumpLines[idx] != null ? dumpLines[idx] : (el.getAttribute("data-src") || "");
-      let prefix = 0;
-      if (body && md.indexOf(body) >= 0) prefix = md.indexOf(body);
       const tmp = document.createElement("div");
       tmp.innerHTML = formatOneLine(md, true, idx < frontmatterLineCount($("dump") ? $("dump").value : ""));
       const next = tmp.firstElementChild;
       if (next) {
+        let answerOff = null;
+        if (el.querySelector(".md-q") && next.querySelector(".md-q")) {
+          const bodyEl = el.querySelector(".md-body");
+          const sel = window.getSelection();
+          const node = sel && sel.anchorNode;
+          const host = node && (node.nodeType === 1 ? node : node.parentElement);
+          const inBody = !!(bodyEl && host && (host === bodyEl || bodyEl.contains(host)));
+          answerOff = 0;
+          if (inBody) {
+            try { answerOff = caretOffset(bodyEl); } catch (e) { answerOff = 0; }
+          }
+        }
         el.replaceWith(next);
-        const pos = isSourceTask(next)
-          ? (caretInVisible == null ? lineBody(next).length : Math.max(0, caretInVisible))
-          : (caretInVisible == null ? md.length : Math.max(0, Math.min(md.length, prefix + caretInVisible)));
-        placeCaret(next, clampPaperCaret(next, pos));
+        if (next.querySelector(".md-q")) {
+          placeCaret(next.querySelector(".md-body") || next, Math.max(0, answerOff || 0));
+        } else {
+          const pos = isSourceTask(next)
+            ? (caretInVisible == null ? lineBody(next).length : Math.max(0, caretInVisible))
+            : sourceCaretFromRendered(md, body, caretInVisible, markerLen);
+          placeCaret(next, clampPaperCaret(next, pos));
+        }
       }
     }
     state.activeLine = idx;
@@ -883,6 +1022,7 @@ async function leaveCurrentPaper() {
     closePaperConflict();
     return;
   }
+  if (!state.dirty) return;
   await saveDay();
 }
 
@@ -925,13 +1065,147 @@ function renderWeek() {
   });
 }
 
-function putRawDay(date, markdown, mtime) {
-  return fetch("/api/day?date=" + date, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    cache: "no-store",
-    body: JSON.stringify({ date, paper: markdown, markdown, mtime: Number(mtime) || 0 }),
+const UNSENT_PREFIX = "aidanos-unsent:";
+let unsentSeq = 0;
+const confirmedSaves = new Map();
+
+function captureUnsentStamp() {
+  unsentSeq += 1;
+  return { at: Date.now(), seq: unsentSeq };
+}
+
+function unsentBefore(stored, mark) {
+  if (!stored || !mark) return false;
+  const at = Number(stored.at) || 0;
+  const seq = Number(stored.seq) || 0;
+  const markAt = Number(mark.at) || 0;
+  const markSeq = Number(mark.seq) || 0;
+  if (!at && !seq) return true;
+  if (at !== markAt) return at < markAt;
+  return seq < markSeq;
+}
+
+function notePathFor(snap) {
+  if (!snap) return "";
+  if (snap.kind === "note") return String(snap.path || "").replace(/\\/g, "/");
+  if (snap.date) return "log/" + snap.date + ".md";
+  return "";
+}
+
+function unsentKey(path, base) {
+  return UNSENT_PREFIX + String(path || "").replace(/\\/g, "/") + ":" + String(Number(base) || 0);
+}
+
+function rememberUnsent(snap) {
+  const path = notePathFor(snap);
+  if (!path || !snap) return;
+  if (!snap.at) {
+    const stamp = captureUnsentStamp();
+    snap.at = stamp.at;
+    snap.seq = stamp.seq;
+  }
+  const base = Number(snap.mtime) || 0;
+  try {
+    localStorage.setItem(unsentKey(path, base), JSON.stringify({
+      path,
+      base,
+      markdown: String(snap.markdown || ""),
+      at: snap.at,
+      seq: snap.seq,
+    }));
+  } catch (e) {}
+}
+
+function forgetUnsent(path) {
+  const prefix = UNSENT_PREFIX + String(path || "").replace(/\\/g, "/") + ":";
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.indexOf(prefix) === 0) keys.push(key);
+    }
+    keys.forEach((key) => localStorage.removeItem(key));
+  } catch (e) {}
+}
+
+function forgetUnsentBefore(path, snap) {
+  const prefix = UNSENT_PREFIX + String(path || "").replace(/\\/g, "/") + ":";
+  const want = String(snap && snap.markdown || "");
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.indexOf(prefix) === 0) keys.push(key);
+    }
+    keys.forEach((key) => {
+      try {
+        const parsed = JSON.parse(localStorage.getItem(key) || "null");
+        if (!parsed) return;
+        if (parsed.markdown === want || unsentBefore(parsed, snap)) localStorage.removeItem(key);
+      } catch (e) {}
+    });
+  } catch (e) {}
+}
+
+function noteSaved(snap) {
+  const path = notePathFor(snap);
+  if (!path || !snap) return;
+  forgetUnsentBefore(path, snap);
+  const prev = confirmedSaves.get(path);
+  if (prev && unsentBefore(snap, prev)) return;
+  confirmedSaves.set(path, {
+    at: snap.at,
+    seq: snap.seq,
+    markdown: String(snap.markdown || ""),
   });
+}
+
+function adoptSavedMtime(current, next) {
+  const seen = Number(current) || 0;
+  const got = Number(next) || 0;
+  return got >= seen ? got : seen;
+}
+
+function readUnsent(path) {
+  const prefix = UNSENT_PREFIX + String(path || "").replace(/\\/g, "/") + ":";
+  const out = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || key.indexOf(prefix) !== 0) continue;
+      const parsed = JSON.parse(localStorage.getItem(key) || "null");
+      if (parsed && typeof parsed.markdown === "string") out.push(parsed);
+    }
+  } catch (e) {}
+  return out;
+}
+
+function offerUnsent(kind, path, date, diskMarkdown) {
+  if (paperConflict) return;
+  const disk = String(diskMarkdown || "");
+  const hits = readUnsent(path);
+  const mine = hits.find((item) => item.markdown !== disk);
+  if (!mine) {
+    if (hits.length) forgetUnsent(path);
+    return;
+  }
+  const mtime = kind === "note"
+    ? Number(state.doc && state.doc.mtime) || 0
+    : Number(state.day && state.day.mtime) || 0;
+  openPaperConflict({
+    kind,
+    path,
+    date: date || "",
+    mine: mine.markdown,
+    theirs: disk,
+    mtime,
+  });
+}
+
+function conflictPath(info) {
+  if (!info) return "";
+  if (info.kind === "note") return String(info.path || "").replace(/\\/g, "/");
+  return info.date ? "log/" + info.date + ".md" : "";
 }
 
 async function openDay(date, { silent = false, force = false } = {}) {
@@ -941,12 +1215,40 @@ async function openDay(date, { silent = false, force = false } = {}) {
   const dump = $("dump");
   const oldDate = state.day && state.day.date;
   const oldMd = dump ? dump.value : (state.day ? dayMarkdown(state.day) : "");
-  const oldMtime = state.day ? state.day.mtime : 0;
   const leavingDay = !isNoteDoc() && oldDate && oldDate !== date;
+  const conflictOpen = !!(paperConflict && oldDate && (
+    paperConflict.date === oldDate ||
+    String(paperConflict.path || "").replace(/\\/g, "/") === "log/" + oldDate + ".md"
+  ));
+  if (leavingDay) {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = null;
+    if (state.day) {
+      const kept = cleanPaperMarkdown(oldMd);
+      state.day.markdown = kept;
+      state.day.paper = kept;
+      if (dump) dump.value = kept;
+    }
+    renderDay();
+  }
   if (isNoteDoc()) {
     if (date === todayIso()) await landMapNextStepsOnToday();
     await leaveCurrentPaper();
     if (gen !== state.openDayGen) return;
+  }
+  if (leavingDay && !conflictOpen && state.dirty) {
+    let hops = 0;
+    while (hops < 4 && state.dirty && !paperConflict && state.day && state.day.date === oldDate) {
+      hops += 1;
+      clearTimeout(state.saveTimer);
+      state.saveTimer = null;
+      const saved = await saveDay();
+      if (gen !== state.openDayGen) return;
+      if (paperConflict) return;
+      if (!saved || saved.ok === false) return;
+    }
+    if (gen !== state.openDayGen) return;
+    if (state.dirty || paperConflict) return;
   }
   try {
     const day = await api("/api/day?date=" + date);
@@ -984,7 +1286,10 @@ async function openDay(date, { silent = false, force = false } = {}) {
       state.monthView = { year: viewed.getFullYear(), month: viewed.getMonth() + 1 };
     }
     await renderMonth();
-    if (leavingDay) putRawDay(oldDate, oldMd, oldMtime).catch(() => {});
+    if (gen === state.openDayGen) await surfaceOpenGitConflict();
+    if (gen === state.openDayGen && state.day && state.day.date === date && !paperConflict) {
+      offerUnsent("day", "log/" + date + ".md", date, dayMarkdown(state.day));
+    }
   } catch (e) {
     if (gen !== state.openDayGen) return;
     if (!silent) setStatus(String(e.message || e), "error");
@@ -1457,13 +1762,30 @@ function ensureDumpMatchesPaper() {
   return dump;
 }
 
+function currentSaveBound() {
+  if (isNoteDoc() && state.doc && state.doc.path) {
+    return { kind: "note", path: String(state.doc.path).replace(/\\/g, "/") };
+  }
+  if (state.day && state.day.date) return { kind: "day", date: state.day.date };
+  return null;
+}
+
+function saveBoundMatches(bound) {
+  if (!bound) return true;
+  if (bound.kind === "note") {
+    return isNoteDoc() && state.doc && String(state.doc.path).replace(/\\/g, "/") === bound.path;
+  }
+  return !isNoteDoc() && state.day && state.day.date === bound.date;
+}
+
 function scheduleSave() {
   if (applyingDragSave) return;
   if (paperConflict) return;
   state.dirty = true;
   setStatus("Saving");
   clearTimeout(state.saveTimer);
-  state.saveTimer = setTimeout(saveDay, 350);
+  const bound = currentSaveBound();
+  state.saveTimer = setTimeout(() => saveDay({ bound }), 350);
 }
 
 function applyRemoteDay(day) {
@@ -1508,11 +1830,20 @@ function startDayWatch() {
     dayWatch.onmessage = (ev) => {
       let payload;
       try { payload = JSON.parse(ev.data); } catch (e) { return; }
+      if (payload && payload.type === "git") {
+        surfaceGitConflict(payload);
+        return;
+      }
+      if (payload && payload.path && !payload.date) {
+        onNoteFileChanged(payload);
+        return;
+      }
       onDayFileChanged(payload);
     };
   } catch (e) {}
 }
 async function onDayFileChanged(payload) {
+  if (paperConflict) return;
   if (isNoteDoc()) return;
   const date = payload && payload.date;
   const mtime = Number(payload && payload.mtime) || 0;
@@ -1530,12 +1861,80 @@ async function onDayFileChanged(payload) {
   } catch (e) {}
 }
 
+async function onNoteFileChanged(payload) {
+  if (paperConflict) return;
+  const rel = payload && payload.path ? String(payload.path).replace(/\\/g, "/") : "";
+  if (!rel || !isNoteDoc() || !state.doc || state.doc.path !== rel) return;
+  const mtime = Number(payload && payload.mtime) || 0;
+  const seen = Number(state.doc.mtime) || 0;
+  if (!(mtime > seen)) return;
+  if (state.dirty || applyingHistory) return;
+  try {
+    const body = await api("/api/file?path=" + encodeURIComponent(rel));
+    if (state.dirty || paperConflict) return;
+    if (!isNoteDoc() || !state.doc || state.doc.path !== rel) return;
+    applyRemoteNote(body);
+  } catch (e) {}
+}
+
+function sendKeepaliveSave(snap) {
+  if (!snap) return;
+  const edit = !!(paperConflict && document.body.classList.contains("conflict-edit"));
+  const resolveBody = edit ? { resolve: "edit" } : {};
+  let url = "";
+  let body = null;
+  if (snap.kind === "note") {
+    url = "/api/file?path=" + encodeURIComponent(snap.path);
+    body = { path: snap.path, paper: snap.markdown, markdown: snap.markdown, mtime: snap.mtime, ...resolveBody };
+  } else if (snap.kind === "day") {
+    url = "/api/day?date=" + snap.date;
+    body = { date: snap.date, paper: snap.markdown, markdown: snap.markdown, mtime: snap.mtime, ...resolveBody };
+  } else return;
+  fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    keepalive: true,
+    cache: "no-store",
+  }).then(async (res) => {
+    if (!res.ok) return;
+    const out = await res.json().catch(() => ({}));
+    noteSaved(snap);
+    const next = out && out.mtime != null ? Number(out.mtime) || 0 : 0;
+    if (snap.kind === "note") {
+      if (!(isNoteDoc() && state.doc && state.doc.path === snap.path)) return;
+      if (next) state.doc.mtime = adoptSavedMtime(state.doc.mtime, next);
+      const dump = $("dump");
+      if (dump && dump.value === snap.markdown) state.dirty = false;
+      return;
+    }
+    if (!(state.day && state.day.date === snap.date)) return;
+    if (next) state.day.mtime = adoptSavedMtime(state.day.mtime, next);
+    const dump = $("dump");
+    if (dump && dump.value === snap.markdown) state.dirty = false;
+  }).catch(() => {});
+}
+
 function flushOnLeave() {
   flushActiveLineToDump();
   clearTimeout(state.saveTimer);
   state.saveTimer = null;
+  if (!state.dirty) return;
   if (!state.day && !isNoteDoc()) return;
-  saveDay({ keepalive: true });
+  if (paperConflict && !document.body.classList.contains("conflict-edit")) {
+    rememberUnsent({
+      kind: paperConflict.kind,
+      path: paperConflict.path,
+      date: paperConflict.date,
+      markdown: conflictMineNow(),
+      mtime: Number(state.day && state.day.mtime) || Number(state.doc && state.doc.mtime) || 0,
+    });
+    return;
+  }
+  const snap = paperSaveSnapshot();
+  if (!snap) return;
+  rememberUnsent(snap);
+  sendKeepaliveSave(snap);
 }
 
 function applyRemoteNote(body) {
@@ -1564,30 +1963,40 @@ function paperSaveSnapshot() {
     if (String(state.doc.path || "").replace(/\\/g, "/") === "aidanos/active-horse.md") {
       markdown = normalizeSeasonPlanMarkdown(markdown);
     }
+    if (String(state.doc.path || "").replace(/\\/g, "/") === "family-room-to-office/answers.md") {
+      markdown = repairAnswersMarkdown(markdown);
+    }
     if (dump) dump.value = markdown;
     state.doc.markdown = markdown;
+    const stamp = captureUnsentStamp();
     return {
       kind: "note",
       path: state.doc.path,
       markdown,
       mtime: Number(state.doc.mtime) || 0,
+      at: stamp.at,
+      seq: stamp.seq,
     };
   }
   if (state.day) {
     const markdown = cleanPaperMarkdown(dump ? dump.value : dayMarkdown(state.day));
     if (dump) dump.value = markdown;
     state.day.markdown = markdown;
+    const stamp = captureUnsentStamp();
     return {
       kind: "day",
       date: state.day.date,
       markdown,
       mtime: Number(state.day.mtime) || 0,
+      at: stamp.at,
+      seq: stamp.seq,
     };
   }
   return null;
 }
 
 let paperConflict = null;
+let gitJoin = false;
 
 function conflictStillHere(info) {
   if (!info) return false;
@@ -1605,6 +2014,7 @@ function openPaperConflict(info) {
     mine: String(info.mine || ""),
     theirs: String(info.theirs || ""),
     mtime: Number(info.mtime) || 0,
+    git: !!info.git,
   };
   const sheet = $("conflict-sheet");
   const pathEl = $("conflict-path");
@@ -1618,7 +2028,13 @@ function openPaperConflict(info) {
   if (sheet) {
     sheet.hidden = false;
     sheet.classList.remove("is-edit");
+    sheet.classList.remove("is-join");
   }
+  const joinBtn = $("conflict-join");
+  if (joinBtn) joinBtn.hidden = true;
+  const kicker = sheet && sheet.querySelector(".conflict-kicker");
+  if (kicker) kicker.textContent = "This page changed on disk.";
+  gitJoin = false;
   document.body.classList.add("has-conflict");
   document.body.classList.remove("conflict-edit");
   setStatus("This page changed on disk.");
@@ -1630,12 +2046,19 @@ function closePaperConflict() {
   if (sheet) {
     sheet.hidden = true;
     sheet.classList.remove("is-edit");
+    sheet.classList.remove("is-join");
   }
+  const joinBtn = $("conflict-join");
+  if (joinBtn) joinBtn.hidden = true;
+  gitJoin = false;
   document.body.classList.remove("has-conflict");
   document.body.classList.remove("conflict-edit");
 }
 
 function handleSaveConflict(snap, body, { keepalive = false } = {}) {
+  const confirmed = confirmedSaves.get(notePathFor(snap));
+  if (confirmed && unsentBefore(snap, confirmed)) return;
+  rememberUnsent(snap);
   if (keepalive) return;
   if (!conflictStillHere(snap)) return;
   openPaperConflict({
@@ -1661,6 +2084,7 @@ function conflictMineNow() {
 async function resolveConflictKeep() {
   if (!paperConflict) return;
   const info = paperConflict;
+  forgetUnsent(conflictPath(info));
   const mine = conflictMineNow();
   try {
     let res;
@@ -1673,6 +2097,7 @@ async function resolveConflictKeep() {
           paper: mine,
           markdown: mine,
           mtime: info.mtime,
+          resolve: "keep",
         }),
       });
     } else {
@@ -1684,6 +2109,7 @@ async function resolveConflictKeep() {
           paper: mine,
           markdown: mine,
           mtime: info.mtime,
+          resolve: "keep",
         }),
       });
     }
@@ -1722,6 +2148,10 @@ async function resolveConflictKeep() {
       paintPaper();
     }
     closePaperConflict();
+    if (info.git) {
+      await afterGitChoice(info.kind === "note" ? info.path : ("log/" + info.date + ".md"));
+      if (gitJoin) return;
+    }
     setStatus("Saved", "saved");
     setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
   } catch (e) {
@@ -1729,20 +2159,254 @@ async function resolveConflictKeep() {
   }
 }
 
-function resolveConflictTheirs() {
+async function resolveConflictTheirs() {
   if (!paperConflict) return;
   const info = paperConflict;
-  if (info.kind === "note") {
-    applyRemoteNote({ path: info.path, markdown: info.theirs, mtime: info.mtime });
-  } else {
-    applyRemoteDay({ date: info.date, markdown: info.theirs, mtime: info.mtime });
+  forgetUnsent(conflictPath(info));
+  if (!info.git) {
+    if (info.kind === "note") {
+      applyRemoteNote({ path: info.path, markdown: info.theirs, mtime: info.mtime });
+    } else {
+      applyRemoteDay({ date: info.date, markdown: info.theirs, mtime: info.mtime });
+    }
+    closePaperConflict();
+    setStatus("");
+    return;
   }
-  closePaperConflict();
+  try {
+    const payload = { paper: info.theirs, markdown: info.theirs, mtime: info.mtime, resolve: "theirs" };
+    let res;
+    if (info.kind === "note") {
+      res = await fetch("/api/file?path=" + encodeURIComponent(info.path), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, path: info.path }),
+      });
+    } else {
+      res = await fetch("/api/day?date=" + info.date, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, date: info.date }),
+      });
+    }
+    if (res.status === 409) {
+      const body = await res.json().catch(() => ({}));
+      info.theirs = typeof body.markdown === "string" ? body.markdown : "";
+      info.mtime = Number(body.mtime) || 0;
+      const theirsEl = $("conflict-theirs");
+      if (theirsEl) theirsEl.textContent = info.theirs;
+      setStatus("This page changed on disk.");
+      return;
+    }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || res.statusText);
+    }
+    const out = await res.json().catch(() => ({}));
+    const mtime = out && out.mtime != null ? Number(out.mtime) || 0 : info.mtime;
+    if (info.kind === "note") {
+      applyRemoteNote({ path: info.path, markdown: info.theirs, mtime });
+    } else {
+      applyRemoteDay({ date: info.date, markdown: info.theirs, mtime });
+    }
+    closePaperConflict();
+    if (info.git) {
+      await afterGitChoice(info.kind === "note" ? info.path : ("log/" + info.date + ".md"));
+      if (gitJoin) return;
+    }
+    setStatus("");
+  } catch (e) {
+    setStatus(String(e.message), "error");
+  }
+}
+
+async function afterGitChoice(path) {
+  const rel = String(path || "").replace(/\\/g, "/");
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    let data = null;
+    try { data = await api("/api/sync"); } catch { data = null; }
+    if (!data || data.enabled === false) return;
+    const conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
+    const still = conflicts.some((item) => item && String(item.path || "").replace(/\\/g, "/") === rel);
+    if (still) {
+      await new Promise((r) => setTimeout(r, 80));
+      continue;
+    }
+    if (data.join) {
+      openGitJoin();
+      return;
+    }
+    if (conflicts.length) {
+      surfaceGitConflict(data);
+      return;
+    }
+    return;
+  }
+}
+
+function gitConflictForOpenPage(conflicts) {
+  const list = Array.isArray(conflicts) ? conflicts : [];
+  for (const item of list) {
+    const rel = String(item && item.path || "").replace(/\\/g, "/");
+    const date = item && item.date ? String(item.date) : "";
+    if (isNoteDoc()) {
+      if (state.doc && state.doc.path === rel) return item;
+      continue;
+    }
+    if (state.day && (date === state.day.date || rel === "log/" + state.day.date + ".md")) return item;
+  }
+  return null;
+}
+
+function openGitConflict(item) {
+  const path = String(item && item.path || "").replace(/\\/g, "/");
+  const theirs = String(item && item.theirs || "");
+  let mine = String(item && item.mine || "");
+  if (state.dirty) {
+    ensureDumpMatchesPaper();
+    const dump = $("dump");
+    if (dump) mine = cleanPaperMarkdown(dump.value);
+  }
+  if (mine === theirs) return;
+  const mtime = Number(item && item.mtime) || 0;
+  if (
+    paperConflict && paperConflict.git &&
+    paperConflict.path === path &&
+    paperConflict.mine === mine &&
+    paperConflict.theirs === theirs &&
+    paperConflict.mtime === mtime
+  ) return;
+  if (
+    paperConflict && paperConflict.git &&
+    paperConflict.path === path &&
+    document.body.classList.contains("conflict-edit")
+  ) return;
+  openPaperConflict({
+    kind: isNoteDoc() ? "note" : "day",
+    path,
+    date: item && item.date ? String(item.date) : "",
+    mine,
+    theirs,
+    mtime,
+    git: true,
+  });
+}
+
+function openGitJoin() {
+  if (paperConflict) return;
+  gitJoin = true;
+  const sheet = $("conflict-sheet");
+  const kicker = sheet && sheet.querySelector(".conflict-kicker");
+  if (kicker) kicker.textContent = "Your other copy has changes.";
+  const pathEl = $("conflict-path");
+  if (pathEl) pathEl.textContent = "";
+  const joinBtn = $("conflict-join");
+  if (joinBtn) joinBtn.hidden = false;
+  if (sheet) {
+    sheet.hidden = false;
+    sheet.classList.add("is-join");
+    sheet.classList.remove("is-edit");
+  }
+  document.body.classList.remove("has-conflict");
   setStatus("");
+}
+
+function closeGitJoin() {
+  const sheet = $("conflict-sheet");
+  const joinBtn = $("conflict-join");
+  if (joinBtn) joinBtn.hidden = true;
+  if (sheet) sheet.classList.remove("is-join");
+  const kicker = sheet && sheet.querySelector(".conflict-kicker");
+  if (kicker && !paperConflict) kicker.textContent = "This page changed on disk.";
+  if (sheet && !paperConflict) sheet.hidden = true;
+  gitJoin = false;
+}
+
+let gitJoinBusy = false;
+async function resolveGitJoin() {
+  if (gitJoinBusy || paperConflict) return;
+  gitJoinBusy = true;
+  try {
+    const res = await fetch("/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ join: true }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (body && Array.isArray(body.conflicts) && body.conflicts.length) {
+      closeGitJoin();
+      surfaceGitConflict(body);
+      return;
+    }
+    if (body && body.join) {
+      openGitJoin();
+      return;
+    }
+    if (!res.ok) {
+      closeGitJoin();
+      setStatus(String((body && body.error) || res.statusText || "push refused"), "error");
+      return;
+    }
+    closeGitJoin();
+    setStatus("Saved", "saved");
+    setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
+    if (!state.dirty && state.day && state.day.date && !isNoteDoc()) {
+      const day = await api("/api/day?date=" + encodeURIComponent(state.day.date)).catch(() => null);
+      if (day && !paperConflict && !gitJoin) applyRemoteDay(day);
+    }
+  } catch (e) {
+    setStatus(String(e && e.message || e), "error");
+  } finally {
+    gitJoinBusy = false;
+  }
+}
+
+function surfaceGitConflict(data) {
+  if (!data || data.enabled === false) return;
+  const match = gitConflictForOpenPage(data.conflicts);
+  if (match && String(match.mine || "") !== String(match.theirs || "")) {
+    closeGitJoin();
+    openGitConflict(match);
+    return;
+  }
+  if (paperConflict && paperConflict.git && !document.body.classList.contains("conflict-edit")) {
+    const info = paperConflict;
+    closePaperConflict();
+    if (info.kind === "note" && info.path) {
+      api("/api/file?path=" + encodeURIComponent(info.path)).then((body) => {
+        if (!paperConflict) applyRemoteNote(body);
+      }).catch(() => {});
+    } else if (info.date) {
+      api("/api/day?date=" + encodeURIComponent(info.date)).then((day) => {
+        if (!paperConflict && state.day && state.day.date === info.date) applyRemoteDay(day);
+      }).catch(() => {});
+    }
+  }
+  if (data.join && !paperConflict && currentView() === "today") {
+    openGitJoin();
+    return;
+  }
+  if (gitJoin && !data.join) closeGitJoin();
+  if (data.error && !paperConflict && !gitJoin && currentView() === "today") {
+    setStatus(String(data.error), "error");
+    return;
+  }
+  if (data.left && !paperConflict && !gitJoin && !data.join && currentView() === "today") {
+    setStatus(String(data.left));
+  }
+}
+
+async function surfaceOpenGitConflict() {
+  try {
+    const data = await api("/api/sync");
+    surfaceGitConflict(data);
+  } catch (e) {}
 }
 
 function resolveConflictEdit() {
   if (!paperConflict) return;
+  forgetUnsent(conflictPath(paperConflict));
   const mine = paperConflict.mine;
   const dump = $("dump");
   if (dump) dump.value = mine;
@@ -1756,16 +2420,28 @@ function resolveConflictEdit() {
   setStatus("They wrote this too.");
 }
 
-async function saveDay({ keepalive = false } = {}) {
+async function saveDay({ keepalive = false, bound = null } = {}) {
   const run = async () => {
-    if (paperConflict && !keepalive) {
-      setStatus("This page changed on disk.");
-      return;
+    if (bound && !saveBoundMatches(bound)) return { ok: true, skipped: true };
+    const editInfo = paperConflict && document.body.classList.contains("conflict-edit") ? paperConflict : null;
+    if (paperConflict && !editInfo && keepalive) {
+      rememberUnsent({
+        kind: paperConflict.kind,
+        path: paperConflict.path,
+        date: paperConflict.date,
+        markdown: conflictMineNow(),
+        mtime: Number(state.day && state.day.mtime) || Number(state.doc && state.doc.mtime) || 0,
+      });
     }
+    if (paperConflict && !editInfo) {
+      if (!keepalive) setStatus("This page changed on disk.");
+      return { ok: false, conflict: true };
+    }
+    const resolveBody = editInfo ? { resolve: "edit" } : {};
     const snap = paperSaveSnapshot();
     if (!snap) {
       setStatus("");
-      return;
+      return { ok: true, skipped: true };
     }
     if (snap.kind === "note") {
       const path = snap.path;
@@ -1774,33 +2450,41 @@ async function saveDay({ keepalive = false } = {}) {
         const res = await fetch("/api/file?path=" + encodeURIComponent(path), {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path, paper: markdown, markdown, mtime: snap.mtime }),
+          body: JSON.stringify({ path, paper: markdown, markdown, mtime: snap.mtime, ...resolveBody }),
           keepalive: !!keepalive,
         });
         if (res.status === 409) {
           const body = await res.json().catch(() => ({}));
           handleSaveConflict(snap, body, { keepalive });
-          return;
+          return { ok: false, conflict: true };
         }
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
           throw new Error(err.error || res.statusText);
         }
         const out = await res.json().catch(() => ({}));
+        noteSaved(snap);
         if (isNoteDoc() && state.doc && state.doc.path === path) {
-          if (out && out.mtime != null) state.doc.mtime = Number(out.mtime) || 0;
+          if (out && out.mtime != null) state.doc.mtime = adoptSavedMtime(state.doc.mtime, out.mtime);
           const dump = $("dump");
           if (dump && dump.value === markdown) state.dirty = false;
         }
-        if (keepalive) return;
+        if (editInfo) {
+          closePaperConflict();
+          if (editInfo.git) await afterGitChoice(editInfo.path);
+          if (gitJoin) return { ok: true };
+        }
+        if (keepalive) return { ok: true };
         setStatus("Saved", "saved");
         setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
+        return { ok: true };
       } catch (e) {
+        rememberUnsent(snap);
         if (!keepalive) setStatus(String(e.message), "error");
+        return { ok: false, error: String(e.message || e) };
       }
-      return;
     }
-    if (snap.kind !== "day") { setStatus(""); return; }
+    if (snap.kind !== "day") { setStatus(""); return { ok: true, skipped: true }; }
     const date = snap.date;
     const markdown = snap.markdown;
     const mtime = snap.mtime;
@@ -1808,24 +2492,31 @@ async function saveDay({ keepalive = false } = {}) {
       const res = await fetch("/api/day?date=" + date, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date, paper: markdown, markdown, mtime }),
+        body: JSON.stringify({ date, paper: markdown, markdown, mtime, ...resolveBody }),
         keepalive: !!keepalive,
       });
       if (res.status === 409) {
         const body = await res.json().catch(() => ({}));
         handleSaveConflict(snap, body, { keepalive });
-        return;
+        return { ok: false, conflict: true };
       }
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.error || res.statusText);
       }
       const out = await res.json().catch(() => ({}));
+      noteSaved(snap);
       if (state.day && state.day.date === date) {
-        if (out && out.mtime != null) state.day.mtime = Number(out.mtime) || 0;
-        state.dirty = false;
+        if (out && out.mtime != null) state.day.mtime = adoptSavedMtime(state.day.mtime, out.mtime);
+        const dump = $("dump");
+        if (dump && dump.value === markdown) state.dirty = false;
       }
-      if (keepalive) return;
+      if (editInfo) {
+        closePaperConflict();
+        if (editInfo.git) await afterGitChoice("log/" + editInfo.date + ".md");
+        if (gitJoin) return { ok: true };
+      }
+      if (keepalive) return { ok: true };
       setStatus("Saved", "saved");
       if (state.weekStart) {
         api("/api/week?start=" + state.weekStart).then((week) => {
@@ -1834,8 +2525,11 @@ async function saveDay({ keepalive = false } = {}) {
         }).catch(() => {});
       }
       setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
+      return { ok: true };
     } catch (e) {
+      rememberUnsent(snap);
       if (!keepalive) setStatus(String(e.message), "error");
+      return { ok: false, error: String(e.message || e) };
     }
   };
   saveChain = saveChain.then(run, run);
@@ -1857,12 +2551,16 @@ function showView(view) {
   const captureOn = isCaptureDoc() || isCaptureHash();
   const mapOn = isMapDoc();
   const stageOn = mapOn && !!state.mapStageId;
+  const keepConflict = !!paperConflict;
+  const keepEdit = document.body.classList.contains("conflict-edit");
   document.body.className = "day-page view-" + view
     + (isNoteDoc() ? " doc-note" : "")
     + (captureOn && isCaptureDoc() ? " doc-capture" : "")
     + (planOn && isPlanDoc() ? " doc-plan" : "")
     + (mapOn ? " doc-map" : "")
     + (stageOn ? " doc-stage" : "");
+  if (keepConflict) document.body.classList.add("has-conflict");
+  if (keepConflict && keepEdit) document.body.classList.add("conflict-edit");
   PAGE_VIEWS.forEach((v) => {
     const el = $("view-" + v);
     if (!el) return;
@@ -2079,6 +2777,9 @@ async function openVaultNote(rel) {
   if (String(data.path || path).replace(/\\/g, "/") === "aidanos/active-horse.md") {
     noteMd = normalizeSeasonPlanMarkdown(noteMd);
   }
+  if (String(data.path || path).replace(/\\/g, "/") === "family-room-to-office/answers.md") {
+    noteMd = repairAnswersMarkdown(noteMd);
+  }
   state.doc = {
     kind: "note",
     path: String(data.path || path).replace(/\\/g, "/"),
@@ -2106,6 +2807,10 @@ async function openVaultNote(rel) {
     renderWeek();
   }
   setStatus("");
+  if (noteGen === state.openDayGen) await surfaceOpenGitConflict();
+  if (noteGen === state.openDayGen && isNoteDoc() && state.doc && !paperConflict) {
+    offerUnsent("note", state.doc.path, "", state.doc.markdown);
+  }
 }
 
 async function openVaultSearchHit(rel, line) {
@@ -2171,6 +2876,7 @@ function renderMap() {
     canvas.setAttribute("hidden", "");
     sheet.removeAttribute("hidden");
     paintStagePaper(stage, parsed);
+    if (jobPath() === "family-room-to-office/map.md") syncStageAddButton().catch(() => {});
     return;
   }
   state.mapStageId = "";
@@ -2736,6 +3442,190 @@ $("paper").addEventListener("blur", () => {
   paintPaper();
   if (state.dirty) saveDay();
 });
+function nodeInLockedQuestion(node, line) {
+  const el = node && (node.nodeType === 1 ? node : node.parentElement);
+  if (!el || !el.closest || !line) return false;
+  const hit = el.closest(".md-q, .md-num");
+  return !!(hit && line.contains(hit));
+}
+
+function questionLineOfSelection() {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount) return null;
+  const node = sel.anchorNode;
+  const el = node && (node.nodeType === 1 ? node : node.parentElement);
+  const line = el && el.closest ? el.closest(".md-line") : null;
+  if (!line || !line.querySelector(".md-q")) return null;
+  return line;
+}
+
+function selectionInLockedQuestion(line) {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount || !line) return false;
+  const range = sel.getRangeAt(0);
+  if (nodeInLockedQuestion(range.startContainer, line)) return true;
+  if (!sel.isCollapsed && nodeInLockedQuestion(range.endContainer, line)) return true;
+  if (sel.isCollapsed) return false;
+  const q = line.querySelector(".md-q");
+  const num = line.querySelector(".md-num");
+  try {
+    if (q && range.intersectsNode && range.intersectsNode(q)) return true;
+    if (num && range.intersectsNode && range.intersectsNode(num)) return true;
+  } catch (e) {}
+  return false;
+}
+
+function caretAtAnswerStart(line) {
+  const body = line && line.querySelector ? line.querySelector(".md-body") : null;
+  const sel = window.getSelection();
+  if (!body || !sel || !sel.isCollapsed || !sel.rangeCount) return false;
+  const node = sel.anchorNode;
+  const el = node && (node.nodeType === 1 ? node : node.parentElement);
+  if (!el || (el !== body && !body.contains(el))) return false;
+  let off = 0;
+  try { off = caretOffset(body); } catch (e) { return false; }
+  if (off <= 0) return true;
+  return String(body.textContent || "").slice(0, off).replace(/\u200b/g, "").length === 0;
+}
+
+function placeCaretAtAnswerStart(line) {
+  if (!line) return;
+  const body = line.querySelector(".md-body");
+  if (!body) return;
+  const paper = $("paper");
+  if (paper) paper.focus();
+  placeCaret(body, 0);
+  const idx = paperLines().indexOf(line);
+  if (idx >= 0) {
+    state.activeLine = idx;
+    rememberPaperCaret(idx, 0);
+  }
+}
+
+function placeCaretAtAnswerEnd(line) {
+  if (!line) return;
+  const body = line.querySelector(".md-body");
+  if (!body) return;
+  const paper = $("paper");
+  if (paper) paper.focus();
+  const len = lineBody(line).replace(/\u200b/g, "").length;
+  placeCaret(body, len);
+  const idx = paperLines().indexOf(line);
+  if (idx >= 0) {
+    state.activeLine = idx;
+    rememberPaperCaret(idx, len);
+  }
+}
+
+function insertIntoAnswer(line, text, at) {
+  const body = line && line.querySelector ? line.querySelector(".md-body") : null;
+  if (!body) return;
+  const clean = String(text || "").replace(/\r?\n/g, "");
+  if (!clean) return;
+  const cur = lineBody(line).replace(/\u200b/g, "");
+  const pos = at == null ? cur.length : Math.max(0, Math.min(cur.length, at));
+  body.textContent = cur.slice(0, pos) + clean + cur.slice(pos);
+  placeCaret(body, pos + clean.length);
+  const idx = paperLines().indexOf(line);
+  if (idx >= 0) {
+    writeDumpLine(idx, lineMarkdown(line));
+    scheduleSave();
+  }
+}
+
+function questionLineAtEvent(e) {
+  const t = e && e.target;
+  if (!t || !t.closest) return null;
+  const line = t.closest(".md-line");
+  if (!line || !line.querySelector(".md-q")) return null;
+  if (t.closest(".md-q") || t.closest(".md-num")) return line;
+  const q = line.querySelector(".md-q");
+  if (!q || e.clientX == null) return null;
+  const qRect = q.getBoundingClientRect();
+  const lineRect = line.getBoundingClientRect();
+  if (e.clientY >= lineRect.top && e.clientY <= lineRect.bottom && e.clientX >= lineRect.left && e.clientX <= qRect.right + 2) return line;
+  return null;
+}
+
+function snapQuestionClick(e) {
+  if (e.button != null && e.button !== 0) return;
+  const line = questionLineAtEvent(e);
+  if (!line) return;
+  e.preventDefault();
+  const idx = paperLines().indexOf(line);
+  if (idx < 0) return;
+  if (!line.classList.contains("is-source")) activateLine(idx, 0);
+  placeCaretAtAnswerStart(paperLines()[idx]);
+}
+
+function guardQuestionBeforeInput(e) {
+  const line = questionLineOfSelection();
+  if (!line) return;
+  const type = String(e.inputType || "");
+  if (type === "historyUndo" || type === "historyRedo") return;
+  if (selectionInLockedQuestion(line)) {
+    e.preventDefault();
+    if (type === "insertFromPaste" || type === "insertFromDrop") return;
+    if (type.startsWith("insert") && e.data) insertIntoAnswer(line, e.data, 0);
+    else if (!type.startsWith("insert")) placeCaretAtAnswerStart(line);
+    return;
+  }
+  if (caretAtAnswerStart(line) && /^delete(Content|Word|SoftLine|HardLine)Backward/.test(type)) {
+    e.preventDefault();
+  }
+}
+
+$("paper").addEventListener("pointerdown", snapQuestionClick, true);
+$("paper").addEventListener("mousedown", snapQuestionClick, true);
+$("paper").addEventListener("pointerup", (e) => {
+  if (e.button != null && e.button !== 0) return;
+  const line = questionLineAtEvent(e);
+  if (!line) return;
+  const idx = paperLines().indexOf(line);
+  if (idx < 0) return;
+  placeCaretAtAnswerStart(paperLines()[idx]);
+}, true);
+$("paper").addEventListener("beforeinput", guardQuestionBeforeInput, true);
+$("paper").addEventListener("paste", (e) => {
+  const line = questionLineOfSelection();
+  if (!line || !selectionInLockedQuestion(line)) return;
+  e.preventDefault();
+  const text = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
+  if (text) insertIntoAnswer(line, text, 0);
+});
+$("paper").addEventListener("compositionstart", (e) => {
+  const t = e.target;
+  const el = t && (t.nodeType === 1 ? t : t.parentElement);
+  if (!el || !el.closest) return;
+  const locked = el.closest(".md-q, .md-num");
+  if (!locked) return;
+  const line = locked.closest(".md-line");
+  if (line) placeCaretAtAnswerStart(line);
+}, true);
+$("paper").addEventListener("keydown", (e) => {
+  if (e.isComposing || e.keyCode === 229) return;
+  const line = questionLineOfSelection();
+  if (!line) return;
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount || !nodeInLockedQuestion(sel.anchorNode, line)) return;
+  if (e.key === "End") {
+    e.preventDefault();
+    e.stopPropagation();
+    placeCaretAtAnswerEnd(line);
+    return;
+  }
+  if (e.key === "Backspace" || e.key === "Delete" || e.key === "Home" || e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "ArrowUp" || e.key === "ArrowDown") {
+    e.preventDefault();
+    e.stopPropagation();
+    placeCaretAtAnswerStart(line);
+    return;
+  }
+  if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    e.preventDefault();
+    e.stopPropagation();
+    insertIntoAnswer(line, e.key, 0);
+  }
+}, true);
 $("paper").addEventListener("beforeinput", (e) => {
   if (painting || slotDrag.active) return;
   if (e.isComposing) return;
@@ -3631,14 +4521,91 @@ const DRAWING_CHECKS = [
   "Where the built-in meets the floor",
 ];
 
+function typedAnswerOutsideQuestion(question, body) {
+  const q = String(question || "");
+  const b = String(body || "");
+  if (!q) return b;
+  if (b.startsWith(q)) return b.slice(q.length);
+  const n = q.length;
+  const m = b.length;
+  const neg = -1000000000;
+  const score = Array.from({ length: n + 1 }, () => new Int32Array(m + 1).fill(neg));
+  const fromI = Array.from({ length: n + 1 }, () => new Int32Array(m + 1).fill(-1));
+  const fromJ = Array.from({ length: n + 1 }, () => new Int32Array(m + 1).fill(-1));
+  score[0][0] = 0;
+  for (let i = 0; i <= n; i++) {
+    for (let j = 0; j <= m; j++) {
+      const s = score[i][j];
+      if (s === neg) continue;
+      if (j < m && s > score[i][j + 1]) {
+        score[i][j + 1] = s;
+        fromI[i][j + 1] = i;
+        fromJ[i][j + 1] = j;
+      }
+      if (i < n && j < m && q.charAt(i) === b.charAt(j)) {
+        const bond = i > 0 && fromI[i][j] === i - 1 && fromJ[i][j] === j - 1 ? 1 : 0;
+        const next = s + bond;
+        if (next > score[i + 1][j + 1]) {
+          score[i + 1][j + 1] = next;
+          fromI[i + 1][j + 1] = i;
+          fromJ[i + 1][j + 1] = j;
+        }
+      }
+    }
+  }
+  let best = neg;
+  let bestJ = -1;
+  for (let j = 0; j <= m; j++) {
+    if (score[n][j] > best) {
+      best = score[n][j];
+      bestJ = j;
+    }
+  }
+  if (bestJ < 0 || best === neg) return b;
+  const matched = new Array(m).fill(false);
+  let i = n;
+  let j = bestJ;
+  while (i > 0 || j > 0) {
+    const pi = fromI[i][j];
+    const pj = fromJ[i][j];
+    if (pi < 0 || pj < 0) break;
+    if (pi === i - 1 && pj === j - 1) matched[j - 1] = true;
+    i = pi;
+    j = pj;
+  }
+  let answer = "";
+  for (let k = 0; k < m; k++) if (!matched[k]) answer += b.charAt(k);
+  return answer;
+}
+
+function repairQuestionLine(line) {
+  const raw = String(line ?? "");
+  const m = raw.match(/^(\s*)(\d+)([.)])(\s*)([\s\S]*)$/);
+  if (!m) return raw;
+  const question = familyQuestionText(m[2]);
+  if (!question) return raw;
+  const answer = typedAnswerOutsideQuestion(question, m[5]);
+  return m[1] + m[2] + m[3] + " " + question + answer;
+}
+
+function repairAnswersMarkdown(md) {
+  return String(md ?? "").split("\n").map((line) => repairQuestionLine(line)).join("\n");
+}
+
 function familyAnswerMap(md) {
   const lines = String(md || "").replace(/\r\n/g, "\n").split("\n");
   const answers = {};
   let n = 0;
   for (const line of lines) {
-    const m = line.match(/^\s*(\d+)\.\s+(.*)$/);
+    const repaired = repairQuestionLine(line);
+    const m = repaired.match(/^\s*(\d+)\.\s+(.*)$/);
     if (m) {
       n = Number(m[1]);
+      const parts = familyQuestionLine(repaired);
+      if (parts) {
+        answers[n] = parts.answer.trim();
+        continue;
+      }
       const rest = String(m[2] || "");
       const q = rest.indexOf("?");
       answers[n] = q >= 0 ? rest.slice(q + 1).trim() : "";
@@ -3651,11 +4618,43 @@ function familyAnswerMap(md) {
   return answers;
 }
 
-function townNotCalled(answer) {
-  const a = String(answer || "").trim();
+function isTownRefusal(answer) {
+  const a = String(answer || "").replace(/\s+/g, " ").trim();
   if (!a) return true;
-  if (/\bnot called\b/i.test(a)) return true;
-  if (/\b(haven't|have not|didn't|did not|never)\b/i.test(a) && /\bcall/i.test(a)) return true;
+  if (/^(no|nope|nah|none|nothing|tbd|tba|n\/a|na|unknown|unsure|later|pending|todo|to do|idk|not yet|not asked|not asked yet|not called|not called yet)[.!?]*$/i.test(a)) return true;
+  if (/\b(not yet|not asked|not called|haven't asked|have not asked|didn't ask|did not ask|never asked|haven't called|have not called|didn't call|did not call|never called|to be determined|t\.?b\.?d\.?)\b/i.test(a)) {
+    if (/\bpermits?\b/i.test(a)) return false;
+    if (/\b(town|department|inspector)\b/i.test(a) && /\b(said|says|told|approved|denied|required|yes|no)\b/i.test(a)) return false;
+    return true;
+  }
+  return false;
+}
+
+function townReached(answer) {
+  const a = String(answer || "").replace(/\s+/g, " ").trim();
+  if (!a) return false;
+  if (/\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+\d{1,2}\b/i.test(a)) return true;
+  if (/\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b/.test(a)) return true;
+  if (/\b(spoke|talked|called|emailed|asked|met)\b/i.test(a) && /\b(?:with|to)\s+[A-Z][a-z]/.test(a)) return true;
+  if (isTownRefusal(a)) return false;
+  if (/\bpermits?\b/i.test(a)) return true;
+  if (/\b(town|department|inspector|building official)\b/i.test(a) && /\b(yes|no|approved|denied|required|ok|okay|said|says|told)\b/i.test(a)) return true;
+  return false;
+}
+
+function townNotCalled(answer) {
+  return !townReached(answer);
+}
+
+function wallsDoNotChange(answer) {
+  const a = String(answer || "").replace(/\s+/g, " ").trim();
+  if (!a) return false;
+  if (/^(no|nope|nah|none)[.!?]*$/i.test(a)) return true;
+  if (/\bno walls? change\b/i.test(a)) return true;
+  if (/\bno openings? change\b/i.test(a)) return true;
+  if (/\b(walls?|openings?)\b/i.test(a) && /\b(won't|wont|will not|do not|don't|doesn't|does not)\b/i.test(a) && /\bchange\b/i.test(a)) return true;
+  if (/\b(walls?|openings?) stay\b/i.test(a)) return true;
+  if (/\bnone (?:of them )?(?:come out|change)\b/i.test(a)) return true;
   return false;
 }
 
@@ -3692,7 +4691,7 @@ function familyRoomStops(answersMd, planMd) {
   const trade = /\b(wiring|rewir|electrical|hvac|plumbing|asbestos|\blead\b|bearing wall)\b/i.test(blob)
     || (/\b(new|moved|move)\b/i.test(plugged) && /\b(wire|wiring|outlet|panel)\b/i.test(plugged));
   if (trade) stops.push(FAMILY_ROOM_STOPS[3]);
-  if (checks["walls stay. none come out."]) stops.push(FAMILY_ROOM_STOPS[4]);
+  if (checks["walls stay. none come out."] || wallsDoNotChange(wall)) stops.push(FAMILY_ROOM_STOPS[4]);
   if (/\bopen/i.test(wall) && !/\b(no|not|won't|wont|never)\b/i.test(wall)) stops.push(FAMILY_ROOM_STOPS[5]);
   return stops;
 }
@@ -3701,10 +4700,26 @@ function isNextCutLine(line) {
   return /\b(cut|demolish|tear out|open the wall|opened wall|comes off the wall|come off the wall)\b/i.test(String(line || ""));
 }
 
-function linesToAddToday(lines, stops) {
+function linesToAddToday(lines, stops, answersMd) {
   const list = (Array.isArray(lines) ? lines : []).filter((line) => /^- \[ \] /.test(String(line)));
-  if (!stops || !stops.length) return list;
+  let blockCut = !!(stops && stops.length);
+  if (!blockCut && answersMd) blockCut = wallsDoNotChange(familyAnswerMap(answersMd)[3]);
+  if (!blockCut) return list;
   return list.filter((line) => !isNextCutLine(line));
+}
+
+function boxesOnToday(lines, markdown) {
+  const want = [];
+  for (const line of Array.isArray(lines) ? lines : []) {
+    const key = taskLineKey(line);
+    if (key && want.indexOf(key) < 0) want.push(key);
+  }
+  if (!want.length) return false;
+  const have = new Set(String(markdown || "").split("\n").map(taskLineKey).filter(Boolean));
+  for (const key of want) {
+    if (!have.has(key)) return false;
+  }
+  return true;
 }
 
 function planMarkdownFromChecks(marked) {
@@ -3783,15 +4798,9 @@ function isMissingFileError(err) {
 function familyRoomSeed(rel) {
   const p = String(rel || "").replace(/\\/g, "/");
   if (p === "family-room-to-office/answers.md") {
-    return "# " + FAMILY_ROOM_SENTENCE + "\n\n" +
-      "1. Which room, and will anyone sleep there?\n" +
-      "2. What must stay?\n" +
-      "3. Will any wall or opening change?\n" +
-      "4. Where does the desk go, and which way does the door swing?\n" +
-      "5. What has to be plugged in, and where is the panel?\n" +
-      "6. Supply, return, and will a new door close the room?\n" +
-      "7. When was the house built?\n" +
-      "8. What did the building department say?\n";
+    let lines = "# " + FAMILY_ROOM_SENTENCE + "\n\n";
+    for (let n = 1; n <= 8; n++) lines += n + ". " + familyQuestionText(n) + "\n";
+    return lines;
   }
   if (p === "family-room-to-office/plan.md") return planMarkdownFromChecks([]);
   if (p === "family-room-to-office/walk.md") return "# From the doorway\n";
@@ -4181,17 +5190,19 @@ function taskLinesIn(md) {
 }
 
 async function addTheseToToday() {
-  const stops = await currentFamilyStops();
+  const answers = await readJobFile("family-room-to-office/answers.md");
+  const plan = await readJobFile("family-room-to-office/plan.md");
+  const stops = familyRoomStops(answers.markdown, plan.markdown);
   await writeFamilyStops(stops);
   let lines = [];
   if (jobPath() === "family-room-to-office/map.md" && state.mapStageId) {
     const dump = $("dump");
     const parsed = parseProcessMap(dump ? dump.value : "");
     const stage = (parsed.stages || []).find((s) => s.id === state.mapStageId);
-    lines = linesToAddToday(stageNextStepLines(stage), stops);
+    lines = linesToAddToday(stageNextStepLines(stage), stops, answers.markdown);
   } else {
     const todayFile = await readJobFile("family-room-to-office/today.md");
-    lines = linesToAddToday(taskLinesIn(todayFile.markdown), stops);
+    lines = linesToAddToday(taskLinesIn(todayFile.markdown), stops, answers.markdown);
   }
   if (lines.length) {
     await applyStepsToToday(lines, todayIso());
@@ -4200,6 +5211,7 @@ async function addTheseToToday() {
     if (next !== (todayFile.markdown || "")) await writeJobFile("family-room-to-office/today.md", next, todayFile.mtime);
   }
   if (!isNoteDoc()) paintJobSeason();
+  else syncStageAddButton().catch(() => {});
 }
 
 function syncJobChrome() {
@@ -4326,6 +5338,12 @@ async function paintJobSeason() {
     }
     const season = await readJobFile("aidanos/active-horse.md");
     if (gen !== jobSeasonGen) return;
+    const answers = await readJobFile("family-room-to-office/answers.md");
+    const plan = await readJobFile("family-room-to-office/plan.md");
+    if (gen !== jobSeasonGen) return;
+    const day = await api("/api/day?date=" + encodeURIComponent(state.selectedDate || todayIso()));
+    if (gen !== jobSeasonGen) return;
+    const offer = linesToAddToday(tasks, familyRoomStops(answers.markdown, plan.markdown), answers.markdown);
     host.innerHTML = "";
     const blocks = [
       ["Why it matters", "Why it matters"],
@@ -4363,8 +5381,9 @@ async function paintJobSeason() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "hairline-button";
-    button.textContent = "Add these to today";
+    paintAddTodayButton(button, boxesOnToday(offer, day.markdown));
     button.addEventListener("click", () => {
+      if (button.disabled) return;
       addTheseToToday().catch((err) => setStatus(String(err && err.message || err), "error"));
     });
     host.appendChild(button);
@@ -4408,9 +5427,46 @@ if (jobLink) {
     }
   });
 }
+function paintAddTodayButton(button, on) {
+  if (!button) return;
+  const placed = !!on;
+  button.textContent = placed ? "On today" : "Add these to today";
+  button.classList.toggle("is-on-today", placed);
+  button.disabled = placed;
+}
+
+let stageAddGen = 0;
+async function syncStageAddButton() {
+  const button = $("stage-add");
+  const gen = ++stageAddGen;
+  if (!button) return;
+  if (jobPath() !== "family-room-to-office/map.md" || !state.mapStageId) {
+    paintAddTodayButton(button, false);
+    return;
+  }
+  paintAddTodayButton(button, false);
+  try {
+    const answers = await readJobFile("family-room-to-office/answers.md");
+    const plan = await readJobFile("family-room-to-office/plan.md");
+    const stops = familyRoomStops(answers.markdown, plan.markdown);
+    const dump = $("dump");
+    const parsed = parseProcessMap(dump ? dump.value : "");
+    const stage = (parsed.stages || []).find((s) => s.id === state.mapStageId);
+    const lines = linesToAddToday(stageNextStepLines(stage), stops, answers.markdown);
+    const day = await api("/api/day?date=" + encodeURIComponent(todayIso()));
+    if (gen !== stageAddGen) return;
+    if (jobPath() !== "family-room-to-office/map.md" || !state.mapStageId) return;
+    paintAddTodayButton(button, boxesOnToday(lines, day.markdown));
+  } catch (e) {
+    if (gen !== stageAddGen) return;
+    paintAddTodayButton(button, false);
+  }
+}
+
 const stageAdd = $("stage-add");
 if (stageAdd) {
   stageAdd.addEventListener("click", () => {
+    if (stageAdd.disabled) return;
     addTheseToToday().catch((err) => setStatus(String(err && err.message || err), "error"));
   });
 }
@@ -4807,8 +5863,10 @@ function syncFmtBarForKeyboard() {
   const take = $("conflict-take");
   const edit = $("conflict-edit");
   if (keep) keep.addEventListener("click", () => { resolveConflictKeep().catch(() => {}); });
-  if (take) take.addEventListener("click", () => resolveConflictTheirs());
+  if (take) take.addEventListener("click", () => { resolveConflictTheirs().catch(() => {}); });
   if (edit) edit.addEventListener("click", () => resolveConflictEdit());
+  const join = $("conflict-join");
+  if (join) join.addEventListener("click", () => { resolveGitJoin().catch(() => {}); });
 })();
 
 if (/^https?:$/.test(location.protocol) && "serviceWorker" in navigator) {

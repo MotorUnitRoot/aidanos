@@ -2,7 +2,8 @@ name: independent-review
 
 # Advisory signal only. This workflow does not post
 # independent-review/approved and has no statuses or checks write.
-# The motorunit-aidanos-bots App posts that status from outside Actions.
+# independent-review-post.yml posts that status after the
+# independent-review environment is approved.
 #
 # One run at a time per pull request. cancel-in-progress is off so a
 # slow PASS run cannot finish after a BLOCK run and become the latest

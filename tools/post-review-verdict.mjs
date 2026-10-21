@@ -2,21 +2,26 @@
 /**
  * Post an independent-review verdict as the motorunit-aidanos-bots App.
  *
- * Run this where the App key lives, after minting an installation token.
- * The token arrives in GITHUB_TOKEN. This file never reads the App key
- * and never prints the token. Do not run it from GitHub Actions.
+ * The App private key lives only in the independent-review environment
+ * secret. The gated workflow mints an installation token and passes it
+ * as GITHUB_TOKEN. This file never reads the key and never prints the token.
  *
  *   GITHUB_TOKEN=... GITHUB_REPOSITORY=owner/repo \
  *     node tools/post-review-verdict.mjs <pr> PASS <head-sha>
  *
- * The script refuses if the pull request's current head is not that SHA.
- * On PASS it posts the comment first, then sets success, so a failed
- * comment never turns the commit green. On BLOCK it writes the failure
- * signals first, then posts the comment. A failed BLOCK posts no comment,
- * so an earlier PASS stays green until the BLOCK is retried.
+ * --status-only sets the status and does not post a comment. The gated
+ * workflow uses it because the verdict comment is already on the pull
+ * request. The script refuses if the pull request's current head is not
+ * that SHA. On PASS it posts the comment first, then sets success, so a
+ * failed comment never turns the commit green. On BLOCK it writes the
+ * failure signals first, then posts the comment. A failed BLOCK posts no
+ * comment, so an earlier PASS stays green until the BLOCK is retried.
  *
  * REVIEW_MODE is "status" or "check-run". Changing it is a code change.
+ * --parse-request reads an issue_comment event and accepts a verdict only
+ * from VERDICT_AUTHORS, and only when the SHA is still the pull request head.
  */
+import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { REVIEW_APP_ID, STATUS_CONTEXT, verdictLine } from "../.github/independent-review.mjs";
 
@@ -31,8 +36,14 @@ export const BLOCK_STATUS_FAILED_MESSAGE =
 export const BLOCK_CHECK_PERMISSION_MESSAGE =
   "Cannot write a failing independent-review/approved check run. The App does not have permission to write checks. BLOCK was not posted, and an earlier PASS stays green until this BLOCK is retried.";
 
+export const BLOCK_CHECK_RATE_LIMIT_MESSAGE =
+  "GitHub rate limited independent-review/approved. BLOCK was not posted, and an earlier PASS stays green until this BLOCK is retried.";
+
 const BLOCK_CHECK_LIST_MESSAGE =
   "Cannot list check runs named independent-review/approved, so a BLOCK cannot see an earlier check run. BLOCK was not posted, and an earlier PASS stays green until this BLOCK is retried.";
+
+// Comments that may start the gated status job. One list, checked in one place.
+export const VERDICT_AUTHORS = Object.freeze(["MotorUnitRoot", "motorunit-aidanos-bots[bot]"]);
 
 export function scrubToken(text, token) {
   const source = String(text ?? "");
@@ -48,9 +59,57 @@ function selectedMode(mode) {
   return value;
 }
 
-function isPermissionError(error) {
+function headerValue(headers, name) {
+  if (!headers || typeof headers !== "object") return undefined;
+  if (Object.prototype.hasOwnProperty.call(headers, name)) return headers[name];
+  const match = Object.keys(headers).find((key) => key.toLowerCase() === name);
+  return match ? headers[match] : undefined;
+}
+
+// 403 and 429 are rate limits when GitHub says so. Any other 403 is permissions.
+export function apiFailureKind(error) {
+  const status = Number(error && error.status);
+  const remaining = headerValue(error && error.headers, "x-ratelimit-remaining");
+  const retryAfter = headerValue(error && error.headers, "retry-after");
   const message = String(error && error.message ? error.message : error);
-  return /\b403\b/.test(message) || /Resource not accessible by integration/i.test(message);
+  const rateSignal =
+    remaining === 0 ||
+    remaining === "0" ||
+    (retryAfter != null && String(retryAfter) !== "") ||
+    /rate limit/i.test(message);
+  if ((status === 403 || status === 429) && rateSignal) return "rate-limit";
+  if (status === 403) return "permission";
+  return "other";
+}
+
+function scrubbedError(error, token) {
+  const wrapped = new Error(scrubToken(error && error.message ? error.message : error, token));
+  if (error && typeof error === "object") {
+    if (Number.isInteger(error.status)) wrapped.status = error.status;
+    if (error.headers && typeof error.headers === "object") wrapped.headers = error.headers;
+  }
+  return wrapped;
+}
+
+export function parseVerdictLine(body) {
+  const line = String(body ?? "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .trimStart()
+    .split("\n", 1)[0]
+    .trim();
+  const match = /^Independent review: (PASS|BLOCK)\s+([0-9a-fA-F]{40})$/.exec(line);
+  if (!match) return null;
+  return { verdict: match[1], sha: match[2].toLowerCase() };
+}
+
+export function classifyCommentRequest({ login, body, headSha }) {
+  if (!VERDICT_AUTHORS.includes(login)) return { action: "ignore" };
+  const parsed = parseVerdictLine(body);
+  if (!parsed) return { action: "ignore" };
+  const head = String(headSha || "").toLowerCase();
+  if (head !== parsed.sha) return { action: "refuse", verdict: parsed.verdict, sha: parsed.sha, head };
+  return { action: "accept", verdict: parsed.verdict, sha: parsed.sha };
 }
 
 function isOurCheckRun(run) {
@@ -85,6 +144,7 @@ export async function postReviewVerdict({
   sha,
   request,
   mode,
+  postComment = true,
   log = () => {},
 }) {
   if (!token) throw new Error("GITHUB_TOKEN is required");
@@ -99,7 +159,7 @@ export async function postReviewVerdict({
     try {
       return await request(pathname, { method: options.method || "GET", body: options.body, token });
     } catch (error) {
-      throw new Error(scrubToken(error && error.message ? error.message : error, token));
+      throw scrubbedError(error, token);
     }
   };
 
@@ -110,11 +170,13 @@ export async function postReviewVerdict({
   }
 
   const state = verdict === "PASS" ? "success" : "failure";
-  const postComment = () =>
-    call(`/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
+  const writeComment = () => {
+    if (!postComment) return null;
+    return call(`/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
       method: "POST",
       body: { body: line },
     });
+  };
   const postStatus = () =>
     call(`/repos/${owner}/${repo}/statuses/${encodeURIComponent(head)}`, {
       method: "POST",
@@ -136,27 +198,31 @@ export async function postReviewVerdict({
       },
     });
 
+  const failCheckStep = (error, step) => {
+    const kind = apiFailureKind(error);
+    if (kind === "rate-limit") throw new Error(BLOCK_CHECK_RATE_LIMIT_MESSAGE);
+    if (kind === "permission") {
+      throw new Error(step === "list" ? BLOCK_CHECK_LIST_MESSAGE : BLOCK_CHECK_PERMISSION_MESSAGE);
+    }
+    const what = step === "list" ? `list check runs named ${STATUS_CONTEXT}` : "write the failing check run";
+    throw new Error(`Could not ${what}. BLOCK was not posted. (${scrubToken(error.message, token)})`);
+  };
+
   const failExistingCheckRuns = async () => {
     let listed;
     try {
       listed = await call(
-        `/repos/${owner}/${repo}/commits/${encodeURIComponent(head)}/check-runs?per_page=100`,
+        `/repos/${owner}/${repo}/commits/${encodeURIComponent(head)}/check-runs?check_name=${encodeURIComponent(STATUS_CONTEXT)}&per_page=100`,
       );
     } catch (error) {
-      if (isPermissionError(error)) throw new Error(BLOCK_CHECK_LIST_MESSAGE);
-      throw new Error(
-        `Could not list check runs named ${STATUS_CONTEXT}. BLOCK was not posted. (${scrubToken(error.message, token)})`,
-      );
+      failCheckStep(error, "list");
     }
     const runs = (listed && listed.check_runs) || [];
     if (!runs.some(isOurCheckRun)) return;
     try {
       await postCheckRun();
     } catch (error) {
-      if (isPermissionError(error)) throw new Error(BLOCK_CHECK_PERMISSION_MESSAGE);
-      throw new Error(
-        `Could not write the failing check run. BLOCK was not posted. (${scrubToken(error.message, token)})`,
-      );
+      failCheckStep(error, "write");
     }
   };
 
@@ -164,34 +230,76 @@ export async function postReviewVerdict({
     try {
       await postStatus();
     } catch (error) {
-      throw new Error(`${BLOCK_STATUS_FAILED_MESSAGE} (${scrubToken(error.message, token)})`);
+      const detail = scrubToken(error.message, token);
+      if (apiFailureKind(error) === "rate-limit") {
+        throw new Error(`${BLOCK_CHECK_RATE_LIMIT_MESSAGE} (${detail})`);
+      }
+      throw new Error(`${BLOCK_STATUS_FAILED_MESSAGE} (${detail})`);
     }
   };
 
   if (verdict === "BLOCK" && reviewMode === "status") {
     await failExistingCheckRuns();
     await failStatus();
-    await postComment();
+    await writeComment();
   } else if (verdict === "BLOCK") {
     try {
       await postCheckRun();
     } catch (error) {
-      if (isPermissionError(error)) throw new Error(BLOCK_CHECK_PERMISSION_MESSAGE);
-      throw new Error(
-        `Could not write the failing check run. BLOCK was not posted. (${scrubToken(error.message, token)})`,
-      );
+      failCheckStep(error, "write");
     }
     await failStatus();
-    await postComment();
+    await writeComment();
   } else if (reviewMode === "status") {
-    await postComment();
+    await writeComment();
     await postStatus();
   } else {
-    await postComment();
+    await writeComment();
     await postCheckRun();
   }
-  log(`Posted ${verdict} for PR #${prNumber} at ${head}.`);
-  return { line, state, sha: head, mode: reviewMode };
+  log(
+    postComment
+      ? `Posted ${verdict} for PR #${prNumber} at ${head}.`
+      : `Set independent-review/approved to ${state} for PR #${prNumber} at ${head}.`,
+  );
+  return { line, state, sha: head, mode: reviewMode, postComment };
+}
+
+export async function parseRequest({ event, request, owner, repo, token, writeOutput, writeSummary, log = () => {} }) {
+  const login = event && event.comment && event.comment.user && event.comment.user.login;
+  const body = event && event.comment && event.comment.body;
+  const number = event && event.issue && event.issue.number;
+  if (!VERDICT_AUTHORS.includes(login) || !parseVerdictLine(body)) {
+    log("No allowlisted verdict on the first line. Nothing to post.");
+    return { action: "ignore" };
+  }
+  const pr = await request(`/repos/${owner}/${repo}/pulls/${number}`, { method: "GET", token });
+  const head = pr && pr.head && pr.head.sha;
+  const result = classifyCommentRequest({ login, body, headSha: head });
+  if (result.action !== "accept") {
+    throw new Error(
+      `PR #${number} head is ${head || "missing"}, not ${result.sha}. Refusing to post ${result.verdict}.`,
+    );
+  }
+  const short = result.sha.slice(0, 7);
+  if (writeOutput) writeOutput(`verdict=${result.verdict}\nsha=${result.sha}\nshort=${short}\npr=${number}\n`);
+  if (writeSummary) {
+    writeSummary(
+      [
+        `### Independent review #${number}`,
+        "",
+        `**${result.verdict}** \`${short}\``,
+        "",
+        `Full commit \`${result.sha}\`.`,
+        "",
+        "Approve this in the independent-review environment to set independent-review/approved.",
+        "A waiting BLOCK is a pending approval. Do not merge while one is waiting.",
+        "",
+      ].join("\n"),
+    );
+  }
+  log(`#${number} ${result.verdict} ${short}`);
+  return { action: "accept", verdict: result.verdict, sha: result.sha, short, pr: number };
 }
 
 export async function githubRequest({ apiBase, token, pathname, method, body }) {
@@ -207,7 +315,15 @@ export async function githubRequest({ apiBase, token, pathname, method, body }) 
   });
   const text = await response.text();
   if (!response.ok) {
-    throw new Error(`${method} ${pathname} -> ${response.status} ${scrubToken(text, token).slice(0, 300)}`);
+    const error = new Error(`${method} ${pathname} -> ${response.status} ${scrubToken(text, token).slice(0, 300)}`);
+    error.status = response.status;
+    const headers = {};
+    const remaining = response.headers.get("x-ratelimit-remaining");
+    const retryAfter = response.headers.get("retry-after");
+    if (remaining != null) headers["x-ratelimit-remaining"] = remaining;
+    if (retryAfter != null) headers["retry-after"] = retryAfter;
+    error.headers = headers;
+    throw error;
   }
   if (!text) return null;
   return JSON.parse(text);
@@ -299,6 +415,10 @@ export function selfTest() {
     assert(blockResult.status === "fulfilled", "block posts");
     assert(blockResult.value.line === `Independent review: BLOCK ${sha}`, "block first line");
     assert(blockApi.calls[1].pathname.includes("/check-runs"), "block looks for an earlier check run");
+    assert(
+      blockApi.calls[1].pathname.includes(`check_name=${encodeURIComponent(STATUS_CONTEXT)}`),
+      "check-run lookup is filtered by check_name",
+    );
     assert(blockApi.calls[2].pathname.includes("/statuses/"), "block sets status before the comment");
     assert(blockApi.calls[2].body.state === "failure", "block status");
     assert(blockApi.calls[3].body.body === `Independent review: BLOCK ${sha}`, "block comment after the failure writes");
@@ -437,18 +557,235 @@ export function selfTest() {
     assert(passPosts[1].kind === "check-run" && passPosts[1].conclusion === "success", "check-run mode then posts success");
     assert(!passPosts.some((post) => post.kind === "status"), "a check-run PASS does not set a status");
 
+    assert(
+      VERDICT_AUTHORS.length === 2 &&
+        VERDICT_AUTHORS[0] === "MotorUnitRoot" &&
+        VERDICT_AUTHORS[1] === "motorunit-aidanos-bots[bot]",
+      "verdict authors are the one allowlist",
+    );
+    assert(
+      classifyCommentRequest({ login: "MotorUnitRoot", body: `Independent review: PASS ${sha}\nnote`, headSha: sha }).action ===
+        "accept",
+      "Colby can request a PASS",
+    );
+    assert(
+      classifyCommentRequest({
+        login: "motorunit-aidanos-bots[bot]",
+        body: `Independent review: BLOCK ${sha}`,
+        headSha: sha,
+      }).action === "accept",
+      "the review App can request a BLOCK",
+    );
+    assert(
+      classifyCommentRequest({ login: "octocat", body: `Independent review: PASS ${sha}`, headSha: sha }).action === "ignore",
+      "other authors are ignored",
+    );
+    assert(
+      classifyCommentRequest({ login: "MotorUnitRoot", body: "Independent review: BLOCK", headSha: sha }).action === "ignore",
+      "a BLOCK without the full commit is ignored",
+    );
+    assert(
+      classifyCommentRequest({ login: "MotorUnitRoot", body: `Independent review: PASS ${sha}`, headSha: `b${"c".repeat(39)}` })
+        .action === "refuse",
+      "a verdict for an older commit is refused",
+    );
+
+    let lookups = 0;
+    const ignoredRequest = await parseRequest({
+      event: {
+        comment: { user: { login: "octocat" }, body: `Independent review: PASS ${sha}` },
+        issue: { number: 40 },
+      },
+      request: async () => {
+        lookups += 1;
+        return { head: { sha } };
+      },
+      owner: "MotorUnitRoot",
+      repo: "aidanos",
+      token,
+    });
+    assert(ignoredRequest.action === "ignore" && lookups === 0, "ignored comments do not read the pull request");
+
+    const refusedRequest = await parseRequest({
+      event: {
+        comment: { user: { login: "MotorUnitRoot" }, body: `Independent review: BLOCK ${sha}` },
+        issue: { number: 40 },
+      },
+      request: async () => ({ head: { sha: `b${"c".repeat(39)}` } }),
+      owner: "MotorUnitRoot",
+      repo: "aidanos",
+      token,
+    }).then(
+      () => null,
+      (error) => error,
+    );
+    assert(
+      refusedRequest instanceof Error && refusedRequest.message.includes("Refusing to post BLOCK"),
+      "a moved head refuses the gated post",
+    );
+
+    let parsedOutput = "";
+    const acceptedRequest = await parseRequest({
+      event: {
+        comment: { user: { login: "motorunit-aidanos-bots[bot]" }, body: `Independent review: PASS ${sha}\nlater` },
+        issue: { number: 40 },
+      },
+      request: async () => ({ head: { sha } }),
+      owner: "MotorUnitRoot",
+      repo: "aidanos",
+      token,
+      writeOutput: (text) => {
+        parsedOutput += text;
+      },
+    });
+    assert(acceptedRequest.action === "accept" && acceptedRequest.verdict === "PASS", "an allowlisted current verdict is accepted");
+    assert(parsedOutput.includes("verdict=PASS") && parsedOutput.includes(`sha=${sha}`), "parse writes the verdict outputs");
+
+    const statusOnlyBlock = memoryApi(sha, token, {
+      checkRuns: [{ name: STATUS_CONTEXT, conclusion: "success", app: { id: REVIEW_APP_ID } }],
+    });
+    await postReviewVerdict({
+      token,
+      owner: "MotorUnitRoot",
+      repo: "aidanos",
+      number: 40,
+      verdict: "BLOCK",
+      sha,
+      postComment: false,
+      request: statusOnlyBlock.request,
+      log: () => {},
+    });
+    const statusOnlyBlockPosts = statusOnlyBlock.posts();
+    assert(statusOnlyBlockPosts[0].kind === "check-run" && statusOnlyBlockPosts[0].conclusion === "failure", "status-only BLOCK still fails an earlier check run");
+    assert(statusOnlyBlockPosts[1].kind === "status" && statusOnlyBlockPosts[1].state === "failure", "status-only BLOCK sets the failure status");
+    assert(!statusOnlyBlockPosts.some((post) => post.kind === "comment"), "status-only BLOCK does not post a comment");
+
+    const statusOnlyPass = memoryApi(sha, token);
+    await postReviewVerdict({
+      token,
+      owner: "MotorUnitRoot",
+      repo: "aidanos",
+      number: 40,
+      verdict: "PASS",
+      sha,
+      postComment: false,
+      request: statusOnlyPass.request,
+      log: () => {},
+    });
+    assert(
+      statusOnlyPass.posts().length === 1 && statusOnlyPass.posts()[0].state === "success",
+      "status-only PASS sets success and nothing else",
+    );
+    assert(statusOnlyPass.comments.length === 0, "status-only PASS does not post a comment");
+
+    const rateLimitedList = memoryApi(sha, token, {
+      statuses: [{ state: "success", context: STATUS_CONTEXT, source: "earlier-pass" }],
+      checkRuns: [{ name: STATUS_CONTEXT, conclusion: "success", app: { id: REVIEW_APP_ID } }],
+      listError: httpError(403, "403 API rate limit exceeded", { "x-ratelimit-remaining": "0" }),
+    });
+    const rateLimitedListError = await postReviewVerdict({
+      token,
+      owner: "MotorUnitRoot",
+      repo: "aidanos",
+      number: 40,
+      verdict: "BLOCK",
+      sha,
+      request: rateLimitedList.request,
+      log: () => {},
+    }).then(
+      () => null,
+      (error) => error,
+    );
+    assert(rateLimitedListError instanceof Error && rateLimitedListError.message === BLOCK_CHECK_RATE_LIMIT_MESSAGE, "a 403 with no remaining quota is rate limiting");
+    assert(rateLimitedList.comments.length === 0, "a rate-limited list posts no comment");
+    assert(rateLimitedList.statuses.length === 1 && rateLimitedList.statuses[0].state === "success", "a rate-limited list leaves the PASS");
+    assert(
+      rateLimitedList.lookups[0].includes(`check_name=${encodeURIComponent(STATUS_CONTEXT)}`),
+      "the rate-limited lookup was still filtered by name",
+    );
+
+    const retryAfter = memoryApi(sha, token, {
+      listError: httpError(429, "429 too many requests", { "retry-after": "60" }),
+    });
+    const retryAfterError = await postReviewVerdict({
+      token,
+      owner: "MotorUnitRoot",
+      repo: "aidanos",
+      number: 40,
+      verdict: "BLOCK",
+      sha,
+      request: retryAfter.request,
+      log: () => {},
+    }).then(
+      () => null,
+      (error) => error,
+    );
+    assert(retryAfterError instanceof Error && retryAfterError.message === BLOCK_CHECK_RATE_LIMIT_MESSAGE, "a 429 with retry-after is rate limiting");
+
+    const rateLimitedWrite = memoryApi(sha, token, {
+      statuses: [{ state: "success", context: STATUS_CONTEXT, source: "earlier-pass" }],
+      checkRuns: [{ name: STATUS_CONTEXT, conclusion: "success", app: { id: REVIEW_APP_ID } }],
+      checkWriteError: httpError(403, "secondary rate limit", { "x-ratelimit-remaining": "4", "retry-after": "8" }),
+    });
+    const rateLimitedWriteError = await postReviewVerdict({
+      token,
+      owner: "MotorUnitRoot",
+      repo: "aidanos",
+      number: 40,
+      verdict: "BLOCK",
+      sha,
+      request: rateLimitedWrite.request,
+      log: () => {},
+    }).then(
+      () => null,
+      (error) => error,
+    );
+    assert(
+      rateLimitedWriteError instanceof Error && rateLimitedWriteError.message === BLOCK_CHECK_RATE_LIMIT_MESSAGE,
+      "a rate-limited check write is not a permission error",
+    );
+    assert(rateLimitedWriteError.message !== BLOCK_CHECK_PERMISSION_MESSAGE, "rate limiting stays distinct from permission");
+    assert(rateLimitedWrite.comments.length === 0, "a rate-limited check write posts no comment");
+    assert(rateLimitedWrite.statuses[0].state === "success", "a rate-limited check write leaves the PASS");
+
+    assert(apiFailureKind(httpError(403, "403 Resource not accessible by integration", {})) === "permission", "a plain 403 is permissions");
+    assert(
+      apiFailureKind(httpError(403, "You have exceeded a secondary rate limit", { "x-ratelimit-remaining": "12" })) ===
+        "rate-limit",
+      "a 403 that says rate limit is rate limiting",
+    );
+    assert(apiFailureKind(httpError(429, "429", {})) === "other", "a 429 without a rate-limit signal is not a permission error");
+
     console.log("post-review-verdict self-test ok");
   });
 }
 
-function memoryApi(head, token, { statuses = [], checkRuns = [], denyCheckWrite = false } = {}) {
-  const state = { statuses: statuses.map((item) => ({ ...item })), checkRuns: checkRuns.map((item) => ({ ...item })), comments: [], posts: [] };
+function httpError(status, message, headers) {
+  const error = new Error(message);
+  error.status = status;
+  error.headers = headers;
+  return error;
+}
+
+function memoryApi(head, token, { statuses = [], checkRuns = [], denyCheckWrite = false, listError = null, checkWriteError = null } = {}) {
+  const state = {
+    statuses: statuses.map((item) => ({ ...item })),
+    checkRuns: checkRuns.map((item) => ({ ...item })),
+    comments: [],
+    posts: [],
+    lookups: [],
+  };
   const request = async (pathname, options) => {
     if (String(options.token) !== token) throw new Error("missing token");
     if (options.method === "GET" && pathname.includes("/pulls/")) return { head: { sha: head } };
-    if (options.method === "GET" && pathname.includes("/check-runs")) return { check_runs: state.checkRuns };
+    if (options.method === "GET" && pathname.includes("/check-runs")) {
+      state.lookups.push(pathname);
+      if (listError) throw listError;
+      return { check_runs: state.checkRuns };
+    }
     if (options.method === "POST" && pathname.endsWith("/check-runs")) {
-      if (denyCheckWrite) throw new Error("403 Resource not accessible by integration");
+      if (checkWriteError) throw checkWriteError;
+      if (denyCheckWrite) throw httpError(403, "403 Resource not accessible by integration", {});
       const run = { name: options.body.name, conclusion: options.body.conclusion, app: { id: REVIEW_APP_ID, slug: "motorunit-aidanos-bots" } };
       state.checkRuns.push(run);
       state.posts.push({ kind: "check-run", conclusion: options.body.conclusion });
@@ -474,6 +811,9 @@ function memoryApi(head, token, { statuses = [], checkRuns = [], denyCheckWrite 
     },
     get statuses() {
       return state.statuses;
+    },
+    get lookups() {
+      return state.lookups;
     },
   };
 }
@@ -529,20 +869,42 @@ async function main() {
     await selfTest();
     return;
   }
-  if (process.env.GITHUB_ACTIONS === "true") {
-    throw new Error("post-review-verdict.mjs does not run in GitHub Actions");
-  }
-  const [number, verdict, sha] = process.argv.slice(2);
   const [owner, repo] = String(process.env.GITHUB_REPOSITORY || "").split("/");
   const apiBase = process.env.GITHUB_API_URL || "https://api.github.com";
+  const token = process.env.GITHUB_TOKEN;
+  const request = (pathname, options) => githubRequest({ apiBase, pathname, ...options });
+  if (process.argv.includes("--parse-request")) {
+    const eventPath = process.env.GITHUB_EVENT_PATH;
+    if (!eventPath) throw new Error("GITHUB_EVENT_PATH is required");
+    const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
+    await parseRequest({
+      event,
+      request,
+      owner,
+      repo,
+      token,
+      writeOutput: (text) => {
+        if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, text);
+      },
+      writeSummary: (text) => {
+        if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, text);
+      },
+      log: (message) => console.log(message),
+    });
+    return;
+  }
+  const statusOnly = process.argv.includes("--status-only");
+  const args = process.argv.slice(2).filter((arg) => arg !== "--status-only");
+  const [number, verdict, sha] = args;
   await postReviewVerdict({
-    token: process.env.GITHUB_TOKEN,
+    token,
     owner,
     repo,
     number,
     verdict,
     sha,
-    request: (pathname, options) => githubRequest({ apiBase, pathname, ...options }),
+    postComment: !statusOnly,
+    request,
     log: (message) => console.log(message),
   });
 }

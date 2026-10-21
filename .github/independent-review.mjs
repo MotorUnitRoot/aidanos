@@ -19,8 +19,9 @@
  * A bare BLOCK names no SHA and applies to the current head.
  *
  * This file only reads. It does not post independent-review/approved.
- * The App posts that status from tools/post-review-verdict.mjs, outside
- * Actions. No GitHub App key is read here.
+ * The binding status is posted by independent-review-post.yml, which runs
+ * tools/post-review-verdict.mjs after the independent-review environment
+ * is approved. No GitHub App key is read here.
  */
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";

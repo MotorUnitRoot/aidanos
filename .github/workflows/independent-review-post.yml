@@ -1,0 +1,102 @@
+name: independent-review-post
+
+# Sets the binding status independent-review/approved. issue_comment runs
+# this file from the default branch, so the environment's main branch rule
+# holds. The parse job has no secrets. The post job waits in the
+# independent-review environment, then mints an installation token from
+# that environment's REVIEW_APP_PRIVATE_KEY. The private key is not printed.
+# Do not add set -x.
+#
+# PASS and BLOCK both wait for approval. A waiting BLOCK is a pending
+# approval. Do not merge while one is waiting.
+run-name: "independent-review #${{ github.event.issue.number }}"
+
+concurrency:
+  group: independent-review-post-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  parse:
+    if: github.event.issue.pull_request
+    name: parse verdict
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      verdict: ${{ steps.request.outputs.verdict }}
+      sha: ${{ steps.request.outputs.sha }}
+      short: ${{ steps.request.outputs.short }}
+      pr: ${{ steps.request.outputs.pr }}
+    steps:
+      - name: Checkout default branch
+        # v5.1.0 — default branch SHA. issue_comment does not check out the pull request head.
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js
+        # v6.5.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "22"
+      - name: Read the verdict
+        id: request
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: node tools/post-review-verdict.mjs --parse-request
+
+  post:
+    needs: parse
+    if: ${{ needs.parse.result == 'success' && (needs.parse.outputs.verdict == 'PASS' || needs.parse.outputs.verdict == 'BLOCK') }}
+    name: "#${{ needs.parse.outputs.pr }} ${{ needs.parse.outputs.verdict }} ${{ needs.parse.outputs.short }}"
+    runs-on: ubuntu-latest
+    environment: independent-review
+    permissions:
+      contents: read
+    steps:
+      - name: Record the verdict
+        run: |
+          {
+            echo "### Independent review #${{ needs.parse.outputs.pr }}"
+            echo ""
+            echo "**${{ needs.parse.outputs.verdict }}** \`${{ needs.parse.outputs.short }}\`"
+            echo ""
+            echo "Full commit \`${{ needs.parse.outputs.sha }}\`."
+            echo ""
+            echo "A waiting BLOCK is a pending approval. Do not merge while one is waiting."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Checkout default branch
+        # v5.1.0
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js
+        # v6.5.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "22"
+      - name: Mint the review App token
+        id: app-token
+        # v3.3.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+        with:
+          app-id: ${{ vars.REVIEW_APP_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+      - name: Set independent-review/approved
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REVIEW_PR: ${{ needs.parse.outputs.pr }}
+          REVIEW_VERDICT: ${{ needs.parse.outputs.verdict }}
+          REVIEW_SHA: ${{ needs.parse.outputs.sha }}
+        run: node tools/post-review-verdict.mjs "$REVIEW_PR" "$REVIEW_VERDICT" "$REVIEW_SHA" --status-only

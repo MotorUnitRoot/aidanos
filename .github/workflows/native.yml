@@ -56,7 +56,8 @@ jobs:
       - name: Relay for the iOS simulator
         working-directory: relay
         run: |
-          node src/server.mjs --token aidanos-test-token --port 3757 \
+          AIDANOS_RELAY_TOKEN=aidanos-test-token-0123456789abcdef \
+            node src/server.mjs --port 3757 \
             --vault "$RUNNER_TEMP/aidanos-vault" --data "$RUNNER_TEMP/aidanos-data" \
             > "$RUNNER_TEMP/relay-ios.log" 2>&1 &
           for _ in $(seq 1 50); do

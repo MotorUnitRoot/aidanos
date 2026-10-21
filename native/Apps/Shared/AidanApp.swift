@@ -10,6 +10,7 @@ struct AidanOSApp: App {
 }
 
 struct TodayScreen: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = TodayModel()
 
     var body: some View {
@@ -18,7 +19,7 @@ struct TodayScreen: View {
                 .font(.caption)
             TextField("Relay address", text: $model.address)
                 .textFieldStyle(.roundedBorder)
-            TextField("Token", text: $model.token)
+            SecureField("Token", text: $model.token)
                 .textFieldStyle(.roundedBorder)
             Button("Connect") { model.connect() }
             if let conflict = model.conflict {
@@ -27,10 +28,19 @@ struct TodayScreen: View {
                 HStack {
                     Button("Keep mine") { model.choose(.keepMine) }
                     Button("Take theirs") { model.choose(.takeTheirs) }
+                    Button("Edit") { model.beginConflictEdit() }
+                }
+                if model.draftingConflict {
+                    Button("Save edit") { model.saveConflictEdit() }
                 }
             }
-            NoteEditor(text: $model.text) { model.userEdited($0) }
+            NoteEditor(text: $model.text) { base, edited in
+                model.userEdited(base: base, edited: edited)
+            }
         }
         .padding()
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { model.considerDay() }
+        }
     }
 }

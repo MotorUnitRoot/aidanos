@@ -1,4 +1,4 @@
-import AidanCore
+@testable import AidanCore
 import Foundation
 import XCTest
 
@@ -7,6 +7,8 @@ import Darwin
 #elseif canImport(Glibc)
 import Glibc
 #endif
+
+private let testToken = "aidanos-test-token-0123456789abcdef"
 
 final class SyncTests: XCTestCase {
     func testAirplaneModeMerge() throws {
@@ -17,28 +19,45 @@ final class SyncTests: XCTestCase {
         let path = "log/\(UUID().uuidString)/2026-10-21.md"
         let phone = try AidanSession(vault: phoneVault)
         let mac = try AidanSession(vault: macVault)
-        try phone.replace(path, with: "from the phone")
-        try mac.replace(path, with: "from the mac")
-
         try phone.connect(relayURL: relay.url, token: relay.token)
         try mac.connect(relayURL: relay.url, token: relay.token)
-
+        try phone.replace(path, with: "Hello")
+        let shared = try waitUntil(seconds: 8) {
+            guard (try? phone.text(path)) == "Hello", (try? mac.text(path)) == "Hello" else { return false }
+            if let relayVault = relay.vault {
+                let file = try? String(contentsOf: relayVault.appendingPathComponent(path), encoding: .utf8)
+                return file == "Hello"
+            }
+            return true
+        }
+        XCTAssertTrue(shared)
+        phone.disconnect()
+        mac.disconnect()
+        try phone.replace(path, with: "Hello PHONE")
+        try mac.replace(path, with: "Hello MAC")
+        #if !os(iOS)
+        try relay.restart()
+        #endif
+        try phone.connect(relayURL: relay.url, token: relay.token)
+        try mac.connect(relayURL: relay.url, token: relay.token)
+        let allowed = ["Hello PHONE MAC", "Hello MAC PHONE"]
         let merged = try waitUntil(seconds: 12) {
             guard let left = try? phone.text(path), let right = try? mac.text(path) else { return false }
-            return left.contains("from the phone") && left.contains("from the mac")
-                && right.contains("from the phone") && right.contains("from the mac")
+            return left == right && allowed.contains(left)
         }
         let phoneText = try phone.text(path)
         let macText = try mac.text(path)
         XCTAssertTrue(merged, "phone=\(phoneText) mac=\(macText)")
+        XCTAssertEqual(phoneText, macText)
+        XCTAssertTrue(allowed.contains(phoneText))
         let phoneFile = try String(contentsOf: phoneVault.appendingPathComponent(path), encoding: .utf8)
         let macFile = try String(contentsOf: macVault.appendingPathComponent(path), encoding: .utf8)
-        XCTAssertTrue(phoneFile.contains("from the phone") && phoneFile.contains("from the mac"))
-        XCTAssertTrue(macFile.contains("from the phone") && macFile.contains("from the mac"))
+        XCTAssertEqual(phoneFile, phoneText)
+        XCTAssertEqual(macFile, macText)
         if let relayVault = relay.vault {
             let copied = try waitUntil(seconds: 8) {
                 let text = try? String(contentsOf: relayVault.appendingPathComponent(path), encoding: .utf8)
-                return text?.contains("from the phone") == true && text?.contains("from the mac") == true
+                return text == phoneText
             }
             XCTAssertTrue(copied)
         }
@@ -66,18 +85,71 @@ final class SyncTests: XCTestCase {
         try right.replace(path, with: "evening line")
         try left.connect(relayURL: relay.url, token: relay.token)
         try right.connect(relayURL: relay.url, token: relay.token)
+        let allowed = ["morning lineevening line", "evening linemorning line"]
         let merged = try waitUntil(seconds: 12) {
             guard let a = try? left.text(path), let b = try? right.text(path) else { return false }
-            return a.contains("morning line") && a.contains("evening line")
-                && b.contains("morning line") && b.contains("evening line")
+            return a == b && allowed.contains(a)
         }
         let leftText = try left.text(path)
         let rightText = try right.text(path)
         XCTAssertTrue(merged, "left=\(leftText) right=\(rightText)")
+        XCTAssertEqual(leftText, rightText)
         XCTAssertTrue(left.conflicts().isEmpty)
         XCTAssertTrue(right.conflicts().isEmpty)
         left.disconnect()
         right.disconnect()
+    }
+
+    func testOutsideEditWhileOpenThenKeystrokeKeepsBoth() throws {
+        let vault = try temporaryVault()
+        let session = try AidanSession(vault: vault)
+        let path = "notes/outside.md"
+        try session.replace(path, with: "Hello")
+        let url = vault.appendingPathComponent(path)
+        try "Hello world".write(to: url, atomically: true, encoding: .utf8)
+        var shown: String?
+        session.onText = { _, value in shown = value }
+        session.foldOutsideEdits()
+        XCTAssertEqual(try session.text(path), "Hello world")
+        XCTAssertEqual(shown, "Hello world")
+        let merged = try session.applyEdit(path, from: "Hello", to: "Hello!")
+        XCTAssertEqual(merged, "Hello! world")
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "Hello! world")
+    }
+
+    func testRemoteTextWhileTypingKeepsBoth() throws {
+        let relay = try TestRelay.start()
+        defer { relay.stop() }
+        let phone = try AidanSession(vault: try temporaryVault())
+        let mac = try AidanSession(vault: try temporaryVault())
+        let path = "notes/typing.md"
+        try phone.connect(relayURL: relay.url, token: relay.token)
+        try mac.connect(relayURL: relay.url, token: relay.token)
+        try phone.replace(path, with: "Hello")
+        XCTAssertTrue(try waitUntil(seconds: 8) { (try? mac.text(path)) == "Hello" })
+        try mac.replace(path, with: "Hello there")
+        XCTAssertTrue(try waitUntil(seconds: 8) { (try? phone.text(path)) == "Hello there" })
+        let merged = try phone.applyEdit(path, from: "Hello", to: "Hello!")
+        XCTAssertEqual(merged, "Hello! there")
+        XCTAssertTrue(try waitUntil(seconds: 8) { (try? mac.text(path)) == "Hello! there" })
+        phone.disconnect()
+        mac.disconnect()
+    }
+
+    func testOutsideEditWhileClosedSurvivesLaunch() throws {
+        let vault = try temporaryVault()
+        let path = "notes/outside.md"
+        do {
+            let session = try AidanSession(vault: vault)
+            try session.replace(path, with: "Hello")
+        }
+        let url = vault.appendingPathComponent(path)
+        try "Hello world".write(to: url, atomically: true, encoding: .utf8)
+        let again = try AidanSession(vault: vault)
+        XCTAssertEqual(try again.text(path), "Hello world")
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "Hello world")
+        XCTAssertEqual(try again.open(path), "Hello world")
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "Hello world")
     }
 
     func testOutsideEditFoldedIn() throws {
@@ -102,6 +174,124 @@ final class SyncTests: XCTestCase {
         XCTAssertEqual(try again.text("notes/cached.md"), "from the file")
         let file = try String(contentsOf: vault.appendingPathComponent("notes/cached.md"), encoding: .utf8)
         XCTAssertEqual(file, "from the file")
+    }
+
+    func testRebuildWhileConnectedKeepsBoth() throws {
+        let relay = try TestRelay.start()
+        defer { relay.stop() }
+        let author = try AidanSession(vault: try temporaryVault())
+        let path = "notes/rebuilt.md"
+        try author.connect(relayURL: relay.url, token: relay.token)
+        try author.replace(path, with: "from the relay")
+        if let relayVault = relay.vault {
+            XCTAssertTrue(try waitUntil(seconds: 8) {
+                let text = try? String(contentsOf: relayVault.appendingPathComponent(path), encoding: .utf8)
+                return text == "from the relay"
+            })
+        }
+        author.disconnect()
+        let fileVault = try temporaryVault()
+        let fileURL = fileVault.appendingPathComponent(path)
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "from the file".write(to: fileURL, atomically: true, encoding: .utf8)
+        let reader = try AidanSession(vault: fileVault)
+        try reader.connect(relayURL: relay.url, token: relay.token)
+        let raised = try waitUntil(seconds: 8) {
+            reader.conflicts().contains { $0.path == path }
+        }
+        XCTAssertTrue(raised)
+        let conflict = reader.conflicts().first { $0.path == path }
+        XCTAssertEqual(conflict?.mine, "from the file")
+        XCTAssertEqual(conflict?.theirs, "from the relay")
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "from the file")
+        reader.disconnect()
+    }
+
+    func testCrashBetweenHistoryAndFileDoesNotDuplicate() throws {
+        let vault = try temporaryVault()
+        let path = "notes/crash.md"
+        do {
+            let session = try AidanSession(vault: vault)
+            try session.replace(path, with: "Hello!")
+        }
+        let url = vault.appendingPathComponent(path)
+        try "Hello".write(to: url, atomically: true, encoding: .utf8)
+        let hashes = ["notes/crash.md": Digests.sha256Hex("Hello")]
+        try JSONEncoder().encode(hashes).write(to: vault.appendingPathComponent(".aidanos/written.json"))
+        let again = try AidanSession(vault: vault)
+        XCTAssertEqual(try again.text(path), "Hello!")
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "Hello!")
+    }
+
+    func testNoteCreatedAfterConnectSyncs() throws {
+        let relay = try TestRelay.start()
+        defer { relay.stop() }
+        let left = try AidanSession(vault: try temporaryVault())
+        let right = try AidanSession(vault: try temporaryVault())
+        try left.connect(relayURL: relay.url, token: relay.token)
+        try right.connect(relayURL: relay.url, token: relay.token)
+        let path = AidanSession.todayPath(on: Date(timeIntervalSince1970: 1_800_000_000), timeZone: TimeZone(secondsFromGMT: 0)!)
+        try left.replace(path, with: "created after")
+        XCTAssertTrue(try waitUntil(seconds: 8) { (try? right.text(path)) == "created after" })
+        left.disconnect()
+        right.disconnect()
+    }
+
+    func testTodayPathChangesAtMidnight() {
+        let zone = TimeZone(secondsFromGMT: 0)!
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+        let before = calendar.date(from: DateComponents(year: 2026, month: 10, day: 21, hour: 23, minute: 30))!
+        let after = calendar.date(from: DateComponents(year: 2026, month: 10, day: 22, hour: 0, minute: 5))!
+        let path = AidanSession.todayPath(on: before, timeZone: zone)
+        XCTAssertEqual(path, "log/2026-10-21.md")
+        XCTAssertNil(AidanSession.changedDay(from: path, now: before, timeZone: zone))
+        XCTAssertEqual(AidanSession.changedDay(from: path, now: after, timeZone: zone), "log/2026-10-22.md")
+    }
+
+    func testReconnectsAfterTheRelayDrops() throws {
+        #if os(iOS)
+        throw XCTSkip("The simulator shares a relay this test cannot restart.")
+        #else
+        let relay = try TestRelay.start()
+        defer { relay.stop() }
+        let session = try AidanSession(vault: try temporaryVault())
+        session.reconnectPause = 0.05
+        try session.connect(relayURL: relay.url, token: relay.token)
+        XCTAssertEqual(session.connection, .connected)
+        relay.stop()
+        XCTAssertTrue(try waitUntil(seconds: 8) {
+            session.connection == .reconnecting || session.connection == .connecting
+        })
+        XCTAssertNotEqual(session.connection, .connected)
+        try relay.restart()
+        XCTAssertTrue(try waitUntil(seconds: 8) { session.connection == .connected })
+        try session.replace("notes/back.md", with: "still here")
+        if let relayVault = relay.vault {
+            XCTAssertTrue(try waitUntil(seconds: 8) {
+                let text = try? String(contentsOf: relayVault.appendingPathComponent("notes/back.md"), encoding: .utf8)
+                return text == "still here"
+            })
+        }
+        session.disconnect()
+        #endif
+    }
+
+    func testHiddenGitPathIsRefused() throws {
+        let vault = try temporaryVault()
+        let session = try AidanSession(vault: vault)
+        XCTAssertThrowsError(try session.replace(".git/config", with: "[core]\n\tfake = true\n"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: vault.appendingPathComponent(".git/config").path))
+        let outside = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("aidanos-outside-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: vault.appendingPathComponent("jump"), withDestinationURL: outside)
+        XCTAssertThrowsError(try session.replace("jump/pwn.md", with: "nope"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("pwn.md").path))
+    }
+
+    func testConflictEditStartsWithBothVersions() {
+        XCTAssertEqual(ConflictDraft.bothVersions(mine: "mine", theirs: "theirs"), "mine\ntheirs")
     }
 
     func testRelayRejectsBadToken() throws {
@@ -132,17 +322,29 @@ private func waitUntil(seconds: TimeInterval, _ body: () throws -> Bool) throws 
     return try body()
 }
 
+private final class RunningRelay {
+    let process: Process
+    let collected: Collected
+    init(process: Process, collected: Collected) {
+        self.process = process
+        self.collected = collected
+    }
+}
+
 private final class TestRelay {
     let url: String
     let token: String
     let vault: URL?
     #if !os(iOS)
-    private let process: Process?
+    private var running: RunningRelay?
+    private let data: URL
+    private let port: Int
+    private let server: URL
     #endif
 
     static func start() throws -> TestRelay {
         #if os(iOS)
-        return TestRelay(url: "ws://127.0.0.1:3757", token: "aidanos-test-token", vault: nil)
+        return TestRelay(url: "ws://127.0.0.1:3757", token: testToken, vault: nil)
         #else
         return try spawn()
         #endif
@@ -150,11 +352,28 @@ private final class TestRelay {
 
     func stop() {
         #if !os(iOS)
-        guard let process, process.isRunning else { return }
-        process.terminate()
-        process.waitUntilExit()
+        guard let running, running.process.isRunning else { return }
+        running.process.terminate()
+        let deadline = Date().addingTimeInterval(2)
+        while running.process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if running.process.isRunning {
+            kill(running.process.processIdentifier, SIGKILL)
+            running.process.waitUntilExit()
+        }
         #endif
     }
+
+    #if !os(iOS)
+    func restart() throws {
+        stop()
+        Thread.sleep(forTimeInterval: 0.3)
+        guard let vault else { throw AidanError.io("This relay has no folder.") }
+        running = try Self.launch(server: server, vault: vault, data: data, port: port, token: token)
+        _ = try Self.waitPort(running!)
+    }
+    #endif
 
     #if os(iOS)
     private init(url: String, token: String, vault: URL?) {
@@ -163,11 +382,14 @@ private final class TestRelay {
         self.vault = vault
     }
     #else
-    private init(url: String, token: String, vault: URL?, process: Process?) {
+    private init(url: String, token: String, vault: URL, data: URL, port: Int, server: URL, running: RunningRelay) {
         self.url = url
         self.token = token
         self.vault = vault
-        self.process = process
+        self.data = data
+        self.port = port
+        self.server = server
+        self.running = running
     }
     #endif
 
@@ -186,51 +408,68 @@ private final class TestRelay {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let server = workspace.appendingPathComponent("relay/src/server.mjs")
+        let running = try launch(server: server, vault: vault, data: data, port: 0, token: testToken)
+        let port = try waitPort(running)
+        return TestRelay(
+            url: "ws://127.0.0.1:\(port)",
+            token: testToken,
+            vault: vault,
+            data: data,
+            port: port,
+            server: server,
+            running: running
+        )
+    }
+
+    private static func launch(server: URL, vault: URL, data: URL, port: Int, token: String) throws -> RunningRelay {
         _ = signal(SIGPIPE, SIG_IGN)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [
             "node", server.path,
-            "--token", "aidanos-test-token",
             "--vault", vault.path,
             "--data", data.path,
-            "--port", "0",
+            "--port", String(port),
         ]
         var environment = ProcessInfo.processInfo.environment
+        environment["AIDANOS_RELAY_TOKEN"] = token
         environment["AIDANOS_MIRROR_DEBOUNCE_MS"] = "30"
         environment["AIDANOS_VAULT_GIT_URL"] = ""
         process.environment = environment
-        process.currentDirectoryURL = workspace.appendingPathComponent("relay")
+        process.currentDirectoryURL = server.deletingLastPathComponent().deletingLastPathComponent()
         let output = Pipe()
         let errors = Pipe()
         process.standardOutput = output
         process.standardError = errors
         let collected = Collected()
-        let ready = DispatchSemaphore(value: 0)
         output.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
             if chunk.isEmpty { return }
             collected.append(chunk)
-            if collected.port != nil { ready.signal() }
         }
         errors.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
             if !chunk.isEmpty { collected.appendError(chunk) }
         }
         try process.run()
-        let wait = ready.wait(timeout: .now() + 15)
-        output.fileHandleForReading.readabilityHandler = nil
-        guard wait == .success, let port = collected.port else {
-            let message = collected.errorText.isEmpty ? collected.text : collected.errorText
-            process.terminate()
-            throw AidanError.io("The test relay did not start. \(message)")
+        return RunningRelay(process: process, collected: collected)
+    }
+
+    private static func waitPort(_ running: RunningRelay) throws -> Int {
+        let ready = DispatchSemaphore(value: 0)
+        let timer = DispatchSource.makeTimerSource()
+        timer.schedule(deadline: .now(), repeating: .milliseconds(20))
+        timer.setEventHandler {
+            if running.collected.port != nil { ready.signal() }
         }
-        return TestRelay(
-            url: "ws://127.0.0.1:\(port)",
-            token: "aidanos-test-token",
-            vault: vault,
-            process: process
-        )
+        timer.resume()
+        let wait = ready.wait(timeout: .now() + 15)
+        timer.cancel()
+        guard wait == .success, let port = running.collected.port else {
+            running.process.terminate()
+            throw AidanError.io("The test relay did not start. \(running.collected.errorText)")
+        }
+        return port
     }
     #endif
 }
@@ -239,7 +478,6 @@ private final class Collected {
     private let lock = NSLock()
     private var output = ""
     private var errors = ""
-    private var heard = false
 
     var text: String {
         lock.lock()
@@ -266,21 +504,12 @@ private final class Collected {
     func append(_ data: Data) {
         lock.lock()
         output += String(data: data, encoding: .utf8) ?? ""
-        let found = portUnlocked()
         lock.unlock()
-        if found { heard = true }
     }
 
     func appendError(_ data: Data) {
         lock.lock()
         errors += String(data: data, encoding: .utf8) ?? ""
         lock.unlock()
-    }
-
-    private func portUnlocked() -> Bool {
-        for line in output.split(separator: "\n") where line.hasPrefix("LISTENING") {
-            return true
-        }
-        return false
     }
 }

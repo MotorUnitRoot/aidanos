@@ -88,7 +88,7 @@ Typing merges. Two devices editing the same note, online or offline, do not get 
 
 You see Keep mine / Take theirs / Edit only when the app cannot do that safely:
 
-1. The cache on this device was missing or unreadable, the note was rebuilt from the file, and the relay already has different text for that same path. Keep mine keeps the file on this device and writes it as the note. Take theirs keeps the synced note and rewrites the file to match. Edit opens the text, starting from yours, so you can combine them by hand and save.
+1. The cache on this device was missing or unreadable, the note was rebuilt from the file, and the relay already has different text for that same path. The file is not overwritten while that comparison is still open. Keep mine keeps the file on this device and writes it as the note. Take theirs keeps the synced note and rewrites the file to match. Edit opens the text starting from both versions, one after the other, so you can combine them by hand and save.
 2. The markdown file was deleted on this device while the synced note still has text. The app does not guess whether you meant to delete the note or the other device's edits should restore the file. Keep mine confirms the delete. Take theirs puts the synced text back in the file. Edit lets you write what should remain.
 3. The path is a folder on one side and a note file on the other. The app does not pick.
 
@@ -98,26 +98,30 @@ A text merge that merely interleaves two sentences is not one of these. It looks
 
 The first cut uses one shared secret, called the token. You type the same token into the relay and into each app. The app sends it once, in the connection header (`Authorization: Bearer …`), not in the web address, so it does not show up in an ordinary address log. A wrong token is refused before any note is exchanged. The relay never prints the token and never writes it into an error line.
 
-This is a single password for every device you own. It is not an account system. It is enough for a private relay.
+The relay reads that token from the environment variable `AIDANOS_RELAY_TOKEN` or from a file (mode 0600) named by `AIDANOS_RELAY_TOKEN_FILE`. It is not accepted on the command line. It must be at least 32 characters. Too many wrong guesses from the same address are refused for a while. The Mac and iPhone apps store the token in the Keychain, and the field is masked. This is a single password for every device you own. It is not an account system. It is enough for a private relay. A token per device comes before this relay is ever reachable from outside the house.
 
 ## What the relay writes, and when git gets a copy
 
 The relay listens for edits, stores the Automerge histories on disk (by default under the vault's `.aidanos/relay` folder, which git ignores), and writes the markdown.
 
-When a note changes, the relay writes the `.md` file with the same atomic rename. It waits a short moment so a burst of keystrokes becomes one write. If someone edits a markdown file on the machine where the relay is running, the relay treats that as an outside edit: it diffs the file into the history so the next mirror write does not stamp the old text back over the file.
+When a note changes, the relay writes the `.md` file with the same atomic rename. It waits a short moment so a burst of keystrokes becomes one write. It remembers a hash of what it last wrote, in `.aidanos/written.json`, so a restart can tell that file from a real outside edit. If someone edits a markdown file on the machine where the relay is running, the relay treats that as an outside edit: it diffs the file into the history so the next mirror write does not stamp the old text back over the file.
+
+The relay only writes a relative `.md` path. Hidden names, `..`, absolute paths, and a symlink that leaves the folder are refused. The same rule is enforced in the apps. The relay also refuses to start when its folder is an app vault (it has `.aidanos/actor`, `storage-id`, or `index`). The two folders stay separate.
 
 Git runs on a timer, every five minutes unless `AIDANOS_VAULT_GIT_INTERVAL_MS` says otherwise. Each tick:
 
-- If `AIDANOS_VAULT_GIT_URL` is unset, git is skipped. Sync is unchanged.
-- If it is set, the relay commits the markdown files (not `.aidanos`) and pushes to that URL.
-- It authenticates the push with `AIDANOS_VAULT_GIT_TOKEN`. The token is placed only in the push address the git process sees. Logs, errors, and health output are scrubbed. The token string, the raw URL, and any `x-access-token:…` user-info are replaced before anything is printed.
-- The relay does not pull, fetch, rebase, or force-push. If the backup has commits the relay does not have, the push fails, the failure is logged without the token, and sync continues. Someone can repair the backup by hand. The devices are not waiting on it.
+- If `AIDANOS_VAULT_GIT_URL` is unset, git is skipped. Sync is unchanged. Health reports git as off.
+- If it is set, the relay commits the markdown files (not `.aidanos`) and pushes to that URL. The remote URL stored in the vault's git config does not contain the token.
+- It authenticates the push with `AIDANOS_VAULT_GIT_TOKEN`, passed only in the environment of that push (a short-lived ask-pass helper). Logs, errors, and health output are scrubbed, including a bearer token of any length. The token string, the raw URL, and any `x-access-token:…` user-info are replaced before anything is printed.
+- The relay does not pull, fetch, rebase, or force-push. If the backup has commits the relay does not have, the push fails, health reports git as failed, the failure is logged without the token, and sync continues. Someone can repair the backup by hand. The devices are not waiting on it.
 
 ## Where the relay listens
 
 By default the relay binds to `127.0.0.1` only. That is this computer, and no other computer can connect. That is the standing rule.
 
-To reach the relay from the iPhone on your home network, start it with `--lan`. It then listens on `127.0.0.1` and on this Mac's private network address (an address like `192.168.x.x`, `10.x.x.x`, or `172.16–31.x.x`). It does not listen on every interface. The token is still required. It prints the `ws://` address to type into the phone. It does not print the token. If the Mac has no private address, `--lan` stops and says so.
+To reach the relay from the iPhone on your home network, start it with `--lan`. It then listens on `127.0.0.1` and on one private address. It prefers a home-network address (`192.168.x.x`) over other private addresses, and it skips VPN tunnel interfaces. `--lan-address` chooses a specific private address. It does not listen on every interface. The token is still required. At startup it prints a warning that home-network traffic is unencrypted and the token is the only protection, then the `ws://` address to type into the phone. It does not print the token. If the Mac has no private address, `--lan` stops and says so.
+
+A dropped socket, sleep, or airplane mode reconnects on its own, waiting a second and then longer, up to 30 seconds. The app shows Connecting, Connected, or Reconnecting. It does not say Connected while the socket is down. A note created after the connection, including the next day's note, syncs on that same connection. The app moves to the new day.
 
 ## The phone and the Mac apps in this cut
 
@@ -144,13 +148,13 @@ The Swift package `AidanCore` is that core. It builds and its tests run on Linux
 
 automerge-repo-swift, the Swift twin of the relay's library, is not linked in this cut. Its latest code still requires Automerge 0.5, and 0.5 cannot sit in the same app as automerge-swift 0.7.2. It also imports Apple-only networking, so it cannot be the Linux core. The core uses automerge-swift 0.7.2 for the histories and speaks the same protocol that automerge-repo-swift and the Node server speak. When automerge-repo-swift accepts Automerge 0.7, the Apple apps can switch their socket to that library without changing the vault, the ids, or the relay.
 
-## Open questions
+## Decisions
 
-1. Where should the Mac app keep its vault by default? This cut uses Application Support (`~/Library/Application Support/AidanOS/vault`). Do you want it pointed at the existing MotorUnit folder instead, with a setting for the path?
-2. The relay writes markdown into the vault you point it at, and that folder is what gets pushed as the git backup. Should that be the same folder the Mac app edits, or a separate folder used only as the backup working copy?
-3. The git backup runs every five minutes. Do you want a different rhythm, or a backup only when you ask?
-4. On Edit, the box starts as your text so you can paste the other version in and clean it up. Should it start as both versions, one after the other, instead?
-5. Day notes stay at `log/YYYY-MM-DD.md`, matching the web app. Is that still the path you want once the native app is the one you open first?
-6. One shared token covers every device. When do you want a token per device, so you can revoke a lost phone without changing the Mac?
-7. When automerge-repo-swift moves to Automerge 0.7, should the Apple apps switch onto its WebSocket code? The protocol would stay the same.
-8. A free Apple ID build expires every seven days and has to be reinstalled from Xcode. Is that acceptable until the paid developer account finishes?
+1. Notes stay in the app's own folder for now. On the Mac that is Application Support (`~/Library/Application Support/AidanOS/vault`). On the iPhone it is the app's documents folder. Pointing it at the existing MotorUnit folder can wait.
+2. The relay folder stays separate from the app's folder, and the relay refuses to start if you point it at an app vault.
+3. Still open: the git backup runs every five minutes. A different rhythm, or a backup only when you ask, is not decided.
+4. Edit starts with both versions, one after the other.
+5. Still open: day notes stay at `log/YYYY-MM-DD.md`, matching the web app.
+6. Per-device tokens come before the relay ever leaves the house. This cut still uses one shared token, which is enough while it only listens on this Mac or the home network.
+7. Still open: when automerge-repo-swift moves to Automerge 0.7, the Apple apps may switch onto its WebSocket code. The protocol would stay the same.
+8. Still open: a free Apple ID build expires every seven days and has to be reinstalled from Xcode until the paid developer account finishes.

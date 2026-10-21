@@ -9,6 +9,7 @@ import Glibc
 /// A small WebSocket client. It speaks the automerge-repo sync protocol to the relay.
 final class RelayLink {
     private let queue = DispatchQueue(label: "aidanos.relay")
+    private let readQueue = DispatchQueue(label: "aidanos.relay.read")
     private let lock = NSLock()
     private var socket: Int32 = -1
     private var running = false
@@ -36,7 +37,7 @@ final class RelayLink {
             joinError = error
             joined.signal()
         }
-        queue.async { [weak self] in
+        readQueue.async { [weak self] in
             self?.readLoop()
         }
         try send(encodeJoin(senderId: peerId, storageId: storageId))
@@ -105,15 +106,31 @@ final class RelayLink {
             if !alive { return }
             do {
                 guard let frame = try readFrame() else { continue }
-                try handle(frame)
+                let failure = ErrorBox()
+                let done = DispatchSemaphore(value: 0)
+                queue.async { [weak self] in
+                    do {
+                        try self?.handle(frame)
+                    } catch {
+                        failure.error = error
+                    }
+                    done.signal()
+                }
+                done.wait()
+                if let error = failure.error { throw error }
             } catch {
                 lock.lock()
                 let alive = running
+                let notify = failed
+                failed = nil
+                ready = nil
                 lock.unlock()
                 if alive {
-                    failed?(error)
-                    failed = nil
-                    ready = nil
+                    if let notify {
+                        notify(error)
+                    } else {
+                        host?.linkClosed()
+                    }
                 }
                 return
             }
@@ -242,24 +259,26 @@ final class RelayLink {
     }
 
     private func readFrame() throws -> Data? {
-        guard let first = try readExact(2) else { return nil }
+        let first = try readExact(2)
         let opcode = first[0] & 0x0F
         var length = Int(first[1] & 0x7F)
         let masked = (first[1] & 0x80) != 0
         if length == 126 {
-            guard let extra = try readExact(2) else { return nil }
+            let extra = try readExact(2)
             length = Int(extra[0]) << 8 | Int(extra[1])
         } else if length == 127 {
-            guard let extra = try readExact(8) else { return nil }
+            let extra = try readExact(8)
             length = 0
             for byte in extra { length = (length << 8) | Int(byte) }
         }
         var mask = [UInt8](repeating: 0, count: 4)
         if masked {
-            guard let maskBytes = try readExact(4) else { return nil }
-            mask = Array(maskBytes)
+            mask = Array(try readExact(4))
         }
-        guard length >= 0, length <= 8_000_000, var payload = try readExact(length) else { return nil }
+        guard length >= 0, length <= 8_000_000 else {
+            throw AidanError.protocol("The relay sent a note that is too large.")
+        }
+        var payload = try readExact(length)
         if masked {
             for index in payload.indices { payload[index] ^= mask[index % 4] }
         }
@@ -277,7 +296,7 @@ final class RelayLink {
         try sendFrame(opcode: 0xA, payload: payload)
     }
 
-    private func readExact(_ count: Int) throws -> Data? {
+    private func readExact(_ count: Int) throws -> Data {
         if count == 0 { return Data() }
         var data = Data()
         data.reserveCapacity(count)
@@ -290,7 +309,7 @@ final class RelayLink {
                 if fd < 0 { return 0 }
                 return readFd(fd, raw.baseAddress, raw.count)
             }
-            if got == 0 { return nil }
+            if got == 0 { throw AidanError.io("The relay closed the connection.") }
             if got < 0 {
                 if errno == EINTR { continue }
                 if errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT { continue }
@@ -321,12 +340,17 @@ final class RelayLink {
     }
 }
 
+private final class ErrorBox: @unchecked Sendable {
+    var error: Error?
+}
+
 protocol SyncHost: AnyObject {
     func documentIds() -> [String]
     func takeOutgoing(docId: String) -> (type: String, bytes: Data)?
     func applyIncoming(docId: String, bytes: Data) throws
     func markUnavailable(docId: String)
     func settled(docId: String)
+    func linkClosed()
 }
 
 private struct RelayAddress {

@@ -12,7 +12,9 @@ import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
 import { redact } from "../src/redact.mjs";
-import { startRelay } from "../src/server.mjs";
+import { LAN_WARNING, loadToken, parseArgs, startRelay, startupLines } from "../src/server.mjs";
+
+const TOKEN = "aidanos-test-token-0123456789abcdef";
 
 const exec = promisify(execFile);
 
@@ -41,6 +43,20 @@ test("listen addresses stay on this computer unless --lan", () => {
   assert.equal(isPrivateIPv4("172.16.0.1"), true);
   assert.equal(isPrivateIPv4("172.32.0.1"), false);
   assert.throws(() => listenHosts({ lan: true, interfaces: { lo: interfaces.lo } }), /private network address/);
+  const home = listenHosts({
+    lan: true,
+    interfaces: {
+      utun0: [{ family: "IPv4", internal: false, address: "10.8.0.2" }],
+      en0: [{ family: "IPv4", internal: false, address: "192.168.1.20" }],
+    },
+  });
+  assert.equal(home.phone, "192.168.1.20");
+  const chosen = listenHosts({
+    lan: true,
+    choose: "10.8.0.2",
+    interfaces: { utun0: [{ family: "IPv4", internal: false, address: "10.8.0.2" }] },
+  });
+  assert.equal(chosen.phone, "10.8.0.2");
 });
 
 test("redact removes the token and the git url", () => {
@@ -49,12 +65,16 @@ test("redact removes the token and the git url", () => {
   const cleaned = redact(text, [token, "https://github.com/acme/vault.git"]);
   assert.equal(cleaned.includes(token), false);
   assert.equal(cleaned.includes("github.com"), false);
+  const short = redact("Authorization: Bearer a", []);
+  assert.equal(short.includes("Bearer a"), false);
+  const long = "q".repeat(64);
+  assert.equal(redact("Bearer " + long, []).includes("q"), false);
 });
 
 test("relay rejects a bad token and accepts the real one", async () => {
   const dir = await tempDir();
   const relay = await startRelay({
-    token: "aidanos-test-token",
+    token: TOKEN,
     vault: path.join(dir, "vault"),
     data: path.join(dir, "data"),
     port: 0,
@@ -65,7 +85,7 @@ test("relay rejects a bad token and accepts the real one", async () => {
     const refused = await connect(relay.url, "wrong-token");
     assert.equal(refused.opened, false);
     assert.equal(refused.status, 401);
-    const opened = await connect(relay.url, "aidanos-test-token");
+    const opened = await connect(relay.url, TOKEN);
     assert.equal(opened.opened, true);
     opened.socket.close();
   } finally {
@@ -76,7 +96,7 @@ test("relay rejects a bad token and accepts the real one", async () => {
 test("a bad frame does not stop the relay", async () => {
   const dir = await tempDir();
   const relay = await startRelay({
-    token: "aidanos-test-token",
+    token: TOKEN,
     vault: path.join(dir, "vault"),
     data: path.join(dir, "data"),
     port: 0,
@@ -87,7 +107,7 @@ test("a bad frame does not stop the relay", async () => {
     await sendUnmaskedPong(relay.port);
     const health = await fetch("http://127.0.0.1:" + relay.port + "/health");
     assert.equal(health.status, 200);
-    const opened = await connect(relay.url, "aidanos-test-token");
+    const opened = await connect(relay.url, TOKEN);
     assert.equal(opened.opened, true);
     opened.socket.close();
   } finally {
@@ -99,7 +119,7 @@ test("relay writes markdown and does not use git unless asked", async () => {
   const dir = await tempDir();
   const vault = path.join(dir, "vault");
   const relay = await startRelay({
-    token: "aidanos-test-token",
+    token: TOKEN,
     vault,
     data: path.join(dir, "data"),
     port: 0,
@@ -141,7 +161,7 @@ test("git backup commits and pushes, and never pulls", async () => {
 
   const token = "super-secret-token-value";
   const relay = await startRelay({
-    token: "aidanos-test-token",
+    token: TOKEN,
     vault,
     data: path.join(dir, "data"),
     port: 0,
@@ -160,6 +180,12 @@ test("git backup commits and pushes, and never pulls", async () => {
     assert.equal(log.stdout.includes("other"), false);
     assert.match(log.stdout, /Backup notes/);
     await assert.rejects(fs.stat(path.join(vault, "other.md")));
+    const config = await fs.readFile(path.join(vault, ".git", "config"), "utf8");
+    assert.equal(config.includes(token), false);
+    assert.equal(config.includes("x-access-token"), false);
+    const health = await fetch(relay.healthURL);
+    const body = await health.json();
+    assert.equal(body.gitStatus, "failed");
   } finally {
     await relay.close();
   }
@@ -171,7 +197,7 @@ test("a fresh backup pushes to an empty repo", async () => {
   const bare = path.join(dir, "empty.git");
   await git(["init", "--bare", "-b", "main", bare]);
   const relay = await startRelay({
-    token: "aidanos-test-token",
+    token: TOKEN,
     vault,
     data: path.join(dir, "data"),
     port: 0,
@@ -186,6 +212,147 @@ test("a fresh backup pushes to an empty repo", async () => {
     assert.match(listed.stdout, /Backup notes/);
     const ignore = await fs.readFile(path.join(vault, ".gitignore"), "utf8");
     assert.match(ignore, /\.aidanos\//);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("relay refuses an app vault", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
+  await fs.writeFile(path.join(vault, ".aidanos", "actor"), Buffer.from([1]));
+  await assert.rejects(
+    startRelay({ token: TOKEN, vault, data: path.join(dir, "data"), port: 0, gitUrl: "" }),
+    /app vault/,
+  );
+});
+
+test("relay refuses .git/config", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault,
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 1000,
+  });
+  try {
+    const evil = noteId(".git/config");
+    const ok = noteId("notes/ok.md");
+    importDoc(relay.repo, INDEX_ID, { kind: "index", paths: { ".git/config": evil, "notes/ok.md": ok } });
+    importDoc(relay.repo, evil, { kind: "note", text: "[core]\n" });
+    importDoc(relay.repo, ok, { kind: "note", text: "safe" });
+    await relay.mirrorNow();
+    await assert.rejects(fs.stat(path.join(vault, ".git", "config")));
+    assert.equal(await fs.readFile(path.join(vault, "notes", "ok.md"), "utf8"), "safe");
+  } finally {
+    await relay.close();
+  }
+});
+
+test("restart keeps a newer note instead of the old file", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  const id = noteId("notes/hello.md");
+  const first = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 1000,
+  });
+  importDoc(first.repo, INDEX_ID, { kind: "index", paths: { "notes/hello.md": id } });
+  importDoc(first.repo, id, { kind: "note", text: "Hello" });
+  await first.mirrorNow();
+  assert.equal(await fs.readFile(path.join(vault, "notes", "hello.md"), "utf8"), "Hello");
+  await first.close();
+
+  const second = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 1000,
+  });
+  try {
+    await second.repo.find(INDEX_ID);
+    const handle = await second.repo.find(id);
+    handle.change((doc) => {
+      Automerge.updateText(doc, ["text"], "Hello PHONE");
+    });
+    await second.mirrorNow();
+    assert.equal(await fs.readFile(path.join(vault, "notes", "hello.md"), "utf8"), "Hello PHONE");
+  } finally {
+    await second.close();
+  }
+});
+
+test("token is read from the environment or a 0600 file, never the command line", async () => {
+  assert.throws(() => parseArgs(["--token", TOKEN]), /command line/);
+  const dir = await tempDir();
+  const file = path.join(dir, "token");
+  await fs.writeFile(file, TOKEN + "\n", { mode: 0o644 });
+  await assert.rejects(loadToken({ AIDANOS_RELAY_TOKEN_FILE: file }), /0600/);
+  await fs.chmod(file, 0o600);
+  assert.equal(await loadToken({ AIDANOS_RELAY_TOKEN_FILE: file }), TOKEN);
+  await assert.rejects(loadToken({ AIDANOS_RELAY_TOKEN: "too-short" }), /32/);
+  const lines = startupLines({ lan: true, port: 3750, phone: "ws://192.168.1.20:3750" });
+  assert.equal(lines.includes(LAN_WARNING), true);
+  assert.match(LAN_WARNING, /no encryption/);
+  assert.match(LAN_WARNING, /token is the only protection/);
+});
+
+test("too many bad tokens are refused", async () => {
+  const dir = await tempDir();
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    guessLimit: 2,
+    guessBlockMs: 60_000,
+    mirrorDebounceMs: 1000,
+  });
+  try {
+    assert.equal((await connect(relay.url, "nope")).status, 401);
+    assert.equal((await connect(relay.url, "nope")).status, 401);
+    const blocked = await connect(relay.url, TOKEN);
+    assert.equal(blocked.opened, false);
+    assert.equal(blocked.status, 401);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("an oversized frame does not stop the relay", async () => {
+  const dir = await tempDir();
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    maxPayload: 64,
+    mirrorDebounceMs: 1000,
+  });
+  try {
+    await new Promise((resolve) => {
+      const ws = new WebSocket(relay.url, { headers: { Authorization: "Bearer " + TOKEN } });
+      const done = () => resolve();
+      ws.on("open", () => ws.send(Buffer.alloc(200, 1)));
+      ws.on("close", done);
+      ws.on("error", () => {});
+      setTimeout(done, 1000);
+    });
+    const health = await fetch(relay.healthURL);
+    assert.equal(health.status, 200);
   } finally {
     await relay.close();
   }
@@ -209,7 +376,7 @@ function sendUnmaskedPong(port) {
           "Connection: Upgrade\r\n" +
           "Sec-WebSocket-Key: " + key + "\r\n" +
           "Sec-WebSocket-Version: 13\r\n" +
-          "Authorization: Bearer aidanos-test-token\r\n\r\n",
+          "Authorization: Bearer " + TOKEN + "\r\n\r\n",
       );
     });
     socket.on("data", (chunk) => {

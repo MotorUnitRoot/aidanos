@@ -1,13 +1,9 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import * as Automerge from "@automerge/automerge";
 import { logSafe } from "./redact.mjs";
-
-function safePath(notePath) {
-  const parts = String(notePath || "").split("/");
-  if (!parts.length || parts.some((part) => !part || part === "." || part === "..")) return null;
-  return parts.join("/");
-}
+import { prepareNoteFile, safeNotePath } from "./paths.mjs";
 
 function plainDoc(doc) {
   try {
@@ -25,10 +21,35 @@ function noteText(doc) {
   return null;
 }
 
+function digest(text) {
+  return crypto.createHash("sha256").update(String(text), "utf8").digest("hex");
+}
+
 export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
   const lastWritten = new Map();
+  let records = null;
   let timer = null;
   let chain = Promise.resolve();
+  const recordFile = path.join(vault, ".aidanos", "written.json");
+
+  async function hashes() {
+    if (records) return records;
+    try {
+      const parsed = JSON.parse(await fs.readFile(recordFile, "utf8"));
+      records = parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      records = {};
+    }
+    return records;
+  }
+
+  async function saveHashes() {
+    const body = JSON.stringify(records || {});
+    await fs.mkdir(path.dirname(recordFile), { recursive: true });
+    const tmp = recordFile + "." + process.pid + ".tmp";
+    await fs.writeFile(tmp, body);
+    await fs.rename(tmp, recordFile);
+  }
 
   function indexPaths() {
     const paths = {};
@@ -42,22 +63,28 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
       const plain = plainDoc(doc);
       if (!plain || plain.kind !== "index" || !plain.paths || typeof plain.paths !== "object") continue;
       for (const [notePath, docId] of Object.entries(plain.paths)) {
-        if (typeof docId === "string" && safePath(notePath)) paths[notePath] = docId;
+        if (typeof docId === "string" && safeNotePath(notePath)) paths[notePath] = docId;
       }
     }
     return paths;
   }
 
   async function foldOutside() {
+    const known = await hashes();
     const paths = indexPaths();
     for (const [notePath, docId] of Object.entries(paths)) {
       const handle = repo.handles[docId];
       if (!handle) continue;
-      const file = path.join(vault, ...notePath.split("/"));
+      const file = await prepareNoteFile(vault, notePath);
+      if (!file) continue;
       let fileText;
       try {
         fileText = await fs.readFile(file, "utf8");
       } catch {
+        continue;
+      }
+      if (known[notePath] === digest(fileText)) {
+        lastWritten.set(notePath, fileText);
         continue;
       }
       if (lastWritten.get(notePath) === fileText) continue;
@@ -69,6 +96,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
       }
       if (current == null || current === fileText) {
         lastWritten.set(notePath, fileText);
+        known[notePath] = digest(fileText);
         continue;
       }
       try {
@@ -77,6 +105,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
           Automerge.updateText(doc, ["text"], fileText);
         });
         lastWritten.set(notePath, fileText);
+        known[notePath] = digest(fileText);
       } catch (error) {
         logSafe(secrets, "fold-in failed for", notePath, error instanceof Error ? error.message : error);
       }
@@ -84,7 +113,9 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
   }
 
   async function writeNotes() {
+    const known = await hashes();
     const paths = indexPaths();
+    let changed = false;
     for (const [notePath, docId] of Object.entries(paths)) {
       const handle = repo.handles[docId];
       if (!handle) continue;
@@ -95,7 +126,8 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
         continue;
       }
       if (text == null) continue;
-      const file = path.join(vault, ...notePath.split("/"));
+      const file = await prepareNoteFile(vault, notePath);
+      if (!file) continue;
       let existing = null;
       try {
         existing = await fs.readFile(file, "utf8");
@@ -104,14 +136,20 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
       }
       if (existing === text) {
         lastWritten.set(notePath, text);
+        if (known[notePath] !== digest(text)) {
+          known[notePath] = digest(text);
+          changed = true;
+        }
         continue;
       }
-      await fs.mkdir(path.dirname(file), { recursive: true });
       const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
       await fs.writeFile(tmp, text);
       await fs.rename(tmp, file);
       lastWritten.set(notePath, text);
+      known[notePath] = digest(text);
+      changed = true;
     }
+    if (changed) await saveHashes();
   }
 
   async function syncDisk() {

@@ -1,23 +1,71 @@
 import Automerge
+import Crypto
 import Foundation
+
+public enum ConnectionState: Equatable, Sendable {
+    case disconnected
+    case connecting
+    case connected
+    case reconnecting
+
+    public var label: String {
+        switch self {
+        case .disconnected: return "Not connected"
+        case .connecting: return "Connecting…"
+        case .connected: return "Connected"
+        case .reconnecting: return "Reconnecting…"
+        }
+    }
+}
+
+public enum ConflictDraft {
+    /// Edit starts with both versions, one after the other.
+    public static func bothVersions(mine: String, theirs: String) -> String {
+        if mine.isEmpty { return theirs }
+        if theirs.isEmpty { return mine }
+        return mine + "\n" + theirs
+    }
+}
+
+enum Digests {
+    static func sha256Hex(_ text: String) -> String {
+        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+}
 
 /// One vault, its markdown files, and the Automerge histories beside them.
 public final class AidanSession: SyncHost {
     public let vault: URL
     public var onText: ((String, String) -> Void)?
+    public var onConnection: ((ConnectionState) -> Void)?
+    private var storedConnection: ConnectionState = .disconnected
+    public var connection: ConnectionState {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedConnection
+    }
+    /// First retry wait. Later waits double, up to 30 seconds.
+    public var reconnectPause: TimeInterval = 1
 
     private let lock = NSLock()
     private let deviceActor: ActorId
     private var index: Document
     private var notes: [String: NoteState] = [:]
+    private var loose: [String: NoteState] = [:]
     private var slots: [String: SyncSlot] = [:]
     private var openConflicts: [NoteConflict] = []
     private var lastWritten: [String: String] = [:]
+    private var writtenHash: [String: String] = [:]
     private var suppressWatch = 0
     private var link: RelayLink?
     private var watcher: DispatchSourceTimer?
     private let peerId: String
     private let storageId: String
+    private var desiredURL: String?
+    private var desiredToken: String?
+    private var reconnectAttempt = 0
+    private var reconnectWork: DispatchWorkItem?
+    private var opening = false
 
     public init(vault: URL) throws {
         self.vault = vault
@@ -33,10 +81,20 @@ public final class AidanSession: SyncHost {
         } else {
             self.index = try AidanSession.makeDocument(docId: DocumentIds.indexId, kind: "index", actor: deviceActor).0
         }
+        writtenHash = Self.loadWritten(in: vault)
         try loadFromDisk()
+        loadMeta()
+        _ = foldLocked()
         try saveIndex()
         for note in notes.values { try save(note) }
+        try saveMeta()
         startWatcher()
+    }
+
+    deinit {
+        watcher?.cancel()
+        reconnectWork?.cancel()
+        link?.close()
     }
 
     public static func todayPath(on date: Date = Date(), timeZone: TimeZone = .current) -> String {
@@ -46,13 +104,31 @@ public final class AidanSession: SyncHost {
         return String(format: "log/%04d-%02d-%02d.md", parts.year ?? 1970, parts.month ?? 1, parts.day ?? 1)
     }
 
+    public static func changedDay(from current: String, now: Date = Date(), timeZone: TimeZone = .current) -> String? {
+        let next = todayPath(on: now, timeZone: timeZone)
+        return next == current ? nil : next
+    }
+
     public func open(_ path: String) throws -> String {
         let notePath = try VaultPaths.check(path)
         lock.lock()
         defer { lock.unlock() }
-        let note = try ensureNoteLocked(notePath, initial: readIfPresent(notePath) ?? "")
+        _ = try ensureNoteLocked(notePath, initial: readIfPresent(notePath) ?? "")
+        if var note = notes[notePath], !note.rebuilt, !conflicted(notePath) {
+            if let file = readIfPresent(notePath), writtenHash[notePath] != Self.sha(file) {
+                let current = try note.doc.text(obj: note.textObj)
+                if current != file {
+                    try setText(&note, file)
+                    notes[notePath] = note
+                    try save(note)
+                }
+            }
+        }
+        guard let note = notes[notePath] else { return "" }
         let text = try note.doc.text(obj: note.textObj)
-        try writeFileLocked(notePath, text)
+        if !note.rebuilt && !conflicted(notePath) && readIfPresent(notePath) != text {
+            try writeFileLocked(notePath, text)
+        }
         return text
     }
 
@@ -75,12 +151,46 @@ public final class AidanSession: SyncHost {
         var note = try ensureNoteLocked(notePath, initial: text)
         try setText(&note, text)
         notes[notePath] = note
-        try writeFileLocked(notePath, text)
         try save(note)
-        let docId = note.docId
-        DispatchQueue.global().async { [weak self] in
-            self?.link?.kick(docId)
+        try writeFileLocked(notePath, text)
+        trackAndKick(note.docId)
+    }
+
+    /// Applies the edit from `base` to `edited` onto the current note, even if the note moved on.
+    @discardableResult
+    public func applyEdit(_ path: String, from base: String, to edited: String) throws -> String {
+        let notePath = try VaultPaths.check(path)
+        lock.lock()
+        suppressWatch += 1
+        defer {
+            suppressWatch -= 1
+            lock.unlock()
         }
+        let note = try ensureNoteLocked(notePath, initial: readIfPresent(notePath) ?? "")
+        let edit = TextDiff.diff(from: base, to: edited)
+        if edit.delete != 0 || !edit.insert.isEmpty {
+            let current = try note.doc.text(obj: note.textObj)
+            let count = Array(current.unicodeScalars).count
+            let start = min(max(edit.start, 0), count)
+            let delete = min(edit.delete, count - start)
+            if delete != 0 || !edit.insert.isEmpty {
+                try note.doc.spliceText(
+                    obj: note.textObj,
+                    start: UInt64(start),
+                    delete: Int64(delete),
+                    value: edit.insert.isEmpty ? nil : edit.insert
+                )
+                note.doc.commitWith()
+            }
+        }
+        notes[notePath] = note
+        try save(note)
+        let merged = try note.doc.text(obj: note.textObj)
+        if !note.rebuilt && !conflicted(notePath) {
+            try writeFileLocked(notePath, merged)
+        }
+        trackAndKick(note.docId)
+        return merged
     }
 
     public func conflicts() -> [NoteConflict] {
@@ -106,59 +216,58 @@ public final class AidanSession: SyncHost {
         try setText(&note, chosen)
         note.rebuilt = false
         notes[notePath] = note
-        try writeFileLocked(notePath, chosen)
         try save(note)
+        try writeFileLocked(notePath, chosen)
         openConflicts.removeAll { $0.path == notePath }
         try saveMeta()
-        let docId = note.docId
-        DispatchQueue.global().async { [weak self] in
-            self?.link?.kick(docId)
-        }
+        trackAndKick(note.docId)
     }
 
     public func connect(relayURL: String, token: String) throws {
-        if token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw AidanError.authRejected
-        }
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { throw AidanError.authRejected }
         lock.lock()
-        link?.close()
-        let next = RelayLink()
-        link = next
-        slots = [DocumentIds.indexId: SyncSlot()]
-        for path in Array(notes.keys) {
-            var note = notes[path]!
-            if note.rebuilt {
-                let fresh = try AidanSession.makeDocument(docId: note.docId, kind: "note", actor: deviceActor)
-                note.doc = fresh.0
-                note.textObj = fresh.1!
-                notes[path] = note
-            }
-            slots[note.docId] = SyncSlot()
-        }
-        let peer = peerId
-        let storage = storageId
+        desiredURL = relayURL
+        desiredToken = trimmed
+        reconnectAttempt = 0
+        reconnectWork?.cancel()
         lock.unlock()
+        setConnection(.connecting)
         do {
-            try next.connect(url: relayURL, token: token, peerId: peer, storageId: storage, host: self)
+            try openLink(url: relayURL, token: trimmed)
+        } catch AidanError.authRejected {
+            lock.lock()
+            desiredURL = nil
+            desiredToken = nil
+            storedConnection = .disconnected
+            lock.unlock()
+            throw AidanError.authRejected
         } catch {
-            next.close()
+            setConnection(.reconnecting)
+            scheduleReconnect()
             throw error
         }
     }
 
     public func disconnect() {
         lock.lock()
+        desiredURL = nil
+        desiredToken = nil
+        reconnectWork?.cancel()
         let current = link
         link = nil
         slots = [:]
         lock.unlock()
         current?.close()
+        setConnection(.disconnected)
     }
 
     public func foldOutsideEdits() {
         lock.lock()
-        foldLocked()
+        let updates = foldLocked()
+        let callback = onText
         lock.unlock()
+        for update in updates { callback?(update.0, update.1) }
     }
 
     func documentIds() -> [String] {
@@ -179,29 +288,40 @@ public final class AidanSession: SyncHost {
 
     func applyIncoming(docId: String, bytes: Data) throws {
         lock.lock()
+        if docId != DocumentIds.indexId && documentLocked(docId) == nil {
+            if let made = try? Self.makeDocument(docId: docId, kind: "note", actor: deviceActor), let textObj = made.1 {
+                loose[docId] = NoteState(docId: docId, doc: made.0, textObj: textObj, rebuilt: false)
+                if slots[docId] == nil { slots[docId] = SyncSlot() }
+            }
+        }
         guard let slot = slots[docId], let doc = documentLocked(docId) else {
             lock.unlock()
             return
         }
         let path = pathLocked(for: docId)
+        let rebuilt = path.flatMap { notes[$0]?.rebuilt } ?? false
+        let blocked = path.map { conflicted($0) } ?? false
         let before = path.flatMap { _ in try? textLocked(docId) }
         try doc.receiveSyncMessage(state: slot.state, message: bytes)
         slot.sawReply = true
-        var callback: ((String, String) -> Void)?
-        var changed: (String, String)?
-        if let path, let after = try? textLocked(docId), after != before {
-            suppressWatch += 1
-            try writeFileLocked(path, after)
-            suppressWatch -= 1
-            if let note = notes[path] {
-                try save(note)
+        var changed: [(String, String)] = []
+        if let path, let note = notes[path] {
+            let after = (try? note.doc.text(obj: note.textObj)) ?? ""
+            try? save(note)
+            if !rebuilt && !blocked && after != before {
+                try? writeFileLocked(path, after)
+                changed.append((path, after))
             }
-            callback = onText
-            changed = (path, after)
+        } else if let note = loose[docId] {
+            try? save(note)
         }
-        try saveIndex()
+        if docId == DocumentIds.indexId {
+            try? saveIndex()
+            changed.append(contentsOf: adoptIndexLocked())
+        }
+        let callback = onText
         lock.unlock()
-        if let changed { callback?(changed.0, changed.1) }
+        for update in changed { callback?(update.0, update.1) }
     }
 
     func markUnavailable(docId: String) {
@@ -232,27 +352,139 @@ public final class AidanSession: SyncHost {
             try? setText(&note, mine)
             note.rebuilt = false
             notes[path] = note
-            try? writeFileLocked(path, mine)
             try? save(note)
+            try? writeFileLocked(path, mine)
             try? saveMeta()
             let id = note.docId
             lock.unlock()
             link?.kick(id)
             return
         }
-        note.rebuilt = false
-        notes[path] = note
         let conflict = NoteConflict(
             path: path,
             mine: mine,
             theirs: remote,
             reason: "This device rebuilt the note from the file, and the relay already has different text. Choosing automatically would wipe one side."
         )
+        note.rebuilt = false
+        notes[path] = note
         openConflicts.removeAll { $0.path == path }
         openConflicts.append(conflict)
         try? save(note)
         try? saveMeta()
         lock.unlock()
+    }
+
+    func linkClosed() {
+        DispatchQueue.global().async { [weak self] in
+            self?.handleDrop()
+        }
+    }
+
+    private func openLink(url: String, token: String) throws {
+        lock.lock()
+        if opening {
+            lock.unlock()
+            return
+        }
+        opening = true
+        let next = RelayLink()
+        link?.close()
+        link = next
+        slots = [DocumentIds.indexId: SyncSlot()]
+        do {
+            for path in Array(notes.keys) {
+                var note = notes[path]!
+                if note.rebuilt {
+                    let fresh = try AidanSession.makeDocument(docId: note.docId, kind: "note", actor: deviceActor)
+                    note.doc = fresh.0
+                    note.textObj = fresh.1!
+                    notes[path] = note
+                }
+                slots[note.docId] = SyncSlot()
+            }
+            for docId in loose.keys {
+                slots[docId] = SyncSlot()
+            }
+            try saveMeta()
+        } catch {
+            opening = false
+            lock.unlock()
+            throw error
+        }
+        let peer = peerId
+        let storage = storageId
+        lock.unlock()
+        defer {
+            lock.lock()
+            opening = false
+            lock.unlock()
+        }
+        do {
+            try next.connect(url: url, token: token, peerId: peer, storageId: storage, host: self)
+            lock.lock()
+            reconnectAttempt = 0
+            lock.unlock()
+            setConnection(.connected)
+        } catch {
+            next.close()
+            throw error
+        }
+    }
+
+    private func handleDrop() {
+        lock.lock()
+        let wanted = desiredURL != nil
+        lock.unlock()
+        guard wanted else { return }
+        setConnection(.reconnecting)
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        lock.lock()
+        reconnectWork?.cancel()
+        let attempt = reconnectAttempt
+        reconnectAttempt += 1
+        let pause = min(30, reconnectPause * pow(2.0, Double(min(attempt, 5))))
+        guard desiredURL != nil, desiredToken != nil else {
+            lock.unlock()
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            self?.retry()
+        }
+        reconnectWork = work
+        lock.unlock()
+        DispatchQueue.global().asyncAfter(deadline: .now() + pause, execute: work)
+    }
+
+    private func retry() {
+        lock.lock()
+        let url = desiredURL
+        let token = desiredToken
+        lock.unlock()
+        guard let url, let token else { return }
+        setConnection(.reconnecting)
+        do {
+            try openLink(url: url, token: token)
+        } catch AidanError.authRejected {
+            lock.lock()
+            desiredURL = nil
+            desiredToken = nil
+            lock.unlock()
+            setConnection(.disconnected)
+        } catch {
+            scheduleReconnect()
+        }
+    }
+
+    private func setConnection(_ state: ConnectionState) {
+        lock.lock()
+        storedConnection = state
+        let callback = onConnection
+        lock.unlock()
+        callback?(state)
     }
 
     private func loadFromDisk() throws {
@@ -266,9 +498,9 @@ public final class AidanSession: SyncHost {
     @discardableResult
     private func ensureNoteLocked(_ path: String, initial: String, fromFile: Bool = false) throws -> NoteState {
         if var existing = notes[path] {
-            if fromFile {
+            if fromFile && !existing.rebuilt && !conflicted(path) {
                 let current = try existing.doc.text(obj: existing.textObj)
-                if current != initial && !existing.rebuilt && openConflicts.contains(where: { $0.path == path }) == false {
+                if current != initial && writtenHash[path] != Self.sha(initial) {
                     try setText(&existing, initial)
                     notes[path] = existing
                     try save(existing)
@@ -277,6 +509,11 @@ public final class AidanSession: SyncHost {
             return notes[path]!
         }
         let docId = DocumentIds.noteId(path)
+        if let pending = loose.removeValue(forKey: docId) {
+            notes[path] = pending
+            try remember(path: path, docId: docId)
+            return pending
+        }
         let url = Self.docURL(vault, docId)
         let cached = (try? Data(contentsOf: url)).flatMap { try? Document($0) }
         let note: NoteState
@@ -311,6 +548,7 @@ public final class AidanSession: SyncHost {
     }
 
     private func remember(path: String, docId: String) throws {
+        guard (try? VaultPaths.check(path)) != nil else { return }
         guard let value = try index.get(obj: .ROOT, key: "paths"), case .Object(let map, .Map) = value else {
             throw AidanError.io("The index is missing its path list.")
         }
@@ -324,7 +562,8 @@ public final class AidanSession: SyncHost {
 
     private func documentLocked(_ docId: String) -> Document? {
         if docId == DocumentIds.indexId { return index }
-        return notes.values.first { $0.docId == docId }?.doc
+        if let note = notes.values.first(where: { $0.docId == docId }) { return note.doc }
+        return loose[docId]?.doc
     }
 
     private func pathLocked(for docId: String) -> String? {
@@ -336,14 +575,20 @@ public final class AidanSession: SyncHost {
         return try note.doc.text(obj: note.textObj)
     }
 
+    private func conflicted(_ path: String) -> Bool {
+        openConflicts.contains { $0.path == path }
+    }
+
     private func writeFileLocked(_ path: String, _ text: String) throws {
-        let url = vault.appendingPathComponent(path)
+        let url = try VaultPaths.fileURL(vault: vault, path: path)
         try AtomicFile.write(Data(text.utf8), to: url)
         lastWritten[path] = text
+        writtenHash[path] = Self.sha(text)
+        persistWritten()
     }
 
     private func readIfPresent(_ path: String) -> String? {
-        let url = vault.appendingPathComponent(path)
+        guard let url = try? VaultPaths.fileURL(vault: vault, path: path) else { return nil }
         return try? String(contentsOf: url, encoding: .utf8)
     }
 
@@ -366,37 +611,114 @@ public final class AidanSession: SyncHost {
         try AtomicFile.write(data, to: vault.appendingPathComponent(".aidanos/meta.json"))
     }
 
-    private func foldLocked() {
-        if suppressWatch > 0 { return }
+    private func loadMeta() {
+        let url = vault.appendingPathComponent(".aidanos/meta.json")
+        guard let data = try? Data(contentsOf: url),
+              let meta = try? JSONDecoder().decode(MetaFile.self, from: data) else { return }
+        for path in meta.rebuilt {
+            if var note = notes[path] {
+                note.rebuilt = true
+                notes[path] = note
+            }
+        }
+        openConflicts = meta.conflicts.map {
+            NoteConflict(path: $0.path, mine: $0.mine, theirs: $0.theirs, reason: $0.reason)
+        }
+    }
+
+    private func indexPairsLocked() -> [(String, String)] {
+        guard let value = try? index.get(obj: .ROOT, key: "paths"), case .Object(let map, .Map) = value else { return [] }
+        var pairs: [(String, String)] = []
+        for key in index.keys(obj: map) {
+            guard (try? VaultPaths.check(key)) != nil else { continue }
+            if let current = try? index.get(obj: map, key: key), case .Scalar(.String(let docId)) = current {
+                pairs.append((key, docId))
+            }
+        }
+        return pairs
+    }
+
+    private func adoptIndexLocked() -> [(String, String)] {
+        var updates: [(String, String)] = []
+        for (path, docId) in indexPairsLocked() where notes[path] == nil {
+            if let pending = loose.removeValue(forKey: docId) {
+                notes[path] = pending
+                let text = (try? pending.doc.text(obj: pending.textObj)) ?? ""
+                try? save(pending)
+                if !text.isEmpty { try? writeFileLocked(path, text) }
+                if slots[docId] == nil { slots[docId] = SyncSlot() }
+                updates.append((path, text))
+            } else if let note = try? ensureNoteLocked(path, initial: readIfPresent(path) ?? "") {
+                if slots[note.docId] == nil { slots[note.docId] = SyncSlot() }
+                let active = link
+                let id = note.docId
+                DispatchQueue.global().async { active?.kick(id) }
+            }
+        }
+        return updates
+    }
+
+    private func trackAndKick(_ docId: String) {
+        if link != nil {
+            if slots[docId] == nil { slots[docId] = SyncSlot() }
+            if slots[DocumentIds.indexId] == nil { slots[DocumentIds.indexId] = SyncSlot() }
+        }
+        let active = link
+        DispatchQueue.global().async {
+            active?.kick(docId)
+            active?.kick(DocumentIds.indexId)
+        }
+    }
+
+    private func foldLocked() -> [(String, String)] {
+        if suppressWatch > 0 { return [] }
+        var updates: [(String, String)] = []
+        var dirty = false
         let files = (try? VaultPaths.markdownFiles(in: vault)) ?? []
         for path in files {
             guard let fileText = readIfPresent(path) else { continue }
-            if lastWritten[path] == fileText { continue }
-            guard var note = notes[path] else {
-                if let created = try? ensureNoteLocked(path, initial: fileText, fromFile: true) {
-                    notes[path] = created
+            let fileHash = Self.sha(fileText)
+            if writtenHash[path] == fileHash {
+                lastWritten[path] = fileText
+                if let note = notes[path], !note.rebuilt, !conflicted(path) {
+                    let current = (try? note.doc.text(obj: note.textObj)) ?? ""
+                    if current != fileText { try? writeFileLocked(path, current) }
                 }
                 continue
             }
-            if openConflicts.contains(where: { $0.path == path }) { continue }
+            if lastWritten[path] == fileText { continue }
+            guard var note = notes[path] else {
+                if (try? ensureNoteLocked(path, initial: fileText, fromFile: true)) != nil {
+                    updates.append((path, fileText))
+                }
+                continue
+            }
+            if conflicted(path) || note.rebuilt { continue }
             let current = (try? note.doc.text(obj: note.textObj)) ?? ""
             if current == fileText {
                 lastWritten[path] = fileText
+                writtenHash[path] = fileHash
+                dirty = true
                 continue
             }
             if (try? setText(&note, fileText)) != nil {
                 notes[path] = note
                 lastWritten[path] = fileText
+                writtenHash[path] = fileHash
+                dirty = true
                 try? save(note)
+                updates.append((path, fileText))
                 let docId = note.docId
-                DispatchQueue.global().async { [weak self] in self?.link?.kick(docId) }
+                let active = link
+                DispatchQueue.global().async { active?.kick(docId) }
             }
         }
+        if dirty { persistWritten() }
         let known = Set(files)
         for path in notes.keys where !known.contains(path) {
             let text = (try? notes[path]?.doc.text(obj: notes[path]!.textObj)) ?? ""
             if text.isEmpty || lastWritten[path] == nil { continue }
-            if openConflicts.contains(where: { $0.path == path }) { continue }
+            if conflicted(path) { continue }
             openConflicts.append(NoteConflict(
                 path: path,
                 mine: "",
@@ -404,6 +726,7 @@ public final class AidanSession: SyncHost {
                 reason: "The file was deleted on this device while the synced note still has text."
             ))
         }
+        return updates
     }
 
     private func startWatcher() {
@@ -412,11 +735,29 @@ public final class AidanSession: SyncHost {
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             self.lock.lock()
-            self.foldLocked()
+            let updates = self.foldLocked()
+            let callback = self.onText
             self.lock.unlock()
+            for update in updates { callback?(update.0, update.1) }
         }
         timer.resume()
         watcher = timer
+    }
+
+    private static func sha(_ text: String) -> String {
+        Digests.sha256Hex(text)
+    }
+
+    private static func loadWritten(in vault: URL) -> [String: String] {
+        let url = vault.appendingPathComponent(".aidanos/written.json")
+        guard let data = try? Data(contentsOf: url),
+              let parsed = try? JSONDecoder().decode([String: String].self, from: data) else { return [:] }
+        return parsed
+    }
+
+    private func persistWritten() {
+        guard let data = try? JSONEncoder().encode(writtenHash) else { return }
+        try? AtomicFile.write(data, to: vault.appendingPathComponent(".aidanos/written.json"))
     }
 
     private static func makeDocument(docId: String, kind: String, actor: ActorId) throws -> (Document, ObjId?) {

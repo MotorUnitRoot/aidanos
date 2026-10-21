@@ -13,6 +13,11 @@ import { createMirror } from "./mirror.mjs";
 import { logSafe } from "./redact.mjs";
 
 const DEFAULT_PORT = 3750;
+const MIN_TOKEN_LENGTH = 32;
+export const LAN_WARNING =
+  "WARNING: --lan sends notes across your home network with no encryption. The token is the only protection.";
+
+const CLIENT_MARKERS = ["actor", "storage-id", "index"];
 
 export function tokensMatch(expected, got) {
   const left = Buffer.from(String(expected || ""));
@@ -43,22 +48,76 @@ function rejectUpgrade(socket) {
   socket.destroy();
 }
 
-function health(gitEnabled) {
-  return JSON.stringify({ ok: true, git: Boolean(gitEnabled) });
+function health(gitState) {
+  return JSON.stringify({
+    ok: true,
+    git: gitState.status === "ok",
+    gitStatus: gitState.status,
+  });
 }
 
 export function parseArgs(argv) {
-  const out = { lan: false, token: "", vault: "", data: "", port: null };
+  const out = { lan: false, lanAddress: "", vault: "", data: "", port: null };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--lan") out.lan = true;
-    else if (arg === "--token") out.token = argv[(i += 1)] || "";
+    else if (arg === "--token") {
+      throw new Error(
+        "The token is not read from the command line. Set AIDANOS_RELAY_TOKEN or AIDANOS_RELAY_TOKEN_FILE.",
+      );
+    } else if (arg === "--lan-address") out.lanAddress = argv[(i += 1)] || "";
     else if (arg === "--vault") out.vault = argv[(i += 1)] || "";
     else if (arg === "--data") out.data = argv[(i += 1)] || "";
     else if (arg === "--port") out.port = Number(argv[(i += 1)]);
     else throw new Error("Unknown argument " + arg);
   }
   return out;
+}
+
+export async function loadToken(env = process.env) {
+  const fromEnv = String(env.AIDANOS_RELAY_TOKEN || "").trim();
+  const file = String(env.AIDANOS_RELAY_TOKEN_FILE || "").trim();
+  if (fromEnv && file) {
+    throw new Error("Set only one of AIDANOS_RELAY_TOKEN and AIDANOS_RELAY_TOKEN_FILE.");
+  }
+  let token = fromEnv;
+  if (file) {
+    const stat = await fs.stat(file);
+    if ((stat.mode & 0o777) !== 0o600) {
+      throw new Error("The token file must be readable only by you (mode 0600).");
+    }
+    token = String(await fs.readFile(file, "utf8")).trim();
+  }
+  if (!token) {
+    throw new Error("Set AIDANOS_RELAY_TOKEN or AIDANOS_RELAY_TOKEN_FILE. The relay will not start without one.");
+  }
+  if (token.length < MIN_TOKEN_LENGTH) {
+    throw new Error("The relay token must be at least 32 characters.");
+  }
+  return token;
+}
+
+export function startupLines({ lan, port, phone }) {
+  const lines = ["LISTENING 127.0.0.1 " + port];
+  if (lan) lines.push(LAN_WARNING);
+  if (phone) lines.push("PHONE ws://" + phone + ":" + port);
+  return lines;
+}
+
+async function assertNotClientVault(vault) {
+  for (const name of CLIENT_MARKERS) {
+    try {
+      await fs.stat(path.join(vault, ".aidanos", name));
+    } catch (error) {
+      if (error && error.code === "ENOENT") continue;
+      throw error;
+    }
+    throw new Error(
+      "This folder is an app vault (it has .aidanos/" +
+        name +
+        "). The relay keeps its own folder and will not use the app's folder.",
+    );
+  }
 }
 
 function listen(server, host, port) {
@@ -79,26 +138,57 @@ function listen(server, host, port) {
 }
 
 export async function startRelay(options = {}) {
-  const token = String(options.token || process.env.AIDANOS_RELAY_TOKEN || "").trim();
-  if (!token) {
-    throw new Error("Set AIDANOS_RELAY_TOKEN or pass --token. The relay will not start without one.");
+  const token = String(options.token || "").trim() || (await loadToken(options.env || process.env));
+  if (token.length < MIN_TOKEN_LENGTH) {
+    throw new Error("The relay token must be at least 32 characters.");
   }
   const vault = path.resolve(options.vault || process.env.AIDANOS_VAULT || path.join(process.cwd(), "vault"));
   const dataDir = path.resolve(options.data || process.env.AIDANOS_RELAY_DATA || path.join(vault, ".aidanos", "relay"));
   const port = options.port == null ? portFromEnv() : Number(options.port);
-  const { hosts, phone } = listenHosts({ lan: Boolean(options.lan), interfaces: options.interfaces });
+  const { hosts, phone } = listenHosts({
+    lan: Boolean(options.lan) || Boolean(options.lanAddress),
+    interfaces: options.interfaces,
+    choose: options.lanAddress || "",
+  });
   const gitUrl = String(options.gitUrl ?? process.env.AIDANOS_VAULT_GIT_URL ?? "").trim();
   const gitToken = String(options.gitToken ?? process.env.AIDANOS_VAULT_GIT_TOKEN ?? "").trim();
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
   await fs.mkdir(vault, { recursive: true });
+  await assertNotClientVault(vault);
   await fs.mkdir(dataDir, { recursive: true });
+  const guessLimit = Number(options.guessLimit ?? 5);
+  const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
+  const failures = new Map();
+  const gitState = { status: gitUrl ? "pending" : "off" };
+
+  function clientAddress(req) {
+    return (req.socket && req.socket.remoteAddress) || "";
+  }
+
+  function blocked(ip) {
+    const row = failures.get(ip);
+    return Boolean(row && row.until && Date.now() < row.until);
+  }
+
+  function noteFailure(ip) {
+    const row = failures.get(ip) || { count: 0, until: 0 };
+    row.count += 1;
+    if (row.count >= guessLimit) row.until = Date.now() + guessBlockMs;
+    failures.set(ip, row);
+  }
+
+  function noteGit(result) {
+    if (!result) return;
+    if (result.pushed) gitState.status = "ok";
+    else if (result.committed && result.pushed === false) gitState.status = "failed";
+  }
 
   const servers = [];
   const adapters = [];
   for (const host of hosts) {
     const httpServer = http.createServer((req, res) => {
       if (req.url === "/health") {
-        const body = health(gitUrl);
+        const body = health(gitState);
         res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
         res.end(body);
         return;
@@ -106,14 +196,17 @@ export async function startRelay(options = {}) {
       res.writeHead(404, { "content-length": 0 });
       res.end();
     });
-    const wss = new WebSocketServer({ noServer: true });
+    const wss = new WebSocketServer({ noServer: true, maxPayload: Number(options.maxPayload ?? 1_000_000) });
     const adapter = new NodeWSServerAdapter(wss);
     httpServer.on("upgrade", (req, socket, head) => {
-      if (!tokensMatch(token, bearerToken(req.headers.authorization))) {
+      const ip = clientAddress(req);
+      if (blocked(ip) || !tokensMatch(token, bearerToken(req.headers.authorization))) {
+        if (!blocked(ip)) noteFailure(ip);
         logSafe(secrets, "rejected a sync connection");
         rejectUpgrade(socket);
         return;
       }
+      failures.delete(ip);
       wss.handleUpgrade(req, socket, head, (ws) => {
         ws.on("error", (error) => {
           logSafe(secrets, "sync connection closed:", error instanceof Error ? error.message : error);
@@ -147,9 +240,20 @@ export async function startRelay(options = {}) {
 
   const interval = gitInterval(options.gitIntervalMs);
   let gitTimer = null;
+  async function runBackup() {
+    try {
+      const result = await backupOnce({ vault, gitUrl, gitToken, secrets });
+      noteGit(result);
+      return result;
+    } catch (error) {
+      gitState.status = "failed";
+      throw error;
+    }
+  }
+
   if (gitUrl && interval > 0) {
     gitTimer = setInterval(() => {
-      backupOnce({ vault, gitUrl, gitToken, secrets }).catch((error) => {
+      runBackup().catch((error) => {
         logSafe(secrets, "git backup failed:", error instanceof Error ? error.message : error);
       });
     }, interval);
@@ -168,12 +272,17 @@ export async function startRelay(options = {}) {
       await mirror.now();
     },
     async backupNow() {
-      return backupOnce({ vault, gitUrl, gitToken, secrets });
+      return runBackup();
     },
+    healthURL: "http://127.0.0.1:" + boundPort + "/health",
     async close() {
       mirror.stop();
       if (gitTimer) clearInterval(gitTimer);
-      for (const entry of servers) entry.wss.close();
+      for (const entry of servers) {
+        for (const ws of entry.wss.clients) ws.terminate();
+        entry.wss.close();
+        if (typeof entry.httpServer.closeAllConnections === "function") entry.httpServer.closeAllConnections();
+      }
       await Promise.all(
         servers.map(
           (entry) =>
@@ -205,20 +314,22 @@ async function main() {
   try {
     relay = await startRelay({
       lan: args.lan,
-      token: args.token || process.env.AIDANOS_RELAY_TOKEN,
+      lanAddress: args.lanAddress,
       vault: args.vault || undefined,
       data: args.data || undefined,
       port: args.port == null || Number.isNaN(args.port) ? undefined : args.port,
     });
   } catch (error) {
     logSafe(
-      [process.env.AIDANOS_RELAY_TOKEN, process.env.AIDANOS_VAULT_GIT_TOKEN, args.token],
+      [process.env.AIDANOS_RELAY_TOKEN, process.env.AIDANOS_VAULT_GIT_TOKEN],
       error instanceof Error ? error.message : error,
     );
     process.exit(1);
   }
-  console.log("LISTENING 127.0.0.1 " + relay.port);
-  if (relay.phone) console.log("PHONE " + relay.phone);
+  for (const line of startupLines({ lan: args.lan || Boolean(args.lanAddress), port: relay.port, phone: relay.phone })) {
+    if (line.startsWith("WARNING")) console.error(line);
+    else console.log(line);
+  }
   const shutdown = () => {
     relay.close().then(() => process.exit(0));
   };

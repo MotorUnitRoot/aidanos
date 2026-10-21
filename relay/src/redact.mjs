@@ -14,6 +14,9 @@ export function redact(text, secrets) {
     if (encoded !== secret) out = out.split(encoded).join("***");
   }
   out = out.replace(/x-access-token:[^@\s]+/gi, "x-access-token:***");
+  out = out.replace(/Bearer\s+\S+/gi, "Bearer ***");
+  out = out.replace(/Authorization:\s*Basic\s+\S+/gi, "Authorization: Basic ***");
+  out = out.replace(/AIDANOS_(?:RELAY|VAULT_GIT)_TOKEN=\S+/g, "AIDANOS_TOKEN=***");
   out = out.replace(/https?:\/\/[^\s]+/gi, "[url]");
   out = out.replace(/file:\/\/[^\s]+/gi, "[url]");
   return out;

@@ -1,59 +1,120 @@
 # Try the sync
 
-This is the first cut. It is enough to see today's note on your Mac and, with a cable, on your iPhone, and to watch an edit made while one of them is offline show up on the other.
+This is enough to see today's note on your Mac and, with a cable, on your iPhone, and to watch an edit made while one of them is offline show up on the other.
 
-You need Node 22 on the Mac. The relay is the small program both apps talk to. Git, if you point it at a backup repository, only receives a copy of the markdown. The phone and the Mac never download notes from git.
+You do not need a paid Apple developer account. You do need Xcode and Node 22 on the Mac.
 
-## On your Mac
+## Install Xcode
 
-1. In Terminal, from this repository:
+1. Open the App Store on the Mac.
+2. Search for Xcode and install it. The first time you open Xcode, let it install the extra components it asks for.
+3. Open Xcode once and accept the license. You can quit it again.
+
+## Install Node 22
+
+1. In a browser, open [https://nodejs.org](https://nodejs.org).
+2. Download the macOS installer for version 22 (the one marked LTS is fine if it is 22).
+3. Run the installer. Leave the defaults as they are.
+4. Open Terminal (Applications → Utilities → Terminal) and type `node --version`. It should print a number starting with `v22`.
+
+## Get the project onto the Mac
+
+If the `aidanos` folder is already on the Mac, use that folder. If it is not:
+
+1. Open Terminal.
+2. Type this and press Return. It copies the project into your home folder:
 
    ```
-   cd relay
+   git clone https://github.com/MotorUnitRoot/aidanos.git
+   cd aidanos
+   git checkout cursor/native-sync-foundation-1ab2
+   ```
+
+3. Remember this folder. The steps below call it the project folder.
+
+## Start the relay
+
+The relay is the small program both apps talk to. It keeps its own folder of notes. Do not point it at the Mac app's folder. The two folders stay separate, and the relay will refuse to start if you try to share them.
+
+1. Open Terminal.
+2. Go to the relay folder:
+
+   ```
+   cd aidanos/relay
    npm ci
-   node src/server.mjs --token a-long-secret-you-choose
    ```
 
-   Leave that window open. It prints `LISTENING 127.0.0.1 3750`. Nothing else on the network can connect. That is the normal way to run it.
+   If you are already inside the project folder, `cd relay` is enough.
 
-2. Open `native/Apps/AidanOS.xcodeproj` in Xcode.
-3. At the top, choose the scheme **AidanOS-macOS** and the destination **My Mac**.
-4. Press Run. The window opens on today's note, with the cursor at the end.
-5. In the address field leave `ws://127.0.0.1:3750`. Type the same token you gave the relay. Press Connect.
+3. Pick a token. It is a password you make up, at least 32 characters. An example shape is `correct-horse-battery-staple-and-more`. Do not put it in the command itself.
 
-The Mac app keeps its notes in `~/Library/Application Support/AidanOS/vault`. Today's file is `log/YYYY-MM-DD.md` inside that folder. The relay, started as above, writes its own copy into `relay/vault` (the folder you were in when you started it). To make the Mac app and the relay share one folder, start the relay with `--vault` pointed at the Application Support vault. Do that only when the Mac app is the one you want the relay to mirror.
+4. Either of these is fine. The first keeps the token in a file only your user can read:
+
+   ```
+   umask 077
+   printf '%s' 'paste-your-long-token-here' > "$HOME/.aidanos-relay-token"
+   chmod 600 "$HOME/.aidanos-relay-token"
+   export AIDANOS_RELAY_TOKEN_FILE="$HOME/.aidanos-relay-token"
+   node src/server.mjs
+   ```
+
+   Or, for one window only, type the token into the environment and start the relay:
+
+   ```
+   export AIDANOS_RELAY_TOKEN='paste-your-long-token-here'
+   node src/server.mjs
+   ```
+
+5. Leave that window open. It prints `LISTENING 127.0.0.1 3750`. Nothing else on the network can connect. That is the normal way to run it. It does not print the token.
+
+Git, if you later point it at a backup repository, only receives a copy of the markdown. The phone and the Mac never download notes from git. The git password is not stored in the notes folder.
+
+## Run the Mac app
+
+1. In Finder, open `native/Apps/AidanOS.xcodeproj` inside the project folder. Xcode opens.
+2. At the top, choose the scheme **AidanOS-macOS** and the destination **My Mac**.
+3. In the left sidebar, select the project, then the **AidanOS-macOS** target, then **Signing & Capabilities**. Choose the team named **Your Name (Personal Team)**. Do this for the Mac target, not only the iPhone target. The project does not pick a team for you.
+4. Press Run. The window opens on today's note, with the cursor at the end. The note text scrolls if it is longer than the window.
+5. In the address field leave `ws://127.0.0.1:3750`. Type the same token you gave the relay. The token is hidden as you type. Press Connect. The status says Connected only while the connection is really up.
+
+The Mac app keeps its notes in its own folder, `~/Library/Application Support/AidanOS/vault`. Today's file is `log/YYYY-MM-DD.md` inside that folder. The relay, started as above, writes its own copy into `relay/vault`. The app saves the token in the Keychain, not in a settings file.
 
 ## Free Apple ID on your iPhone
 
 A paid developer account is not required for this test. A free Apple ID installs the app from Xcode over a cable. The app expires after 7 days. Plug the phone back in and press Run again to refresh it. There is no App Store and no TestFlight in this cut.
 
 1. In Xcode, open Settings → Accounts and sign in with your Apple ID.
-2. Select the scheme **AidanOS-iOS**. Open the AidanOS-iOS target, Signing & Capabilities, and choose the team named **Your Name (Personal Team)**. The project does not pick a team for you.
+2. Select the scheme **AidanOS-iOS**. Open the AidanOS-iOS target, Signing & Capabilities, and choose the team named **Your Name (Personal Team)**. The Mac target needs that same choice, from the step above.
 3. If Xcode says the bundle id is already in use, change the one line `PRODUCT_BUNDLE_IDENTIFIER_PREFIX` in `native/Apps/Config/Shared.xcconfig`. That is the only place the prefix lives. The iPhone id becomes that prefix plus `.ios`.
 4. Plug the iPhone into the Mac with a cable. Choose that iPhone as the run destination. Press Run.
 5. On the iPhone, turn on Developer Mode if iOS asks (Settings → Privacy & Security → Developer Mode) and restart if it tells you to.
 6. Trust the developer: Settings → General → VPN & Device Management, tap the Apple Development entry, and choose Trust.
-7. On the Mac, stop the relay if it is still running, and start it so the phone can see it:
+7. On the Mac, stop the relay if it is still running (click the Terminal window and press Control-C), and start it so the phone can see it. Use the same token file or environment variable as before, and add `--lan`:
 
    ```
-   node src/server.mjs --token a-long-secret-you-choose --lan
+   export AIDANOS_RELAY_TOKEN_FILE="$HOME/.aidanos-relay-token"
+   node src/server.mjs --lan
    ```
 
-   It still listens on this Mac only at `127.0.0.1`, and it also listens on this Mac's home-network address. The token is still required. It prints a line like `PHONE ws://192.168.1.20:3750`. It does not print the token. Type that address and the token into the iPhone app and press Connect. The first time, iOS asks permission to find devices on the local network. Allow it.
+   The first time, the Mac may show a firewall prompt asking whether to allow incoming connections for `node`. Choose Allow. Without that, the phone cannot reach the Mac.
 
-   `--lan` refuses to start if the Mac has no private address (an address like `192.168.x.x`, `10.x.x.x`, or `172.16–31.x.x`). It never listens on every interface.
+   The relay still listens on this Mac only at `127.0.0.1`, and it also listens on this Mac's home-network address. It prefers the home Wi-Fi address over a VPN address. It prints a warning: traffic on the home network is not encrypted, and the token is the only protection. Then it prints a line like `PHONE ws://192.168.1.20:3750`. It does not print the token. Type that address and the token into the iPhone app and press Connect. The first time, iOS asks permission to find devices on the local network. Allow it.
+
+   `--lan` refuses to start if the Mac has no private address (an address like `192.168.x.x`). It never listens on every interface. If you need a specific address, add `--lan-address 192.168.1.20`.
 
 The phone build asks for no capability a free account cannot have. There is no widget and no share sheet in this cut. A paid account (the enrollment that is in progress) will later allow TestFlight, widgets, and the share sheet.
 
 ## The airplane-mode test
 
 1. Connect the iPhone and the Mac to the relay, as above, so today's note is open on both.
-2. Put the iPhone in airplane mode. Type a sentence in today's note on the phone.
+2. Put the iPhone in airplane mode. The phone's status changes to Reconnecting. It does not stay on Connected. Type a sentence in today's note on the phone.
 3. On the Mac, type a different sentence in the same note.
-4. Take the iPhone out of airplane mode and let it reach the relay again.
+4. Take the iPhone out of airplane mode. Leave the app open. It connects again by itself, with a short wait that gets longer if the network is still gone. You do not have to press Connect again. When the status says Connected, both sentences are on the phone and on the Mac.
 
-Both sentences are on the phone, on the Mac, and in the `log/YYYY-MM-DD.md` file. You are not asked to pick one. The order of the two sentences is the one the merge produces, and it is the same on both devices.
+Both sentences are also in the `log/YYYY-MM-DD.md` file. You are not asked to pick one. The order of the two sentences is the one the merge produces, and it is the same on both devices.
+
+If the two sides cannot be merged safely, the app shows Keep mine, Take theirs, and Edit. Edit starts with both versions in the note, so you can combine them and press Save edit.
 
 ## What this cut does not do
 
-It does not install over TestFlight. It does not sync through git. It does not run a widget or a share extension. Those wait on the paid account, and git stays a backup even then.
+It does not install over TestFlight. It does not sync through git. It does not run a widget or a share extension. Those wait on the paid account, and git stays a backup even then. A separate token for each device comes before the relay is ever reachable from outside the house.

@@ -30,11 +30,51 @@ enum AtomicFile {
 
 enum VaultPaths {
     static func check(_ path: String) throws -> String {
+        if path.hasPrefix("/") || path.hasPrefix("\\") || path.contains("\\") || path.contains("\0") {
+            throw AidanError.badPath(path)
+        }
+        if !path.hasSuffix(".md") {
+            throw AidanError.badPath(path)
+        }
         let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
-        if parts.isEmpty || parts.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) {
+        if parts.isEmpty || parts.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." || $0.hasPrefix(".") }) {
             throw AidanError.badPath(path)
         }
         return parts.joined(separator: "/")
+    }
+
+    /// The file inside the vault. A symlink anywhere along the path is refused.
+    static func fileURL(vault: URL, path: String) throws -> URL {
+        let safe = try check(path)
+        let root = URL(fileURLWithPath: vault.path).standardizedFileURL.path
+        var current = root
+        let parts = safe.split(separator: "/").map(String.init)
+        for (index, part) in parts.enumerated() {
+            current = URL(fileURLWithPath: current).appendingPathComponent(part).path
+            if isSymbolicLink(current) {
+                throw AidanError.badPath(path)
+            }
+            let isLast = index == parts.count - 1
+            var isDirectory: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: current, isDirectory: &isDirectory)
+            if exists && !isLast && !isDirectory.boolValue {
+                throw AidanError.badPath(path)
+            }
+            if !exists && !isLast {
+                try FileManager.default.createDirectory(atPath: current, withIntermediateDirectories: false)
+            }
+        }
+        let target = URL(fileURLWithPath: current).standardizedFileURL.path
+        if target != root && !target.hasPrefix(root.hasSuffix("/") ? root : root + "/") {
+            throw AidanError.badPath(path)
+        }
+        return URL(fileURLWithPath: current)
+    }
+
+    private static func isSymbolicLink(_ path: String) -> Bool {
+        var info = stat()
+        if lstat(path, &info) != 0 { return false }
+        return (info.st_mode & S_IFMT) == S_IFLNK
     }
 
     static func markdownFiles(in vault: URL) throws -> [String] {

@@ -584,6 +584,102 @@ await check("a day switch that cannot reach the server stays on the day", async 
   assert(!client.requests.some((r) => r.url.includes(next)), "the failed switch still loaded the next day");
 });
 
+await check("an older stored copy is not offered after a later good save", async () => {
+  const client = boot();
+  const day = "2026-10-21";
+  await loadDay(client, day, "saved line", 100);
+  const dump = client.doc.getElementById("dump");
+  dump.value = "first typing";
+  client.sandbox.scheduleSave();
+  const saving = client.sandbox.saveDay();
+  await tick();
+  const autosave = take(client.requests, (r) => r.method === "PUT" && r.url.includes(day));
+  assert(autosave, "the autosave never started");
+  dump.value = "first typing plus";
+  client.sandbox.scheduleSave();
+  client.sandbox.flushOnLeave();
+  const hide = take(client.requests, (r) => r.method === "PUT" && r.opts && r.opts.keepalive === true);
+  assert(hide, "the hide did not send a save");
+  assert(JSON.parse(hide.opts.body).markdown === "first typing plus", "the hide save was not the text on the page");
+  hide.resolve(jsonRes(409, {
+    error: "disk newer",
+    date: day,
+    markdown: "from elsewhere",
+    mtime: 150,
+  }));
+  await tick();
+  const stored = client.storage.keys().filter((k) => k.indexOf("log/" + day + ".md") >= 0);
+  assert(stored.length === 1, "the refused hide did not keep a local copy (" + stored.join(", ") + ")");
+  assert(JSON.parse(client.storage.getItem(stored[0])).markdown === "first typing plus", "the stored copy was not the hide text");
+  autosave.resolve(jsonRes(200, { ok: true, date: day, mtime: 180 }));
+  await saving;
+  await tick();
+  const still = client.storage.keys().filter((k) => k.indexOf("log/" + day + ".md") >= 0);
+  assert(still.length === 1, "the earlier save cleared the newer stored copy");
+  assert(JSON.parse(client.storage.getItem(still[0])).markdown === "first typing plus", "the stored copy changed after the earlier save");
+  dump.value = "second typing";
+  client.sandbox.scheduleSave();
+  const later = client.sandbox.saveDay();
+  await tick();
+  const put = take(client.requests, (r) => r.method === "PUT" && r.url.includes(day));
+  assert(put, "the later save was not sent");
+  assert(JSON.parse(put.opts.body).markdown === "second typing", "the later save was not the newest text");
+  put.resolve(jsonRes(200, { ok: true, date: day, mtime: 220 }));
+  await later;
+  await tick();
+  assert(
+    !client.storage.keys().some((k) => k.indexOf("log/" + day + ".md") >= 0),
+    "the later save left the older copy stored (" + client.storage.keys().join(", ") + ")",
+  );
+  await loadDay(client, day, "second typing", 220);
+  assert(client.doc.getElementById("conflict-sheet").hidden === true, "the next open offered the older copy");
+  assert(dump.value === "second typing", "the next open replaced the saved text (" + dump.value + ")");
+});
+
+await check("a refused save older than a confirmed save does not open the sheet", async () => {
+  const client = boot();
+  const day = "2026-10-21";
+  await loadDay(client, day, "saved line", 100);
+  const dump = client.doc.getElementById("dump");
+  dump.value = "older line";
+  client.sandbox.scheduleSave();
+  const saving = client.sandbox.saveDay();
+  await tick();
+  const autosave = take(client.requests, (r) => r.method === "PUT" && r.url.includes(day) && !(r.opts && r.opts.keepalive));
+  assert(autosave, "the autosave never started");
+  assert(JSON.parse(autosave.opts.body).markdown === "older line", "the autosave was not the older text");
+  dump.value = "newer line";
+  client.sandbox.scheduleSave();
+  client.sandbox.flushOnLeave();
+  const hide = take(client.requests, (r) => r.method === "PUT" && r.opts && r.opts.keepalive === true);
+  assert(hide, "the hide did not send a save");
+  assert(JSON.parse(hide.opts.body).markdown === "newer line", "the hide save was not the newer text");
+  hide.resolve(jsonRes(200, { ok: true, date: day, mtime: 180 }));
+  await tick();
+  autosave.resolve(jsonRes(409, {
+    error: "disk newer",
+    date: day,
+    markdown: "newer line",
+    mtime: 180,
+  }));
+  await saving;
+  await tick();
+  const sheet = client.doc.getElementById("conflict-sheet");
+  assert(sheet.hidden === true, "the refused older save opened the conflict sheet");
+  assert(client.doc.getElementById("conflict-mine").textContent !== "older line", "the sheet offered the older text as mine");
+  assert(dump.value === "newer line", "the refused save replaced the newer text (" + dump.value + ")");
+  assert(
+    !client.storage.keys().some((k) => {
+      if (k.indexOf("log/" + day + ".md") < 0) return false;
+      return JSON.parse(client.storage.getItem(k)).markdown === "older line";
+    }),
+    "the refused older save was stored",
+  );
+  await loadDay(client, day, "newer line", 180);
+  assert(sheet.hidden === true, "the next open offered the older text");
+  assert(dump.value === "newer line", "the next open did not keep the confirmed text (" + dump.value + ")");
+});
+
 const failed = results.filter((r) => !r.ok);
 console.log("");
 if (failed.length) {

@@ -1066,6 +1066,24 @@ function renderWeek() {
 }
 
 const UNSENT_PREFIX = "aidanos-unsent:";
+let unsentSeq = 0;
+const confirmedSaves = new Map();
+
+function captureUnsentStamp() {
+  unsentSeq += 1;
+  return { at: Date.now(), seq: unsentSeq };
+}
+
+function unsentBefore(stored, mark) {
+  if (!stored || !mark) return false;
+  const at = Number(stored.at) || 0;
+  const seq = Number(stored.seq) || 0;
+  const markAt = Number(mark.at) || 0;
+  const markSeq = Number(mark.seq) || 0;
+  if (!at && !seq) return true;
+  if (at !== markAt) return at < markAt;
+  return seq < markSeq;
+}
 
 function notePathFor(snap) {
   if (!snap) return "";
@@ -1081,12 +1099,19 @@ function unsentKey(path, base) {
 function rememberUnsent(snap) {
   const path = notePathFor(snap);
   if (!path || !snap) return;
+  if (!snap.at) {
+    const stamp = captureUnsentStamp();
+    snap.at = stamp.at;
+    snap.seq = stamp.seq;
+  }
   const base = Number(snap.mtime) || 0;
   try {
     localStorage.setItem(unsentKey(path, base), JSON.stringify({
       path,
       base,
       markdown: String(snap.markdown || ""),
+      at: snap.at,
+      seq: snap.seq,
     }));
   } catch (e) {}
 }
@@ -1103,9 +1128,9 @@ function forgetUnsent(path) {
   } catch (e) {}
 }
 
-function forgetUnsentText(path, markdown) {
+function forgetUnsentBefore(path, snap) {
   const prefix = UNSENT_PREFIX + String(path || "").replace(/\\/g, "/") + ":";
-  const want = String(markdown ?? "");
+  const want = String(snap && snap.markdown || "");
   try {
     const keys = [];
     for (let i = 0; i < localStorage.length; i++) {
@@ -1115,10 +1140,24 @@ function forgetUnsentText(path, markdown) {
     keys.forEach((key) => {
       try {
         const parsed = JSON.parse(localStorage.getItem(key) || "null");
-        if (parsed && parsed.markdown === want) localStorage.removeItem(key);
+        if (!parsed) return;
+        if (parsed.markdown === want || unsentBefore(parsed, snap)) localStorage.removeItem(key);
       } catch (e) {}
     });
   } catch (e) {}
+}
+
+function noteSaved(snap) {
+  const path = notePathFor(snap);
+  if (!path || !snap) return;
+  forgetUnsentBefore(path, snap);
+  const prev = confirmedSaves.get(path);
+  if (prev && unsentBefore(snap, prev)) return;
+  confirmedSaves.set(path, {
+    at: snap.at,
+    seq: snap.seq,
+    markdown: String(snap.markdown || ""),
+  });
 }
 
 function adoptSavedMtime(current, next) {
@@ -1842,7 +1881,6 @@ function sendKeepaliveSave(snap) {
   if (!snap) return;
   const edit = !!(paperConflict && document.body.classList.contains("conflict-edit"));
   const resolveBody = edit ? { resolve: "edit" } : {};
-  const path = notePathFor(snap);
   let url = "";
   let body = null;
   if (snap.kind === "note") {
@@ -1861,7 +1899,7 @@ function sendKeepaliveSave(snap) {
   }).then(async (res) => {
     if (!res.ok) return;
     const out = await res.json().catch(() => ({}));
-    forgetUnsentText(path, snap.markdown);
+    noteSaved(snap);
     const next = out && out.mtime != null ? Number(out.mtime) || 0 : 0;
     if (snap.kind === "note") {
       if (!(isNoteDoc() && state.doc && state.doc.path === snap.path)) return;
@@ -1930,22 +1968,28 @@ function paperSaveSnapshot() {
     }
     if (dump) dump.value = markdown;
     state.doc.markdown = markdown;
+    const stamp = captureUnsentStamp();
     return {
       kind: "note",
       path: state.doc.path,
       markdown,
       mtime: Number(state.doc.mtime) || 0,
+      at: stamp.at,
+      seq: stamp.seq,
     };
   }
   if (state.day) {
     const markdown = cleanPaperMarkdown(dump ? dump.value : dayMarkdown(state.day));
     if (dump) dump.value = markdown;
     state.day.markdown = markdown;
+    const stamp = captureUnsentStamp();
     return {
       kind: "day",
       date: state.day.date,
       markdown,
       mtime: Number(state.day.mtime) || 0,
+      at: stamp.at,
+      seq: stamp.seq,
     };
   }
   return null;
@@ -2012,6 +2056,8 @@ function closePaperConflict() {
 }
 
 function handleSaveConflict(snap, body, { keepalive = false } = {}) {
+  const confirmed = confirmedSaves.get(notePathFor(snap));
+  if (confirmed && unsentBefore(snap, confirmed)) return;
   rememberUnsent(snap);
   if (keepalive) return;
   if (!conflictStillHere(snap)) return;
@@ -2417,7 +2463,7 @@ async function saveDay({ keepalive = false, bound = null } = {}) {
           throw new Error(err.error || res.statusText);
         }
         const out = await res.json().catch(() => ({}));
-        forgetUnsentText(path, markdown);
+        noteSaved(snap);
         if (isNoteDoc() && state.doc && state.doc.path === path) {
           if (out && out.mtime != null) state.doc.mtime = adoptSavedMtime(state.doc.mtime, out.mtime);
           const dump = $("dump");
@@ -2459,7 +2505,7 @@ async function saveDay({ keepalive = false, bound = null } = {}) {
         throw new Error(err.error || res.statusText);
       }
       const out = await res.json().catch(() => ({}));
-      forgetUnsentText("log/" + date + ".md", markdown);
+      noteSaved(snap);
       if (state.day && state.day.date === date) {
         if (out && out.mtime != null) state.day.mtime = adoptSavedMtime(state.day.mtime, out.mtime);
         const dump = $("dump");

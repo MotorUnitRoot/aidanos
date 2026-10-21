@@ -1,3 +1,6 @@
 logs/
 *.tmp
 node_modules/
+native/.cache/
+.build/
+native/AidanCore/Package.resolved

@@ -1,0 +1,91 @@
+name: native
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+      - run: npm ci
+        working-directory: relay
+      - run: npm test
+        working-directory: relay
+
+  aidan-core-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: C++ headers Swift's clang can see
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ g++-14
+      - run: npm ci
+        working-directory: relay
+      - run: bash native/scripts/build-linux-ffi.sh
+      - name: swift test
+        working-directory: native/AidanCore
+        run: swift test
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/native/.cache/pkgconfig
+
+  apple:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+        working-directory: relay
+      - name: Relay for the iOS simulator
+        working-directory: relay
+        run: |
+          node src/server.mjs --token aidanos-test-token --port 3757 \
+            --vault "$RUNNER_TEMP/aidanos-vault" --data "$RUNNER_TEMP/aidanos-data" &
+          for _ in $(seq 1 50); do
+            curl -sf http://127.0.0.1:3757/health && exit 0
+            sleep 0.2
+          done
+          echo "relay did not start" >&2
+          exit 1
+      - name: AidanCore tests on macOS
+        working-directory: native/AidanCore
+        run: swift test
+      - name: Build the Mac app
+        run: >
+          xcodebuild build
+          -project native/Apps/AidanOS.xcodeproj
+          -scheme AidanOS-macOS
+          -destination platform=macOS
+          CODE_SIGNING_ALLOWED=NO
+      - name: Build the iPhone app
+        run: >
+          xcodebuild build
+          -project native/Apps/AidanOS.xcodeproj
+          -scheme AidanOS-iOS
+          -destination "generic/platform=iOS Simulator"
+          CODE_SIGNING_ALLOWED=NO
+      - name: AidanCore tests on the iOS simulator
+        working-directory: native/AidanCore
+        run: |
+          set -euo pipefail
+          line=$(xcodebuild -scheme AidanCore -showdestinations 2>/dev/null | awk -F '[{}]' '/platform:iOS Simulator/ && /name:iPhone/ && $0 !~ /placeholder/ { print $2; exit }')
+          echo "destination:${line}"
+          test -n "$line"
+          xcodebuild test -scheme AidanCore -destination "$line" CODE_SIGNING_ALLOWED=NO

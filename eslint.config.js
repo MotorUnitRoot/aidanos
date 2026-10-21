@@ -38,7 +38,7 @@ const globals = require("globals");
 
 export default [
   {
-    ignores: ["node_modules/**", "public/fonts/**"],
+    ignores: ["node_modules/**", "public/fonts/**", "native/.cache/**", "relay/node_modules/**"],
   },
   js.configs.recommended,
   {
@@ -49,7 +49,7 @@ export default [
     },
   },
   {
-    files: ["server.mjs", "*-test.mjs", "eslint.config.js", ".github/**/*.mjs"],
+    files: ["server.mjs", "*-test.mjs", "eslint.config.js", ".github/**/*.mjs", "relay/**/*.mjs"],
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",

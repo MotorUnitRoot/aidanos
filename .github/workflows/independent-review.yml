@@ -6,9 +6,10 @@ name: independent-review
 # independent-review environment. BLOCK uses independent-review-block
 # and does not wait.
 #
-# One run at a time per pull request. cancel-in-progress is off so a
-# slow PASS run cannot finish after a BLOCK run and become the latest
-# advisory result.
+# One advisory run at a time per pull request. cancel-in-progress is
+# off, so an advisory run that has started is not cancelled. This group
+# does not order the binding status. independent-review-post.yml posts
+# that status.
 concurrency:
   group: independent-review-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: false

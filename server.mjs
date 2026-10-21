@@ -1067,21 +1067,7 @@ async function releaseCleanPending() {
 
 async function noteUnrelated() {
   if (!vaultGit.enabled || !vaultGit.ready) return;
-  let dirty;
-  try {
-    dirty = await dirtySet();
-  } catch {
-    return;
-  }
-  let extra = false;
-  for (const file of dirty) {
-    if (vaultGit.conflicts.has(file)) continue;
-    if (vaultGit.hold.has(file)) continue;
-    if (vaultGit.pending.has(file)) continue;
-    extra = true;
-    break;
-  }
-  vaultGit.left = extra ? "Left an unrelated file alone." : "";
+  vaultGit.left = "";
 }
 
 async function publishPush() {

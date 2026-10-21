@@ -322,6 +322,7 @@ private func waitUntil(seconds: TimeInterval, _ body: () throws -> Bool) throws 
     return try body()
 }
 
+#if !os(iOS)
 private final class RunningRelay {
     let process: Process
     let log: URL
@@ -345,6 +346,7 @@ private final class RunningRelay {
         (try? String(contentsOf: log, encoding: .utf8)) ?? ""
     }
 }
+#endif
 
 private final class TestRelay {
     let url: String

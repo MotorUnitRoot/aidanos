@@ -203,8 +203,9 @@ final class SyncTests: XCTestCase {
         try "from the file".write(to: fileURL, atomically: true, encoding: .utf8)
         let reader = try AidanSession(vault: fileVault)
         try reader.connect(relayURL: relay.url, token: relay.token)
-        let raised = try waitUntil(seconds: 15) {
-            reader.conflicts().contains { $0.path == path }
+        let raised = try waitUntil(seconds: 20) {
+            guard let conflict = reader.conflicts().first(where: { $0.path == path }) else { return false }
+            return conflict.mine == "from the file" && conflict.theirs == "from the relay"
         }
         XCTAssertTrue(raised)
         let conflict = reader.conflicts().first { $0.path == path }

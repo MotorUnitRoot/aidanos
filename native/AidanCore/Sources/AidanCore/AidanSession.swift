@@ -35,6 +35,7 @@ enum Digests {
 
 /// One vault, its markdown files, and the Automerge histories beside them.
 public final class AidanSession: SyncHost {
+    fileprivate static let rebuildConflictReason = "This device rebuilt the note from the file, and the relay already has different text. Choosing automatically would wipe one side."
     public let vault: URL
     public var onText: ((String, String) -> Void)?
     public var onConnection: ((ConnectionState) -> Void)?
@@ -308,10 +309,31 @@ public final class AidanSession: SyncHost {
         // the note as empty just because an earlier check saw nothing.
         slot.emptyChecks = 0
         var changed: [(String, String)] = []
-        if let path, let note = notes[path] {
+        if let path, var note = notes[path] {
             let after = (try? note.doc.text(obj: note.textObj)) ?? ""
             try? save(note)
-            if !rebuilt && !blocked && after != before {
+            if rebuilt {
+                let mine = readIfPresent(path) ?? ""
+                if !after.isEmpty && after != mine {
+                    // The relay's text is here. Compare now, before a later
+                    // idle check can upload the file and erase the difference.
+                    note.rebuilt = false
+                    notes[path] = note
+                    openConflicts.removeAll { $0.path == path }
+                    openConflicts.append(NoteConflict(
+                        path: path,
+                        mine: mine,
+                        theirs: after,
+                        reason: Self.rebuildConflictReason
+                    ))
+                    try? saveMeta()
+                }
+            } else if blocked, let index = openConflicts.firstIndex(where: { $0.path == path }),
+                      !after.isEmpty, openConflicts[index].theirs != after {
+                let old = openConflicts[index]
+                openConflicts[index] = NoteConflict(path: old.path, mine: old.mine, theirs: after, reason: old.reason)
+                try? saveMeta()
+            } else if !blocked && after != before {
                 try? writeFileLocked(path, after)
                 changed.append((path, after))
             }
@@ -359,7 +381,10 @@ public final class AidanSession: SyncHost {
             let attempts = slot.emptyChecks + 1
             slot.emptyChecks = attempts
             let peerHasNothing = slot.unavailable && !slot.sawReply && attempts >= 8
-            if !caughtUp && !peerHasNothing {
+            // Heads can match the shared root before the peer's text arrives.
+            // Wait through a quiet period instead of uploading on that match.
+            let peerDocIsEmpty = caughtUp && attempts >= 40
+            if !peerHasNothing && !peerDocIsEmpty {
                 lock.unlock()
                 let active = link
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
@@ -382,7 +407,7 @@ public final class AidanSession: SyncHost {
             path: path,
             mine: mine,
             theirs: remote,
-            reason: "This device rebuilt the note from the file, and the relay already has different text. Choosing automatically would wipe one side."
+            reason: Self.rebuildConflictReason
         )
         note.rebuilt = false
         notes[path] = note

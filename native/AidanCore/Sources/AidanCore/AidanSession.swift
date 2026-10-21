@@ -304,6 +304,9 @@ public final class AidanSession: SyncHost {
         let before = path.flatMap { _ in try? textLocked(docId) }
         try doc.receiveSyncMessage(state: slot.state, message: bytes)
         slot.sawReply = true
+        // A partial handshake can arrive before the peer's text. Don't treat
+        // the note as empty just because an earlier check saw nothing.
+        slot.emptyChecks = 0
         var changed: [(String, String)] = []
         if let path, let note = notes[path] {
             let after = (try? note.doc.text(obj: note.textObj)) ?? ""
@@ -349,6 +352,20 @@ public final class AidanSession: SyncHost {
             return
         }
         if remote.isEmpty {
+            // The first reply is often just the handshake. Uploading the file
+            // now would clear `rebuilt` and the peer's text would merge over
+            // the markdown instead of raising a conflict. Wait until the peer
+            // has gone quiet with nothing in the note.
+            let attempts = (slots[docId]?.emptyChecks ?? 0) + 1
+            slots[docId]?.emptyChecks = attempts
+            if attempts < 8 {
+                lock.unlock()
+                let active = link
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
+                    active?.kick(docId)
+                }
+                return
+            }
             try? setText(&note, mine)
             note.rebuilt = false
             notes[path] = note
@@ -821,6 +838,7 @@ private final class SyncSlot {
     var state = SyncState()
     var requested = false
     var sawReply = false
+    var emptyChecks = 0
 }
 
 private struct NoteState {

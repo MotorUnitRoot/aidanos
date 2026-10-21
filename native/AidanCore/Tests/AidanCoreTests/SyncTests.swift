@@ -196,7 +196,7 @@ final class SyncTests: XCTestCase {
         try "from the file".write(to: fileURL, atomically: true, encoding: .utf8)
         let reader = try AidanSession(vault: fileVault)
         try reader.connect(relayURL: relay.url, token: relay.token)
-        let raised = try waitUntil(seconds: 8) {
+        let raised = try waitUntil(seconds: 12) {
             reader.conflicts().contains { $0.path == path }
         }
         XCTAssertTrue(raised)

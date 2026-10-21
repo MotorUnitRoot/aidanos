@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node --test test/*.mjs"
+    "test": "node --test --test-force-exit test/*.mjs"
   },
   "dependencies": {
     "@automerge/automerge": "3.2.6",

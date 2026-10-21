@@ -168,6 +168,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
       timer = null;
       syncDisk();
     }, debounceMs);
+    if (timer.unref) timer.unref();
   }
 
   const poll = setInterval(schedule, Math.max(debounceMs, 200));

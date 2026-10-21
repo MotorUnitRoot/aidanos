@@ -183,12 +183,19 @@ final class SyncTests: XCTestCase {
         let path = "notes/rebuilt.md"
         try author.connect(relayURL: relay.url, token: relay.token)
         try author.replace(path, with: "from the relay")
+        let witness = try AidanSession(vault: try temporaryVault())
+        try witness.connect(relayURL: relay.url, token: relay.token)
+        let arrived = try waitUntil(seconds: 15) {
+            (try? witness.text(path)) == "from the relay"
+        }
+        XCTAssertTrue(arrived)
         if let relayVault = relay.vault {
             XCTAssertTrue(try waitUntil(seconds: 8) {
                 let text = try? String(contentsOf: relayVault.appendingPathComponent(path), encoding: .utf8)
                 return text == "from the relay"
             })
         }
+        witness.disconnect()
         author.disconnect()
         let fileVault = try temporaryVault()
         let fileURL = fileVault.appendingPathComponent(path)
@@ -196,7 +203,7 @@ final class SyncTests: XCTestCase {
         try "from the file".write(to: fileURL, atomically: true, encoding: .utf8)
         let reader = try AidanSession(vault: fileVault)
         try reader.connect(relayURL: relay.url, token: relay.token)
-        let raised = try waitUntil(seconds: 12) {
+        let raised = try waitUntil(seconds: 15) {
             reader.conflicts().contains { $0.path == path }
         }
         XCTAssertTrue(raised)

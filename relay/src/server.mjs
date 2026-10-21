@@ -280,7 +280,7 @@ export async function startRelay(options = {}) {
       mirror.stop();
       if (gitTimer) clearInterval(gitTimer);
       for (const entry of servers) {
-        for (const ws of entry.wss.clients) ws.terminate();
+        for (const ws of [...entry.wss.clients]) ws.terminate();
         entry.wss.close();
         if (typeof entry.httpServer.closeAllConnections === "function") entry.httpServer.closeAllConnections();
       }
@@ -292,6 +292,10 @@ export async function startRelay(options = {}) {
             }),
         ),
       );
+      // The websocket adapter clears its ping timer on "close". A client that
+      // already went away can leave that timer running, which holds the
+      // process open after the tests have finished.
+      for (const entry of servers) entry.wss.emit("close");
       if (typeof repo.shutdown === "function") await repo.shutdown();
     },
   };

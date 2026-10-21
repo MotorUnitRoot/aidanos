@@ -329,20 +329,21 @@ public final class AidanSession: SyncHost {
 
     func markUnavailable(docId: String) {
         lock.lock()
-        slots[docId]?.sawReply = true
+        slots[docId]?.unavailable = true
         lock.unlock()
     }
 
     func settled(docId: String) {
         lock.lock()
-        let ready = slots[docId]?.sawReply == true
-        guard ready, let path = pathLocked(for: docId), var note = notes[path], note.rebuilt else {
+        guard let slot = slots[docId], slot.sawReply || slot.unavailable,
+              let path = pathLocked(for: docId), var note = notes[path], note.rebuilt else {
             lock.unlock()
             return
         }
         let remote = (try? note.doc.text(obj: note.textObj)) ?? ""
         let mine = readIfPresent(path) ?? ""
-        if remote == mine {
+        let caughtUp = peerCaughtUp(slot, note)
+        if remote == mine && (caughtUp || !remote.isEmpty) {
             note.rebuilt = false
             notes[path] = note
             openConflicts.removeAll { $0.path == path }
@@ -352,13 +353,13 @@ public final class AidanSession: SyncHost {
             return
         }
         if remote.isEmpty {
-            // The first reply is often just the handshake. Uploading the file
-            // now would clear `rebuilt` and the peer's text would merge over
-            // the markdown instead of raising a conflict. Wait until the peer
-            // has gone quiet with nothing in the note.
-            let attempts = (slots[docId]?.emptyChecks ?? 0) + 1
-            slots[docId]?.emptyChecks = attempts
-            if attempts < 8 {
+            // An empty document here is usually the handshake, not the peer's
+            // note. Uploading now would clear `rebuilt`, and the real text
+            // would merge over the file instead of raising a conflict.
+            let attempts = slot.emptyChecks + 1
+            slot.emptyChecks = attempts
+            let peerHasNothing = slot.unavailable && !slot.sawReply && attempts >= 8
+            if !caughtUp && !peerHasNothing {
                 lock.unlock()
                 let active = link
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
@@ -838,7 +839,13 @@ private final class SyncSlot {
     var state = SyncState()
     var requested = false
     var sawReply = false
+    var unavailable = false
     var emptyChecks = 0
+}
+
+private func peerCaughtUp(_ slot: SyncSlot, _ note: NoteState) -> Bool {
+    guard slot.sawReply, let theirs = slot.state.theirHeads, !theirs.isEmpty else { return false }
+    return theirs.isSubset(of: note.doc.heads())
 }
 
 private struct NoteState {

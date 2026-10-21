@@ -10,16 +10,27 @@
  *     node tools/post-review-verdict.mjs <pr> PASS <head-sha>
  *
  * The script refuses if the pull request's current head is not that SHA.
- * It posts a comment whose first line is the verdict, then sets the
- * commit status independent-review/approved on that SHA. Calling it with
- * BLOCK again reposts the BLOCK comment and sets the failure status.
+ * On PASS it posts the comment first, then sets success, so a failed
+ * comment never turns the commit green. On BLOCK it sets failure first,
+ * then posts the comment, so a failed status write posts no comment.
+ * Calling it with BLOCK again sets failure and reposts the BLOCK comment.
+ *
+ * --check-run or REVIEW_CHECK_RUN=1 also creates a check run named
+ * independent-review/approved. That mode is off by default.
  */
+import { spawnSync } from "node:child_process";
 import { STATUS_CONTEXT, verdictLine } from "../.github/independent-review.mjs";
 
 export function scrubToken(text, token) {
   const source = String(text ?? "");
   if (!token) return source;
   return source.split(token).join("[redacted]");
+}
+
+export function checkRunEnabled(argv = [], env = {}) {
+  if (argv.includes("--check-run")) return true;
+  const flag = env.REVIEW_CHECK_RUN;
+  return flag === "1" || flag === "true";
 }
 
 export async function postReviewVerdict({
@@ -30,6 +41,7 @@ export async function postReviewVerdict({
   verdict,
   sha,
   request,
+  checkRun = false,
   log = () => {},
 }) {
   if (!token) throw new Error("GITHUB_TOKEN is required");
@@ -53,20 +65,44 @@ export async function postReviewVerdict({
     throw new Error(`PR #${prNumber} head is ${head || "missing"}, not ${normalized}`);
   }
 
-  await call(`/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
-    method: "POST",
-    body: { body: line },
-  });
-  await call(`/repos/${owner}/${repo}/statuses/${encodeURIComponent(head)}`, {
-    method: "POST",
-    body: {
-      state: verdict === "PASS" ? "success" : "failure",
-      context: STATUS_CONTEXT,
-      description: line.slice(0, 140),
-    },
-  });
+  const state = verdict === "PASS" ? "success" : "failure";
+  const postComment = () =>
+    call(`/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
+      method: "POST",
+      body: { body: line },
+    });
+  const postStatus = () =>
+    call(`/repos/${owner}/${repo}/statuses/${encodeURIComponent(head)}`, {
+      method: "POST",
+      body: {
+        state,
+        context: STATUS_CONTEXT,
+        description: line.slice(0, 140),
+      },
+    });
+  const postCheckRun = () =>
+    call(`/repos/${owner}/${repo}/check-runs`, {
+      method: "POST",
+      body: {
+        name: STATUS_CONTEXT,
+        head_sha: head,
+        status: "completed",
+        conclusion: state,
+        completed_at: new Date().toISOString(),
+      },
+    });
+
+  if (verdict === "BLOCK") {
+    await postStatus();
+    if (checkRun) await postCheckRun();
+    await postComment();
+  } else {
+    await postComment();
+    await postStatus();
+    if (checkRun) await postCheckRun();
+  }
   log(`Posted ${verdict} for PR #${prNumber} at ${head}.`);
-  return { line, state: verdict === "PASS" ? "success" : "failure", sha: head };
+  return { line, state, sha: head };
 }
 
 export async function githubRequest({ apiBase, token, pathname, method, body }) {
@@ -160,7 +196,7 @@ export function selfTest() {
     log: (message) => logs.push(message),
   });
 
-  return Promise.allSettled([pass, block, stale, leaked]).then((results) => {
+  return Promise.allSettled([pass, block, stale, leaked]).then(async (results) => {
     const [passResult, blockResult, staleResult, leakedResult] = results;
     assert(passResult.status === "fulfilled", "pass posts");
     assert(passResult.value.line === `Independent review: PASS ${sha}`, "pass first line");
@@ -172,8 +208,11 @@ export function selfTest() {
 
     assert(blockResult.status === "fulfilled", "block posts");
     assert(blockResult.value.line === `Independent review: BLOCK ${sha}`, "block first line");
-    assert(blockApi.calls[1].body.body === `Independent review: BLOCK ${sha}`, "block comment");
-    assert(blockApi.calls[2].body.state === "failure", "block status");
+    assert(blockApi.calls[1].pathname.includes("/statuses/"), "block sets status first");
+    assert(blockApi.calls[1].body.state === "failure", "block status");
+    assert(blockApi.calls[2].body.body === `Independent review: BLOCK ${sha}`, "block comment after status");
+    assert(!passApi.calls.some((call) => call.pathname.endsWith("/check-runs")), "check run stays off");
+    assert(!blockApi.calls.some((call) => call.pathname.endsWith("/check-runs")), "block check run stays off");
 
     assert(staleResult.status === "rejected", "stale head is refused");
     assert(staleApi.calls.length === 1, "stale head posts nothing");
@@ -183,8 +222,105 @@ export function selfTest() {
     assert(!String(leakedResult.reason.message).includes(token), "errors redact the token");
     assert(leakedResult.reason.message.includes("[redacted]"), "redaction marker");
     assert(logs.every((line) => !line.includes(token)), "logs hide the token");
+
+    const passCommentFails = fake(sha);
+    const savedRequest = passCommentFails.request;
+    passCommentFails.request = async (pathname, options) => {
+      if (pathname.includes("/comments")) throw new Error("comment failed");
+      return savedRequest(pathname, options);
+    };
+    const passStopped = await postReviewVerdict({
+      token,
+      owner: "MotorUnitRoot",
+      repo: "aidanos",
+      number: 40,
+      verdict: "PASS",
+      sha,
+      request: passCommentFails.request,
+      log: (message) => logs.push(message),
+    }).then(
+      () => null,
+      (error) => error,
+    );
+    assert(passStopped instanceof Error, "a failed PASS comment stops the script");
+    assert(
+      !passCommentFails.calls.some((call) => call.pathname.includes("/statuses/")),
+      "a failed PASS comment does not set success",
+    );
+
+    const blockStatusFails = spawnSync(
+      process.execPath,
+      ["--input-type=module", "--eval", blockStatusFailsSource(token, sha)],
+      { encoding: "utf8" },
+    );
+    assert(blockStatusFails.status === 1, "a failed BLOCK status exits non-zero");
+    assert(
+      !String(blockStatusFails.stdout || "").includes("comment-posted"),
+      "a failed BLOCK status posts no comment",
+    );
+
+    const withCheck = fake(sha);
+    const checked = await postReviewVerdict({
+      token,
+      owner: "MotorUnitRoot",
+      repo: "aidanos",
+      number: 40,
+      verdict: "PASS",
+      sha,
+      checkRun: true,
+      request: withCheck.request,
+      log: () => {},
+    });
+    const checkCall = withCheck.calls.find((call) => call.pathname.endsWith("/check-runs"));
+    assert(checked.state === "success", "check run follows a pass");
+    assert(withCheck.calls[1].pathname.includes("/comments"), "pass still comments first");
+    assert(withCheck.calls[2].pathname.includes("/statuses/"), "pass status before the check run");
+    assert(checkCall && checkCall.body.name === STATUS_CONTEXT, "check run name");
+    assert(checkCall.body.conclusion === "success" && checkCall.body.status === "completed", "check run conclusion");
+    assert(checkCall.body.head_sha === sha, "check run sha");
+    assert(checkRunEnabled(["--check-run"], {}), "flag enables the check run");
+    assert(checkRunEnabled([], { REVIEW_CHECK_RUN: "1" }), "env enables the check run");
+    assert(!checkRunEnabled([], {}), "check run defaults off");
+    assert(!checkRunEnabled([], { REVIEW_CHECK_RUN: "0" }), "zero does not enable the check run");
+
     console.log("post-review-verdict self-test ok");
   });
+}
+
+function blockStatusFailsSource(token, sha) {
+  const scriptUrl = new URL("./post-review-verdict.mjs", import.meta.url);
+  return `
+    import { postReviewVerdict } from ${JSON.stringify(scriptUrl.href)};
+    const token = ${JSON.stringify(token)};
+    const sha = ${JSON.stringify(sha)};
+    const state = { status: "success", comments: 0 };
+    try {
+      await postReviewVerdict({
+        token,
+        owner: "MotorUnitRoot",
+        repo: "aidanos",
+        number: 40,
+        verdict: "BLOCK",
+        sha,
+        request: async (pathname, options) => {
+          if (options.method === "GET") return { head: { sha } };
+          if (pathname.includes("/statuses/")) throw new Error("status write failed");
+          if (pathname.includes("/comments")) {
+            state.comments += 1;
+            console.log("comment-posted");
+            return {};
+          }
+          throw new Error("unexpected " + pathname);
+        },
+        log: () => {},
+      });
+      process.exit(state.status === "success" ? 0 : 4);
+    } catch (error) {
+      if (state.comments !== 0) process.exit(2);
+      if (state.status !== "success") process.exit(3);
+      process.exit(1);
+    }
+  `;
 }
 
 async function main() {
@@ -195,7 +331,7 @@ async function main() {
   if (process.env.GITHUB_ACTIONS === "true") {
     throw new Error("post-review-verdict.mjs does not run in GitHub Actions");
   }
-  const [number, verdict, sha] = process.argv.slice(2);
+  const [number, verdict, sha] = process.argv.slice(2).filter((arg) => arg !== "--check-run");
   const [owner, repo] = String(process.env.GITHUB_REPOSITORY || "").split("/");
   const apiBase = process.env.GITHUB_API_URL || "https://api.github.com";
   await postReviewVerdict({
@@ -205,6 +341,7 @@ async function main() {
     number,
     verdict,
     sha,
+    checkRun: checkRunEnabled(process.argv, process.env),
     request: (pathname, options) => githubRequest({ apiBase, pathname, ...options }),
     log: (message) => console.log(message),
   });

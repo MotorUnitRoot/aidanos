@@ -3,26 +3,27 @@
  * Independent review gate.
  *
  * A PASS counts only when all of these are true:
- * - The comment begins with "Independent review: PASS" and the current head SHA.
+ * - The first line is exactly "Independent review: PASS <sha>".
+ * - The sha is the pull request's current head. Later lines are not read.
  * - The comment has not been edited, so a later edit cannot retarget the SHA.
  * - The author is the motorunit-aidanos-bots GitHub App: login
  *   motorunit-aidanos-bots[bot] and type Bot. When performed_via_github_app
  *   is present, its id is 5413571. A user account does not count.
  *
  * A BLOCK from that App stays in force until a newer qualifying PASS
- * for this head SHA. The original body and every later version count. The
- * most restrictive version wins, so editing a BLOCK into a PASS does not
- * lift it. If the edit history cannot be read, that comment stays a BLOCK.
+ * for this head SHA. Each edit-history entry is the full text after that
+ * edit. The most restrictive version wins, so editing a BLOCK into a PASS
+ * does not lift it. The text from before the first edit is not in the
+ * history, so an edited comment stays a BLOCK. If the history cannot be
+ * read, the comment stays a BLOCK. A deleted BLOCK stays a BLOCK.
  * A bare BLOCK names no SHA and applies to the current head.
  *
- * pull_request only prints a result and exits. It must not post a status.
- * issue_comment and pull_request_target run this file from the default
- * branch and post the commit status `independent-review/approved` on the
- * PR head, using the built-in GITHUB_TOKEN. No GitHub App key is read.
- * Those runs read the head SHA from the event, never from a checkout of
- * the pull request.
+ * This file only reads. It does not post independent-review/approved.
+ * The App posts that status from tools/post-review-verdict.mjs, outside
+ * Actions. No GitHub App key is read here.
  */
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const PASS_PREFIX = "Independent review: PASS";
 const BLOCK_PREFIX = "Independent review: BLOCK";
@@ -33,22 +34,32 @@ export const REVIEW_APP_ID = 5413571;
 
 export const STATUS_CONTEXT = "independent-review/approved";
 
-export function commentKind(body, headSha) {
-  const text = String(body || "")
+export function verdictLine(verdict, sha) {
+  const normalized = String(sha || "").toLowerCase();
+  if (verdict !== "PASS" && verdict !== "BLOCK") throw new Error("verdict must be PASS or BLOCK");
+  if (!/^[0-9a-f]{40}$/.test(normalized)) throw new Error("reviewed sha must be 40 hex characters");
+  return `Independent review: ${verdict} ${normalized}`;
+}
+
+function firstLine(body) {
+  return String(body || "")
     .replace(/^\uFEFF/, "")
     .replace(/\r\n/g, "\n")
-    .trimStart();
+    .trimStart()
+    .split("\n", 1)[0]
+    .trim();
+}
+
+export function commentKind(body, headSha) {
   const sha = String(headSha || "").toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(sha)) return null;
-
-  if (/^Independent review: BLOCK(?:\s|$)/.test(text)) {
-    const named = text.match(/\b[0-9a-f]{40}\b/gi) || [];
-    if (named.length === 0) return "block";
-    if (named.some((item) => item.toLowerCase() === sha)) return "block";
-    return null;
+  const line = firstLine(body);
+  const block = line.match(/^Independent review: BLOCK(?:\s+([0-9a-fA-F]{40}))?$/);
+  if (block) {
+    if (!block[1]) return "block";
+    return block[1].toLowerCase() === sha ? "block" : null;
   }
-
-  const pass = text.match(/^Independent review: PASS\s+([0-9a-fA-F]{40})\b/);
+  const pass = line.match(/^Independent review: PASS\s+([0-9a-fA-F]{40})$/);
   if (pass && pass[1].toLowerCase() === sha) return "pass";
   return null;
 }
@@ -66,8 +77,15 @@ export function commentWasEdited(comment) {
   return comment.created_at !== comment.updated_at;
 }
 
-export function eventPublishesStatus(eventName) {
-  return eventName === "issue_comment" || eventName === "pull_request_target";
+export function eventPublishesStatus() {
+  return false;
+}
+
+export const COMMENT_PAGE_LIMIT = 1000;
+
+export function commentListComplete(page, batchLength) {
+  if (page > COMMENT_PAGE_LIMIT) throw new Error("comment list is too long");
+  return batchLength < 100;
 }
 
 function timeMs(value) {
@@ -75,149 +93,28 @@ function timeMs(value) {
   return Number.isNaN(ms) ? null : ms;
 }
 
-function splitFile(text) {
-  const source = String(text).replace(/\r\n/g, "\n");
-  if (source === "") return { lines: [], trailing: false };
-  const trailing = source.endsWith("\n");
-  const lines = source.split("\n");
-  if (trailing) lines.pop();
-  return { lines, trailing };
+function normalizeNewlines(text) {
+  return String(text ?? "").replace(/\r\n/g, "\n");
 }
 
-function joinFile(lines, trailing) {
-  if (lines.length === 0) return trailing ? "\n" : "";
-  const body = lines.join("\n");
-  return trailing ? `${body}\n` : body;
-}
-
-export function parseUnifiedDiff(diff) {
-  const text = String(diff || "").replace(/\r\n/g, "\n");
-  const raw = text.split("\n");
-  if (raw.length && raw[raw.length - 1] === "") raw.pop();
-  let index = 0;
-  while (index < raw.length && !raw[index].startsWith("@@")) index += 1;
-  if (index >= raw.length) throw new Error("diff has no hunks");
-
-  const hunks = [];
-  while (index < raw.length) {
-    const header = raw[index].match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
-    if (!header) throw new Error("bad hunk header");
-    const oldStart = Number(header[1]);
-    const oldCount = header[2] === undefined ? 1 : Number(header[2]);
-    const newStart = Number(header[3]);
-    const newCount = header[4] === undefined ? 1 : Number(header[4]);
-    index += 1;
-    const hunkLines = [];
-    let oldSeen = 0;
-    let newSeen = 0;
-    while (index < raw.length && !raw[index].startsWith("@@")) {
-      const line = raw[index];
-      index += 1;
-      if (line.startsWith("\\")) continue;
-      if (line.startsWith("+")) {
-        hunkLines.push({ type: "add", text: line.slice(1) });
-        newSeen += 1;
-      } else if (line.startsWith("-")) {
-        hunkLines.push({ type: "del", text: line.slice(1) });
-        oldSeen += 1;
-      } else if (line.startsWith(" ")) {
-        hunkLines.push({ type: "context", text: line.slice(1) });
-        oldSeen += 1;
-        newSeen += 1;
-      } else {
-        throw new Error("unexpected diff line");
-      }
-    }
-    if (oldSeen !== oldCount || newSeen !== newCount) throw new Error("hunk counts do not match");
-    hunks.push({ oldStart, oldCount, newStart, newCount, lines: hunkLines });
-  }
-  return hunks;
-}
-
-function applyReverse(newLines, hunks) {
-  const oldLines = [];
-  let cursor = 0;
-  for (const hunk of hunks) {
-    const newStart = hunk.newStart === 0 ? 0 : hunk.newStart - 1;
-    if (newStart < cursor) throw new Error("overlapping hunk");
-    while (cursor < newStart) {
-      if (cursor >= newLines.length) throw new Error("hunk starts past the end of the text");
-      oldLines.push(newLines[cursor]);
-      cursor += 1;
-    }
-    for (const line of hunk.lines) {
-      if (line.type === "del") {
-        oldLines.push(line.text);
-        continue;
-      }
-      if (newLines[cursor] !== line.text) throw new Error("diff does not match the current text");
-      if (line.type === "context") oldLines.push(line.text);
-      cursor += 1;
-    }
-  }
-  while (cursor < newLines.length) {
-    oldLines.push(newLines[cursor]);
-    cursor += 1;
-  }
-  return oldLines;
-}
-
-function applyForward(oldLines, hunks) {
-  const nextLines = [];
-  let cursor = 0;
-  for (const hunk of hunks) {
-    const oldStart = hunk.oldStart === 0 ? 0 : hunk.oldStart - 1;
-    if (oldStart < cursor) throw new Error("overlapping hunk");
-    while (cursor < oldStart) {
-      if (cursor >= oldLines.length) throw new Error("hunk starts past the end of the text");
-      nextLines.push(oldLines[cursor]);
-      cursor += 1;
-    }
-    for (const line of hunk.lines) {
-      if (line.type === "add") {
-        nextLines.push(line.text);
-        continue;
-      }
-      if (oldLines[cursor] !== line.text) throw new Error("forward diff mismatch");
-      if (line.type === "context") nextLines.push(line.text);
-      cursor += 1;
-    }
-  }
-  while (cursor < oldLines.length) {
-    nextLines.push(oldLines[cursor]);
-    cursor += 1;
-  }
-  return nextLines;
-}
-
-export function reverseUnifiedDiff(newText, diff) {
-  const hunks = parseUnifiedDiff(diff);
-  const current = splitFile(newText);
-  const oldLines = applyReverse(current.lines, hunks);
-  const roundTrip = applyForward(oldLines, hunks);
-  if (
-    roundTrip.length !== current.lines.length ||
-    roundTrip.some((line, index) => line !== current.lines[index])
-  ) {
-    throw new Error("diff did not round-trip");
-  }
-  return joinFile(oldLines, current.trailing);
+export function looksLikeUnifiedDiff(text) {
+  const line = String(text || "").replace(/^\uFEFF/, "").split(/\r?\n/, 1)[0];
+  return line.startsWith("@@ ") || line.startsWith("diff --git ") || line.startsWith("--- ");
 }
 
 export function versionsFromEdits(currentBody, createdAt, edits) {
-  const ordered = [...(edits || [])].sort((a, b) => String(a.editedAt).localeCompare(String(b.editedAt)));
+  const ordered = [...(edits || [])].sort((a, b) => String(a && a.editedAt).localeCompare(String(b && b.editedAt)));
+  if (ordered.length === 0) throw new Error("edited comment has no edit history");
+  const versions = [];
   for (const edit of ordered) {
-    if (!edit || edit.deletedAt || !edit.diff) throw new Error("edit history is incomplete");
+    if (!edit || edit.deletedAt || typeof edit.diff !== "string" || looksLikeUnifiedDiff(edit.diff)) {
+      throw new Error("edit history is incomplete");
+    }
+    versions.push({ body: edit.diff, at: edit.editedAt || createdAt });
   }
-  const afterEdit = new Array(ordered.length);
-  let body = String(currentBody ?? "");
-  for (let index = ordered.length - 1; index >= 0; index -= 1) {
-    afterEdit[index] = body;
-    body = reverseUnifiedDiff(body, ordered[index].diff);
-  }
-  const versions = [{ body, at: createdAt }];
-  for (let index = 0; index < ordered.length; index += 1) {
-    versions.push({ body: afterEdit[index], at: ordered[index].editedAt });
+  const newest = versions[versions.length - 1].body;
+  if (normalizeNewlines(newest) !== normalizeNewlines(currentBody)) {
+    throw new Error("newest edit does not match the current comment");
   }
   return versions;
 }
@@ -229,31 +126,48 @@ function versionsFor(comment) {
 
 export function attachEditHistory(comment, edits) {
   const list = edits || [];
-  comment.editDiffs = list.map((edit) => (edit && edit.diff) || "");
   if (list.length === 0) throw new Error("edited comment has no edit history");
   comment.versions = versionsFromEdits(comment.body, comment.created_at, list);
+  // userContentEdits stores the text after each edit, not the original.
+  comment.originalUnseen = true;
   return comment;
 }
 
-export function blockEffectiveAt(comment, headSha) {
-  // Missing history cannot prove the original body was clean, so an edited
-  // comment from a reviewer stays a BLOCK until a newer PASS.
-  if (comment && comment.historyUnavailable) {
-    return comment.updated_at || comment.created_at || "9999-12-31T23:59:59Z";
-  }
-  let earliest = null;
-  let earliestMs = null;
-  for (const version of versionsFor(comment)) {
-    if (commentKind(version.body, headSha) !== "block") continue;
-    const at = version.at || "9999-12-31T23:59:59Z";
+function latestTime(times) {
+  let best = null;
+  let bestMs = null;
+  for (const at of times) {
     const ms = timeMs(at);
-    const comparable = ms === null ? Number.POSITIVE_INFINITY : ms;
-    if (earliestMs === null || comparable < earliestMs) {
-      earliestMs = comparable;
-      earliest = at;
+    if (ms === null) continue;
+    if (bestMs === null || ms > bestMs) {
+      bestMs = ms;
+      best = at;
     }
   }
-  return earliest;
+  return best || times[0] || null;
+}
+
+export function blockEffectiveAt(comment, headSha) {
+  if (!comment) return null;
+  // Missing history cannot prove the comment was never a BLOCK.
+  if (comment.historyUnavailable) {
+    return comment.deletedBlockAt || comment.updated_at || comment.created_at || "9999-12-31T23:59:59Z";
+  }
+  const times = [];
+  for (const version of versionsFor(comment)) {
+    if (commentKind(version.body, headSha) !== "block") continue;
+    times.push(version.at || "9999-12-31T23:59:59Z");
+  }
+  if (comment.originalUnseen) times.push(comment.created_at || "9999-12-31T23:59:59Z");
+  if (comment.deletedBlockAt && times.length) times.push(comment.deletedBlockAt);
+  if (!times.length) return null;
+  return latestTime(times);
+}
+
+export function deletedCommentForcesBlock(comment, headSha) {
+  if (!isReviewBot(comment)) return false;
+  if (comment.historyUnavailable || comment.originalUnseen || commentWasEdited(comment)) return true;
+  return commentKind(comment.body, headSha) === "block";
 }
 
 export function isQualifyingPass(comment, headSha) {
@@ -298,8 +212,8 @@ export function summaryFor(result, headSha) {
     `Head SHA: \`${headSha}\`.`,
     "",
     `Only an unedited PASS from ${REVIEW_APP_LOGIN} counts.`,
-    "A BLOCK stays in force until a newer PASS for this SHA. Editing a BLOCK does not lift it.",
-    `The binding result is the commit status \`${STATUS_CONTEXT}\`, posted only from main.`,
+    "A BLOCK stays in force until a newer PASS for this SHA. Editing or deleting a BLOCK does not lift it.",
+    `The binding result is the commit status \`${STATUS_CONTEXT}\`, posted by the App outside Actions.`,
   ];
   if (result.reason === "pass") {
     const ids = result.pass.map((comment) => comment.id).filter(Boolean).join(", ");
@@ -342,7 +256,7 @@ export function selfTest() {
   const cases = [
     ["exact pass", `Independent review: PASS ${sha}`, sha, "pass"],
     ["leading space and note", `  Independent review: PASS ${sha}\nlooks good`, sha, "pass"],
-    ["sha on next line", `Independent review: PASS\n${sha}`, sha, "pass"],
+    ["sha on next line", `Independent review: PASS\n${sha}`, sha, null],
     ["uppercase hex", `Independent review: PASS ${sha.toUpperCase()}`, sha, "pass"],
     ["other sha", `Independent review: PASS ${other}`, sha, null],
     ["not at the start", `Note: Independent review: PASS ${sha}`, sha, null],
@@ -391,9 +305,16 @@ export function selfTest() {
   assert(!commentWasEdited({ created_at: stamp, updated_at: stamp }), "unedited");
   assert(!commentWasEdited({ body: "no timestamps" }), "timestamps absent");
   assert(commentWasEdited({ created_at: stamp, updated_at: "2026-10-18T00:00:01Z" }), "edited");
-  assert(eventPublishesStatus("issue_comment"), "comment job publishes");
-  assert(eventPublishesStatus("pull_request_target"), "target job publishes");
-  assert(!eventPublishesStatus("pull_request"), "advisory job does not publish");
+  assert(!eventPublishesStatus(), "actions does not publish the status");
+  assert(commentListComplete(1, 100) === false, "full page continues");
+  assert(commentListComplete(2, 3) === true, "short page ends");
+  let tooLong = false;
+  try {
+    commentListComplete(COMMENT_PAGE_LIMIT + 1, 100);
+  } catch {
+    tooLong = true;
+  }
+  assert(tooLong, "comment paging fails closed past the last page");
   assert(STATUS_CONTEXT === "independent-review/approved", "status context");
 
   const t0 = "2026-10-18T00:00:00Z";
@@ -453,6 +374,11 @@ export function selfTest() {
   });
   const retargeted = classifyReview([retarget], sha);
   assert(retargeted.conclusion === "failure" && retargeted.reason === "missing", "an edited pass cannot name this sha");
+  const unseen = classifyReview(
+    [reviewComment(13, `${PASS_PREFIX} ${sha}`, t0, { updated_at: t1, originalUnseen: true })],
+    sha,
+  );
+  assert(unseen.conclusion === "failure" && unseen.reason === "block", "an unseen original stays a block");
 
   const becameBlock = reviewComment(14, BLOCK_PREFIX, t0, {
     updated_at: t2,
@@ -516,26 +442,54 @@ export function selfTest() {
   }
   assert(missingHistory, "edited comment with no history fails closed");
 
-  const current = `${PASS_PREFIX} ${sha}`;
-  const diffToPass = `@@ -1 +1 @@\n-${BLOCK_PREFIX}\n+${current}\n`;
-  assert(reverseUnifiedDiff(current, diffToPass) === BLOCK_PREFIX, "reverse a one-line edit");
-  const withHeader = `diff --git a/body b/body\n--- a/body\n+++ b/body\n${diffToPass}`;
-  assert(reverseUnifiedDiff(current, withHeader) === BLOCK_PREFIX, "reverse ignores git headers");
-  const oldLines = `${BLOCK_PREFIX}\nstill wrong`;
-  const newLines = `${current}\nstill wrong`;
-  const contextDiff = `@@ -1,2 +1,2 @@\n-${BLOCK_PREFIX}\n+${current}\n still wrong\n`;
-  assert(reverseUnifiedDiff(newLines, contextDiff) === oldLines, "reverse keeps surrounding lines");
+  const below = `Independent review: BLOCK ${sha}\nalso see ${other}`;
+  assert(commentKind(below, sha) === "block", "another sha below does not hide a block");
+  const wrongFirst = `Independent review: BLOCK ${other}\n${sha}`;
+  assert(commentKind(wrongFirst, sha) === null, "the sha is read only from the first line");
+  const bareBelow = `Independent review: BLOCK\nsee ${other}`;
+  assert(commentKind(bareBelow, sha) === "block", "a bare block ignores a later sha");
+  assert(verdictLine("PASS", sha) === `${PASS_PREFIX} ${sha}`, "pass line");
+  assert(commentKind(verdictLine("BLOCK", sha), sha) === "block", "block line");
 
-  const versions = versionsFromEdits(current, t0, [
-    { editedAt: t1, diff: `@@ -1 +1 @@\n-thanks\n+${BLOCK_PREFIX}\n` },
-    { editedAt: t2, diff: diffToPass },
-  ]);
-  assert(versions[0].body === "thanks" && versions[0].at === t0, "original body");
-  assert(versions[1].body === BLOCK_PREFIX && versions[1].at === t1, "middle body");
-  assert(versions[2].body === current && versions[2].at === t2, "current body");
+  const deletedBlock = classifyReview(
+    [
+      reviewComment(23, `${PASS_PREFIX} ${sha}`, t1),
+      reviewComment(24, `${BLOCK_PREFIX} ${sha}`, t0, { deletedBlockAt: t2 }),
+    ],
+    sha,
+  );
+  assert(deletedBlock.reason === "block", "deleting a block keeps the commit blocked");
+  const deletedPass = reviewComment(25, `${PASS_PREFIX} ${sha}`, t0);
+  assert(!deletedCommentForcesBlock(deletedPass, sha), "a deleted pass is not a block");
+  assert(
+    deletedCommentForcesBlock(reviewComment(26, `${BLOCK_PREFIX} ${sha}`, t0), sha),
+    "a deleted block forces a block",
+  );
+
+  const fixtureUrl = new URL("./fixtures/user-content-edit.json", import.meta.url);
+  const fixture = JSON.parse(fs.readFileSync(fileURLToPath(fixtureUrl), "utf8"));
+  assert(fixture.edits[0].diff === fixture.body, "newest recorded edit is the full comment");
+  assert(fixture.edits[1].diff !== fixture.body, "older recorded edit is an earlier full comment");
+  assert(!looksLikeUnifiedDiff(fixture.edits[0].diff), "recorded edit is not a unified diff");
+  const recorded = versionsFromEdits(fixture.body, fixture.createdAt, fixture.edits);
+  assert(recorded[recorded.length - 1].body === fixture.body, "versions keep the full text");
+  assert(recorded[0].body === fixture.edits[1].diff, "older version is the earlier full text");
+  const recordedComment = reviewComment(27, fixture.body, fixture.createdAt, {
+    updated_at: fixture.updatedAt,
+  });
+  attachEditHistory(recordedComment, fixture.edits);
+  assert(recordedComment.originalUnseen === true, "the pre-edit text is unseen");
+  assert(classifyReview([recordedComment], sha).reason === "block", "unseen original fails closed");
+  let patchRejected = false;
+  try {
+    versionsFromEdits("b", t0, [{ editedAt: t1, diff: "@@ -1 +1 @@\n-a\n+b\n" }]);
+  } catch {
+    patchRejected = true;
+  }
+  assert(patchRejected, "a unified diff fails closed");
   let threw = false;
   try {
-    versionsFromEdits(current, t0, [{ editedAt: t1, diff: null, deletedAt: t2 }]);
+    versionsFromEdits("b", t0, [{ editedAt: t1, diff: null, deletedAt: t2 }]);
   } catch {
     threw = true;
   }
@@ -584,12 +538,12 @@ async function ghGraphql(query, variables) {
 
 async function listComments(owner, repo, number) {
   const comments = [];
-  for (let page = 1; page <= 20; page += 1) {
+  for (let page = 1; ; page += 1) {
     const batch = await gh(`/repos/${owner}/${repo}/issues/${number}/comments?per_page=100&page=${page}`);
+    if (!Array.isArray(batch)) throw new Error("comment page is not a list");
     comments.push(...batch);
-    if (batch.length < 100) break;
+    if (commentListComplete(page, batch.length)) return comments;
   }
-  return comments;
 }
 
 async function listEdits(nodeId) {
@@ -612,7 +566,11 @@ async function listEdits(nodeId) {
     const connection = data && data.node && data.node.userContentEdits;
     if (!connection) throw new Error("edit history is missing");
     const nodes = connection.nodes || [];
-    if (nodes.some((node) => !node || node.deletedAt || !node.diff)) {
+    if (
+      nodes.some(
+        (node) => !node || node.deletedAt || typeof node.diff !== "string" || looksLikeUnifiedDiff(node.diff),
+      )
+    ) {
       throw new Error("edit history is incomplete");
     }
     edits.push(...nodes);
@@ -647,22 +605,6 @@ async function commentsFromReviewers(comments) {
     accepted.push(comment);
   }
   return accepted;
-}
-
-async function publishStatus(owner, repo, headSha, conclusion, summary) {
-  const server = process.env.GITHUB_SERVER_URL || "https://github.com";
-  const runId = process.env.GITHUB_RUN_ID;
-  const repository = process.env.GITHUB_REPOSITORY;
-  const description = summary.split("\n").find((line) => line.trim()) || "Independent review";
-  await gh(`/repos/${owner}/${repo}/statuses/${headSha}`, {
-    method: "POST",
-    body: {
-      state: conclusion === "success" ? "success" : "failure",
-      context: STATUS_CONTEXT,
-      description: description.slice(0, 140),
-      target_url: runId && repository ? `${server}/${repository}/actions/runs/${runId}` : undefined,
-    },
-  });
 }
 
 function writeStepSummary(summary) {
@@ -710,18 +652,33 @@ async function main() {
   }
 
   const comments = await commentsFromReviewers(await listComments(owner, repo, number));
+  if (eventName === "issue_comment" && event.action === "deleted" && event.comment) {
+    const deleted = event.comment;
+    if (isReviewBot(deleted)) {
+      if (commentWasEdited(deleted)) {
+        try {
+          attachEditHistory(deleted, await listEdits(deleted.node_id));
+        } catch (error) {
+          console.log(`Could not reconstruct deleted comment ${deleted.id}: ${error.message}`);
+          deleted.historyUnavailable = true;
+        }
+      } else {
+        deleted.versions = [{ body: deleted.body, at: deleted.created_at }];
+      }
+      if (deletedCommentForcesBlock(deleted, headSha)) {
+        deleted.deletedBlockAt = new Date().toISOString();
+        comments.push(deleted);
+        console.log(`Deleted review comment ${deleted.id || "?"} stays in force.`);
+      }
+    }
+  }
   const result = classifyReview(comments, headSha);
   const summary = summaryFor(result, headSha);
   console.log(summary);
   writeStepSummary(summary);
 
-  if (eventPublishesStatus(eventName)) {
-    // Workflow source for these events is the default branch. Publish onto
-    // the PR head and leave this job green when the review is missing.
-    await publishStatus(owner, repo, headSha, result.conclusion, summary);
-    return;
-  }
-
+  // No verdict yet is not a failure. Actions does not post the binding status.
+  if (result.reason === "missing") return;
   if (result.conclusion !== "success") process.exitCode = 1;
 }
 

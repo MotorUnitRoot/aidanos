@@ -1,15 +1,16 @@
 name: independent-review
 
-# The binding gate is the commit status `independent-review/approved`.
-# Only the job below posts it, and only for events whose workflow file
-# comes from the default branch: issue_comment, and pull_request_target.
-# A pull request cannot change that file until it is merged.
+# Advisory signal only. This workflow does not post
+# independent-review/approved and has no statuses or checks write.
+# The motorunit-aidanos-bots App posts that status from outside Actions.
 #
-# pull_request_target re-evaluates on open, push, and reopen. It checks
-# out github.sha, which is the base branch, and never checks out or runs
-# the pull request head. The head SHA is taken from the event payload.
-# Until this file is on main, a push does not post the status; a later
-# comment still does, through the copy of this file already on main.
+# One run at a time per pull request. cancel-in-progress is off so a
+# slow PASS run cannot finish after a BLOCK run and become the latest
+# advisory result.
+concurrency:
+  group: independent-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
 on:
   pull_request:
     branches: [main]
@@ -17,7 +18,7 @@ on:
     types: [opened, synchronize, reopened]
     branches: [main]
   issue_comment:
-    types: [created, edited]
+    types: [created, edited, deleted]
 
 permissions:
   contents: read
@@ -27,9 +28,8 @@ jobs:
     if: github.event_name == 'pull_request'
     name: independent-review (advisory)
     runs-on: ubuntu-latest
-    # Early signal only. A pull request can change this job, so it stays
-    # read-only and must not post independent-review/approved.
-    # issues: read lists conversation comments; pull-requests: read does not.
+    # Early signal only. A pull request can change this job. It stays
+    # read-only. issues: read lists conversation comments.
     permissions:
       contents: read
       pull-requests: read
@@ -46,22 +46,22 @@ jobs:
         with:
           node-version: "22"
       - name: Self-test
-        run: node .github/independent-review.mjs --self-test
+        run: node .github/independent-review.mjs --self-test && node tools/post-review-verdict.mjs --self-test
       - name: Advisory review signal for this head
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node .github/independent-review.mjs
 
   # Default-branch workflow only. Checkout stays on github.sha.
-  independent-review-status:
+  # Read-only: this job must not post the binding status.
+  independent-review-advisory-from-main:
     if: github.event_name == 'pull_request_target' || (github.event_name == 'issue_comment' && github.event.issue.pull_request)
-    name: independent-review-status
+    name: independent-review (advisory, from main)
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
       issues: read
-      statuses: write
     steps:
       - name: Checkout default branch
         # v5.1.0 — base branch SHA, never the pull request head.
@@ -75,9 +75,8 @@ jobs:
         with:
           node-version: "22"
       - name: Self-test
-        run: node .github/independent-review.mjs --self-test
-      - name: Post independent-review/approved on the PR head
-        # Built-in GITHUB_TOKEN only. No GitHub App key is stored in Actions.
+        run: node .github/independent-review.mjs --self-test && node tools/post-review-verdict.mjs --self-test
+      - name: Advisory review signal for this head
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node .github/independent-review.mjs

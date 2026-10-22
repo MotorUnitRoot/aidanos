@@ -2408,19 +2408,19 @@ function renderElsewhereChoices(conflicts) {
     return;
   }
   for (const line of choice.lines) {
+    const row = document.createElement("div");
+    row.className = "choice-row";
     const kicker = document.createElement("p");
     kicker.className = "conflict-kicker";
     kicker.textContent = line.label;
-    const actions = document.createElement("div");
-    actions.className = "conflict-actions";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "hairline-button";
     button.textContent = "Open";
     button.setAttribute("data-choice-date", line.date);
-    actions.appendChild(button);
-    box.appendChild(kicker);
-    box.appendChild(actions);
+    row.appendChild(kicker);
+    row.appendChild(button);
+    box.appendChild(row);
   }
   if (choice.more) {
     const more = document.createElement("p");

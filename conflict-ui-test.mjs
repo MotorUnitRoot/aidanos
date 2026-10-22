@@ -47,6 +47,10 @@ assert(html.includes("This note was also changed on your other device."), "the c
 assert(!src.includes("This page changed on disk."), "the old heading is gone");
 assert(src.includes('pathEl.hidden = true'), "the bare date under the heading is hidden");
 assert(src.includes('textContent = "Open"'), "each off-page conflict has Open");
+assert(src.includes('row.className = "choice-row"'), "Open sits on the choice line");
+assert(src.includes("row.appendChild(kicker)") && src.includes("row.appendChild(button)"), "the label and Open share one row");
+assert(css.includes("#conflict-waiting .choice-row"), "the choice row is a line");
+assert(/#conflict-waiting \.choice-row \{[^}]*justify-content:\s*space-between/.test(css), "Open sits at the right end of the line");
 assert(src.includes('more."'), "several pages end with and N more");
 assert(src.includes("function needsChoiceLine("), "the choice line is computed");
 assert(!src.includes("Tuesday, October 20 needs a choice"), "the weekday is not hard-coded");

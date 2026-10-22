@@ -352,7 +352,7 @@ public final class AidanSession: SyncHost {
         return Array(slots.keys)
     }
 
-    func takeOutgoing(docId: String) -> (type: String, bytes: Data)? {
+    func takeOutgoing(docId: String) -> (type: String, bytes: Data, heads: String)? {
         lock.lock()
         defer { lock.unlock() }
         guard let slot = slots[docId], let doc = documentLocked(docId) else { return nil }
@@ -360,7 +360,14 @@ public final class AidanSession: SyncHost {
         guard let message = doc.generateSyncMessage(state: slot.state), !message.isEmpty else { return nil }
         let type = slot.requested ? "sync" : "request"
         slot.requested = true
-        return (type, message)
+        return (type, message, SyncLog.heads(doc.heads()))
+    }
+
+    func syncHeads(docId: String) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let doc = documentLocked(docId) else { return "" }
+        return SyncLog.heads(doc.heads())
     }
 
     func applyIncoming(docId: String, bytes: Data) throws {

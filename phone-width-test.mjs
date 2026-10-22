@@ -229,7 +229,8 @@ try {
       const rows = box.querySelectorAll(".choice-row").length;
       const text = box.textContent || "";
       if (rows !== 3) return "rows " + rows;
-      if (!text.includes("and 1 more.")) return text;
+      if (!text.includes("and 1 more")) return text;
+      if (text.includes("and 1 more.")) return "full stop";
       return true;
     })()`);
     if (last === true) break;
@@ -252,11 +253,15 @@ try {
       }
     }
     const rows = [...document.querySelectorAll("#conflict-waiting .choice-row")].map((row, index, all) => {
-      const label = row.querySelector(".conflict-kicker").getBoundingClientRect();
-      const button = row.querySelector("button").getBoundingClientRect();
+      const labelEl = row.querySelector(".conflict-kicker");
+      const buttonEl = row.querySelector("button");
+      const label = labelEl.getBoundingClientRect();
+      const button = buttonEl.getBoundingClientRect();
       const next = all[index + 1] ? all[index + 1].getBoundingClientRect() : null;
       return {
-        label: row.querySelector(".conflict-kicker").textContent,
+        label: labelEl.textContent,
+        buttonText: buttonEl.textContent,
+        aria: buttonEl.getAttribute("aria-label"),
         buttonRightOfLabel: button.left >= label.right - 1,
         sharesRow: button.top < label.bottom && button.bottom > label.top,
         gap: next ? next.top - row.getBoundingClientRect().bottom : null,
@@ -287,6 +292,8 @@ try {
   for (const row of phone.rows) {
     assert(row.buttonRightOfLabel && row.sharesRow, "Open is on the line at 390 " + JSON.stringify(row));
     assert(row.label.endsWith(" needs a choice"), row.label);
+    assert(row.buttonText === "Open", "visible button text " + row.buttonText);
+    assert(row.aria === "Open " + row.label.replace(/ needs a choice$/, ""), "screen reader label " + row.aria);
     if (row.gap !== null) assert(row.gap >= 8, "rows touch " + row.gap);
   }
 

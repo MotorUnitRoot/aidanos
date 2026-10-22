@@ -41,6 +41,7 @@ final class RelayLink {
             self?.readLoop()
         }
         try send(encodeJoin(senderId: peerId, storageId: storageId))
+        SyncLog.write("sync out join")
         let wait = joined.wait(timeout: .now() + 15)
         if wait == .timedOut {
             close()
@@ -82,8 +83,12 @@ final class RelayLink {
             } catch {
                 return
             }
+            SyncLog.write("sync out \(outgoing.type) doc=\(docId) heads=\(outgoing.heads)")
             host.noteSent(docId: docId)
             sent += 1
+        }
+        if sent == 16 {
+            SyncLog.write("sync cap 16 doc=\(docId)")
         }
         if sent == 0 {
             host.settled(docId: docId)
@@ -149,6 +154,7 @@ final class RelayLink {
         switch type {
         case "peer":
             serverId = message["senderId"]?.textValue ?? ""
+            SyncLog.write("sync in peer")
             let callback = ready
             ready = nil
             failed = nil
@@ -157,9 +163,12 @@ final class RelayLink {
         case "sync", "request":
             guard let docId = message["documentId"]?.textValue, let bytes = message["data"]?.bytesValue else { return }
             try host?.applyIncoming(docId: docId, bytes: bytes)
+            let heads = host?.syncHeads(docId: docId) ?? ""
+            SyncLog.write("sync in \(type) doc=\(docId) heads=\(heads)")
             pump(docId)
         case "doc-unavailable":
             if let docId = message["documentId"]?.textValue {
+                SyncLog.write("sync in doc-unavailable doc=\(docId)")
                 host?.markUnavailable(docId: docId)
                 pump(docId)
             }
@@ -372,7 +381,8 @@ private final class ErrorBox: @unchecked Sendable {
 protocol SyncHost: AnyObject {
     var maxSyncBytes: Int { get }
     func documentIds() -> [String]
-    func takeOutgoing(docId: String) -> (type: String, bytes: Data)?
+    func takeOutgoing(docId: String) -> (type: String, bytes: Data, heads: String)?
+    func syncHeads(docId: String) -> String
     func applyIncoming(docId: String, bytes: Data) throws
     func markUnavailable(docId: String)
     func settled(docId: String)

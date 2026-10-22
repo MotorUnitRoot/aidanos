@@ -85,20 +85,45 @@ function conflictDate(item) {
   return match ? match[1] : "";
 }
 
-function elsewhereConflicts(conflicts, openDate) {
-  const seen = new Set();
-  const dates = [];
-  for (const item of conflicts || []) {
-    const date = conflictDate(item);
-    if (!date || date === openDate || seen.has(date)) continue;
-    seen.add(date);
-    dates.push(date);
+function noteChoiceTitle(path) {
+  const parts = String(path || "").replace(/\\/g, "/").replace(/\.md$/i, "").split("/").filter(Boolean);
+  return (parts.length ? parts[parts.length - 1] : "") || "note";
+}
+
+function choiceTarget(item) {
+  const rel = String(item && item.path || "").replace(/\\/g, "/");
+  const date = conflictDate(item);
+  if (date) {
+    const path = rel || "log/" + date + ".md";
+    return { key: path, date: date, path: path, name: formatPaperTitle(date) };
   }
-  dates.sort();
-  const shown = dates.slice(0, 3);
+  if (!rel || /^log\//.test(rel)) return null;
+  return { key: rel, date: "", path: rel, name: noteChoiceTitle(rel) };
+}
+
+function elsewhereConflicts(conflicts, open) {
+  const openDate = typeof open === "string" ? open : (open && open.date) || "";
+  const openPath = typeof open === "string" ? "" : String(open && open.path || "").replace(/\\/g, "/");
+  const seen = new Set();
+  const rows = [];
+  for (const item of conflicts || []) {
+    const target = choiceTarget(item);
+    if (!target || seen.has(target.key)) continue;
+    if (target.date && target.date === openDate) continue;
+    if (openPath && target.path === openPath) continue;
+    seen.add(target.key);
+    rows.push(target);
+  }
+  rows.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  const shown = rows.slice(0, 3);
   return {
-    lines: shown.map((date) => ({ date: date, label: needsChoiceLine(date) })),
-    more: Math.max(0, dates.length - shown.length),
+    lines: shown.map((row) => ({
+      date: row.date,
+      path: row.path,
+      name: row.name,
+      label: row.name + " needs a choice",
+    })),
+    more: Math.max(0, rows.length - shown.length),
   };
 }
 
@@ -2392,6 +2417,21 @@ async function resolveGitJoin() {
   }
 }
 
+function reloadClearedPage(info) {
+  if (!info) return;
+  if (info.kind === "note" && info.path) {
+    api("/api/file?path=" + encodeURIComponent(info.path)).then((body) => {
+      if (!paperConflict) applyRemoteNote(body);
+    }).catch(() => {});
+    return;
+  }
+  if (info.date) {
+    api("/api/day?date=" + encodeURIComponent(info.date)).then((day) => {
+      if (!paperConflict && state.day && state.day.date === info.date) applyRemoteDay(day);
+    }).catch(() => {});
+  }
+}
+
 function renderElsewhereChoices(conflicts) {
   const box = $("conflict-waiting");
   if (!box) return;
@@ -2401,7 +2441,8 @@ function renderElsewhereChoices(conflicts) {
     return;
   }
   const openDate = !isNoteDoc() && state.day ? state.day.date : "";
-  const choice = elsewhereConflicts(conflicts, openDate);
+  const openPath = isNoteDoc() && state.doc ? String(state.doc.path || "").replace(/\\/g, "/") : "";
+  const choice = elsewhereConflicts(conflicts, { date: openDate, path: openPath });
   box.replaceChildren();
   if (!choice.lines.length) {
     box.hidden = true;
@@ -2417,7 +2458,9 @@ function renderElsewhereChoices(conflicts) {
     button.type = "button";
     button.className = "hairline-button";
     button.textContent = "Open";
-    button.setAttribute("data-choice-date", line.date);
+    button.setAttribute("aria-label", "Open " + line.name);
+    if (line.date) button.setAttribute("data-choice-date", line.date);
+    else button.setAttribute("data-choice-path", line.path);
     row.appendChild(kicker);
     row.appendChild(button);
     box.appendChild(row);
@@ -2425,7 +2468,7 @@ function renderElsewhereChoices(conflicts) {
   if (choice.more) {
     const more = document.createElement("p");
     more.className = "conflict-kicker";
-    more.textContent = "and " + choice.more + " more.";
+    more.textContent = "and " + choice.more + " more";
     box.appendChild(more);
   }
   box.hidden = false;
@@ -2439,22 +2482,18 @@ function surfaceGitConflict(data) {
     renderElsewhereChoices(conflicts);
     const match = gitConflictForOpenPage(conflicts);
     if (match && String(match.mine || "") !== String(match.theirs || "")) openGitConflict(match);
-    else if (paperConflict && paperConflict.git && !document.body.classList.contains("conflict-edit")) closePaperConflict();
+    else if (paperConflict && paperConflict.git && !document.body.classList.contains("conflict-edit")) {
+      const info = paperConflict;
+      closePaperConflict();
+      reloadClearedPage(info);
+    }
     return;
   }
   renderElsewhereChoices([]);
   if (paperConflict && paperConflict.git && !document.body.classList.contains("conflict-edit")) {
     const info = paperConflict;
     closePaperConflict();
-    if (info.kind === "note" && info.path) {
-      api("/api/file?path=" + encodeURIComponent(info.path)).then((body) => {
-        if (!paperConflict) applyRemoteNote(body);
-      }).catch(() => {});
-    } else if (info.date) {
-      api("/api/day?date=" + encodeURIComponent(info.date)).then((day) => {
-        if (!paperConflict && state.day && state.day.date === info.date) applyRemoteDay(day);
-      }).catch(() => {});
-    }
+    reloadClearedPage(info);
   }
   if (data.join && !paperConflict && currentView() === "today") {
     openGitJoin();
@@ -5942,11 +5981,12 @@ function syncFmtBarForKeyboard() {
   if (join) join.addEventListener("click", () => { resolveGitJoin().catch(() => {}); });
   const waiting = $("conflict-waiting");
   if (waiting) waiting.addEventListener("click", (e) => {
-    const button = e.target && e.target.closest ? e.target.closest("[data-choice-date]") : null;
+    const button = e.target && e.target.closest ? e.target.closest("[data-choice-date], [data-choice-path]") : null;
     if (!button) return;
     const date = button.getAttribute("data-choice-date");
-    if (!date) return;
-    openDay(date, { force: true }).catch((err) => setStatus(String(err && err.message || err), "error"));
+    const path = button.getAttribute("data-choice-path");
+    const open = date ? openDay(date, { force: true }) : path ? openVaultNote(path) : null;
+    if (open) open.catch((err) => setStatus(String(err && err.message || err), "error"));
   });
 })();
 

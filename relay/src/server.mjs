@@ -13,6 +13,7 @@ import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import { createMirror } from "./mirror.mjs";
 import { logSafe, stampLine } from "./redact.mjs";
+import { logSyncFrame } from "./sync-log.mjs";
 
 const DEFAULT_PORT = 3750;
 const MIN_TOKEN_LENGTH = 32;
@@ -246,6 +247,14 @@ export async function startRelay(options = {}) {
         ws.on("error", (error) => {
           logSafe(secrets, "sync connection closed:", error instanceof Error ? error.message : error);
         });
+        ws.on("message", (data) => {
+          logSyncFrame("in", data, secrets);
+        });
+        const send = ws.send;
+        ws.send = function sendLogged(...args) {
+          logSyncFrame("out", args[0], secrets);
+          return send.apply(ws, args);
+        };
         logSafe(secrets, "accepted a sync connection");
         wss.emit("connection", ws, req);
       });

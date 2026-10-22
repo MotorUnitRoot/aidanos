@@ -277,6 +277,35 @@ final class SyncTests: XCTestCase {
         XCTAssertEqual(secondDone.wait(timeout: .now() + 5), .success)
     }
 
+    func testStalledConnectLeavesAnotherQueueFree() throws {
+        let stall = try StallServer()
+        defer { stall.stop() }
+        let session = try AidanSession(vault: try temporaryVault())
+        let blocked = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            try? session.connect(relayURL: stall.url, token: testToken)
+            blocked.signal()
+        }
+        XCTAssertTrue(try waitUntil(seconds: 3) {
+            session.connection == .connecting || session.connection == .reconnecting
+        })
+        let free = DispatchSemaphore(value: 0)
+        let started = Date()
+        DispatchQueue.global(qos: .userInitiated).async {
+            free.signal()
+        }
+        XCTAssertEqual(free.wait(timeout: .now() + 0.5), .success)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.5)
+        stall.stop()
+        XCTAssertEqual(blocked.wait(timeout: .now() + 5), .success)
+    }
+
+    func testSyncLogNamesHeadsAndTime() {
+        let line = SyncLog.format("sync out request doc=abc heads=aa,bb", at: Date(timeIntervalSince1970: 1_761_091_323))
+        let pattern = #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z sync out request doc=abc heads=aa,bb\n$"#
+        XCTAssertNotNil(line.range(of: pattern, options: .regularExpression), line)
+    }
+
     func testRebuiltTypingBeforeRelayAnswers() throws {
         let relay = try TestRelay.start()
         defer { relay.stop() }

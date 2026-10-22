@@ -51,7 +51,11 @@ assert(src.includes('row.className = "choice-row"'), "Open sits on the choice li
 assert(src.includes("row.appendChild(kicker)") && src.includes("row.appendChild(button)"), "the label and Open share one row");
 assert(css.includes("#conflict-waiting .choice-row"), "the choice row is a line");
 assert(/#conflict-waiting \.choice-row \{[^}]*justify-content:\s*space-between/.test(css), "Open sits at the right end of the line");
-assert(src.includes('more."'), "several pages end with and N more");
+assert(src.includes('and " + choice.more + " more"'), "several pages end with and N more");
+assert(!src.includes('and " + choice.more + " more."'), "and N more has no full stop");
+assert(src.includes('setAttribute("aria-label", "Open " + line.name)'), "Open names its page for a screen reader");
+assert(src.includes("function reloadClearedPage("), "a cleared page reloads its text");
+assert(src.includes("reloadClearedPage(info)"), "reload runs when the open page's conflict clears");
 assert(src.includes("function needsChoiceLine("), "the choice line is computed");
 assert(!src.includes("Tuesday, October 20 needs a choice"), "the weekday is not hard-coded");
 
@@ -75,6 +79,22 @@ assert(listed.lines[1].label === "Monday, October 19 needs a choice", listed.lin
 assert(listed.lines[2].label === "Tuesday, October 20 needs a choice", listed.lines[2] && listed.lines[2].label);
 const here = sandbox.elsewhereConflicts([{ date: "2026-10-20" }], "2026-10-20");
 assert(here.lines.length === 0 && here.more === 0, "the open page is not listed again");
+const mixed = sandbox.elsewhereConflicts([
+  { path: "notes/Kitchen remodel.md" },
+  { date: "2026-10-20", path: "log/2026-10-20.md" },
+  { path: "notes/Other.md" },
+  { date: "2026-10-21" },
+], "2026-10-22");
+assert(mixed.lines.length === 3, "days and notes share three lines");
+assert(mixed.more === 1, "and 1 more counts both kinds");
+assert(mixed.lines[0].label === "Tuesday, October 20 needs a choice", mixed.lines[0] && mixed.lines[0].label);
+assert(mixed.lines[2].label === "Kitchen remodel needs a choice", mixed.lines[2] && mixed.lines[2].label);
+assert(mixed.lines[2].name === "Kitchen remodel", "the note title is the screen-reader name");
+const onNote = sandbox.elsewhereConflicts([
+  { path: "notes/Kitchen remodel.md" },
+  { date: "2026-10-20" },
+], { date: "", path: "notes/Kitchen remodel.md" });
+assert(onNote.lines.length === 1 && onNote.lines[0].date === "2026-10-20", "the open note is left off the list");
 
 assert(css.includes(".conflict-sheet"), "conflict styles");
 assert(!css.includes("body.view-door .conflict-sheet"), "conflict is not Door-skinned");

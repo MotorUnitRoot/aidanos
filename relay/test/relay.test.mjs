@@ -12,6 +12,8 @@ import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
 import { logSafe, redact, stampLine } from "../src/redact.mjs";
+import { cbor } from "@automerge/automerge-repo";
+import { describeSyncFrame, logSyncFrame } from "../src/sync-log.mjs";
 import { LAN_WARNING, MAX_PAYLOAD, loadToken, nodeRequirement, parseArgs, startRelay, startupLines } from "../src/server.mjs";
 
 const TOKEN = "aidanos-test-token-0123456789abcdef";
@@ -71,6 +73,39 @@ test("every relay log line starts with a timestamp", () => {
     console.error = write;
   }
   assert.match(seen[0], /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z LISTENING 127\.0\.0\.1 3757$/);
+});
+
+test("a sync frame log names the type, document, and heads", () => {
+  let doc = Automerge.from({ text: "hello" });
+  const heads = Automerge.getHeads(doc);
+  const [, message] = Automerge.generateSyncMessage(doc, Automerge.initSyncState());
+  assert.ok(message);
+  const frame = cbor.encode({
+    type: "request",
+    senderId: "phone",
+    targetId: "relay",
+    documentId: "doc-1",
+    data: message,
+  });
+  const line = describeSyncFrame("out", frame);
+  assert.equal(line.startsWith("sync out request doc=doc-1 heads="), true);
+  assert.equal(line.includes(String(heads[0])), true);
+  const unavailable = cbor.encode({ type: "doc-unavailable", documentId: "doc-1", senderId: "relay" });
+  assert.equal(describeSyncFrame("in", unavailable), "sync in doc-unavailable doc=doc-1");
+  assert.equal(describeSyncFrame("out", cbor.encode({ type: "join", senderId: "phone" })), "sync out join");
+  assert.equal(describeSyncFrame("in", cbor.encode({ type: "peer", senderId: "relay" })), "sync in peer");
+  assert.equal(describeSyncFrame("in", Buffer.from([0xff, 0x00])), "");
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(text);
+  try {
+    logSyncFrame("out", frame, []);
+    logSyncFrame("in", Buffer.from([0xff]), []);
+  } finally {
+    console.error = write;
+  }
+  assert.equal(seen.length, 1);
+  assert.match(seen[0], /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z sync out request doc=doc-1 heads=/);
 });
 
 test("an old Node gets a plain startup message", () => {
@@ -527,6 +562,49 @@ test("an oversized frame does not stop the relay", async () => {
   } finally {
     await relay.close();
   }
+});
+
+test("the relay logs the handshake it sends and receives", async () => {
+  const dir = await tempDir();
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(String(text));
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 1000,
+  });
+  try {
+    const join = cbor.encode({
+      type: "join",
+      senderId: "phone-1",
+      supportedProtocolVersions: ["1"],
+      peerMetadata: { storageId: "storage-1", isEphemeral: false },
+    });
+    await new Promise((resolve, reject) => {
+      const ws = new WebSocket(relay.url, { headers: { Authorization: "Bearer " + TOKEN } });
+      const timer = setTimeout(() => reject(new Error("no peer")), 3000);
+      ws.on("error", (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+      ws.on("open", () => ws.send(join));
+      ws.on("message", () => {
+        clearTimeout(timer);
+        ws.close();
+        resolve();
+      });
+    });
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+  const text = seen.join("\n");
+  assert.match(text, /sync in join/);
+  assert.match(text, /sync out peer/);
 });
 
 function importDoc(repo, docId, value) {

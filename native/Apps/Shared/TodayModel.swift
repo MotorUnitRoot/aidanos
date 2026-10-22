@@ -151,18 +151,27 @@ final class TodayModel: ObservableObject {
 
     func connect() {
         UserDefaults.standard.set(address, forKey: "aidanos.relayAddress")
-        RelayTokenStore.save(token)
-        UserDefaults.standard.removeObject(forKey: "aidanos.relayToken")
+        if RelayTokenStore.save(token) {
+            UserDefaults.standard.removeObject(forKey: "aidanos.relayToken")
+        }
         guard let session else { return }
         status = ConnectionState.connecting.label
-        do {
-            try session.connect(relayURL: address, token: token)
-        } catch {
-            if status == ConnectionState.connecting.label {
-                status = String(describing: error)
+        let url = address
+        let secret = token
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                try session.connect(relayURL: url, token: secret)
+                Task { @MainActor in self?.publishConflict() }
+            } catch {
+                Task { @MainActor in
+                    guard let self else { return }
+                    if self.status == ConnectionState.connecting.label {
+                        self.status = String(describing: error)
+                    }
+                    self.publishConflict()
+                }
             }
         }
-        publishConflict()
     }
 
     func beginConflictEdit() {

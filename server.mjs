@@ -1067,21 +1067,7 @@ async function releaseCleanPending() {
 
 async function noteUnrelated() {
   if (!vaultGit.enabled || !vaultGit.ready) return;
-  let dirty;
-  try {
-    dirty = await dirtySet();
-  } catch {
-    return;
-  }
-  let extra = false;
-  for (const file of dirty) {
-    if (vaultGit.conflicts.has(file)) continue;
-    if (vaultGit.hold.has(file)) continue;
-    if (vaultGit.pending.has(file)) continue;
-    extra = true;
-    break;
-  }
-  vaultGit.left = extra ? "Left an unrelated file alone." : "";
+  vaultGit.left = "";
 }
 
 async function publishPush() {
@@ -1850,6 +1836,29 @@ function isSelfWrite(date, diskMtime) {
   return diskMtime <= own + MTIME_SKEW_MS;
 }
 
+const pathWriteChains = new Map();
+
+function enqueuePathWrite(key, fn) {
+  const prev = pathWriteChains.get(key) || Promise.resolve();
+  const run = prev.then(fn, fn);
+  pathWriteChains.set(key, run);
+  run.then(
+    () => {
+      if (pathWriteChains.get(key) === run) pathWriteChains.delete(key);
+    },
+    () => {
+      if (pathWriteChains.get(key) === run) pathWriteChains.delete(key);
+    },
+  );
+  return run;
+}
+
+function sameTextAlreadyStored(exists, raw, markdown, conflict, resolve) {
+  if (!exists || typeof raw !== "string" || raw !== markdown) return false;
+  if (conflict || resolve) return false;
+  return true;
+}
+
 async function atomicWriteFile(filePath, markdown) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
@@ -2005,6 +2014,7 @@ function startLogWatch() {
         if (vaultGit.suppressWatch) return;
         if (err || !st) return;
         const mtime = Math.trunc(st.mtimeMs);
+        // Own writes are already announced by the save. Ignore the echo.
         if (isSelfWrite(date, mtime)) return;
         sendDayWatch(date, mtime);
       });
@@ -2203,51 +2213,59 @@ const server = http.createServer(async (req, res) => {
         ? Number(body.mtime)
         : NaN;
       const logPath = path.join(VAULT, "log", `${date}.md`);
-      let diskMtime = 0;
-      let exists = false;
-      try {
-        const st = await fs.stat(logPath);
-        exists = st.isFile();
-        diskMtime = Math.trunc(st.mtimeMs);
-      } catch (e) {
-        if (e.code !== "ENOENT") throw e;
-      }
-      if (
-        exists &&
-        Number.isFinite(clientMtime) &&
-        diskMtime > clientMtime + MTIME_SKEW_MS &&
-        !isSelfWrite(date, diskMtime)
-      ) {
-        const raw = await readFileSafe(logPath);
-        return json(res, 409, {
-          error: "disk newer",
-          date,
-          markdown: raw == null ? "" : raw,
-          mtime: diskMtime,
-        });
-      }
       const dayRel = `log/${date}.md`;
-      const dayResolve = explicitResolve(body);
-      const dayConflict = openConflict(dayRel);
-      if (dayConflict && !dayResolve) {
-        return json(res, 409, {
-          error: "still conflicted",
-          date,
-          markdown: dayConflict.theirs,
-          mtime: dayConflict.mtime,
-        });
-      }
-      pendingSelfWrites.add(date);
-      try {
-        await atomicWriteDay(logPath, markdown);
-        const mtime = await fileMtimeMs(logPath);
-        lastSelfWrites.set(date, mtime);
-        if (dayResolve && dayConflict) bindChoice(dayRel, dayConflict);
-        scheduleVaultSync(dayRel, Boolean(dayResolve && dayConflict));
-        return json(res, 200, { ok: true, date, mtime, git: gitHint() });
-      } finally {
-        pendingSelfWrites.delete(date);
-      }
+      return enqueuePathWrite(dayRel, async () => {
+        let diskMtime = 0;
+        let exists = false;
+        try {
+          const st = await fs.stat(logPath);
+          exists = st.isFile();
+          diskMtime = Math.trunc(st.mtimeMs);
+        } catch (e) {
+          if (e.code !== "ENOENT") throw e;
+        }
+        const raw = exists ? await readFileSafe(logPath) : null;
+        const dayResolve = explicitResolve(body);
+        const dayConflict = openConflict(dayRel);
+        if (sameTextAlreadyStored(exists, raw, markdown, dayConflict, dayResolve)) {
+          scheduleVaultSync(dayRel, false);
+          return json(res, 200, { ok: true, date, mtime: diskMtime, git: gitHint() });
+        }
+        // A shared server's own earlier save is still a newer version.
+        // The log watcher, not this check, ignores the echo of that save.
+        if (
+          exists &&
+          Number.isFinite(clientMtime) &&
+          diskMtime > clientMtime + MTIME_SKEW_MS
+        ) {
+          return json(res, 409, {
+            error: "disk newer",
+            date,
+            markdown: raw == null ? "" : raw,
+            mtime: diskMtime,
+          });
+        }
+        if (dayConflict && !dayResolve) {
+          return json(res, 409, {
+            error: "still conflicted",
+            date,
+            markdown: dayConflict.theirs,
+            mtime: dayConflict.mtime,
+          });
+        }
+        pendingSelfWrites.add(date);
+        try {
+          await atomicWriteDay(logPath, markdown);
+          const mtime = await fileMtimeMs(logPath);
+          lastSelfWrites.set(date, mtime);
+          sendDayWatch(date, mtime);
+          if (dayResolve && dayConflict) bindChoice(dayRel, dayConflict);
+          scheduleVaultSync(dayRel, Boolean(dayResolve && dayConflict));
+          return json(res, 200, { ok: true, date, mtime, git: gitHint() });
+        } finally {
+          pendingSelfWrites.delete(date);
+        }
+      });
     }
 
     if (pathname === "/api/plan" && req.method === "GET") {
@@ -2365,16 +2383,19 @@ const server = http.createServer(async (req, res) => {
         if (!isPngBuffer(buf)) {
           return json(res, 400, { error: "bad png" });
         }
-        pendingSelfWrites.add("f:" + relPath);
-        try {
-          await atomicWriteBuffer(real, buf);
-          const mtime = await fileMtimeMs(real);
-          lastSelfWrites.set("f:" + relPath, mtime);
-          scheduleVaultSync(relPath);
-          return json(res, 200, { ok: true, path: relPath, mtime, git: gitHint() });
-        } finally {
-          pendingSelfWrites.delete("f:" + relPath);
-        }
+        const pngKey = "f:" + relPath;
+        return enqueuePathWrite(pngKey, async () => {
+          pendingSelfWrites.add(pngKey);
+          try {
+            await atomicWriteBuffer(real, buf);
+            const mtime = await fileMtimeMs(real);
+            lastSelfWrites.set(pngKey, mtime);
+            scheduleVaultSync(relPath);
+            return json(res, 200, { ok: true, path: relPath, mtime, git: gitHint() });
+          } finally {
+            pendingSelfWrites.delete(pngKey);
+          }
+        });
       }
       try {
         await resolveInside(VAULT, abs);
@@ -2402,52 +2423,59 @@ const server = http.createServer(async (req, res) => {
       const clientMtime = body && typeof body === "object" && body.mtime != null
         ? Number(body.mtime)
         : NaN;
-      let diskMtime = 0;
-      let exists = false;
-      try {
-        const st = await fs.stat(abs);
-        if (st.isDirectory()) return json(res, 400, { error: "not a file" });
-        exists = st.isFile();
-        diskMtime = Math.trunc(st.mtimeMs);
-      } catch (e) {
-        if (e.code !== "ENOENT") throw e;
-      }
       const writeKey = "f:" + relPath;
-      if (
-        exists &&
-        Number.isFinite(clientMtime) &&
-        diskMtime > clientMtime + MTIME_SKEW_MS &&
-        !isSelfWrite(writeKey, diskMtime)
-      ) {
-        const raw = await readFileSafe(abs);
-        return json(res, 409, {
-          error: "disk newer",
-          path: relPath,
-          markdown: raw == null ? "" : raw,
-          mtime: diskMtime,
-        });
-      }
-      const fileResolve = explicitResolve(body);
-      const fileConflict = openConflict(relPath);
-      if (fileConflict && !fileResolve) {
-        return json(res, 409, {
-          error: "still conflicted",
-          path: relPath,
-          markdown: fileConflict.theirs,
-          mtime: fileConflict.mtime,
-        });
-      }
-      pendingSelfWrites.add(writeKey);
-      try {
-        await atomicWriteFile(abs, markdown);
-        const mtime = await fileMtimeMs(abs);
-        lastSelfWrites.set(writeKey, mtime);
-        if (fileResolve && fileConflict) bindChoice(relPath, fileConflict);
-        scheduleVaultSync(relPath, Boolean(fileResolve && fileConflict));
-        return json(res, 200, { ok: true, path: relPath, mtime, git: gitHint() });
-      } finally {
-        pendingSelfWrites.delete(writeKey);
-      }
+      return enqueuePathWrite(writeKey, async () => {
+        let diskMtime = 0;
+        let exists = false;
+        try {
+          const st = await fs.stat(abs);
+          if (st.isDirectory()) return json(res, 400, { error: "not a file" });
+          exists = st.isFile();
+          diskMtime = Math.trunc(st.mtimeMs);
+        } catch (e) {
+          if (e.code !== "ENOENT") throw e;
+        }
+        const raw = exists ? await readFileSafe(abs) : null;
+        const fileResolve = explicitResolve(body);
+        const fileConflict = openConflict(relPath);
+        if (sameTextAlreadyStored(exists, raw, markdown, fileConflict, fileResolve)) {
+          scheduleVaultSync(relPath, false);
+          return json(res, 200, { ok: true, path: relPath, mtime: diskMtime, git: gitHint() });
+        }
+        // A shared server's own earlier save is still a newer version.
+        if (
+          exists &&
+          Number.isFinite(clientMtime) &&
+          diskMtime > clientMtime + MTIME_SKEW_MS
+        ) {
+          return json(res, 409, {
+            error: "disk newer",
+            path: relPath,
+            markdown: raw == null ? "" : raw,
+            mtime: diskMtime,
+          });
+        }
+        if (fileConflict && !fileResolve) {
+          return json(res, 409, {
+            error: "still conflicted",
+            path: relPath,
+            markdown: fileConflict.theirs,
+            mtime: fileConflict.mtime,
+          });
+        }
+        pendingSelfWrites.add(writeKey);
+        try {
+          await atomicWriteFile(abs, markdown);
+          const mtime = await fileMtimeMs(abs);
+          lastSelfWrites.set(writeKey, mtime);
+          sendWatch({ path: relPath, mtime });
+          if (fileResolve && fileConflict) bindChoice(relPath, fileConflict);
+          scheduleVaultSync(relPath, Boolean(fileResolve && fileConflict));
+          return json(res, 200, { ok: true, path: relPath, mtime, git: gitHint() });
+        } finally {
+          pendingSelfWrites.delete(writeKey);
+        }
+      });
     }
 
     if (pathname === "/api/tree" && req.method === "GET") {

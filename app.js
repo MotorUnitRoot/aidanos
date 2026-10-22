@@ -1022,6 +1022,7 @@ async function leaveCurrentPaper() {
     closePaperConflict();
     return;
   }
+  if (!state.dirty) return;
   await saveDay();
 }
 
@@ -1064,13 +1065,147 @@ function renderWeek() {
   });
 }
 
-function putRawDay(date, markdown, mtime) {
-  return fetch("/api/day?date=" + date, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    cache: "no-store",
-    body: JSON.stringify({ date, paper: markdown, markdown, mtime: Number(mtime) || 0 }),
+const UNSENT_PREFIX = "aidanos-unsent:";
+let unsentSeq = 0;
+const confirmedSaves = new Map();
+
+function captureUnsentStamp() {
+  unsentSeq += 1;
+  return { at: Date.now(), seq: unsentSeq };
+}
+
+function unsentBefore(stored, mark) {
+  if (!stored || !mark) return false;
+  const at = Number(stored.at) || 0;
+  const seq = Number(stored.seq) || 0;
+  const markAt = Number(mark.at) || 0;
+  const markSeq = Number(mark.seq) || 0;
+  if (!at && !seq) return true;
+  if (at !== markAt) return at < markAt;
+  return seq < markSeq;
+}
+
+function notePathFor(snap) {
+  if (!snap) return "";
+  if (snap.kind === "note") return String(snap.path || "").replace(/\\/g, "/");
+  if (snap.date) return "log/" + snap.date + ".md";
+  return "";
+}
+
+function unsentKey(path, base) {
+  return UNSENT_PREFIX + String(path || "").replace(/\\/g, "/") + ":" + String(Number(base) || 0);
+}
+
+function rememberUnsent(snap) {
+  const path = notePathFor(snap);
+  if (!path || !snap) return;
+  if (!snap.at) {
+    const stamp = captureUnsentStamp();
+    snap.at = stamp.at;
+    snap.seq = stamp.seq;
+  }
+  const base = Number(snap.mtime) || 0;
+  try {
+    localStorage.setItem(unsentKey(path, base), JSON.stringify({
+      path,
+      base,
+      markdown: String(snap.markdown || ""),
+      at: snap.at,
+      seq: snap.seq,
+    }));
+  } catch (e) {}
+}
+
+function forgetUnsent(path) {
+  const prefix = UNSENT_PREFIX + String(path || "").replace(/\\/g, "/") + ":";
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.indexOf(prefix) === 0) keys.push(key);
+    }
+    keys.forEach((key) => localStorage.removeItem(key));
+  } catch (e) {}
+}
+
+function forgetUnsentBefore(path, snap) {
+  const prefix = UNSENT_PREFIX + String(path || "").replace(/\\/g, "/") + ":";
+  const want = String(snap && snap.markdown || "");
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.indexOf(prefix) === 0) keys.push(key);
+    }
+    keys.forEach((key) => {
+      try {
+        const parsed = JSON.parse(localStorage.getItem(key) || "null");
+        if (!parsed) return;
+        if (parsed.markdown === want || unsentBefore(parsed, snap)) localStorage.removeItem(key);
+      } catch (e) {}
+    });
+  } catch (e) {}
+}
+
+function noteSaved(snap) {
+  const path = notePathFor(snap);
+  if (!path || !snap) return;
+  forgetUnsentBefore(path, snap);
+  const prev = confirmedSaves.get(path);
+  if (prev && unsentBefore(snap, prev)) return;
+  confirmedSaves.set(path, {
+    at: snap.at,
+    seq: snap.seq,
+    markdown: String(snap.markdown || ""),
   });
+}
+
+function adoptSavedMtime(current, next) {
+  const seen = Number(current) || 0;
+  const got = Number(next) || 0;
+  return got >= seen ? got : seen;
+}
+
+function readUnsent(path) {
+  const prefix = UNSENT_PREFIX + String(path || "").replace(/\\/g, "/") + ":";
+  const out = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || key.indexOf(prefix) !== 0) continue;
+      const parsed = JSON.parse(localStorage.getItem(key) || "null");
+      if (parsed && typeof parsed.markdown === "string") out.push(parsed);
+    }
+  } catch (e) {}
+  return out;
+}
+
+function offerUnsent(kind, path, date, diskMarkdown) {
+  if (paperConflict) return;
+  const disk = String(diskMarkdown || "");
+  const hits = readUnsent(path);
+  const mine = hits.find((item) => item.markdown !== disk);
+  if (!mine) {
+    if (hits.length) forgetUnsent(path);
+    return;
+  }
+  const mtime = kind === "note"
+    ? Number(state.doc && state.doc.mtime) || 0
+    : Number(state.day && state.day.mtime) || 0;
+  openPaperConflict({
+    kind,
+    path,
+    date: date || "",
+    mine: mine.markdown,
+    theirs: disk,
+    mtime,
+  });
+}
+
+function conflictPath(info) {
+  if (!info) return "";
+  if (info.kind === "note") return String(info.path || "").replace(/\\/g, "/");
+  return info.date ? "log/" + info.date + ".md" : "";
 }
 
 async function openDay(date, { silent = false, force = false } = {}) {
@@ -1080,16 +1215,40 @@ async function openDay(date, { silent = false, force = false } = {}) {
   const dump = $("dump");
   const oldDate = state.day && state.day.date;
   const oldMd = dump ? dump.value : (state.day ? dayMarkdown(state.day) : "");
-  const oldMtime = state.day ? state.day.mtime : 0;
   const leavingDay = !isNoteDoc() && oldDate && oldDate !== date;
   const conflictOpen = !!(paperConflict && oldDate && (
     paperConflict.date === oldDate ||
     String(paperConflict.path || "").replace(/\\/g, "/") === "log/" + oldDate + ".md"
   ));
+  if (leavingDay) {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = null;
+    if (state.day) {
+      const kept = cleanPaperMarkdown(oldMd);
+      state.day.markdown = kept;
+      state.day.paper = kept;
+      if (dump) dump.value = kept;
+    }
+    renderDay();
+  }
   if (isNoteDoc()) {
     if (date === todayIso()) await landMapNextStepsOnToday();
     await leaveCurrentPaper();
     if (gen !== state.openDayGen) return;
+  }
+  if (leavingDay && !conflictOpen && state.dirty) {
+    let hops = 0;
+    while (hops < 4 && state.dirty && !paperConflict && state.day && state.day.date === oldDate) {
+      hops += 1;
+      clearTimeout(state.saveTimer);
+      state.saveTimer = null;
+      const saved = await saveDay();
+      if (gen !== state.openDayGen) return;
+      if (paperConflict) return;
+      if (!saved || saved.ok === false) return;
+    }
+    if (gen !== state.openDayGen) return;
+    if (state.dirty || paperConflict) return;
   }
   try {
     const day = await api("/api/day?date=" + date);
@@ -1127,8 +1286,10 @@ async function openDay(date, { silent = false, force = false } = {}) {
       state.monthView = { year: viewed.getFullYear(), month: viewed.getMonth() + 1 };
     }
     await renderMonth();
-    if (leavingDay && !conflictOpen) putRawDay(oldDate, oldMd, oldMtime).catch(() => {});
     if (gen === state.openDayGen) await surfaceOpenGitConflict();
+    if (gen === state.openDayGen && state.day && state.day.date === date && !paperConflict) {
+      offerUnsent("day", "log/" + date + ".md", date, dayMarkdown(state.day));
+    }
   } catch (e) {
     if (gen !== state.openDayGen) return;
     if (!silent) setStatus(String(e.message || e), "error");
@@ -1601,13 +1762,30 @@ function ensureDumpMatchesPaper() {
   return dump;
 }
 
+function currentSaveBound() {
+  if (isNoteDoc() && state.doc && state.doc.path) {
+    return { kind: "note", path: String(state.doc.path).replace(/\\/g, "/") };
+  }
+  if (state.day && state.day.date) return { kind: "day", date: state.day.date };
+  return null;
+}
+
+function saveBoundMatches(bound) {
+  if (!bound) return true;
+  if (bound.kind === "note") {
+    return isNoteDoc() && state.doc && String(state.doc.path).replace(/\\/g, "/") === bound.path;
+  }
+  return !isNoteDoc() && state.day && state.day.date === bound.date;
+}
+
 function scheduleSave() {
   if (applyingDragSave) return;
   if (paperConflict) return;
   state.dirty = true;
   setStatus("Saving");
   clearTimeout(state.saveTimer);
-  state.saveTimer = setTimeout(saveDay, 350);
+  const bound = currentSaveBound();
+  state.saveTimer = setTimeout(() => saveDay({ bound }), 350);
 }
 
 function applyRemoteDay(day) {
@@ -1699,12 +1877,64 @@ async function onNoteFileChanged(payload) {
   } catch (e) {}
 }
 
+function sendKeepaliveSave(snap) {
+  if (!snap) return;
+  const edit = !!(paperConflict && document.body.classList.contains("conflict-edit"));
+  const resolveBody = edit ? { resolve: "edit" } : {};
+  let url = "";
+  let body = null;
+  if (snap.kind === "note") {
+    url = "/api/file?path=" + encodeURIComponent(snap.path);
+    body = { path: snap.path, paper: snap.markdown, markdown: snap.markdown, mtime: snap.mtime, ...resolveBody };
+  } else if (snap.kind === "day") {
+    url = "/api/day?date=" + snap.date;
+    body = { date: snap.date, paper: snap.markdown, markdown: snap.markdown, mtime: snap.mtime, ...resolveBody };
+  } else return;
+  fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    keepalive: true,
+    cache: "no-store",
+  }).then(async (res) => {
+    if (!res.ok) return;
+    const out = await res.json().catch(() => ({}));
+    noteSaved(snap);
+    const next = out && out.mtime != null ? Number(out.mtime) || 0 : 0;
+    if (snap.kind === "note") {
+      if (!(isNoteDoc() && state.doc && state.doc.path === snap.path)) return;
+      if (next) state.doc.mtime = adoptSavedMtime(state.doc.mtime, next);
+      const dump = $("dump");
+      if (dump && dump.value === snap.markdown) state.dirty = false;
+      return;
+    }
+    if (!(state.day && state.day.date === snap.date)) return;
+    if (next) state.day.mtime = adoptSavedMtime(state.day.mtime, next);
+    const dump = $("dump");
+    if (dump && dump.value === snap.markdown) state.dirty = false;
+  }).catch(() => {});
+}
+
 function flushOnLeave() {
   flushActiveLineToDump();
   clearTimeout(state.saveTimer);
   state.saveTimer = null;
+  if (!state.dirty) return;
   if (!state.day && !isNoteDoc()) return;
-  saveDay({ keepalive: true });
+  if (paperConflict && !document.body.classList.contains("conflict-edit")) {
+    rememberUnsent({
+      kind: paperConflict.kind,
+      path: paperConflict.path,
+      date: paperConflict.date,
+      markdown: conflictMineNow(),
+      mtime: Number(state.day && state.day.mtime) || Number(state.doc && state.doc.mtime) || 0,
+    });
+    return;
+  }
+  const snap = paperSaveSnapshot();
+  if (!snap) return;
+  rememberUnsent(snap);
+  sendKeepaliveSave(snap);
 }
 
 function applyRemoteNote(body) {
@@ -1738,22 +1968,28 @@ function paperSaveSnapshot() {
     }
     if (dump) dump.value = markdown;
     state.doc.markdown = markdown;
+    const stamp = captureUnsentStamp();
     return {
       kind: "note",
       path: state.doc.path,
       markdown,
       mtime: Number(state.doc.mtime) || 0,
+      at: stamp.at,
+      seq: stamp.seq,
     };
   }
   if (state.day) {
     const markdown = cleanPaperMarkdown(dump ? dump.value : dayMarkdown(state.day));
     if (dump) dump.value = markdown;
     state.day.markdown = markdown;
+    const stamp = captureUnsentStamp();
     return {
       kind: "day",
       date: state.day.date,
       markdown,
       mtime: Number(state.day.mtime) || 0,
+      at: stamp.at,
+      seq: stamp.seq,
     };
   }
   return null;
@@ -1820,6 +2056,9 @@ function closePaperConflict() {
 }
 
 function handleSaveConflict(snap, body, { keepalive = false } = {}) {
+  const confirmed = confirmedSaves.get(notePathFor(snap));
+  if (confirmed && unsentBefore(snap, confirmed)) return;
+  rememberUnsent(snap);
   if (keepalive) return;
   if (!conflictStillHere(snap)) return;
   openPaperConflict({
@@ -1845,6 +2084,7 @@ function conflictMineNow() {
 async function resolveConflictKeep() {
   if (!paperConflict) return;
   const info = paperConflict;
+  forgetUnsent(conflictPath(info));
   const mine = conflictMineNow();
   try {
     let res;
@@ -1922,6 +2162,7 @@ async function resolveConflictKeep() {
 async function resolveConflictTheirs() {
   if (!paperConflict) return;
   const info = paperConflict;
+  forgetUnsent(conflictPath(info));
   if (!info.git) {
     if (info.kind === "note") {
       applyRemoteNote({ path: info.path, markdown: info.theirs, mtime: info.mtime });
@@ -2166,6 +2407,7 @@ async function surfaceOpenGitConflict() {
 
 function resolveConflictEdit() {
   if (!paperConflict) return;
+  forgetUnsent(conflictPath(paperConflict));
   const mine = paperConflict.mine;
   const dump = $("dump");
   if (dump) dump.value = mine;
@@ -2179,18 +2421,28 @@ function resolveConflictEdit() {
   setStatus("They wrote this too.");
 }
 
-async function saveDay({ keepalive = false } = {}) {
+async function saveDay({ keepalive = false, bound = null } = {}) {
   const run = async () => {
+    if (bound && !saveBoundMatches(bound)) return { ok: true, skipped: true };
     const editInfo = paperConflict && document.body.classList.contains("conflict-edit") ? paperConflict : null;
+    if (paperConflict && !editInfo && keepalive) {
+      rememberUnsent({
+        kind: paperConflict.kind,
+        path: paperConflict.path,
+        date: paperConflict.date,
+        markdown: conflictMineNow(),
+        mtime: Number(state.day && state.day.mtime) || Number(state.doc && state.doc.mtime) || 0,
+      });
+    }
     if (paperConflict && !editInfo) {
       if (!keepalive) setStatus("");
-      return;
+      return { ok: false, conflict: true };
     }
     const resolveBody = editInfo ? { resolve: "edit" } : {};
     const snap = paperSaveSnapshot();
     if (!snap) {
       setStatus("");
-      return;
+      return { ok: true, skipped: true };
     }
     if (snap.kind === "note") {
       const path = snap.path;
@@ -2205,32 +2457,35 @@ async function saveDay({ keepalive = false } = {}) {
         if (res.status === 409) {
           const body = await res.json().catch(() => ({}));
           handleSaveConflict(snap, body, { keepalive });
-          return;
+          return { ok: false, conflict: true };
         }
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
           throw new Error(err.error || res.statusText);
         }
         const out = await res.json().catch(() => ({}));
+        noteSaved(snap);
         if (isNoteDoc() && state.doc && state.doc.path === path) {
-          if (out && out.mtime != null) state.doc.mtime = Number(out.mtime) || 0;
+          if (out && out.mtime != null) state.doc.mtime = adoptSavedMtime(state.doc.mtime, out.mtime);
           const dump = $("dump");
           if (dump && dump.value === markdown) state.dirty = false;
         }
         if (editInfo) {
           closePaperConflict();
           if (editInfo.git) await afterGitChoice(editInfo.path);
-          if (gitJoin) return;
+          if (gitJoin) return { ok: true };
         }
-        if (keepalive) return;
+        if (keepalive) return { ok: true };
         setStatus("Saved", "saved");
         setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
+        return { ok: true };
       } catch (e) {
+        rememberUnsent(snap);
         if (!keepalive) setStatus(String(e.message), "error");
+        return { ok: false, error: String(e.message || e) };
       }
-      return;
     }
-    if (snap.kind !== "day") { setStatus(""); return; }
+    if (snap.kind !== "day") { setStatus(""); return { ok: true, skipped: true }; }
     const date = snap.date;
     const markdown = snap.markdown;
     const mtime = snap.mtime;
@@ -2244,23 +2499,25 @@ async function saveDay({ keepalive = false } = {}) {
       if (res.status === 409) {
         const body = await res.json().catch(() => ({}));
         handleSaveConflict(snap, body, { keepalive });
-        return;
+        return { ok: false, conflict: true };
       }
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.error || res.statusText);
       }
       const out = await res.json().catch(() => ({}));
+      noteSaved(snap);
       if (state.day && state.day.date === date) {
-        if (out && out.mtime != null) state.day.mtime = Number(out.mtime) || 0;
-        state.dirty = false;
+        if (out && out.mtime != null) state.day.mtime = adoptSavedMtime(state.day.mtime, out.mtime);
+        const dump = $("dump");
+        if (dump && dump.value === markdown) state.dirty = false;
       }
       if (editInfo) {
         closePaperConflict();
         if (editInfo.git) await afterGitChoice("log/" + editInfo.date + ".md");
-        if (gitJoin) return;
+        if (gitJoin) return { ok: true };
       }
-      if (keepalive) return;
+      if (keepalive) return { ok: true };
       setStatus("Saved", "saved");
       if (state.weekStart) {
         api("/api/week?start=" + state.weekStart).then((week) => {
@@ -2269,8 +2526,11 @@ async function saveDay({ keepalive = false } = {}) {
         }).catch(() => {});
       }
       setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
+      return { ok: true };
     } catch (e) {
+      rememberUnsent(snap);
       if (!keepalive) setStatus(String(e.message), "error");
+      return { ok: false, error: String(e.message || e) };
     }
   };
   saveChain = saveChain.then(run, run);
@@ -2549,6 +2809,9 @@ async function openVaultNote(rel) {
   }
   setStatus("");
   if (noteGen === state.openDayGen) await surfaceOpenGitConflict();
+  if (noteGen === state.openDayGen && isNoteDoc() && state.doc && !paperConflict) {
+    offerUnsent("note", state.doc.path, "", state.doc.markdown);
+  }
 }
 
 async function openVaultSearchHit(rel, line) {

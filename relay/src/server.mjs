@@ -283,6 +283,15 @@ export async function startRelay(options = {}) {
   await preloadStoredNotes(repo);
   await mirror.now();
 
+  // The socket listener is attached only after the storage id is read.
+  // The port stays closed until that has finished, or the first join is missed.
+  await repo.networkSubsystem.peerMetadata;
+  for (const adapter of adapters) {
+    if (!adapter.peerId) {
+      throw new Error("The sync engine was not ready.");
+    }
+  }
+
   let boundPort = port;
   for (const entry of servers) {
     boundPort = await listen(entry.httpServer, entry.host, port);

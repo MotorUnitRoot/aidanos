@@ -13,14 +13,19 @@ function assert(cond, msg) {
 }
 
 function chromeBin() {
-  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) return process.env.CHROME_PATH;
-  for (const name of ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]) {
+  const names = [];
+  if (process.env.CHROME_PATH) names.push(process.env.CHROME_PATH);
+  names.push("google-chrome-stable", "google-chrome", "chromium", "chromium-browser");
+  const errors = [];
+  for (const name of names) {
     try {
-      const found = execFileSync("sh", ["-c", "command -v " + name], { encoding: "utf8" }).trim();
-      if (found) return found;
-    } catch {}
+      execFileSync(name, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+      return name;
+    } catch (error) {
+      errors.push(name + ": " + String(error && error.message || error).split("\n")[0]);
+    }
   }
-  throw new Error("Chrome is required to measure scrollWidth at 390.");
+  throw new Error("Chrome is required to measure scrollWidth at 390. " + errors.join("; "));
 }
 
 function freePort() {
@@ -90,16 +95,21 @@ function spawnServer(port, vault) {
 const childA = spawnServer(portA, vaultA);
 const childB = spawnServer(portB, vaultB);
 const chromeDir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-chrome-"));
+const chromeLog = [];
 const chrome = spawn(chromeBin(), [
   "--headless=new",
   "--disable-gpu",
   "--no-sandbox",
   "--disable-dev-shm-usage",
+  "--remote-debugging-address=127.0.0.1",
   "--remote-debugging-port=" + debugPort,
+  "--no-first-run",
   "--user-data-dir=" + chromeDir,
   "--window-size=390,844",
   "about:blank",
-], { stdio: "ignore" });
+], { stdio: ["ignore", "pipe", "pipe"] });
+chrome.stdout.on("data", (chunk) => { chromeLog.push(String(chunk)); });
+chrome.stderr.on("data", (chunk) => { chromeLog.push(String(chunk)); });
 
 function stop() {
   chrome.kill("SIGKILL");
@@ -150,15 +160,16 @@ try {
   assert(paths === want, "conflicts not ready " + paths);
 
   let version;
-  for (let i = 0; i < 50; i++) {
+  for (let i = 0; i < 200; i++) {
     try {
       version = await (await fetch("http://127.0.0.1:" + debugPort + "/json/version")).json();
       break;
     } catch {
+      if (chrome.exitCode !== null) break;
       await sleep(100);
     }
   }
-  assert(version, "Chrome did not open a debugger");
+  assert(version, "Chrome did not open a debugger. " + chromeLog.join("").slice(-800));
   const ws = new WebSocket(version.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => {
     ws.addEventListener("open", resolve);

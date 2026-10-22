@@ -121,7 +121,7 @@ function elsewhereConflicts(conflicts, open) {
       date: row.date,
       path: row.path,
       name: row.name,
-      label: row.name + " needs a choice",
+      label: row.date ? needsChoiceLine(row.date) : row.name + " needs a choice",
     })),
     more: Math.max(0, rows.length - shown.length),
   };

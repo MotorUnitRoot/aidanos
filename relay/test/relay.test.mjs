@@ -63,8 +63,7 @@ test("redact removes the token and the git url", () => {
   const token = "super-secret-token-value";
   const text = "push failed https://x-access-token:" + token + "@github.com/acme/vault.git " + token;
   const cleaned = redact(text, [token, "https://github.com/acme/vault.git"]);
-  assert.equal(cleaned.includes(token), false);
-  assert.equal(cleaned.includes("github.com"), false);
+  assert.equal(cleaned, "push failed [url] ***");
   const short = redact("Authorization: Bearer a", []);
   assert.equal(short.includes("Bearer a"), false);
   const long = "q".repeat(64);

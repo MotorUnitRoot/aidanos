@@ -192,6 +192,9 @@ function assertClientSurfacesConflict() {
   assert(openDayFn.includes("leavingDay && !conflictOpen"), "day switch does not re-save an open conflict");
   const surface = app.slice(app.indexOf("function surfaceGitConflict("), app.indexOf("async function surfaceOpenGitConflict("));
   assert(surface.indexOf("data.join") < surface.indexOf("data.left"), "an unrelated file stays off the other-copy sheet");
+  assert(surface.indexOf("conflicts.length") < surface.indexOf("openGitJoin("), "Bring them in stays hidden while any conflict is unresolved");
+  const afterChoice = app.slice(app.indexOf("function afterGitChoice("), app.indexOf("function gitConflictForOpenPage("));
+  assert(afterChoice.indexOf("conflicts.length") < afterChoice.indexOf("openGitJoin("), "a remaining conflict hides Bring them in");
   assert(keepFn.includes("afterGitChoice(") && takeFn.includes("afterGitChoice("), "a choice looks for changes still waiting");
   assert(app.includes("function afterGitChoice(") && app.slice(app.indexOf("function afterGitChoice("), app.indexOf("function gitConflictForOpenPage(")).includes("openGitJoin("), "a choice opens the other-copy sheet when changes are still waiting");
   assert(app.includes("function resolveGitJoin("), "join waits for the click");
@@ -1034,6 +1037,63 @@ async function withChoiceThenSecondEdit(portBase, resolve, chosen, fn) {
   }
 }
 
+async function joinHiddenUntilEveryConflictIsChosen() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-join-set-"));
+  const bare = seedBare(tmp);
+  const vaultA = path.join(tmp, "a");
+  const vaultB = path.join(tmp, "b");
+  fs.mkdirSync(vaultA, { recursive: true });
+  fs.mkdirSync(vaultB, { recursive: true });
+  const portA = 45100 + Math.floor(Math.random() * 400);
+  const portB = portA + 1;
+  const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
+  const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
+  const childB = spawnServer(serverEnv(portB, vaultB, bare, extra));
+  const baseB = "http://127.0.0.1:" + portB;
+  const first = "2026-10-19";
+  const second = "2026-10-20";
+  try {
+    await waitHealth("http://127.0.0.1:" + portA, childA);
+    await waitHealth(baseB, childB);
+    commitFile(vaultA, "log/" + first + ".md", "A one\n", "A first");
+    commitFile(vaultA, "log/" + second + ".md", "A two\n", "A second");
+    commitFile(vaultA, "log/2026-10-21.md", "only on A\n", "A waiting");
+    git(["push", "origin", "HEAD"], vaultA);
+    commitFile(vaultB, "log/" + first + ".md", "B one\n", "B first");
+    commitFile(vaultB, "log/" + second + ".md", "B two\n", "B second");
+    const trigger = await putDay(baseB, "2026-10-18", "trigger compare\n", 0);
+    assert(trigger.res.ok, "trigger " + trigger.res.status);
+    const opened = await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      const paths = (body.conflicts || []).map((item) => item && item.path).sort();
+      return paths.join(",") === "log/" + first + ".md,log/" + second + ".md" && body.join !== true ? body : "";
+    }, 8000, "both conflicts before any choice");
+    assert(opened.join !== true, "Bring them in is hidden while both notes are unresolved");
+    const one = opened.conflicts.find((item) => item.path === "log/" + first + ".md");
+    const keptOne = await putDay(baseB, first, "B one\n", one.mtime, "keep");
+    assert(keptOne.res.ok, "first choice " + keptOne.res.status + " " + JSON.stringify(keptOne.body));
+    const midway = await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      const hit = (body.conflicts || []).find((item) => item && item.path === "log/" + second + ".md");
+      return hit && body.join !== true ? body : "";
+    }, 8000, "second conflict still open");
+    assert(midway.join !== true, "Bring them in stays hidden after only one choice");
+    assert((midway.conflicts || []).some((item) => item.path === "log/" + second + ".md"), "the other note is still a conflict");
+    const two = midway.conflicts.find((item) => item.path === "log/" + second + ".md");
+    const keptTwo = await putDay(baseB, second, "B two\n", two.mtime, "keep");
+    assert(keptTwo.res.ok, "second choice " + keptTwo.res.status + " " + JSON.stringify(keptTwo.body));
+    const offered = await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      return body.join === true && !(body.conflicts || []).length ? body : "";
+    }, 8000, "Bring them in after every choice");
+    assert(offered.join === true, "Bring them in is shown once every conflicting note has a choice");
+  } finally {
+    await stop(childA);
+    await stop(childB);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 async function staleChoiceAfterKeepMine() {
   await withChoiceThenSecondEdit(46100, "keep", "B1\n", async (ctx) => {
     const nudge = await putDay(ctx.baseB, "2026-10-17", "nudge compare\n", 0);
@@ -1113,6 +1173,7 @@ try {
   await refusedPushIsShown();
   await divergedDifferentFiles();
   await mixedOverlapAndDisjoint();
+  await joinHiddenUntilEveryConflictIsChosen();
   await conflictSurvivesDaySwitch();
   await strayFileLeftAlone();
   await otherNoteSurvivesConflict();

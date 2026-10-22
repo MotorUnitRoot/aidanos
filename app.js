@@ -1801,7 +1801,7 @@ function openPaperConflict(info) {
   gitJoin = false;
   document.body.classList.add("has-conflict");
   document.body.classList.remove("conflict-edit");
-  setStatus("This page changed on disk.");
+  setStatus("");
 }
 
 function closePaperConflict() {
@@ -1882,7 +1882,7 @@ async function resolveConflictKeep() {
       const theirsEl = $("conflict-theirs");
       if (mineEl) mineEl.textContent = info.mine;
       if (theirsEl) theirsEl.textContent = info.theirs;
-      setStatus("This page changed on disk.");
+      setStatus("");
       return;
     }
     if (!res.ok) {
@@ -1954,7 +1954,7 @@ async function resolveConflictTheirs() {
       info.mtime = Number(body.mtime) || 0;
       const theirsEl = $("conflict-theirs");
       if (theirsEl) theirsEl.textContent = info.theirs;
-      setStatus("This page changed on disk.");
+      setStatus("");
       return;
     }
     if (!res.ok) {
@@ -1992,12 +1992,12 @@ async function afterGitChoice(path) {
       await new Promise((r) => setTimeout(r, 80));
       continue;
     }
-    if (data.join) {
-      openGitJoin();
-      return;
-    }
     if (conflicts.length) {
       surfaceGitConflict(data);
+      return;
+    }
+    if (data.join) {
+      openGitJoin();
       return;
     }
     return;
@@ -2123,10 +2123,11 @@ async function resolveGitJoin() {
 
 function surfaceGitConflict(data) {
   if (!data || data.enabled === false) return;
-  const match = gitConflictForOpenPage(data.conflicts);
-  if (match && String(match.mine || "") !== String(match.theirs || "")) {
+  const conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
+  if (conflicts.length) {
     closeGitJoin();
-    openGitConflict(match);
+    const match = gitConflictForOpenPage(conflicts);
+    if (match && String(match.mine || "") !== String(match.theirs || "")) openGitConflict(match);
     return;
   }
   if (paperConflict && paperConflict.git && !document.body.classList.contains("conflict-edit")) {
@@ -2182,7 +2183,7 @@ async function saveDay({ keepalive = false } = {}) {
   const run = async () => {
     const editInfo = paperConflict && document.body.classList.contains("conflict-edit") ? paperConflict : null;
     if (paperConflict && !editInfo) {
-      if (!keepalive) setStatus("This page changed on disk.");
+      if (!keepalive) setStatus("");
       return;
     }
     const resolveBody = editInfo ? { resolve: "edit" } : {};

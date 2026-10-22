@@ -684,9 +684,13 @@ private final class RunningRelay {
 
     var port: Int? {
         guard let text = try? String(contentsOf: log, encoding: .utf8) else { return nil }
-        for line in text.split(separator: "\n") where line.hasPrefix("LISTENING") {
+        for line in text.split(separator: "\n") {
             let parts = line.split(separator: " ")
-            if parts.count >= 3, let value = Int(parts[2]) { return value }
+            guard let mark = parts.firstIndex(of: "LISTENING") else { continue }
+            let host = parts.index(after: mark)
+            let number = parts.index(after: host)
+            guard number < parts.endIndex, let value = Int(parts[number]) else { continue }
+            return value
         }
         return nil
     }

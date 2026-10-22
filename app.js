@@ -73,6 +73,35 @@ function formatPaperTitle(dateStr) {
   });
 }
 
+function needsChoiceLine(dateStr) {
+  return formatPaperTitle(dateStr) + " needs a choice";
+}
+
+function conflictDate(item) {
+  const date = item && item.date ? String(item.date) : "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(date)) return date;
+  const rel = String(item && item.path || "").replace(/\\/g, "/");
+  const match = rel.match(/^log\/(\d{4}-\d{2}-\d{2})\.md$/);
+  return match ? match[1] : "";
+}
+
+function elsewhereConflicts(conflicts, openDate) {
+  const seen = new Set();
+  const dates = [];
+  for (const item of conflicts || []) {
+    const date = conflictDate(item);
+    if (!date || date === openDate || seen.has(date)) continue;
+    seen.add(date);
+    dates.push(date);
+  }
+  dates.sort();
+  const shown = dates.slice(0, 3);
+  return {
+    lines: shown.map((date) => ({ date: date, label: needsChoiceLine(date) })),
+    more: Math.max(0, dates.length - shown.length),
+  };
+}
+
 function formatRailDate(dateStr) {
   return parseDate(dateStr).toLocaleDateString("en-GB", {
     weekday: "long",
@@ -2020,9 +2049,10 @@ function openPaperConflict(info) {
   const pathEl = $("conflict-path");
   const mineEl = $("conflict-mine");
   const theirsEl = $("conflict-theirs");
-  if (pathEl) pathEl.textContent = paperConflict.kind === "note"
-    ? (paperConflict.path || "note")
-    : (paperConflict.date || "today");
+  if (pathEl) {
+    pathEl.textContent = "";
+    pathEl.hidden = true;
+  }
   if (mineEl) mineEl.textContent = paperConflict.mine;
   if (theirsEl) theirsEl.textContent = paperConflict.theirs;
   if (sheet) {
@@ -2033,7 +2063,7 @@ function openPaperConflict(info) {
   const joinBtn = $("conflict-join");
   if (joinBtn) joinBtn.hidden = true;
   const kicker = sheet && sheet.querySelector(".conflict-kicker");
-  if (kicker) kicker.textContent = "This page changed on disk.";
+  if (kicker) kicker.textContent = "This note was also changed on your other device.";
   gitJoin = false;
   document.body.classList.add("has-conflict");
   document.body.classList.remove("conflict-edit");
@@ -2318,7 +2348,7 @@ function closeGitJoin() {
   if (joinBtn) joinBtn.hidden = true;
   if (sheet) sheet.classList.remove("is-join");
   const kicker = sheet && sheet.querySelector(".conflict-kicker");
-  if (kicker && !paperConflict) kicker.textContent = "This page changed on disk.";
+  if (kicker && !paperConflict) kicker.textContent = "This note was also changed on your other device.";
   if (sheet && !paperConflict) sheet.hidden = true;
   gitJoin = false;
 }
@@ -2362,15 +2392,57 @@ async function resolveGitJoin() {
   }
 }
 
+function renderElsewhereChoices(conflicts) {
+  const box = $("conflict-waiting");
+  if (!box) return;
+  if (currentView() !== "today") {
+    box.hidden = true;
+    box.replaceChildren();
+    return;
+  }
+  const openDate = !isNoteDoc() && state.day ? state.day.date : "";
+  const choice = elsewhereConflicts(conflicts, openDate);
+  box.replaceChildren();
+  if (!choice.lines.length) {
+    box.hidden = true;
+    return;
+  }
+  for (const line of choice.lines) {
+    const kicker = document.createElement("p");
+    kicker.className = "conflict-kicker";
+    kicker.textContent = line.label;
+    const actions = document.createElement("div");
+    actions.className = "conflict-actions";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "hairline-button";
+    button.textContent = "Open";
+    button.setAttribute("data-choice-date", line.date);
+    actions.appendChild(button);
+    box.appendChild(kicker);
+    box.appendChild(actions);
+  }
+  if (choice.more) {
+    const more = document.createElement("p");
+    more.className = "conflict-kicker";
+    more.textContent = "and " + choice.more + " more.";
+    box.appendChild(more);
+  }
+  box.hidden = false;
+}
+
 function surfaceGitConflict(data) {
   if (!data || data.enabled === false) return;
   const conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
   if (conflicts.length) {
     closeGitJoin();
+    renderElsewhereChoices(conflicts);
     const match = gitConflictForOpenPage(conflicts);
     if (match && String(match.mine || "") !== String(match.theirs || "")) openGitConflict(match);
+    else if (paperConflict && paperConflict.git && !document.body.classList.contains("conflict-edit")) closePaperConflict();
     return;
   }
+  renderElsewhereChoices([]);
   if (paperConflict && paperConflict.git && !document.body.classList.contains("conflict-edit")) {
     const info = paperConflict;
     closePaperConflict();
@@ -5868,6 +5940,14 @@ function syncFmtBarForKeyboard() {
   if (edit) edit.addEventListener("click", () => resolveConflictEdit());
   const join = $("conflict-join");
   if (join) join.addEventListener("click", () => { resolveGitJoin().catch(() => {}); });
+  const waiting = $("conflict-waiting");
+  if (waiting) waiting.addEventListener("click", (e) => {
+    const button = e.target && e.target.closest ? e.target.closest("[data-choice-date]") : null;
+    if (!button) return;
+    const date = button.getAttribute("data-choice-date");
+    if (!date) return;
+    openDay(date, { force: true }).catch((err) => setStatus(String(err && err.message || err), "error"));
+  });
 })();
 
 if (/^https?:$/.test(location.protocol) && "serviceWorker" in navigator) {

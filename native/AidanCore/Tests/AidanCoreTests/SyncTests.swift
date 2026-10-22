@@ -10,6 +10,10 @@ import Glibc
 
 private let testToken = "aidanos-test-token-0123456789abcdef"
 
+private func uniqueNote(_ name: String) -> String {
+    "notes/\(name)-\(UUID().uuidString).md"
+}
+
 final class SyncTests: XCTestCase {
     func testAirplaneModeMerge() throws {
         let relay = try TestRelay.start()
@@ -72,8 +76,9 @@ final class SyncTests: XCTestCase {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = zone
         let date = calendar.date(from: DateComponents(year: 2026, month: 10, day: 21))!
-        let path = AidanSession.todayPath(on: date, timeZone: zone)
-        XCTAssertEqual(path, "log/2026-10-21.md")
+        let today = AidanSession.todayPath(on: date, timeZone: zone)
+        XCTAssertEqual(today, "log/2026-10-21.md")
+        let path = uniqueNote("same-day")
 
         let relay = try TestRelay.start()
         defer { relay.stop() }
@@ -126,7 +131,7 @@ final class SyncTests: XCTestCase {
             mac.disconnect()
             relay.stop()
         }
-        let path = "notes/typing.md"
+        let path = uniqueNote("typing")
         try phone.connect(relayURL: relay.url, token: relay.token)
         try mac.connect(relayURL: relay.url, token: relay.token)
         try phone.replace(path, with: "Hello")
@@ -186,7 +191,7 @@ final class SyncTests: XCTestCase {
         let relay = try TestRelay.start()
         defer { relay.stop() }
         let author = try AidanSession(vault: try temporaryVault())
-        let path = "notes/rebuilt.md"
+        let path = uniqueNote("rebuilt")
         try author.connect(relayURL: relay.url, token: relay.token)
         try author.replace(path, with: "from the relay")
         let witness = try AidanSession(vault: try temporaryVault())
@@ -222,7 +227,7 @@ final class SyncTests: XCTestCase {
     }
 
     func testRebuiltTypingSurvivesFailedConnections() throws {
-        let path = "notes/rebuilt-offline.md"
+        let path = uniqueNote("rebuilt-offline")
         let (vault, session) = try rebuiltSession(path: path, text: "Hello")
         defer { session.disconnect() }
         let fileURL = vault.appendingPathComponent(path)
@@ -246,6 +251,30 @@ final class SyncTests: XCTestCase {
             XCTAssertEqual(try session.text(path), typed)
             XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), typed)
         }
+    }
+
+    func testConnectWaitsForTheAttemptAlreadyRunning() throws {
+        let stall = try StallServer()
+        defer { stall.stop() }
+        let session = try AidanSession(vault: try temporaryVault())
+        let firstDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            try? session.connect(relayURL: stall.url, token: testToken)
+            firstDone.signal()
+        }
+        XCTAssertTrue(try waitUntil(seconds: 3) {
+            session.connection == .connecting || session.connection == .reconnecting
+        })
+        Thread.sleep(forTimeInterval: 0.2)
+        let secondDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            try? session.connect(relayURL: stall.url, token: testToken)
+            secondDone.signal()
+        }
+        XCTAssertEqual(secondDone.wait(timeout: .now() + 0.4), .timedOut)
+        stall.stop()
+        XCTAssertEqual(firstDone.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(secondDone.wait(timeout: .now() + 5), .success)
     }
 
     func testRebuiltTypingBeforeRelayAnswers() throws {
@@ -515,7 +544,7 @@ final class SyncTests: XCTestCase {
         let right = try AidanSession(vault: try temporaryVault())
         try left.connect(relayURL: relay.url, token: relay.token)
         try right.connect(relayURL: relay.url, token: relay.token)
-        let path = AidanSession.todayPath(on: Date(timeIntervalSince1970: 1_800_000_000), timeZone: TimeZone(secondsFromGMT: 0)!)
+        let path = uniqueNote("created-after")
         try left.replace(path, with: "created after")
         XCTAssertTrue(try waitUntil(seconds: 8) { (try? right.text(path)) == "created after" })
         left.disconnect()
@@ -551,10 +580,11 @@ final class SyncTests: XCTestCase {
         XCTAssertNotEqual(session.connection, .connected)
         try relay.restart()
         XCTAssertTrue(try waitUntil(seconds: 8) { session.connection == .connected })
-        try session.replace("notes/back.md", with: "still here")
+        let path = uniqueNote("back")
+        try session.replace(path, with: "still here")
         if let relayVault = relay.vault {
             XCTAssertTrue(try waitUntil(seconds: 8) {
-                let text = try? String(contentsOf: relayVault.appendingPathComponent("notes/back.md"), encoding: .utf8)
+                let text = try? String(contentsOf: relayVault.appendingPathComponent(path), encoding: .utf8)
                 return text == "still here"
             })
         }

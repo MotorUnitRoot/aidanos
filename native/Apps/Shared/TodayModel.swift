@@ -23,17 +23,29 @@ enum RelayTokenStore {
         return text
     }
 
-    static func save(_ token: String) {
+    @discardableResult
+    static func save(_ token: String) -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        SecItemDelete(query as CFDictionary)
-        var add = query
-        add[kSecValueData as String] = Data(token.utf8)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        SecItemAdd(add as CFDictionary, nil)
+        let value: [String: Any] = [
+            kSecValueData as String: Data(token.utf8),
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        let updated = SecItemUpdate(query as CFDictionary, value as CFDictionary)
+        if updated == errSecSuccess { return true }
+        if updated == errSecItemNotFound {
+            var add = query
+            for (key, item) in value { add[key] = item }
+            let added = SecItemAdd(add as CFDictionary, nil)
+            if added == errSecSuccess { return true }
+            NSLog("AidanOS could not save the relay token (%d). The previous token is unchanged.", Int(added))
+            return false
+        }
+        NSLog("AidanOS could not update the relay token (%d). The previous token is unchanged.", Int(updated))
+        return false
     }
 }
 
@@ -58,8 +70,9 @@ final class TodayModel: ObservableObject {
         let stored = RelayTokenStore.load()
         if stored.isEmpty, let old = defaults.string(forKey: "aidanos.relayToken"), !old.isEmpty {
             token = old
-            RelayTokenStore.save(old)
-            defaults.removeObject(forKey: "aidanos.relayToken")
+            if RelayTokenStore.save(old) {
+                defaults.removeObject(forKey: "aidanos.relayToken")
+            }
         } else {
             token = stored
         }

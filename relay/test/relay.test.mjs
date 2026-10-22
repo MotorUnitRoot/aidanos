@@ -11,8 +11,8 @@ import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
-import { redact } from "../src/redact.mjs";
-import { LAN_WARNING, MAX_PAYLOAD, loadToken, parseArgs, startRelay, startupLines } from "../src/server.mjs";
+import { logSafe, redact, stampLine } from "../src/redact.mjs";
+import { LAN_WARNING, MAX_PAYLOAD, loadToken, nodeRequirement, parseArgs, startRelay, startupLines } from "../src/server.mjs";
 
 const TOKEN = "aidanos-test-token-0123456789abcdef";
 
@@ -57,6 +57,26 @@ test("listen addresses stay on this computer unless --lan", () => {
     interfaces: { utun0: [{ family: "IPv4", internal: false, address: "10.8.0.2" }] },
   });
   assert.equal(chosen.phone, "10.8.0.2");
+});
+
+test("every relay log line starts with a timestamp", () => {
+  const stamped = stampLine("accepted a sync connection", new Date("2026-10-22T01:02:03.004Z"));
+  assert.equal(stamped, "2026-10-22T01:02:03.004Z accepted a sync connection");
+  const seen = [];
+  const write = console.error;
+  console.error = (line) => seen.push(line);
+  try {
+    logSafe([], "LISTENING 127.0.0.1 3757");
+  } finally {
+    console.error = write;
+  }
+  assert.match(seen[0], /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z LISTENING 127\.0\.0\.1 3757$/);
+});
+
+test("an old Node gets a plain startup message", () => {
+  assert.equal(nodeRequirement("22.14.0"), "");
+  assert.equal(nodeRequirement("20.11.1"), "Node 22 or newer is needed.");
+  assert.equal(nodeRequirement("18.0.0"), "Node 22 or newer is needed.");
 });
 
 test("redact removes the token and the git url", () => {

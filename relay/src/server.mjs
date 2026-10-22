@@ -12,7 +12,7 @@ import { listenHosts } from "./bind.mjs";
 import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import { createMirror } from "./mirror.mjs";
-import { logSafe } from "./redact.mjs";
+import { logSafe, stampLine } from "./redact.mjs";
 
 const DEFAULT_PORT = 3750;
 const MIN_TOKEN_LENGTH = 32;
@@ -102,6 +102,12 @@ export async function loadToken(env = process.env) {
     throw new Error("The relay token must be at least 32 characters.");
   }
   return token;
+}
+
+export function nodeRequirement(version = process.versions.node) {
+  const major = Number(String(version).split(".")[0]);
+  if (Number.isFinite(major) && major >= 22) return "";
+  return "Node 22 or newer is needed.";
 }
 
 export function startupLines({ lan, port, phone }) {
@@ -363,6 +369,11 @@ function gitInterval(override) {
 }
 
 async function main() {
+  const needed = nodeRequirement();
+  if (needed) {
+    logSafe([], needed);
+    process.exit(1);
+  }
   const args = parseArgs(process.argv.slice(2));
   let relay;
   try {
@@ -381,7 +392,7 @@ async function main() {
     process.exit(1);
   }
   for (const line of startupLines({ lan: args.lan || Boolean(args.lanAddress), port: relay.port, phone: relay.phone })) {
-    writeSync(line.startsWith("WARNING") ? 2 : 1, line + "\n");
+    writeSync(line.startsWith("WARNING") ? 2 : 1, stampLine(line) + "\n");
   }
   const shutdown = () => {
     relay.close().then(() => process.exit(0));

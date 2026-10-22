@@ -22,6 +22,10 @@ export function redact(text, secrets) {
   return out;
 }
 
+export function stampLine(line, now = new Date()) {
+  return now.toISOString() + " " + String(line);
+}
+
 export function logSafe(secrets, ...parts) {
   const line = parts
     .map((part) => {
@@ -29,5 +33,5 @@ export function logSafe(secrets, ...parts) {
       return String(part);
     })
     .join(" ");
-  console.error(redact(line, secrets));
+  console.error(stampLine(redact(line, secrets)));
 }

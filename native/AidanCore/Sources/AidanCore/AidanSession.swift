@@ -85,7 +85,11 @@ public final class AidanSession: SyncHost {
     private var desiredToken: String?
     private var reconnectAttempt = 0
     private var reconnectWork: DispatchWorkItem?
+    private let openingGate = NSCondition()
     private var opening = false
+    private var openingURL = ""
+    private var openingToken = ""
+    private var openingError: Error?
 
     public init(vault: URL) throws {
         if Self.looksLikeRelayFolder(vault) {
@@ -555,12 +559,30 @@ public final class AidanSession: SyncHost {
     }
 
     private func openLink(url: String, token: String) throws {
-        lock.lock()
-        if opening {
-            lock.unlock()
-            return
+        openingGate.lock()
+        while opening {
+            let same = openingURL == url && openingToken == token
+            openingGate.wait()
+            if opening { continue }
+            if same {
+                let error = openingError
+                openingGate.unlock()
+                if let error { throw error }
+                return
+            }
         }
         opening = true
+        openingURL = url
+        openingToken = token
+        openingError = nil
+        openingGate.unlock()
+        defer {
+            openingGate.lock()
+            opening = false
+            openingGate.broadcast()
+            openingGate.unlock()
+        }
+        lock.lock()
         lastOutbound = nil
         let next = RelayLink()
         link?.close()
@@ -584,18 +606,15 @@ public final class AidanSession: SyncHost {
             try saveMeta()
         } catch {
             restoreAwaitingLocked()
-            opening = false
             lock.unlock()
+            openingGate.lock()
+            openingError = error
+            openingGate.unlock()
             throw error
         }
         let peer = peerId
         let storage = storageId
         lock.unlock()
-        defer {
-            lock.lock()
-            opening = false
-            lock.unlock()
-        }
         do {
             try next.connect(url: url, token: token, peerId: peer, storageId: storage, host: self)
             lock.lock()
@@ -607,6 +626,9 @@ public final class AidanSession: SyncHost {
             lock.lock()
             restoreAwaitingLocked()
             lock.unlock()
+            openingGate.lock()
+            openingError = error
+            openingGate.unlock()
             throw error
         }
     }

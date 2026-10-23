@@ -56,11 +56,12 @@ function rejectUpgrade(socket) {
   socket.destroy();
 }
 
-function health(gitState) {
+function health(gitState, bootedAt) {
   return JSON.stringify({
     ok: true,
     git: gitState.status === "ok",
     gitStatus: gitState.status,
+    bootedAt,
   });
 }
 
@@ -116,6 +117,15 @@ export function startupLines({ lan, port, phone }) {
   if (lan) lines.push(LAN_WARNING);
   if (phone) lines.push("PHONE ws://" + phone + ":" + port);
   return lines;
+}
+
+async function emptyDirectory(dir) {
+  // One name at a time. A parallel delete races a mirror rename and macOS
+  // then returns ENOTEMPTY for the directory.
+  const names = await fs.readdir(dir);
+  for (const name of names) {
+    await fs.rm(path.join(dir, name), { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+  }
 }
 
 async function assertNotClientVault(vault) {
@@ -218,14 +228,137 @@ export async function startRelay(options = {}) {
     else if (result.committed && result.pushed === false) gitState.status = "failed";
   }
 
+  let bootedAt = new Date().toISOString();
+  const allowReset = options.allowReset === true;
   const servers = [];
-  const adapters = [];
+  let live = null;
+  let resetChain = Promise.resolve();
+  let api = null;
+
+  async function openSession() {
+    const adapters = [];
+    for (const entry of servers) {
+      adapters.push(new NodeWSServerAdapter(entry.wss));
+    }
+    const repo = new Repo({
+      storage: new NodeFSStorageAdapter(dataDir),
+      network: adapters,
+      sharePolicy: async () => true,
+      peerId: options.peerId || "aidanos-relay",
+    });
+    const debounce = Number(options.mirrorDebounceMs ?? process.env.AIDANOS_MIRROR_DEBOUNCE_MS);
+    const mirror = createMirror({
+      repo,
+      vault,
+      debounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
+      secrets,
+    });
+    // Fold a file that changed while this process was stopped before any device
+    // can connect. Doing it later lets that device's offline edit arrive first,
+    // and the file then replaces it.
+    await preloadStoredNotes(repo);
+    await mirror.now();
+    // The socket listener is attached only after the storage id is read.
+    // The port stays closed until that has finished, or the first join is missed.
+    await repo.networkSubsystem.peerMetadata;
+    for (const adapter of adapters) {
+      if (!adapter.peerId) throw new Error("The sync engine was not ready.");
+    }
+    return { repo, mirror, adapters };
+  }
+
+  async function disposeSession(session) {
+    if (!session) return;
+    session.mirror.stop();
+    for (const entry of servers) {
+      for (const ws of [...entry.wss.clients]) ws.terminate();
+      // The adapter clears its ping timer on "close". Emitting it here does not
+      // mark the socket server shut, so the next test can still connect.
+      entry.wss.emit("close");
+      entry.wss.removeAllListeners();
+    }
+    // The folder is about to be deleted, so do not flush or write it again.
+    // Wait only for a rename that has already started.
+    await session.mirror.idle();
+    try {
+      session.repo.networkSubsystem.disconnect();
+    } catch {
+      // The adapter is already detached from the socket server.
+    }
+    try {
+      await session.repo.storageSubsystem?.close();
+    } catch {
+      // Closing storage is best effort. The directory is removed next.
+    }
+  }
+
+  async function rotate() {
+    await disposeSession(live);
+    live = null;
+    let lastError;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await emptyDirectory(vault);
+        await emptyDirectory(dataDir);
+        await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
+        await fs.writeFile(path.join(vault, ".aidanos", "relay-folder"), "relay\n");
+        await fs.writeFile(path.join(dataDir, "relay-folder"), "relay\n");
+        live = await openSession();
+        bootedAt = new Date().toISOString();
+        if (api) api.repo = live.repo;
+        logSafe(secrets, "reset complete");
+        if (typeof options.onReset === "function") options.onReset();
+        return;
+      } catch (error) {
+        lastError = error;
+        logSafe(secrets, "reset attempt failed:", error instanceof Error ? error.message : error);
+      }
+    }
+    throw lastError;
+  }
+
+  function scheduleReset() {
+    resetChain = resetChain.then(rotate).catch((error) => {
+      logSafe(secrets, "reset failed:", error instanceof Error ? error.message : error);
+    });
+  }
+
   for (const host of hosts) {
     const httpServer = http.createServer((req, res) => {
-      if (req.url === "/health") {
-        const body = health(gitState);
-        res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+      const pathOnly = String(req.url || "").split("?")[0];
+      if (pathOnly === "/health") {
+        const body = health(gitState, bootedAt);
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          "cache-control": "no-store",
+        });
         res.end(body);
+        return;
+      }
+      if (req.method === "POST" && pathOnly === "/reset") {
+        if (!allowReset) {
+          res.writeHead(404, { "content-length": 0 });
+          res.end();
+          return;
+        }
+        if (!tokensMatch(token, bearerToken(req.headers.authorization))) {
+          res.writeHead(401, { "content-length": 0 });
+          res.end();
+          return;
+        }
+        const body = JSON.stringify({ ok: true, resetting: true });
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          "cache-control": "no-store",
+        });
+        res.end(body);
+        logSafe(secrets, "resetting");
+        // The iOS simulator shares this process. Empty the folder here instead
+        // of exiting: starting Node again while the simulator is up takes
+        // longer than the tests will wait. Off unless allowReset is set.
+        scheduleReset();
         return;
       }
       res.writeHead(404, { "content-length": 0 });
@@ -233,8 +366,12 @@ export async function startRelay(options = {}) {
     });
     const cap = Number(options.maxPayload ?? process.env.AIDANOS_MAX_PAYLOAD ?? MAX_PAYLOAD);
     const wss = new WebSocketServer({ noServer: true, maxPayload: cap });
-    const adapter = new NodeWSServerAdapter(wss);
+    const entry = { httpServer, host, wss };
     httpServer.on("upgrade", (req, socket, head) => {
+      if (!live) {
+        socket.destroy();
+        return;
+      }
       const ip = clientAddress(req);
       if (blocked(ip) || !tokensMatch(token, bearerToken(req.headers.authorization))) {
         if (!blocked(ip)) noteFailure(ip);
@@ -243,7 +380,7 @@ export async function startRelay(options = {}) {
         return;
       }
       failures.delete(ip);
-      wss.handleUpgrade(req, socket, head, (ws) => {
+      entry.wss.handleUpgrade(req, socket, head, (ws) => {
         ws.on("error", (error) => {
           logSafe(secrets, "sync connection closed:", error instanceof Error ? error.message : error);
         });
@@ -256,41 +393,13 @@ export async function startRelay(options = {}) {
           return send.apply(ws, args);
         };
         logSafe(secrets, "accepted a sync connection");
-        wss.emit("connection", ws, req);
+        entry.wss.emit("connection", ws, req);
       });
     });
-    servers.push({ httpServer, host, wss });
-    adapters.push(adapter);
+    servers.push(entry);
   }
 
-  const repo = new Repo({
-    storage: new NodeFSStorageAdapter(dataDir),
-    network: adapters,
-    sharePolicy: async () => true,
-    peerId: options.peerId || "aidanos-relay",
-  });
-  const debounce = Number(options.mirrorDebounceMs ?? process.env.AIDANOS_MIRROR_DEBOUNCE_MS);
-  const mirror = createMirror({
-    repo,
-    vault,
-    debounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
-    secrets,
-  });
-
-  // Fold a file that changed while this process was stopped before any device
-  // can connect. Doing it later lets that device's offline edit arrive first,
-  // and the file then replaces it.
-  await preloadStoredNotes(repo);
-  await mirror.now();
-
-  // The socket listener is attached only after the storage id is read.
-  // The port stays closed until that has finished, or the first join is missed.
-  await repo.networkSubsystem.peerMetadata;
-  for (const adapter of adapters) {
-    if (!adapter.peerId) {
-      throw new Error("The sync engine was not ready.");
-    }
-  }
+  live = await openSession();
 
   let boundPort = port;
   for (const entry of servers) {
@@ -319,23 +428,26 @@ export async function startRelay(options = {}) {
     if (gitTimer.unref) gitTimer.unref();
   }
 
-  return {
+  api = {
     port: boundPort,
     url: "ws://" + "127.0.0.1:" + boundPort,
     phone: phone ? "ws://" + phone + ":" + boundPort : null,
     hosts,
     vault,
-    repo,
+    repo: live.repo,
     token,
     async mirrorNow() {
-      await mirror.now();
+      await live.mirror.now();
     },
     async backupNow() {
       return runBackup();
     },
     healthURL: "http://127.0.0.1:" + boundPort + "/health",
     async close() {
-      mirror.stop();
+      await resetChain.catch(() => {});
+      const session = live;
+      live = null;
+      if (session) session.mirror.stop();
       if (gitTimer) clearInterval(gitTimer);
       for (const entry of servers) {
         for (const ws of [...entry.wss.clients]) ws.terminate();
@@ -354,9 +466,10 @@ export async function startRelay(options = {}) {
       // already went away can leave that timer running, which holds the
       // process open after the tests have finished.
       for (const entry of servers) entry.wss.emit("close");
-      if (typeof repo.shutdown === "function") await repo.shutdown();
+      if (session && typeof session.repo.shutdown === "function") await session.repo.shutdown();
     },
   };
+  return api;
 }
 
 async function preloadStoredNotes(repo) {
@@ -401,6 +514,7 @@ async function main() {
       vault: args.vault || undefined,
       data: args.data || undefined,
       port: args.port == null || Number.isNaN(args.port) ? undefined : args.port,
+      allowReset: process.env.AIDANOS_RELAY_ALLOW_RESET === "1",
     });
   } catch (error) {
     logSafe(

@@ -16,6 +16,6 @@
     "@automerge/automerge-repo-network-websocket": "2.6.0-alpha.3",
     "@automerge/automerge-repo-storage-nodefs": "2.6.0-alpha.3",
     "bs58check": "4.0.0",
-    "ws": "8.18.3"
+    "ws": "8.22.0"
   }
 }

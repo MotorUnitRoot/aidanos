@@ -41,7 +41,7 @@ The relay is the small program both apps talk to. It keeps its own folder of not
 
    ```
    cd aidanos/relay
-   npm ci
+   npm ci --omit=optional
    ```
 
    If you are already inside the project folder, `cd relay` is enough.

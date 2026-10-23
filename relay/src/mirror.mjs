@@ -281,9 +281,14 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
       }
       await syncDisk();
     },
+    // Wait for a write that has already started. Does not start another one.
+    async idle() {
+      await chain;
+    },
     stop() {
       clearInterval(poll);
       if (timer) clearTimeout(timer);
+      timer = null;
     },
   };
 }

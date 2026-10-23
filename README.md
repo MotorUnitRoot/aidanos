@@ -87,3 +87,10 @@ A finding is urgent in any of these cases:
 The weekly summary names an end-of-support date starting 60 days before it. Once that date has passed, the same fact is urgent. That rule uses the hosted image. The summary also prints the Node version GitHub Actions installs from `.nvmrc`. The run fails when something is urgent. Everything else is listed in the summary, in severity order, with urgent items first. This scan is not a required check on pull requests.
 
 The app still has no runtime npm dependencies.
+
+### Tracked, not done yet
+
+- Keep the Trivy download's sha256 in this repo, or check its cosign signature in an install step we own.
+- Dependabot does not bump the Trivy version written in the workflow. A daily version check should cover that pin.
+- An urgent finding should later open an issue or send an alert. Today the run only fails.
+- GitHub turns off a scheduled workflow after 60 days with no activity. A daily check should confirm this scan ran.

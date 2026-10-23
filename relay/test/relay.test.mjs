@@ -14,7 +14,16 @@ import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
 import { logSafe, redact, stampLine } from "../src/redact.mjs";
 import { cbor } from "@automerge/automerge-repo";
 import { describeSyncFrame, logSyncFrame } from "../src/sync-log.mjs";
-import { LAN_WARNING, MAX_PAYLOAD, loadToken, nodeRequirement, parseArgs, startRelay, startupLines } from "../src/server.mjs";
+import {
+  LAN_WARNING,
+  MAX_PAYLOAD,
+  loadToken,
+  nodeRequirement,
+  parseArgs,
+  payloadLimit,
+  startRelay,
+  startupLines,
+} from "../src/server.mjs";
 
 const TOKEN = "aidanos-test-token-0123456789abcdef";
 
@@ -530,11 +539,10 @@ test("the try-it guide keeps the token off the command line", async () => {
   assert.equal(text.includes("printf"), false);
   assert.equal(text.includes("AIDANOS_RELAY_TOKEN="), false);
   assert.equal(text.includes("paste-your-long-token"), false);
-  const readAt = text.indexOf("read -s");
-  const editAt = text.indexOf("TextEdit");
-  assert.equal(readAt >= 0 && editAt > readAt, true);
-  assert.match(text, /Make Plain Text/);
-  assert.match(text, /If no extension is provided, use \.txt/);
+  assert.equal(text.includes("several words"), false);
+  assert.match(text, /openssl rand -base64 32/);
+  assert.match(text, /chmod 600/);
+  assert.match(text, /--vault/);
 });
 
 test("an oversized frame does not stop the relay", async () => {
@@ -582,7 +590,7 @@ test("the relay logs the handshake it sends and receives", async () => {
       type: "join",
       senderId: "phone-1",
       supportedProtocolVersions: ["1"],
-      peerMetadata: { storageId: "storage-1", isEphemeral: false },
+      peerMetadata: { storageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", isEphemeral: false },
     });
     await new Promise((resolve, reject) => {
       const ws = new WebSocket(relay.url, { headers: { Authorization: "Bearer " + TOKEN } });
@@ -689,6 +697,225 @@ test("an allowed reset checks the token and empties the folder", async () => {
     await relay.close();
   }
 });
+
+test("relay refuses a notes folder", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "notes");
+  await fs.mkdir(path.join(vault, "log"), { recursive: true });
+  await fs.writeFile(path.join(vault, "log", "2026-10-23.md"), "# day\n");
+  await fs.writeFile(path.join(vault, "readme.txt"), "notes\n");
+  await fs.mkdir(path.join(vault, ".git"), { recursive: true });
+  await fs.writeFile(path.join(vault, ".git", "config"), '[remote "origin"]\n\turl = /tmp/notes.git\n');
+  await assert.rejects(
+    startRelay({ token: TOKEN, vault, data: path.join(dir, "data"), port: 0, gitUrl: "" }),
+    /notes|git remote/,
+  );
+  assert.equal(await fs.readFile(path.join(vault, "log", "2026-10-23.md"), "utf8"), "# day\n");
+  await assert.rejects(fs.stat(path.join(vault, ".aidanos", "relay-folder")));
+  await assert.rejects(fs.stat(path.join(dir, "data")));
+});
+
+test("relay ignores the old vault variables and accepts its own marked folder", async () => {
+  const dir = await tempDir();
+  const notes = path.join(dir, "notes");
+  await fs.mkdir(path.join(notes, "log"), { recursive: true });
+  await fs.writeFile(path.join(notes, "log", "2026-10-23.md"), "secret\n");
+  const own = path.join(dir, "relay-vault");
+  await fs.mkdir(path.join(own, ".aidanos"), { recursive: true });
+  await fs.writeFile(path.join(own, ".aidanos", "relay-folder"), "relay\n");
+  await fs.writeFile(path.join(own, "day.md"), "kept\n");
+  await fs.mkdir(path.join(own, ".git"), { recursive: true });
+  await fs.writeFile(path.join(own, ".git", "config"), '[remote "origin"]\n\turl = /tmp/backup.git\n');
+  const env = {
+    AIDANOS_VAULT: notes,
+    AIDANOS_VAULT_GIT_URL: "https://example.invalid/vault.git",
+    AIDANOS_VAULT_GIT_TOKEN: "should-not-be-used-0123456789abcdef",
+    AIDANOS_RELAY_VAULT: own,
+  };
+  const relay = await startRelay({
+    token: TOKEN,
+    env,
+    data: path.join(dir, "data"),
+    port: 0,
+    gitIntervalMs: 0,
+  });
+  try {
+    const body = await (await fetch(relay.healthURL)).json();
+    assert.equal(body.git, false);
+    assert.equal(body.gitStatus, "off");
+    assert.equal(await fs.readFile(path.join(notes, "log", "2026-10-23.md"), "utf8"), "secret\n");
+    await assert.rejects(fs.stat(path.join(notes, ".aidanos", "relay-folder")));
+    assert.equal(await fs.readFile(path.join(own, "day.md"), "utf8"), "kept\n");
+    assert.equal(await fs.readFile(path.join(own, ".aidanos", "relay-folder"), "utf8"), "relay\n");
+  } finally {
+    await relay.close();
+  }
+  await assert.rejects(
+    startRelay({ token: TOKEN, env: { AIDANOS_VAULT: notes }, port: 0, gitUrl: "" }),
+    /AIDANOS_RELAY_VAULT/,
+  );
+});
+
+test("a token with spaces is refused before the relay listens", async () => {
+  const spaced = "several words you can remember today";
+  assert.ok(spaced.length >= 32);
+  await assert.rejects(loadToken({ AIDANOS_RELAY_TOKEN: spaced }), /whitespace/);
+  const dir = await tempDir();
+  const file = path.join(dir, "token");
+  await fs.writeFile(file, spaced + "\n", { mode: 0o600 });
+  await assert.rejects(loadToken({ AIDANOS_RELAY_TOKEN_FILE: file }), /whitespace/);
+  await fs.writeFile(file, TOKEN + "\n\n", { mode: 0o600 });
+  await assert.rejects(loadToken({ AIDANOS_RELAY_TOKEN_FILE: file }), /whitespace/);
+  await fs.writeFile(file, TOKEN + "\n", { mode: 0o600 });
+  assert.equal(await loadToken({ AIDANOS_RELAY_TOKEN_FILE: file }), TOKEN);
+  await assert.rejects(
+    startRelay({ token: spaced, vault: path.join(dir, "vault"), port: 0, gitUrl: "" }),
+    /whitespace/,
+  );
+  await assert.rejects(fs.stat(path.join(dir, "vault")));
+});
+
+test("zero or a nonsense payload cap stays at 32 MB", () => {
+  assert.equal(payloadLimit(0), MAX_PAYLOAD);
+  assert.equal(payloadLimit("0"), MAX_PAYLOAD);
+  assert.equal(payloadLimit("nope"), MAX_PAYLOAD);
+  assert.equal(payloadLimit(""), MAX_PAYLOAD);
+  assert.equal(payloadLimit(undefined), MAX_PAYLOAD);
+  assert.equal(payloadLimit(64), 64);
+});
+
+test("wrong reset guesses count toward the block", async () => {
+  const dir = await tempDir();
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    allowReset: true,
+    guessLimit: 2,
+    guessBlockMs: 60_000,
+  });
+  try {
+    const reset = (header) =>
+      fetch(relay.healthURL.replace("/health", "/reset"), {
+        method: "POST",
+        headers: header ? { Authorization: header } : {},
+      });
+    assert.equal((await reset("Bearer nope")).status, 401);
+    assert.equal((await reset("Bearer nope")).status, 401);
+    assert.equal((await reset("Bearer " + TOKEN)).status, 401);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("a ../ storage id closes the connection and stays inside the data folder", async () => {
+  const parent = await tempDir();
+  const data = path.join(parent, "data");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(parent, "vault"),
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 1000,
+  });
+  try {
+    const before = new Set(await filesUnder(parent));
+    const frame = cbor.encode({
+      type: "join",
+      senderId: "phone-1",
+      supportedProtocolVersions: ["1"],
+      peerMetadata: { storageId: "../", isEphemeral: false },
+    });
+    await expectClosed(relay.url, [frame]);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    for (const file of await filesUnder(parent)) {
+      if (before.has(file)) continue;
+      assert.equal(file.startsWith(data + path.sep), true, file);
+    }
+    await assert.rejects(fs.stat(path.join(parent, "sync-state")));
+  } finally {
+    await relay.close();
+  }
+});
+
+test("a bad document id closes the connection and stays inside the data folder", async () => {
+  const parent = await tempDir();
+  const data = path.join(parent, "data");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(parent, "vault"),
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 1000,
+  });
+  try {
+    const before = new Set(await filesUnder(parent));
+    const join = cbor.encode({
+      type: "join",
+      senderId: "phone-1",
+      supportedProtocolVersions: ["1"],
+      peerMetadata: { storageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", isEphemeral: false },
+    });
+    const request = cbor.encode({
+      type: "request",
+      senderId: "phone-1",
+      targetId: "aidanos-relay",
+      documentId: "../",
+      data: Buffer.from([1, 2, 3, 4]),
+    });
+    await expectClosed(relay.url, [join, request]);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    for (const file of await filesUnder(parent)) {
+      if (before.has(file)) continue;
+      assert.equal(file.startsWith(data + path.sep), true, file);
+    }
+    await assert.rejects(fs.stat(path.join(parent, "sync-state")));
+  } finally {
+    await relay.close();
+  }
+});
+
+async function filesUnder(root) {
+  const out = [];
+  async function walk(dir) {
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      if (error && error.code === "ENOENT") return;
+      throw error;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) await walk(full);
+      else out.push(full);
+    }
+  }
+  await walk(root);
+  return out;
+}
+
+function expectClosed(url, frames) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url, { headers: { Authorization: "Bearer " + TOKEN } });
+    const timer = setTimeout(() => {
+      ws.terminate();
+      reject(new Error("connection stayed open"));
+    }, 2500);
+    ws.on("open", () => {
+      for (const frame of frames) ws.send(frame);
+    });
+    ws.on("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    ws.on("error", () => {});
+  });
+}
 
 function sendUnmaskedPong(port) {
   return new Promise((resolve, reject) => {

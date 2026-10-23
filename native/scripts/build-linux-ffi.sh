@@ -23,7 +23,7 @@ fi
 
 lib="$src/rust/target/release/libuniffi_automerge.a"
 if [[ ! -f "$lib" ]]; then
-  cargo build --manifest-path "$src/rust/Cargo.toml" --release
+  cargo build --manifest-path "$src/rust/Cargo.toml" --locked --release
 fi
 
 mkdir -p "$pkgdir"

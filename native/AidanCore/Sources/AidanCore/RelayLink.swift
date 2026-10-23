@@ -392,7 +392,7 @@ protocol SyncHost: AnyObject {
     func noteSent(docId: String)
 }
 
-private struct RelayAddress {
+struct RelayAddress {
     var host: String
     var port: UInt16
     var path: String
@@ -406,7 +406,10 @@ private struct RelayAddress {
         }
         self.host = host
         if let explicit = url.port {
-            self.port = UInt16(explicit)
+            guard let port = UInt16(exactly: explicit) else {
+                throw AidanError.protocol("The relay port must be between 1 and 65535.")
+            }
+            self.port = port
         } else {
             self.port = 80
         }

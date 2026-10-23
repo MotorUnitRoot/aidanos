@@ -13,8 +13,8 @@ jobs:
   relay:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "22"
           cache: npm
@@ -30,18 +30,23 @@ jobs:
           set -euo pipefail
           docker build -t aidanos-relay relay
           docker run --rm --entrypoint bash aidanos-relay -lc 'bash scripts/reject-optional-native.sh'
+          docker run --rm --entrypoint cat aidanos-relay /app/Acknowledgements.txt > "$RUNNER_TEMP/ack-image.txt"
+          cmp "$RUNNER_TEMP/ack-image.txt" relay/Acknowledgements.txt
+          cmp native/Apps/Shared/Acknowledgements.txt relay/Acknowledgements.txt
 
   aidan-core-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "22"
-      - uses: swift-actions/setup-swift@v2
+      - uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
         with:
           swift-version: "6.2"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.99.1"
       - name: C++ headers Swift's clang can see
         run: |
           sudo apt-get update
@@ -60,8 +65,8 @@ jobs:
   apple:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "22"
       - run: npm ci --omit=optional
@@ -124,10 +129,14 @@ jobs:
       - name: Acknowledgements is in both app bundles
         run: |
           set -euo pipefail
+          src="$GITHUB_WORKSPACE/native/Apps/Shared/Acknowledgements.txt"
+          test -f "$src"
+          cmp "$GITHUB_WORKSPACE/relay/Acknowledgements.txt" "$src"
           mac=0
           ios=0
           while IFS= read -r path; do
             printf '%s\n' "$path"
+            cmp "$path" "$src"
             case "$path" in
               */Contents/Resources/Acknowledgements.txt) mac=$((mac + 1)) ;;
               */AidanOS.app/Acknowledgements.txt) ios=$((ios + 1)) ;;

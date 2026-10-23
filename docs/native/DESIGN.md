@@ -106,13 +106,13 @@ The relay listens for edits, stores the Automerge histories on disk (by default 
 
 When a note changes, the relay writes the `.md` file with the same atomic rename. It waits a short moment so a burst of keystrokes becomes one write. It remembers a hash of what it last wrote, in `.aidanos/written.json`, so a restart can tell that file from a real outside edit. If someone edits a markdown file on the machine where the relay is running, the relay treats that as an outside edit: it diffs the file into the history so the next mirror write does not stamp the old text back over the file.
 
-The relay only writes a relative `.md` path. Hidden names, `..`, absolute paths, and a symlink that leaves the folder are refused. The same rule is enforced in the apps. The relay also refuses to start when its folder is an app vault (it has `.aidanos/actor`, `storage-id`, or `index`). The two folders stay separate.
+The relay only writes a relative `.md` path. Hidden names, `..`, absolute paths, and a symlink that leaves the folder are refused. The same rule is enforced in the apps. The relay also refuses to start when its folder is an app vault (it has `.aidanos/actor`, `storage-id`, or `index`). It will not start in a folder that already has notes (`.md`, `.txt`, or files under `log/`) or a git remote, unless that folder is one it marked itself. The first start has to be an empty folder, named with `--vault` or `AIDANOS_RELAY_VAULT`. It writes `.aidanos/relay-folder` there. `AIDANOS_VAULT`, `AIDANOS_VAULT_GIT_URL`, and `AIDANOS_VAULT_GIT_TOKEN` are the hosted app's settings and the relay does not read them. The two folders stay separate.
 
-Git runs on a timer, every five minutes unless `AIDANOS_VAULT_GIT_INTERVAL_MS` says otherwise. Each tick:
+Git runs on a timer, every five minutes unless `AIDANOS_RELAY_GIT_INTERVAL_MS` says otherwise. Each tick:
 
-- If `AIDANOS_VAULT_GIT_URL` is unset, git is skipped. Sync is unchanged. Health reports git as off.
+- If `AIDANOS_RELAY_GIT_URL` is unset, git is skipped. Sync is unchanged. Health reports git as off.
 - If it is set, the relay commits the markdown files (not `.aidanos`) and pushes to that URL. The remote URL stored in the vault's git config does not contain the token.
-- It authenticates the push with `AIDANOS_VAULT_GIT_TOKEN`, passed only in the environment of that push (a short-lived ask-pass helper). Logs, errors, and health output are scrubbed, including a bearer token of any length. The token string, the raw URL, and any `x-access-token:…` user-info are replaced before anything is printed.
+- It authenticates the push with `AIDANOS_RELAY_GIT_TOKEN`, passed only in the environment of that push (a short-lived ask-pass helper). Logs, errors, and health output are scrubbed, including a bearer token of any length. The token string, the raw URL, and any `x-access-token:…` user-info are replaced before anything is printed.
 - The relay does not pull, fetch, rebase, or force-push. If the backup has commits the relay does not have, the push fails, health reports git as failed, the failure is logged without the token, and sync continues. Someone can repair the backup by hand. The devices are not waiting on it.
 
 ## Where the relay listens

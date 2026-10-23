@@ -23,6 +23,9 @@ export function authenticatedGitUrl(url, token) {
   return parsed.href;
 }
 
+// SSH_AUTH_SOCK stays out. An SSH backup URL must not use the keys in the
+// user's agent. Proxy and certificate variables are also left out; that is
+// tracked in the relay README.
 const GIT_ENV_KEYS = [
   "PATH",
   "HOME",
@@ -30,7 +33,6 @@ const GIT_ENV_KEYS = [
   "LANG",
   "LC_ALL",
   "LC_CTYPE",
-  "SSH_AUTH_SOCK",
   "GIT_EXEC_PATH",
   "GIT_TEMPLATE_DIR",
   "GIT_CONFIG_GLOBAL",

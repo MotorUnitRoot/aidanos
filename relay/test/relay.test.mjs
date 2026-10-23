@@ -841,9 +841,11 @@ test("git does not see an unrelated secret", async () => {
   const previousPath = process.env.PATH;
   const previousSecret = process.env.UNRELATED_SECRET;
   const previousVaultToken = process.env.AIDANOS_VAULT_GIT_TOKEN;
+  const previousSsh = process.env.SSH_AUTH_SOCK;
   process.env.PATH = bin + path.delimiter + (previousPath || "");
   process.env.UNRELATED_SECRET = "unrelated-secret-not-for-git";
   process.env.AIDANOS_VAULT_GIT_TOKEN = "hosted-vault-token-should-stay-out";
+  process.env.SSH_AUTH_SOCK = "/tmp/ssh-agent-not-for-the-relay.sock";
   const relay = await startRelay({
     token: TOKEN,
     vault,
@@ -859,6 +861,8 @@ test("git does not see an unrelated secret", async () => {
     const seen = await fs.readFile(log, "utf8");
     assert.equal(seen.includes("unrelated-secret-not-for-git"), false);
     assert.equal(seen.includes("hosted-vault-token-should-stay-out"), false);
+    assert.equal(seen.includes("SSH_AUTH_SOCK="), false);
+    assert.equal(seen.includes("/tmp/ssh-agent-not-for-the-relay.sock"), false);
     assert.match(seen, /^PATH=/m);
   } finally {
     if (previousPath == null) delete process.env.PATH;
@@ -867,6 +871,158 @@ test("git does not see an unrelated secret", async () => {
     else process.env.UNRELATED_SECRET = previousSecret;
     if (previousVaultToken == null) delete process.env.AIDANOS_VAULT_GIT_TOKEN;
     else process.env.AIDANOS_VAULT_GIT_TOKEN = previousVaultToken;
+    if (previousSsh == null) delete process.env.SSH_AUTH_SOCK;
+    else process.env.SSH_AUTH_SOCK = previousSsh;
+    await relay.close();
+  }
+});
+
+test("the id file beside the notes folder is not followed or overwritten", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const target = path.join(dir, "precious.txt");
+  await fs.writeFile(target, "keep-me\n");
+  await fs.symlink(target, relayIdFile(vault));
+  await assert.rejects(
+    startRelay({ token: TOKEN, vault, data: path.join(dir, "data"), port: 0, gitUrl: "" }),
+    /symlink/,
+  );
+  assert.equal(await fs.readFile(target, "utf8"), "keep-me\n");
+  assert.equal((await fs.lstat(relayIdFile(vault))).isSymbolicLink(), true);
+  await assert.rejects(fs.stat(path.join(vault, ".aidanos", "relay-folder")));
+  await assert.rejects(fs.stat(path.join(dir, "data", "relay-folder")));
+
+  const other = path.join(dir, "other");
+  const occupied = relayIdFile(other);
+  await fs.writeFile(occupied, "not a marker\n");
+  await assert.rejects(
+    startRelay({ token: TOKEN, vault: other, data: path.join(dir, "other-data"), port: 0, gitUrl: "" }),
+    /already exists/,
+  );
+  assert.equal(await fs.readFile(occupied, "utf8"), "not a marker\n");
+  assert.equal((await fs.lstat(occupied)).isSymbolicLink(), false);
+
+  const marked = path.join(dir, "marked");
+  const markedData = path.join(dir, "marked-data");
+  const vaultTarget = path.join(dir, "vault-target.txt");
+  const dataTarget = path.join(dir, "data-target.txt");
+  await fs.writeFile(vaultTarget, "vault-keep\n");
+  await fs.writeFile(dataTarget, "data-keep\n");
+  await fs.mkdir(path.join(marked, ".aidanos"), { recursive: true });
+  await fs.mkdir(markedData, { recursive: true });
+  await fs.symlink(vaultTarget, path.join(marked, ".aidanos", "relay-folder"));
+  await fs.symlink(dataTarget, path.join(markedData, "relay-folder"));
+  await assert.rejects(
+    startRelay({ token: TOKEN, vault: marked, data: markedData, port: 0, gitUrl: "" }),
+  );
+  assert.equal(await fs.readFile(vaultTarget, "utf8"), "vault-keep\n");
+  assert.equal(await fs.readFile(dataTarget, "utf8"), "data-keep\n");
+  assert.equal((await fs.lstat(path.join(marked, ".aidanos", "relay-folder"))).isSymbolicLink(), true);
+  assert.equal((await fs.lstat(path.join(markedData, "relay-folder"))).isSymbolicLink(), true);
+});
+
+test("reset recreates a data folder inside the notes folder", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault,
+    port: 0,
+    gitUrl: "",
+    allowReset: true,
+  });
+  try {
+    const data = path.join(vault, ".aidanos", "relay");
+    const marker = await fs.readFile(path.join(data, "relay-folder"), "utf8");
+    assert.notEqual(relayMarkerId(marker), "");
+    const first = await fetch(relay.healthURL);
+    assert.equal(first.status, 200);
+    const body = await first.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.status, "ok");
+    const id = noteId("notes/nested-reset.md");
+    await importDoc(relay.repo, id, { kind: "note", text: "secret-before-reset" });
+    await relay.repo.flush();
+    const previous = relay.repo;
+    const accepted = await fetch(relay.healthURL.replace("/health", "/reset"), {
+      method: "POST",
+      headers: { Authorization: "Bearer " + TOKEN },
+    });
+    assert.equal(accepted.status, 200);
+    const deadline = Date.now() + 5000;
+    let after = null;
+    while (Date.now() < deadline) {
+      const again = await fetch(relay.healthURL + "?n=" + Date.now());
+      const parsed = await again.json();
+      if (again.status === 200 && parsed.bootedAt !== body.bootedAt) {
+        after = { status: again.status, body: parsed };
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(after);
+    assert.equal(after.status, 200);
+    assert.equal(after.body.ok, true);
+    assert.equal(after.body.status, "ok");
+    assert.notEqual(relay.repo, previous);
+    assert.equal(await relay.repo.storageSubsystem.loadDoc(id), null);
+    await fs.stat(data);
+    assert.equal(await fs.readFile(path.join(data, "relay-folder"), "utf8"), marker);
+    const opened = await Promise.race([
+      connect(relay.url, TOKEN),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("connect timed out")), 2000)),
+    ]);
+    assert.equal(opened.opened, true);
+    opened.socket.close();
+  } finally {
+    await relay.close();
+  }
+});
+
+test("a failed reset makes health report sync down", async () => {
+  const dir = await tempDir();
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    port: 0,
+    gitUrl: "",
+    allowReset: true,
+    beforeReopen() {
+      throw new Error("forced reset failure");
+    },
+  });
+  try {
+    const accepted = await fetch(relay.healthURL.replace("/health", "/reset"), {
+      method: "POST",
+      headers: { Authorization: "Bearer " + TOKEN },
+    });
+    assert.equal(accepted.status, 200);
+    const deadline = Date.now() + 5000;
+    let down = null;
+    while (Date.now() < deadline) {
+      const again = await fetch(relay.healthURL + "?n=" + Date.now());
+      if (again.status !== 200) {
+        down = { status: again.status, body: await again.json() };
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(down);
+    assert.notEqual(down.status, 200);
+    assert.equal(down.body.ok, false);
+    assert.equal(down.body.status, "sync down");
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const still = await fetch(relay.healthURL + "?n=" + Date.now());
+    const stillBody = await still.json();
+    assert.equal(still.status, 503);
+    assert.equal(stillBody.ok, false);
+    assert.equal(stillBody.status, "sync down");
+    const opened = await Promise.race([
+      connect(relay.url, TOKEN),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("connect timed out")), 2000)),
+    ]);
+    assert.equal(opened.opened, false);
+  } finally {
     await relay.close();
   }
 });

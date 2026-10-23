@@ -56,11 +56,12 @@ function rejectUpgrade(socket) {
   socket.destroy();
 }
 
-function health(gitState) {
+function health(gitState, bootedAt) {
   return JSON.stringify({
     ok: true,
     git: gitState.status === "ok",
     gitStatus: gitState.status,
+    bootedAt,
   });
 }
 
@@ -218,14 +219,39 @@ export async function startRelay(options = {}) {
     else if (result.committed && result.pushed === false) gitState.status = "failed";
   }
 
+  const bootedAt = new Date().toISOString();
+  const allowReset = options.allowReset === true;
   const servers = [];
   const adapters = [];
   for (const host of hosts) {
     const httpServer = http.createServer((req, res) => {
       if (req.url === "/health") {
-        const body = health(gitState);
+        const body = health(gitState, bootedAt);
         res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
         res.end(body);
+        return;
+      }
+      if (req.method === "POST" && req.url === "/reset") {
+        if (!allowReset) {
+          res.writeHead(404, { "content-length": 0 });
+          res.end();
+          return;
+        }
+        if (!tokensMatch(token, bearerToken(req.headers.authorization))) {
+          res.writeHead(401, { "content-length": 0 });
+          res.end();
+          return;
+        }
+        const body = JSON.stringify({ ok: true, resetting: true });
+        res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+        res.end(body);
+        // The iOS simulator shares this process. A test asks it to exit so the
+        // supervisor can start again on an empty folder. Off unless that
+        // supervisor set allowReset.
+        setTimeout(() => {
+          if (typeof options.onReset === "function") options.onReset();
+          else process.exit(75);
+        }, 30);
         return;
       }
       res.writeHead(404, { "content-length": 0 });
@@ -401,6 +427,8 @@ async function main() {
       vault: args.vault || undefined,
       data: args.data || undefined,
       port: args.port == null || Number.isNaN(args.port) ? undefined : args.port,
+      allowReset: process.env.AIDANOS_RELAY_ALLOW_RESET === "1",
+      onReset: () => process.exit(75),
     });
   } catch (error) {
     logSafe(

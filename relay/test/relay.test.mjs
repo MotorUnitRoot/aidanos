@@ -611,6 +611,60 @@ function importDoc(repo, docId, value) {
   return repo.import(Automerge.save(Automerge.from(value)), { docId });
 }
 
+test("reset is off unless a supervisor asked for it", async () => {
+  const dir = await tempDir();
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+  });
+  try {
+    const hidden = await fetch(relay.healthURL.replace("/health", "/reset"), { method: "POST" });
+    assert.equal(hidden.status, 404);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("an allowed reset checks the token and then asks to exit", async () => {
+  const dir = await tempDir();
+  let resets = 0;
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    allowReset: true,
+    onReset: () => {
+      resets += 1;
+    },
+  });
+  try {
+    const health = await fetch(relay.healthURL);
+    const body = await health.json();
+    assert.equal(typeof body.bootedAt, "string");
+    const denied = await fetch(relay.healthURL.replace("/health", "/reset"), {
+      method: "POST",
+      headers: { Authorization: "Bearer nope" },
+    });
+    assert.equal(denied.status, 401);
+    assert.equal(resets, 0);
+    const accepted = await fetch(relay.healthURL.replace("/health", "/reset"), {
+      method: "POST",
+      headers: { Authorization: "Bearer " + TOKEN },
+    });
+    assert.equal(accepted.status, 200);
+    assert.deepEqual(await accepted.json(), { ok: true, resetting: true });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(resets, 1);
+  } finally {
+    await relay.close();
+  }
+});
+
 function sendUnmaskedPong(port) {
   return new Promise((resolve, reject) => {
     const socket = net.connect(port, "127.0.0.1");

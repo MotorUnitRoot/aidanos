@@ -743,7 +743,9 @@ private final class TestRelay {
 
     static func start() throws -> TestRelay {
         #if os(iOS)
-        return TestRelay(url: "ws://127.0.0.1:3757", token: testToken, vault: nil)
+        let relay = TestRelay(url: "ws://127.0.0.1:3757", token: testToken, vault: nil)
+        try relay.resetSharedRelay()
+        return relay
         #else
         return try spawn()
         #endif
@@ -779,6 +781,60 @@ private final class TestRelay {
         self.url = url
         self.token = token
         self.vault = vault
+    }
+
+    /// The simulator uses the relay CI started. Ask that process to exit so the
+    /// next test syncs an empty folder. A relay that does not offer reset is
+    /// left as it is.
+    private func resetSharedRelay() throws {
+        guard let resetURL = URL(string: "http://127.0.0.1:3757/reset"),
+              let healthURL = URL(string: "http://127.0.0.1:3757/health") else {
+            throw AidanError.io("The test relay address is not a URL.")
+        }
+        guard let before = try Self.bootedAt(healthURL) else {
+            throw AidanError.io("The test relay did not answer.")
+        }
+        var request = URLRequest(url: resetURL)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let done = DispatchSemaphore(value: 0)
+        var status = 0
+        URLSession.shared.dataTask(with: request) { _, response, _ in
+            status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            done.signal()
+        }.resume()
+        if done.wait(timeout: .now() + 5) == .timedOut {
+            throw AidanError.io("The test relay did not reset.")
+        }
+        if status == 404 { return }
+        if status != 200 {
+            throw AidanError.io("The test relay did not reset (\(status)).")
+        }
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline {
+            if let booted = try? Self.bootedAt(healthURL), booted != before {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        throw AidanError.io("The test relay did not come back.")
+    }
+
+    private static func bootedAt(_ url: URL) throws -> String? {
+        let done = DispatchSemaphore(value: 0)
+        var body = Data()
+        var failed = false
+        URLSession.shared.dataTask(with: url) { data, response, _ in
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if code == 200, let data { body = data }
+            else { failed = true }
+            done.signal()
+        }.resume()
+        if done.wait(timeout: .now() + 2) == .timedOut || failed {
+            return nil
+        }
+        let parsed = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        return parsed?["bootedAt"] as? String
     }
     #else
     private init(url: String, token: String, vault: URL, data: URL, port: Int, server: URL, running: RunningRelay) {

@@ -71,16 +71,37 @@ jobs:
       - name: Relay for the iOS simulator
         working-directory: relay
         run: |
-          AIDANOS_RELAY_TOKEN=aidanos-test-token-0123456789abcdef \
-            node src/server.mjs --port 3757 \
-            --vault "$RUNNER_TEMP/aidanos-vault" --data "$RUNNER_TEMP/aidanos-data" \
-            > "$RUNNER_TEMP/relay-ios.log" 2>&1 &
+          vault="$RUNNER_TEMP/aidanos-vault"
+          data="$RUNNER_TEMP/aidanos-data"
+          log="$RUNNER_TEMP/relay-ios.log"
+          : > "$log"
+          # The simulator cannot start its own relay, so every iOS test shares
+          # this process. POST /reset exits 75 and this loop starts a new
+          # process on empty folders. That keeps one test's notes from making
+          # the next test sync the whole pile.
+          (
+            set +e
+            while true; do
+              rm -rf "$vault" "$data"
+              mkdir -p "$vault" "$data"
+              AIDANOS_RELAY_TOKEN=aidanos-test-token-0123456789abcdef \
+                AIDANOS_RELAY_ALLOW_RESET=1 \
+                node src/server.mjs --port 3757 \
+                --vault "$vault" --data "$data" >> "$log" 2>&1
+              code=$?
+              if [ "$code" -ne 75 ]; then
+                echo "relay stopped ($code)" >> "$log"
+                exit "$code"
+              fi
+              sleep 0.2
+            done
+          ) &
           for _ in $(seq 1 50); do
             curl -sf http://127.0.0.1:3757/health && exit 0
             sleep 0.2
           done
           echo "relay did not start" >&2
-          cat "$RUNNER_TEMP/relay-ios.log" >&2 || true
+          cat "$log" >&2 || true
           exit 1
       - name: AidanCore tests on macOS
         working-directory: native/AidanCore

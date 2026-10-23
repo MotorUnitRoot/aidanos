@@ -63,6 +63,9 @@ let package = Package(
         .testTarget(
             name: "AidanCoreTests",
             dependencies: ["AidanCore"],
+            resources: [
+                .copy("SampleNotes"),
+            ],
             linkerSettings: linuxLink
         ),
     ]

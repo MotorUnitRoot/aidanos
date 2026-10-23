@@ -14,3 +14,6 @@ These are for the later cloud relay ticket. They are not fixed here.
 - An `Origin` check is needed if login by cookie or a token in the URL is ever added. The relay does not look at `Origin` today.
 - Storage ids inside `remote-subscription-change` messages are not checked. That message is only handled when remote-heads gossip is turned on, and this relay does not turn it on.
 - The Docker image has no data folder owned by `node`, and `CMD` does not pass `--vault`, so the image does not start as written.
+- A failed parent write leaves a half-marked vault that has to be cleaned up by hand.
+- The final marker check in `rotate()` should move to after `disposeSession`.
+- Proxy and certificate variables (`HTTPS_PROXY`, `NO_PROXY`, `GIT_SSL_CAINFO`, `SSL_CERT_FILE` and so on) aren't passed to git, so a push behind a proxy or custom certificate authority will fail.

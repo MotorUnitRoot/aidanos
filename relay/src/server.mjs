@@ -1,5 +1,5 @@
 import http from "node:http";
-import { writeSync } from "node:fs";
+import { constants as fsConstants, writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID, timingSafeEqual } from "node:crypto";
@@ -115,9 +115,10 @@ function rejectUpgrade(socket) {
   socket.destroy();
 }
 
-function health(gitState, bootedAt) {
+function health(gitState, bootedAt, syncUp) {
   return JSON.stringify({
-    ok: true,
+    ok: syncUp,
+    status: syncUp ? "ok" : "sync down",
     git: gitState.status === "ok",
     gitStatus: gitState.status,
     bootedAt,
@@ -178,21 +179,80 @@ export function startupLines({ lan, port, phone }) {
   return lines;
 }
 
+function isInsideDirectory(parent, child) {
+  const root = path.resolve(parent);
+  const target = path.resolve(child);
+  if (root === target) return true;
+  const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+  return target.startsWith(prefix);
+}
+
 async function emptyDirectory(dir) {
   // One name at a time. A parallel delete races a mirror rename and macOS
-  // then returns ENOTEMPTY for the directory.
-  const names = await fs.readdir(dir);
+  // then returns ENOTEMPTY for the directory. A missing directory is already empty:
+  // wiping the notes folder also removes a data folder that lives inside it.
+  let names;
+  try {
+    names = await fs.readdir(dir);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
   for (const name of names) {
     await fs.rm(path.join(dir, name), { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
   }
 }
 
+// Create only. O_EXCL refuses an existing path, and O_NOFOLLOW refuses a symlink,
+// so a marker cannot replace another file by pointing at it.
+const MARKER_CREATE_FLAGS =
+  fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | (fsConstants.O_NOFOLLOW || 0);
+const MARKER_READ_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0);
+
 async function readMarker(file) {
+  let info;
   try {
-    return await fs.readFile(file, "utf8");
+    info = await fs.lstat(file);
   } catch (error) {
     if (error && error.code === "ENOENT") return null;
     throw error;
+  }
+  if (info.isSymbolicLink() || !info.isFile()) return null;
+  let handle;
+  try {
+    handle = await fs.open(file, MARKER_READ_FLAGS);
+  } catch (error) {
+    if (error && (error.code === "ENOENT" || error.code === "ELOOP")) return null;
+    throw error;
+  }
+  try {
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+async function writeMarkerFile(file, text) {
+  let handle;
+  try {
+    handle = await fs.open(file, MARKER_CREATE_FLAGS, 0o600);
+  } catch (error) {
+    if (!error || (error.code !== "EEXIST" && error.code !== "ELOOP")) throw error;
+    const info = await fs.lstat(file);
+    if (info.isSymbolicLink()) {
+      throw new Error("The relay marker is a symlink and will not be followed.");
+    }
+    if (!info.isFile()) {
+      throw new Error("The relay marker already exists and is not a regular file.");
+    }
+    const current = await readMarker(file);
+    if (current === text) return;
+    throw new Error("The relay marker already exists and does not match this relay.");
+  }
+  try {
+    await handle.writeFile(text);
+  } finally {
+    await handle.close();
   }
 }
 
@@ -304,11 +364,13 @@ async function claimRelayFolders(vault, dataDir) {
   }
   const id = randomUUID();
   const text = relayMarkerText(id);
+  // The id file sits beside the notes folder. Write it before the folder so a
+  // symlink there is refused without leaving a half-written marker inside.
+  await writeMarkerFile(outside, text);
   await fs.mkdir(path.dirname(vaultMarker), { recursive: true });
   await fs.mkdir(dataDir, { recursive: true });
-  await fs.writeFile(vaultMarker, text);
-  await fs.writeFile(dataMarker, text);
-  await fs.writeFile(outside, text, { mode: 0o600 });
+  await writeMarkerFile(vaultMarker, text);
+  await writeMarkerFile(dataMarker, text);
   return id;
 }
 
@@ -500,13 +562,18 @@ export async function startRelay(options = {}) {
     live = null;
     let lastError;
     const marker = relayMarkerText(markerId);
+    const dataInsideVault = isInsideDirectory(vault, dataDir);
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
         await emptyDirectory(vault);
-        await emptyDirectory(dataDir);
+        // The default data folder is vault/.aidanos/relay. Emptying the notes
+        // folder already removed it, so do not try to empty a path that is gone.
+        if (!dataInsideVault) await emptyDirectory(dataDir);
         await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
-        await fs.writeFile(path.join(vault, ".aidanos", "relay-folder"), marker);
-        await fs.writeFile(path.join(dataDir, "relay-folder"), marker);
+        await fs.mkdir(dataDir, { recursive: true });
+        await writeMarkerFile(path.join(vault, ".aidanos", "relay-folder"), marker);
+        await writeMarkerFile(path.join(dataDir, "relay-folder"), marker);
+        if (typeof options.beforeReopen === "function") await options.beforeReopen();
         live = await openSession();
         bootedAt = new Date().toISOString();
         if (api) api.repo = live.repo;
@@ -531,8 +598,9 @@ export async function startRelay(options = {}) {
     const httpServer = http.createServer((req, res) => {
       const pathOnly = String(req.url || "").split("?")[0];
       if (pathOnly === "/health") {
-        const body = health(gitState, bootedAt);
-        res.writeHead(200, {
+        const syncUp = live != null;
+        const body = health(gitState, bootedAt, syncUp);
+        res.writeHead(syncUp ? 200 : 503, {
           "content-type": "application/json",
           "content-length": Buffer.byteLength(body),
           "cache-control": "no-store",

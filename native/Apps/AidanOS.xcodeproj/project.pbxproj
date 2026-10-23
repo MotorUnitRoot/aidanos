@@ -1,0 +1,377 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000061 /* TodayModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000021 /* TodayModel.swift */; };
+		A10000000000000000000062 /* NoteEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000022 /* NoteEditor.swift */; };
+		A10000000000000000000063 /* AidanApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000023 /* AidanApp.swift */; };
+		A10000000000000000000064 /* TodayModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000021 /* TodayModel.swift */; };
+		A10000000000000000000065 /* NoteEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000022 /* NoteEditor.swift */; };
+		A10000000000000000000066 /* AidanApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000023 /* AidanApp.swift */; };
+		A10000000000000000000054 /* AidanCore in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000052 /* AidanCore */; };
+		A10000000000000000000055 /* AidanCore in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000053 /* AidanCore */; };
+		A10000000000000000000067 /* Acknowledgements.txt in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000027 /* Acknowledgements.txt */; };
+		A10000000000000000000068 /* Acknowledgements.txt in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000027 /* Acknowledgements.txt */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A10000000000000000000021 /* TodayModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TodayModel.swift; sourceTree = "<group>"; };
+		A10000000000000000000022 /* NoteEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoteEditor.swift; sourceTree = "<group>"; };
+		A10000000000000000000023 /* AidanApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AidanApp.swift; sourceTree = "<group>"; };
+		A10000000000000000000027 /* Acknowledgements.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = Acknowledgements.txt; sourceTree = "<group>"; };
+		A10000000000000000000024 /* Shared.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Shared.xcconfig; sourceTree = "<group>"; };
+		A10000000000000000000025 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A10000000000000000000026 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A10000000000000000000091 /* AidanOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AidanOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000092 /* AidanOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AidanOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000043 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000054 /* AidanCore in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A10000000000000000000044 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000055 /* AidanCore in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A10000000000000000000031 = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000032 /* Shared */,
+				A10000000000000000000033 /* iOS */,
+				A10000000000000000000034 /* macOS */,
+				A10000000000000000000035 /* Config */,
+				A10000000000000000000036 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A10000000000000000000032 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000021 /* TodayModel.swift */,
+				A10000000000000000000022 /* NoteEditor.swift */,
+				A10000000000000000000023 /* AidanApp.swift */,
+				A10000000000000000000027 /* Acknowledgements.txt */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000033 /* iOS */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000025 /* Info.plist */,
+			);
+			path = iOS;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000034 /* macOS */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000026 /* Info.plist */,
+			);
+			path = macOS;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000035 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000024 /* Shared.xcconfig */,
+			);
+			path = Config;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000036 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000091 /* AidanOS.app */,
+				A10000000000000000000092 /* AidanOS.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A10000000000000000000002 /* AidanOS-iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000082 /* Build configuration list for PBXNativeTarget "AidanOS-iOS" */;
+			buildPhases = (
+				A10000000000000000000041 /* Sources */,
+				A10000000000000000000043 /* Frameworks */,
+				A10000000000000000000045 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "AidanOS-iOS";
+			packageProductDependencies = (
+				A10000000000000000000052 /* AidanCore */,
+			);
+			productName = "AidanOS-iOS";
+			productReference = A10000000000000000000091 /* AidanOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A10000000000000000000003 /* AidanOS-macOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000083 /* Build configuration list for PBXNativeTarget "AidanOS-macOS" */;
+			buildPhases = (
+				A10000000000000000000042 /* Sources */,
+				A10000000000000000000044 /* Frameworks */,
+				A10000000000000000000046 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "AidanOS-macOS";
+			packageProductDependencies = (
+				A10000000000000000000053 /* AidanCore */,
+			);
+			productName = "AidanOS-macOS";
+			productReference = A10000000000000000000092 /* AidanOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A10000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1500;
+			};
+			buildConfigurationList = A10000000000000000000081 /* Build configuration list for PBXProject "AidanOS" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A10000000000000000000031;
+			packageReferences = (
+				A10000000000000000000051 /* XCLocalSwiftPackageReference "../AidanCore" */,
+			);
+			productRefGroup = A10000000000000000000036 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A10000000000000000000002 /* AidanOS-iOS */,
+				A10000000000000000000003 /* AidanOS-macOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A10000000000000000000045 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000067 /* Acknowledgements.txt in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A10000000000000000000046 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000068 /* Acknowledgements.txt in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A10000000000000000000041 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000061 /* TodayModel.swift in Sources */,
+				A10000000000000000000062 /* NoteEditor.swift in Sources */,
+				A10000000000000000000063 /* AidanApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A10000000000000000000042 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000064 /* TodayModel.swift in Sources */,
+				A10000000000000000000065 /* NoteEditor.swift in Sources */,
+				A10000000000000000000066 /* AidanApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A10000000000000000000071 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+			};
+			name = Debug;
+		};
+		A10000000000000000000072 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		A10000000000000000000073 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A10000000000000000000024 /* Shared.xcconfig */;
+			buildSettings = {
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = iOS/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER_PREFIX).ios";
+				PRODUCT_NAME = AidanOS;
+				SDKROOT = iphoneos;
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		A10000000000000000000074 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A10000000000000000000024 /* Shared.xcconfig */;
+			buildSettings = {
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = iOS/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER_PREFIX).ios";
+				PRODUCT_NAME = AidanOS;
+				SDKROOT = iphoneos;
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		A10000000000000000000075 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A10000000000000000000024 /* Shared.xcconfig */;
+			buildSettings = {
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = macOS/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER_PREFIX).macos";
+				PRODUCT_NAME = AidanOS;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		A10000000000000000000076 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A10000000000000000000024 /* Shared.xcconfig */;
+			buildSettings = {
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = macOS/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER_PREFIX).macos";
+				PRODUCT_NAME = AidanOS;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A10000000000000000000081 /* Build configuration list for PBXProject "AidanOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000071 /* Debug */,
+				A10000000000000000000072 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A10000000000000000000082 /* Build configuration list for PBXNativeTarget "AidanOS-iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000073 /* Debug */,
+				A10000000000000000000074 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A10000000000000000000083 /* Build configuration list for PBXNativeTarget "AidanOS-macOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000075 /* Debug */,
+				A10000000000000000000076 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A10000000000000000000051 /* XCLocalSwiftPackageReference "../AidanCore" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../AidanCore;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A10000000000000000000052 /* AidanCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A10000000000000000000051 /* XCLocalSwiftPackageReference "../AidanCore" */;
+			productName = AidanCore;
+		};
+		A10000000000000000000053 /* AidanCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A10000000000000000000051 /* XCLocalSwiftPackageReference "../AidanCore" */;
+			productName = AidanCore;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = A10000000000000000000001 /* Project object */;
+}

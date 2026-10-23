@@ -1,0 +1,164 @@
+name: native
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+      - run: npm ci --omit=optional
+        working-directory: relay
+      - name: No optional native CBOR packages
+        run: bash relay/scripts/reject-optional-native.sh
+      - run: npm test
+        working-directory: relay
+      - name: Relay image omits native CBOR packages
+        run: |
+          set -euo pipefail
+          docker build -t aidanos-relay relay
+          docker run --rm --entrypoint bash aidanos-relay -lc 'bash scripts/reject-optional-native.sh'
+          docker run --rm --entrypoint cat aidanos-relay /app/Acknowledgements.txt > "$RUNNER_TEMP/ack-image.txt"
+          cmp "$RUNNER_TEMP/ack-image.txt" relay/Acknowledgements.txt
+          cmp native/Apps/Shared/Acknowledgements.txt relay/Acknowledgements.txt
+
+  aidan-core-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22"
+      - uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
+        with:
+          swift-version: "6.2"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.99.1"
+      - name: C++ headers Swift's clang can see
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ g++-14
+      - run: npm ci --omit=optional
+        working-directory: relay
+      - name: No optional native CBOR packages
+        run: bash relay/scripts/reject-optional-native.sh
+      - run: bash native/scripts/build-linux-ffi.sh
+      - name: swift test
+        working-directory: native/AidanCore
+        run: swift test --force-resolved-versions
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/native/.cache/pkgconfig
+
+  apple:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22"
+      - run: npm ci --omit=optional
+        working-directory: relay
+      - name: No optional native CBOR packages
+        run: bash relay/scripts/reject-optional-native.sh
+      - name: Relay for the iOS simulator
+        working-directory: relay
+        run: |
+          vault="$RUNNER_TEMP/aidanos-vault"
+          data="$RUNNER_TEMP/aidanos-data"
+          log="$RUNNER_TEMP/relay-ios.log"
+          : > "$log"
+          # The simulator cannot start its own relay, so every iOS test shares
+          # this process. POST /reset empties the folder in that process.
+          # Starting Node again while the simulator is up is too slow.
+          # This loop only starts a new process if the current one dies.
+          (
+            set +e
+            while true; do
+              rm -rf "$vault" "$data"
+              mkdir -p "$vault" "$data"
+              AIDANOS_RELAY_TOKEN=aidanos-test-token-0123456789abcdef \
+                AIDANOS_RELAY_ALLOW_RESET=1 \
+                node src/server.mjs --port 3757 \
+                --vault "$vault" --data "$data" >> "$log" 2>&1
+              code=$?
+              echo "relay stopped ($code)" >> "$log"
+              sleep 0.2
+            done
+          ) &
+          for _ in $(seq 1 50); do
+            curl -sf http://127.0.0.1:3757/health && exit 0
+            sleep 0.2
+          done
+          echo "relay did not start" >&2
+          cat "$log" >&2 || true
+          exit 1
+      - name: AidanCore tests on macOS
+        working-directory: native/AidanCore
+        run: swift test --force-resolved-versions
+      - name: Build the Mac app
+        run: >
+          xcodebuild build
+          -project native/Apps/AidanOS.xcodeproj
+          -scheme AidanOS-macOS
+          -destination platform=macOS
+          -onlyUsePackageVersionsFromResolvedFile
+          CODE_SIGNING_ALLOWED=NO
+          CODE_SIGNING_REQUIRED=NO
+      - name: Build the iPhone app
+        run: >
+          xcodebuild build
+          -project native/Apps/AidanOS.xcodeproj
+          -scheme AidanOS-iOS
+          -destination "generic/platform=iOS Simulator"
+          -onlyUsePackageVersionsFromResolvedFile
+          CODE_SIGNING_ALLOWED=NO
+          CODE_SIGNING_REQUIRED=NO
+      - name: Acknowledgements is in both app bundles
+        run: |
+          set -euo pipefail
+          src="$GITHUB_WORKSPACE/native/Apps/Shared/Acknowledgements.txt"
+          test -f "$src"
+          cmp "$GITHUB_WORKSPACE/relay/Acknowledgements.txt" "$src"
+          mac=0
+          ios=0
+          while IFS= read -r path; do
+            printf '%s\n' "$path"
+            cmp "$path" "$src"
+            case "$path" in
+              */Contents/Resources/Acknowledgements.txt) mac=$((mac + 1)) ;;
+              */AidanOS.app/Acknowledgements.txt) ios=$((ios + 1)) ;;
+            esac
+          done < <(find "$HOME/Library/Developer/Xcode/DerivedData" -path '*AidanOS.app*' -name Acknowledgements.txt)
+          test "$mac" -ge 1
+          test "$ios" -ge 1
+      - name: AidanCore tests on the iOS simulator
+        working-directory: native/AidanCore
+        run: |
+          set -euo pipefail
+          line=$(xcodebuild -scheme AidanCore -showdestinations 2>&1 | awk -F '[{}]' '/platform:iOS Simulator/ && /name:iPhone/ && $0 !~ /placeholder/ { print $2; exit }')
+          sim_id=$(printf '%s' "$line" | sed -n 's/.*id:\([^,]*\).*/\1/p' | tr -d ' ')
+          echo "simulator:${sim_id}"
+          test -n "$sim_id"
+          curl -sf http://127.0.0.1:3757/health
+          set +e
+          xcodebuild test -scheme AidanCore -destination "id=${sim_id}" -onlyUsePackageVersionsFromResolvedFile CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          status=$?
+          set -e
+          if [ "$status" != 0 ]; then
+            echo "---- relay log ----"
+            cat "$RUNNER_TEMP/relay-ios.log" || true
+          fi
+          exit "$status"

@@ -73,6 +73,60 @@ function formatPaperTitle(dateStr) {
   });
 }
 
+function needsChoiceLine(dateStr) {
+  return formatPaperTitle(dateStr) + " needs a choice";
+}
+
+function conflictDate(item) {
+  const date = item && item.date ? String(item.date) : "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(date)) return date;
+  const rel = String(item && item.path || "").replace(/\\/g, "/");
+  const match = rel.match(/^log\/(\d{4}-\d{2}-\d{2})\.md$/);
+  return match ? match[1] : "";
+}
+
+function noteChoiceTitle(path) {
+  const parts = String(path || "").replace(/\\/g, "/").replace(/\.md$/i, "").split("/").filter(Boolean);
+  return (parts.length ? parts[parts.length - 1] : "") || "note";
+}
+
+function choiceTarget(item) {
+  const rel = String(item && item.path || "").replace(/\\/g, "/");
+  const date = conflictDate(item);
+  if (date) {
+    const path = rel || "log/" + date + ".md";
+    return { key: path, date: date, path: path, name: formatPaperTitle(date) };
+  }
+  if (!rel || /^log\//.test(rel)) return null;
+  return { key: rel, date: "", path: rel, name: noteChoiceTitle(rel) };
+}
+
+function elsewhereConflicts(conflicts, open) {
+  const openDate = typeof open === "string" ? open : (open && open.date) || "";
+  const openPath = typeof open === "string" ? "" : String(open && open.path || "").replace(/\\/g, "/");
+  const seen = new Set();
+  const rows = [];
+  for (const item of conflicts || []) {
+    const target = choiceTarget(item);
+    if (!target || seen.has(target.key)) continue;
+    if (target.date && target.date === openDate) continue;
+    if (openPath && target.path === openPath) continue;
+    seen.add(target.key);
+    rows.push(target);
+  }
+  rows.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  const shown = rows.slice(0, 3);
+  return {
+    lines: shown.map((row) => ({
+      date: row.date,
+      path: row.path,
+      name: row.name,
+      label: row.date ? needsChoiceLine(row.date) : row.name + " needs a choice",
+    })),
+    more: Math.max(0, rows.length - shown.length),
+  };
+}
+
 function formatRailDate(dateStr) {
   return parseDate(dateStr).toLocaleDateString("en-GB", {
     weekday: "long",
@@ -2020,9 +2074,10 @@ function openPaperConflict(info) {
   const pathEl = $("conflict-path");
   const mineEl = $("conflict-mine");
   const theirsEl = $("conflict-theirs");
-  if (pathEl) pathEl.textContent = paperConflict.kind === "note"
-    ? (paperConflict.path || "note")
-    : (paperConflict.date || "today");
+  if (pathEl) {
+    pathEl.textContent = "";
+    pathEl.hidden = true;
+  }
   if (mineEl) mineEl.textContent = paperConflict.mine;
   if (theirsEl) theirsEl.textContent = paperConflict.theirs;
   if (sheet) {
@@ -2033,11 +2088,11 @@ function openPaperConflict(info) {
   const joinBtn = $("conflict-join");
   if (joinBtn) joinBtn.hidden = true;
   const kicker = sheet && sheet.querySelector(".conflict-kicker");
-  if (kicker) kicker.textContent = "This page changed on disk.";
+  if (kicker) kicker.textContent = "This note was also changed on your other device.";
   gitJoin = false;
   document.body.classList.add("has-conflict");
   document.body.classList.remove("conflict-edit");
-  setStatus("This page changed on disk.");
+  setStatus("");
 }
 
 function closePaperConflict() {
@@ -2122,7 +2177,7 @@ async function resolveConflictKeep() {
       const theirsEl = $("conflict-theirs");
       if (mineEl) mineEl.textContent = info.mine;
       if (theirsEl) theirsEl.textContent = info.theirs;
-      setStatus("This page changed on disk.");
+      setStatus("");
       return;
     }
     if (!res.ok) {
@@ -2195,7 +2250,7 @@ async function resolveConflictTheirs() {
       info.mtime = Number(body.mtime) || 0;
       const theirsEl = $("conflict-theirs");
       if (theirsEl) theirsEl.textContent = info.theirs;
-      setStatus("This page changed on disk.");
+      setStatus("");
       return;
     }
     if (!res.ok) {
@@ -2233,12 +2288,12 @@ async function afterGitChoice(path) {
       await new Promise((r) => setTimeout(r, 80));
       continue;
     }
-    if (data.join) {
-      openGitJoin();
-      return;
-    }
     if (conflicts.length) {
       surfaceGitConflict(data);
+      return;
+    }
+    if (data.join) {
+      openGitJoin();
       return;
     }
     return;
@@ -2318,7 +2373,7 @@ function closeGitJoin() {
   if (joinBtn) joinBtn.hidden = true;
   if (sheet) sheet.classList.remove("is-join");
   const kicker = sheet && sheet.querySelector(".conflict-kicker");
-  if (kicker && !paperConflict) kicker.textContent = "This page changed on disk.";
+  if (kicker && !paperConflict) kicker.textContent = "This note was also changed on your other device.";
   if (sheet && !paperConflict) sheet.hidden = true;
   gitJoin = false;
 }
@@ -2362,26 +2417,83 @@ async function resolveGitJoin() {
   }
 }
 
-function surfaceGitConflict(data) {
-  if (!data || data.enabled === false) return;
-  const match = gitConflictForOpenPage(data.conflicts);
-  if (match && String(match.mine || "") !== String(match.theirs || "")) {
-    closeGitJoin();
-    openGitConflict(match);
+function reloadClearedPage(info) {
+  if (!info) return;
+  if (info.kind === "note" && info.path) {
+    api("/api/file?path=" + encodeURIComponent(info.path)).then((body) => {
+      if (!paperConflict) applyRemoteNote(body);
+    }).catch(() => {});
     return;
   }
+  if (info.date) {
+    api("/api/day?date=" + encodeURIComponent(info.date)).then((day) => {
+      if (!paperConflict && state.day && state.day.date === info.date) applyRemoteDay(day);
+    }).catch(() => {});
+  }
+}
+
+function renderElsewhereChoices(conflicts) {
+  const box = $("conflict-waiting");
+  if (!box) return;
+  if (currentView() !== "today") {
+    box.hidden = true;
+    box.replaceChildren();
+    return;
+  }
+  const openDate = !isNoteDoc() && state.day ? state.day.date : "";
+  const openPath = isNoteDoc() && state.doc ? String(state.doc.path || "").replace(/\\/g, "/") : "";
+  const choice = elsewhereConflicts(conflicts, { date: openDate, path: openPath });
+  box.replaceChildren();
+  if (!choice.lines.length) {
+    box.hidden = true;
+    return;
+  }
+  for (const line of choice.lines) {
+    const row = document.createElement("div");
+    row.className = "choice-row";
+    const kicker = document.createElement("p");
+    kicker.className = "conflict-kicker";
+    kicker.textContent = line.label;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "hairline-button";
+    button.textContent = "Open";
+    button.setAttribute("aria-label", "Open " + line.name);
+    if (line.date) button.setAttribute("data-choice-date", line.date);
+    else button.setAttribute("data-choice-path", line.path);
+    row.appendChild(kicker);
+    row.appendChild(button);
+    box.appendChild(row);
+  }
+  if (choice.more) {
+    const more = document.createElement("p");
+    more.className = "conflict-kicker";
+    more.textContent = "and " + choice.more + " more";
+    box.appendChild(more);
+  }
+  box.hidden = false;
+}
+
+function surfaceGitConflict(data) {
+  if (!data || data.enabled === false) return;
+  const conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
+  if (conflicts.length) {
+    closeGitJoin();
+    renderElsewhereChoices(conflicts);
+    const match = gitConflictForOpenPage(conflicts);
+    if (match && String(match.mine || "") !== String(match.theirs || "")) openGitConflict(match);
+    else if (paperConflict && paperConflict.git && !document.body.classList.contains("conflict-edit")) {
+      const info = paperConflict;
+      closePaperConflict();
+      reloadClearedPage(info);
+    }
+    return;
+  }
+  renderElsewhereChoices([]);
   if (paperConflict && paperConflict.git && !document.body.classList.contains("conflict-edit")) {
     const info = paperConflict;
     closePaperConflict();
-    if (info.kind === "note" && info.path) {
-      api("/api/file?path=" + encodeURIComponent(info.path)).then((body) => {
-        if (!paperConflict) applyRemoteNote(body);
-      }).catch(() => {});
-    } else if (info.date) {
-      api("/api/day?date=" + encodeURIComponent(info.date)).then((day) => {
-        if (!paperConflict && state.day && state.day.date === info.date) applyRemoteDay(day);
-      }).catch(() => {});
-    }
+    reloadClearedPage(info);
   }
   if (data.join && !paperConflict && currentView() === "today") {
     openGitJoin();
@@ -2434,7 +2546,7 @@ async function saveDay({ keepalive = false, bound = null } = {}) {
       });
     }
     if (paperConflict && !editInfo) {
-      if (!keepalive) setStatus("This page changed on disk.");
+      if (!keepalive) setStatus("");
       return { ok: false, conflict: true };
     }
     const resolveBody = editInfo ? { resolve: "edit" } : {};
@@ -5867,6 +5979,15 @@ function syncFmtBarForKeyboard() {
   if (edit) edit.addEventListener("click", () => resolveConflictEdit());
   const join = $("conflict-join");
   if (join) join.addEventListener("click", () => { resolveGitJoin().catch(() => {}); });
+  const waiting = $("conflict-waiting");
+  if (waiting) waiting.addEventListener("click", (e) => {
+    const button = e.target && e.target.closest ? e.target.closest("[data-choice-date], [data-choice-path]") : null;
+    if (!button) return;
+    const date = button.getAttribute("data-choice-date");
+    const path = button.getAttribute("data-choice-path");
+    const open = date ? openDay(date, { force: true }) : path ? openVaultNote(path) : null;
+    if (open) open.catch((err) => setStatus(String(err && err.message || err), "error"));
+  });
 })();
 
 if (/^https?:$/.test(location.protocol) && "serviceWorker" in navigator) {

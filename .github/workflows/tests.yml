@@ -22,5 +22,12 @@ jobs:
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: "22"
+      - name: Chrome for the phone width check
+        run: |
+          if ! google-chrome-stable --version >/dev/null 2>&1 && ! google-chrome --version >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get update
+            sudo apt-get install -y /tmp/chrome.deb
+          fi
       - name: npm test
         run: npm test

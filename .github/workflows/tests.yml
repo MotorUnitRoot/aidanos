@@ -29,5 +29,7 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y /tmp/chrome.deb
           fi
+      - name: Install playwright-core for the question caret check
+        run: npm install --prefix /tmp/pw playwright-core@1.64.1
       - name: npm test
         run: npm test

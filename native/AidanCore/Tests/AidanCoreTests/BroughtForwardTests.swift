@@ -214,6 +214,26 @@ final class BroughtForwardTests: XCTestCase {
         XCTAssertFalse(projectRows(automatic).joined(separator: "\n").contains("It is an ordinary note"))
     }
 
+    func testDefaultModeIsAutomatic() throws {
+        XCTAssertEqual(BroughtForward.defaultMode, .everyOpenTaskFromEarlierDays)
+        let loaded = try loadSamples()
+        let when = utcDate(year: 2026, month: 10, day: 23, hour: 15, minute: 0)
+        let omitted = BroughtForward.tasks(in: loaded.notes, on: when, timeZone: utc)
+        let automatic = BroughtForward.tasks(
+            in: loaded.notes,
+            on: when,
+            timeZone: utc,
+            mode: .everyOpenTaskFromEarlierDays
+        )
+        XCTAssertEqual(omitted.mode, .everyOpenTaskFromEarlierDays)
+        XCTAssertEqual(omitted, automatic)
+        let glaze = try omitted.task(key: "Carry the glaze")
+        XCTAssertEqual(glaze.moveCount, 1)
+        let hinge = try omitted.task(key: "Oil the hinge")
+        XCTAssertEqual(hinge.moveCount, 5)
+        XCTAssertFalse(broughtRows(list(loaded.notes, .onlyTasksMovedForward)).map(\.key).contains("Carry the glaze"))
+    }
+
     func testTasksOlderThanAYearStayInTheSampleAndOutOfTheList() throws {
         let loaded = try loadSamples()
         let shelf = try loaded.notes.line("Calendar/20231020.md", "* [ ] Rebuild the shelf")

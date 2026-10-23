@@ -1,6 +1,9 @@
 import Foundation
 
-/// Which brought-forward list to build. The caller passes one. There is no default.
+/// Which brought-forward list to build.
+///
+/// The default is `everyOpenTaskFromEarlierDays`: open tasks come forward on their own
+/// and keep their move count. Pass `onlyTasksMovedForward` to keep only the tasks he marked moved.
 ///
 /// Both modes use the same rules:
 /// 1. Only day notes from the last 30 calendar days before today, in the time zone passed in.
@@ -121,11 +124,14 @@ public enum BroughtForward {
     /// Day notes this many calendar days before today still contribute. Today does not.
     public static let lookbackDays = 30
 
+    /// Tasks come forward on their own and keep their move count.
+    public static let defaultMode = BroughtForwardMode.everyOpenTaskFromEarlierDays
+
     public static func tasks(
         in notes: [ReadNote],
         on instant: Date,
         timeZone: TimeZone,
-        mode: BroughtForwardMode
+        mode: BroughtForwardMode = BroughtForward.defaultMode
     ) -> BroughtForwardResult {
         let today = NotePaths.calendarDay(on: instant, timeZone: timeZone)
         let windowStart = today.adding(days: -lookbackDays, timeZone: timeZone) ?? today

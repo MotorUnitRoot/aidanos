@@ -1,6 +1,6 @@
 # Brought forward
 
-Pure functions over notes that have already been read. They do not write, and they do not choose a mode. The caller passes `everyOpenTaskFromEarlierDays` or `onlyTasksMovedForward`.
+Pure functions over notes that have already been read. They do not write. The default mode is `everyOpenTaskFromEarlierDays`: open tasks come forward on their own and keep their move count. The caller can pass `onlyTasksMovedForward` to list only the tasks he marked moved.
 
 The day is the calendar day of the instant in the time zone the caller passes. The machine's zone is not used. "Today" below means that day.
 
@@ -24,9 +24,9 @@ Groups are newest day first. Tasks from the same day stay in line order.
 
 Both modes run all six rules, and both use the same move-count formula.
 
-`everyOpenTaskFromEarlierDays` keeps every open task that survives the rules. A task that was never marked `[>]` is still listed. Its count is only how many days it has waited.
+`everyOpenTaskFromEarlierDays` is the default. It keeps every open task that survives the rules. A task that was never marked `[>]` is still listed. Its count is only how many days it has waited.
 
-`onlyTasksMovedForward` then drops any task whose earlier-note `[>]` count is zero. Waiting is not enough. He has to have marked the task moved.
+`onlyTasksMovedForward` is the other setting. It drops any task whose earlier-note `[>]` count is zero. Waiting is not enough. He has to have marked the task moved.
 
 ## Project tasks due today
 

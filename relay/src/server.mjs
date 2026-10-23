@@ -270,9 +270,6 @@ export async function startRelay(options = {}) {
   async function disposeSession(session) {
     if (!session) return;
     session.mirror.stop();
-    // stop() only cancels the next pass. Wait until the one already writing
-    // notes has finished, or the delete below races that rename.
-    await session.mirror.now();
     for (const entry of servers) {
       for (const ws of [...entry.wss.clients]) ws.terminate();
       // The adapter clears its ping timer on "close". Emitting it here does not
@@ -280,7 +277,19 @@ export async function startRelay(options = {}) {
       entry.wss.emit("close");
       entry.wss.removeAllListeners();
     }
-    if (typeof session.repo.shutdown === "function") await session.repo.shutdown();
+    // The folder is about to be deleted, so do not flush or write it again.
+    // Wait only for a rename that has already started.
+    await session.mirror.idle();
+    try {
+      session.repo.networkSubsystem.disconnect();
+    } catch {
+      // The adapter is already detached from the socket server.
+    }
+    try {
+      await session.repo.storageSubsystem?.close();
+    } catch {
+      // Closing storage is best effort. The directory is removed next.
+    }
   }
 
   async function rotate() {

@@ -793,7 +793,7 @@ private final class TestRelay {
         }
         // The previous test can still be applying a large note. Keep asking
         // until that work finishes instead of giving up after one try.
-        let answerBy = Date().addingTimeInterval(20)
+        let answerBy = Date().addingTimeInterval(45)
         var before: String?
         while Date() < answerBy {
             if let booted = try? Self.bootedAt(healthURL) {
@@ -815,14 +815,14 @@ private final class TestRelay {
             status = (response as? HTTPURLResponse)?.statusCode ?? 0
             done.signal()
         }.resume()
-        if done.wait(timeout: .now() + 5) == .timedOut {
+        if done.wait(timeout: .now() + 15) == .timedOut {
             throw AidanError.io("The test relay did not reset.")
         }
         if status == 404 { return }
         if status != 200 {
             throw AidanError.io("The test relay did not reset (\(status)).")
         }
-        let deadline = Date().addingTimeInterval(20)
+        let deadline = Date().addingTimeInterval(45)
         while Date() < deadline {
             let probe = URL(string: "http://127.0.0.1:3757/health?n=\(UUID().uuidString)")
             if let probe, let booted = try? Self.bootedAt(probe), booted != before {

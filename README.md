@@ -82,9 +82,9 @@ A finding is urgent in any of these cases:
 
 - It is on CISA's Known Exploited Vulnerabilities list, the list of vulnerabilities already used in real attacks.
 - It is critical severity and reachable from the internet. The hosted app's container image is reachable, and so is the server code that image runs. A critical finding in dev-only or CI-only tooling stays in the weekly summary.
-- The hosted image's Node version, or the Linux distribution that image is built on, is past its end-of-support date.
+- The hosted image's Node version, or the Linux distribution that image is built on, has reached its end-of-support date. The date itself counts.
 
-The weekly summary names an end-of-support date starting 60 days before it. Once that date has passed, the same fact is urgent. That rule uses the hosted image. The summary also prints the Node version GitHub Actions installs from `.nvmrc`. The run fails when something is urgent. Everything else is listed in the summary, in severity order, with urgent items first. This scan is not a required check on pull requests.
+The weekly summary names an end-of-support date starting 60 days before it. On that date, and after it, the same fact is urgent. That rule uses the hosted image. The summary also prints the Node version GitHub Actions installs from `.nvmrc`. The run fails when something is urgent. Everything else is listed in the summary, in severity order, with urgent items first. This scan is not a required check on pull requests.
 
 The app still has no runtime npm dependencies.
 

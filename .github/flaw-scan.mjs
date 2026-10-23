@@ -6,14 +6,14 @@
  * - Its CVE is on CISA's Known Exploited Vulnerabilities list.
  * - Its severity is critical and it is reachable from the internet.
  * - The hosted image's Node, or the Linux distribution that image is
- *   built on, is past its end-of-support date.
+ *   built on, has reached its end-of-support date. The date itself counts.
  *
  * Reachable means the hosted container image or the server code that
  * image runs. Dev-only and CI-only tooling is not reachable.
  *
  * End of support is a summary warning from 60 days before the date.
- * It becomes urgent once that date has passed. End of support is the
- * day security fixes stop.
+ * The date itself is urgent, and so is every day after it. End of
+ * support is the day security fixes stop.
  */
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -77,7 +77,7 @@ export function supportStatus(eolIso, todayIso) {
   const today = parseDay(todayIso);
   if (eol == null || today == null) return { status: "unknown", daysUntil: null };
   const daysUntil = Math.round((eol - today) / DAY_MS);
-  if (daysUntil < 0) return { status: "urgent", daysUntil };
+  if (daysUntil <= 0) return { status: "urgent", daysUntil };
   if (daysUntil <= 60) return { status: "warn", daysUntil };
   return { status: "ok", daysUntil };
 }
@@ -535,7 +535,8 @@ function runtimeSentence(runtime) {
     return runtime.label + ": no end-of-support date.";
   }
   if (runtime.status === "urgent") {
-    return runtime.label + " passed end of support on " + runtime.eol + " (" + runtime.source + ").";
+    const verb = runtime.daysUntil === 0 ? "reaches end of support on " : "passed end of support on ";
+    return runtime.label + " " + verb + runtime.eol + " (" + runtime.source + ").";
   }
   if (runtime.status === "warn") {
     return runtime.label + " reaches end of support on " + runtime.eol + ", " + runtime.daysUntil + " days left (" + runtime.source + ").";
@@ -587,7 +588,7 @@ export function renderReport(report) {
   lines.push("");
   lines.push("## Base runtime");
   lines.push("");
-  lines.push("End of support is judged on the hosted image. A warning starts 60 days before the date. The finding is urgent once that date has passed. GitHub Actions installs Node from .nvmrc; that line is here so the two versions can be compared.");
+  lines.push("End of support is judged on the hosted image. A warning starts 60 days before the date. The date itself is urgent, and so is every day after it. GitHub Actions installs Node from .nvmrc; that line is here so the two versions can be compared.");
   lines.push("");
   for (const runtime of report.runtimes) lines.push("- " + runtimeSentence(runtime));
   lines.push("");
@@ -620,7 +621,7 @@ export function renderReport(report) {
   lines.push("");
   lines.push("## Rule");
   lines.push("");
-  lines.push("Urgent means the finding is on CISA's Known Exploited Vulnerabilities list, or it is critical and reachable from the internet, or the hosted image's Node or Linux is past end of support.");
+  lines.push("Urgent means the finding is on CISA's Known Exploited Vulnerabilities list, or it is critical and reachable from the internet, or the hosted image's Node or Linux has reached its end-of-support date.");
   lines.push("Reachable means the hosted container image, or the server code that image runs. Dev-only and CI-only tooling stays in this summary.");
   lines.push("");
   return lines.join("\n");
@@ -773,7 +774,8 @@ function selfTest() {
   assert(supportStatus("2026-04-30", "2026-03-01").status === "warn", "60 days before is a warning");
   assert(supportStatus("2026-04-30", "2026-03-01").daysUntil === 60, "March 1 is 60 days before April 30");
   assert(supportStatus("2026-04-30", "2026-02-28").status === "ok", "61 days before stays quiet");
-  assert(supportStatus("2026-04-30", "2026-04-30").status === "warn", "end-of-support day is still a warning");
+  assert(supportStatus("2026-04-30", "2026-04-29").status === "warn", "the day before end of support is a warning");
+  assert(supportStatus("2026-04-30", "2026-04-30").status === "urgent", "the end-of-support date is urgent");
   assert(supportStatus("2026-04-30", "2026-05-01").status === "urgent", "the day after is urgent");
   assert(supportStatus("2026-04-30", "2026-10-23").status === "urgent", "Node 20 date has passed");
   assert(supportStatus("2027-04-30", "2026-10-23").status === "ok", "Node 22 is outside the warning window");
@@ -816,6 +818,14 @@ function selfTest() {
   }));
   assert(soon.urgent === false, "60 days before end of support does not fail");
   assert(soon.runtimes.some((runtime) => runtime.role === "hosted-node" && runtime.status === "warn"), "that window is a warning");
+
+  const dayBefore = buildReport(baseInput({ today: "2026-04-29", nodeVersion: "v20.19.0\n" }));
+  const dayOf = buildReport(baseInput({ today: "2026-04-30", nodeVersion: "v20.19.0\n" }));
+  const dayAfter = buildReport(baseInput({ today: "2026-05-01", nodeVersion: "v20.19.0\n" }));
+  const hostedOn = (report) => report.runtimes.find((runtime) => runtime.role === "hosted-node");
+  assert(hostedOn(dayBefore).status === "warn" && dayBefore.urgent === false, "hosted runtime the day before end of support is a warning");
+  assert(hostedOn(dayOf).status === "urgent" && dayOf.urgent === true, "hosted runtime on the end-of-support date is urgent");
+  assert(hostedOn(dayAfter).status === "urgent" && dayAfter.urgent === true, "hosted runtime the day after end of support is urgent");
 
   const actionsOld = buildReport(baseInput({ actionsNode: "18.20.8\n" }));
   assert(actionsOld.urgent === false, "a past-due Actions Node does not fail when the image is current");

@@ -6,7 +6,9 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+COPY scripts/reject-optional-native.sh scripts/reject-optional-native.sh
+RUN npm ci --omit=dev --omit=optional \
+  && bash scripts/reject-optional-native.sh
 COPY src ./src
 
 ENV AIDANOS_RELAY_PORT=3750

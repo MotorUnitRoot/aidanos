@@ -46,6 +46,9 @@ let package = Package(
     dependencies: [
         automerge,
         .package(url: "https://github.com/apple/swift-crypto.git", exact: "3.15.1"),
+        // swift-crypto 3.15.1 depends on swift-asn1 from 1.2.0, which floats
+        // inside 1.x. 1.7.3 is the release that range resolves to.
+        .package(url: "https://github.com/apple/swift-asn1.git", exact: "1.7.3"),
     ],
     targets: [
         .target(
@@ -53,6 +56,7 @@ let package = Package(
             dependencies: [
                 .product(name: "Automerge", package: "automerge-swift"),
                 .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "SwiftASN1", package: "swift-asn1"),
             ],
             linkerSettings: linuxLink
         ),

@@ -15,12 +15,15 @@
 		A10000000000000000000066 /* AidanApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000023 /* AidanApp.swift */; };
 		A10000000000000000000054 /* AidanCore in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000052 /* AidanCore */; };
 		A10000000000000000000055 /* AidanCore in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000053 /* AidanCore */; };
+		A10000000000000000000067 /* Acknowledgements.txt in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000027 /* Acknowledgements.txt */; };
+		A10000000000000000000068 /* Acknowledgements.txt in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000027 /* Acknowledgements.txt */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		A10000000000000000000021 /* TodayModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TodayModel.swift; sourceTree = "<group>"; };
 		A10000000000000000000022 /* NoteEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoteEditor.swift; sourceTree = "<group>"; };
 		A10000000000000000000023 /* AidanApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AidanApp.swift; sourceTree = "<group>"; };
+		A10000000000000000000027 /* Acknowledgements.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = Acknowledgements.txt; sourceTree = "<group>"; };
 		A10000000000000000000024 /* Shared.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Shared.xcconfig; sourceTree = "<group>"; };
 		A10000000000000000000025 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A10000000000000000000026 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -65,6 +68,7 @@
 				A10000000000000000000021 /* TodayModel.swift */,
 				A10000000000000000000022 /* NoteEditor.swift */,
 				A10000000000000000000023 /* AidanApp.swift */,
+				A10000000000000000000027 /* Acknowledgements.txt */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -181,6 +185,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A10000000000000000000067 /* Acknowledgements.txt in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -188,6 +193,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A10000000000000000000068 /* Acknowledgements.txt in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

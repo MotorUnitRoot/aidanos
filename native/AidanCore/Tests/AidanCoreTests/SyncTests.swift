@@ -787,8 +787,8 @@ private final class TestRelay {
     /// next test syncs an empty folder. A relay that does not offer reset is
     /// left as it is.
     private func resetSharedRelay() throws {
-        guard let resetURL = URL(string: "http://127.0.0.1:3757/reset"),
-              let healthURL = URL(string: "http://127.0.0.1:3757/health") else {
+        guard let resetURL = URL(string: "http://127.0.0.1:3757/reset?n=\(UUID().uuidString)"),
+              let healthURL = URL(string: "http://127.0.0.1:3757/health?n=\(UUID().uuidString)") else {
             throw AidanError.io("The test relay address is not a URL.")
         }
         guard let before = try Self.bootedAt(healthURL) else {
@@ -796,6 +796,7 @@ private final class TestRelay {
         }
         var request = URLRequest(url: resetURL)
         request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let done = DispatchSemaphore(value: 0)
         var status = 0
@@ -810,9 +811,10 @@ private final class TestRelay {
         if status != 200 {
             throw AidanError.io("The test relay did not reset (\(status)).")
         }
-        let deadline = Date().addingTimeInterval(15)
+        let deadline = Date().addingTimeInterval(20)
         while Date() < deadline {
-            if let booted = try? Self.bootedAt(healthURL), booted != before {
+            let probe = URL(string: "http://127.0.0.1:3757/health?n=\(UUID().uuidString)")
+            if let probe, let booted = try? Self.bootedAt(probe), booted != before {
                 return
             }
             Thread.sleep(forTimeInterval: 0.05)
@@ -824,7 +826,9 @@ private final class TestRelay {
         let done = DispatchSemaphore(value: 0)
         var body = Data()
         var failed = false
-        URLSession.shared.dataTask(with: url) { data, response, _ in
+        var probe = URLRequest(url: url)
+        probe.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        URLSession.shared.dataTask(with: probe) { data, response, _ in
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             if code == 200, let data { body = data }
             else { failed = true }

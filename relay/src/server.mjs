@@ -225,13 +225,18 @@ export async function startRelay(options = {}) {
   const adapters = [];
   for (const host of hosts) {
     const httpServer = http.createServer((req, res) => {
-      if (req.url === "/health") {
+      const pathOnly = String(req.url || "").split("?")[0];
+      if (pathOnly === "/health") {
         const body = health(gitState, bootedAt);
-        res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          "cache-control": "no-store",
+        });
         res.end(body);
         return;
       }
-      if (req.method === "POST" && req.url === "/reset") {
+      if (req.method === "POST" && pathOnly === "/reset") {
         if (!allowReset) {
           res.writeHead(404, { "content-length": 0 });
           res.end();
@@ -243,8 +248,13 @@ export async function startRelay(options = {}) {
           return;
         }
         const body = JSON.stringify({ ok: true, resetting: true });
-        res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          "cache-control": "no-store",
+        });
         res.end(body);
+        logSafe(secrets, "resetting");
         // The iOS simulator shares this process. A test asks it to exit so the
         // supervisor can start again on an empty folder. Off unless that
         // supervisor set allowReset.

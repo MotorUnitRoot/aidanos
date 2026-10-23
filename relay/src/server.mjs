@@ -120,8 +120,12 @@ export function startupLines({ lan, port, phone }) {
 }
 
 async function emptyDirectory(dir) {
+  // One name at a time. A parallel delete races a mirror rename and macOS
+  // then returns ENOTEMPTY for the directory.
   const names = await fs.readdir(dir);
-  await Promise.all(names.map((name) => fs.rm(path.join(dir, name), { recursive: true, force: true })));
+  for (const name of names) {
+    await fs.rm(path.join(dir, name), { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+  }
 }
 
 async function assertNotClientVault(vault) {
@@ -266,6 +270,9 @@ export async function startRelay(options = {}) {
   async function disposeSession(session) {
     if (!session) return;
     session.mirror.stop();
+    // stop() only cancels the next pass. Wait until the one already writing
+    // notes has finished, or the delete below races that rename.
+    await session.mirror.now();
     for (const entry of servers) {
       for (const ws of [...entry.wss.clients]) ws.terminate();
       // The adapter clears its ping timer on "close". Emitting it here does not
@@ -279,16 +286,26 @@ export async function startRelay(options = {}) {
   async function rotate() {
     await disposeSession(live);
     live = null;
-    await emptyDirectory(vault);
-    await emptyDirectory(dataDir);
-    await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
-    await fs.writeFile(path.join(vault, ".aidanos", "relay-folder"), "relay\n");
-    await fs.writeFile(path.join(dataDir, "relay-folder"), "relay\n");
-    live = await openSession();
-    bootedAt = new Date().toISOString();
-    if (api) api.repo = live.repo;
-    logSafe(secrets, "reset complete");
-    if (typeof options.onReset === "function") options.onReset();
+    let lastError;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await emptyDirectory(vault);
+        await emptyDirectory(dataDir);
+        await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
+        await fs.writeFile(path.join(vault, ".aidanos", "relay-folder"), "relay\n");
+        await fs.writeFile(path.join(dataDir, "relay-folder"), "relay\n");
+        live = await openSession();
+        bootedAt = new Date().toISOString();
+        if (api) api.repo = live.repo;
+        logSafe(secrets, "reset complete");
+        if (typeof options.onReset === "function") options.onReset();
+        return;
+      } catch (error) {
+        lastError = error;
+        logSafe(secrets, "reset attempt failed:", error instanceof Error ? error.message : error);
+      }
+    }
+    throw lastError;
   }
 
   function scheduleReset() {

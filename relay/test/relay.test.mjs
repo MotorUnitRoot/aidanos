@@ -651,6 +651,8 @@ test("an allowed reset checks the token and empties the folder", async () => {
     await importDoc(relay.repo, id, { kind: "note", text: "secret-before-reset" });
     await relay.repo.flush();
     const previous = relay.repo;
+    await fs.mkdir(path.join(vault, "notes"), { recursive: true });
+    await fs.writeFile(path.join(vault, "notes", "hello.md"), "still here");
     await fs.writeFile(path.join(vault, "leftover.txt"), "still here");
     const denied = await fetch(relay.healthURL.replace("/health", "/reset"), {
       method: "POST",
@@ -675,6 +677,7 @@ test("an allowed reset checks the token and empties the folder", async () => {
     assert.equal(resets, 1);
     assert.notEqual(relay.repo, previous);
     await assert.rejects(fs.stat(path.join(vault, "leftover.txt")));
+    await assert.rejects(fs.stat(path.join(vault, "notes", "hello.md")));
     assert.equal(await relay.repo.storageSubsystem.loadDoc(id), null);
     const opened = await Promise.race([
       connect(relay.url, TOKEN),

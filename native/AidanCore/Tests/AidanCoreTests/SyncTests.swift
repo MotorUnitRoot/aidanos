@@ -791,7 +791,18 @@ private final class TestRelay {
               let healthURL = URL(string: "http://127.0.0.1:3757/health?n=\(UUID().uuidString)") else {
             throw AidanError.io("The test relay address is not a URL.")
         }
-        guard let before = try Self.bootedAt(healthURL) else {
+        // The previous test can still be applying a large note. Keep asking
+        // until that work finishes instead of giving up after one try.
+        let answerBy = Date().addingTimeInterval(20)
+        var before: String?
+        while Date() < answerBy {
+            if let booted = try? Self.bootedAt(healthURL) {
+                before = booted
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        guard let before else {
             throw AidanError.io("The test relay did not answer.")
         }
         var request = URLRequest(url: resetURL)

@@ -56,7 +56,7 @@ The relay is the small program both apps talk to. It keeps its own folder of not
 
    `openssl rand -base64 32` writes a token with no spaces. The file is only readable by your user (mode 0600). A single newline at the end of that file is fine.
 
-4. Start the relay with its own empty folder. Do not point it at the Mac app's notes. The relay marks the folder the first time. The next start has to use that same folder.
+4. Start the relay with its own empty folder. Do not point it at the Mac app's notes. The relay marks the folder the first time, and it writes an id file next to that folder. Leave the id file where it is. The next start has to use that same folder. A folder an older relay marked is not accepted.
 
    ```
    export AIDANOS_RELAY_TOKEN_FILE="$HOME/aidanos-relay-token"
@@ -73,7 +73,15 @@ Git, if you later point it at a backup repository, only receives a copy of the m
 2. At the top, choose the scheme **AidanOS-macOS** and the destination **My Mac**.
 3. In the left sidebar, select the project, then the **AidanOS-macOS** target, then **Signing & Capabilities**. Choose the team named **Your Name (Personal Team)**. Do this for the Mac target, not only the iPhone target. The project does not pick a team for you.
 4. Press Run. The window opens on today's note, with the cursor at the end. The note text scrolls if it is longer than the window.
-5. In the address field leave `ws://127.0.0.1:3750`. Type the same token you gave the relay. The token is hidden as you type. Press Connect. The status says Connected only while the connection is really up.
+5. In the address field leave `ws://127.0.0.1:3750`. Put the token into the app from the token file, then press Connect. The token is hidden. The status says Connected only while the connection is really up.
+
+   On the Mac, in a second Terminal window:
+
+   ```
+   pbcopy < "$HOME/aidanos-relay-token"
+   ```
+
+   Click the token field in the app and paste. Then copy something else, such as the word done, so the token is no longer on the clipboard. Do not paste the token into a note or a message.
 
 The Mac app keeps its notes in its own folder, `~/Library/Application Support/AidanOS/vault`. Today's file is `log/YYYY-MM-DD.md` inside that folder. The relay, started as above, writes its own copy into the folder you passed with `--vault` (`$HOME/aidanos-relay-notes`). The app saves the token in the Keychain, not in a settings file.
 
@@ -96,7 +104,7 @@ A paid developer account is not required for this test. A free Apple ID installs
 
    The first time, the Mac may show a firewall prompt asking whether to allow incoming connections for `node`. Choose Allow. Without that, the phone cannot reach the Mac.
 
-   The relay still listens on this Mac only at `127.0.0.1`, and it also listens on this Mac's home-network address. It prefers the home Wi-Fi address over a VPN address. It prints a warning: traffic on the home network is not encrypted, and the token is the only protection. Then it prints a line like `PHONE ws://192.168.1.20:3750`. It does not print the token. Type that address and the token into the iPhone app and press Connect. The first time, iOS asks permission to find devices on the local network. Allow it.
+   The relay still listens on this Mac only at `127.0.0.1`, and it also listens on this Mac's home-network address. It prefers the home Wi-Fi address over a VPN address. It prints a warning: traffic on the home network is not encrypted, and the token is the only protection. Then it prints a line like `PHONE ws://192.168.1.20:3750`. It does not print the token. Type that address into the iPhone app. For the token, run `pbcopy < "$HOME/aidanos-relay-token"` on the Mac again if you already cleared the clipboard, then use Universal Clipboard, or type the token in. Paste it only into the token field. Do not paste the token into a note or a message. Press Connect. Copy something else afterward so the token is no longer on the clipboard. The first time, iOS asks permission to find devices on the local network. Allow it.
 
    `--lan` refuses to start if the Mac has no private address (an address like `192.168.x.x`). It never listens on every interface. If you need a specific address, add `--lan-address 192.168.1.20`.
 

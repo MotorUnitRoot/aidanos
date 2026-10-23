@@ -21,6 +21,9 @@ import {
   nodeRequirement,
   parseArgs,
   payloadLimit,
+  relayIdFile,
+  relayMarkerId,
+  relayMarkerText,
   startRelay,
   startupLines,
 } from "../src/server.mjs";
@@ -407,8 +410,10 @@ test("an edit while the relay is stopped merges with an offline change", async (
     gitUrl: "",
     mirrorDebounceMs: 1000,
   });
-  assert.equal(await fs.readFile(path.join(vault, ".aidanos", "relay-folder"), "utf8"), "relay\n");
-  assert.equal(await fs.readFile(path.join(data, "relay-folder"), "utf8"), "relay\n");
+  const vaultMarker = await fs.readFile(path.join(vault, ".aidanos", "relay-folder"), "utf8");
+  assert.equal(relayMarkerId(vaultMarker).length > 0, true);
+  assert.equal(await fs.readFile(path.join(data, "relay-folder"), "utf8"), vaultMarker);
+  assert.equal(await fs.readFile(relayIdFile(vault), "utf8"), vaultMarker);
   importDoc(first.repo, INDEX_ID, { kind: "index", paths: { "notes/hello.md": id } });
   importDoc(first.repo, id, { kind: "note", text: "Hello" });
   await first.mirrorNow();
@@ -721,8 +726,13 @@ test("relay ignores the old vault variables and accepts its own marked folder", 
   await fs.mkdir(path.join(notes, "log"), { recursive: true });
   await fs.writeFile(path.join(notes, "log", "2026-10-23.md"), "secret\n");
   const own = path.join(dir, "relay-vault");
+  const data = path.join(dir, "data");
+  const marker = relayMarkerText("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
   await fs.mkdir(path.join(own, ".aidanos"), { recursive: true });
-  await fs.writeFile(path.join(own, ".aidanos", "relay-folder"), "relay\n");
+  await fs.mkdir(data, { recursive: true });
+  await fs.writeFile(path.join(own, ".aidanos", "relay-folder"), marker);
+  await fs.writeFile(path.join(data, "relay-folder"), marker);
+  await fs.writeFile(relayIdFile(own), marker);
   await fs.writeFile(path.join(own, "day.md"), "kept\n");
   await fs.mkdir(path.join(own, ".git"), { recursive: true });
   await fs.writeFile(path.join(own, ".git", "config"), '[remote "origin"]\n\turl = /tmp/backup.git\n');
@@ -735,7 +745,7 @@ test("relay ignores the old vault variables and accepts its own marked folder", 
   const relay = await startRelay({
     token: TOKEN,
     env,
-    data: path.join(dir, "data"),
+    data,
     port: 0,
     gitIntervalMs: 0,
   });
@@ -746,7 +756,7 @@ test("relay ignores the old vault variables and accepts its own marked folder", 
     assert.equal(await fs.readFile(path.join(notes, "log", "2026-10-23.md"), "utf8"), "secret\n");
     await assert.rejects(fs.stat(path.join(notes, ".aidanos", "relay-folder")));
     assert.equal(await fs.readFile(path.join(own, "day.md"), "utf8"), "kept\n");
-    assert.equal(await fs.readFile(path.join(own, ".aidanos", "relay-folder"), "utf8"), "relay\n");
+    assert.equal(await fs.readFile(path.join(own, ".aidanos", "relay-folder"), "utf8"), marker);
   } finally {
     await relay.close();
   }
@@ -754,6 +764,111 @@ test("relay ignores the old vault variables and accepts its own marked folder", 
     startRelay({ token: TOKEN, env: { AIDANOS_VAULT: notes }, port: 0, gitUrl: "" }),
     /AIDANOS_RELAY_VAULT/,
   );
+});
+
+test("an old relay marker does not authorize a notes folder or a reset", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "notes");
+  await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
+  await fs.writeFile(path.join(vault, ".aidanos", "relay-folder"), "relay\n");
+  await fs.mkdir(path.join(vault, "log"), { recursive: true });
+  await fs.writeFile(path.join(vault, "log", "2026-10-23.md"), "# day\n");
+  await fs.mkdir(path.join(vault, ".git"), { recursive: true });
+  await fs.writeFile(path.join(vault, ".git", "config"), '[remote "origin"]\n\turl = /tmp/notes.git\n');
+  await fs.writeFile(path.join(vault, ".git", "HEAD"), "ref: refs/heads/main\n");
+  await assert.rejects(
+    startRelay({
+      token: TOKEN,
+      vault,
+      data: path.join(dir, "data"),
+      port: 0,
+      gitUrl: "",
+      allowReset: true,
+    }),
+    /notes|git remote/,
+  );
+  assert.equal(await fs.readFile(path.join(vault, "log", "2026-10-23.md"), "utf8"), "# day\n");
+  assert.match(await fs.readFile(path.join(vault, ".git", "config"), "utf8"), /\[remote /);
+  assert.equal(await fs.readFile(path.join(vault, ".git", "HEAD"), "utf8"), "ref: refs/heads/main\n");
+  assert.equal(await fs.readFile(path.join(vault, ".aidanos", "relay-folder"), "utf8"), "relay\n");
+  await assert.rejects(fs.stat(relayIdFile(vault)));
+  await assert.rejects(fs.stat(path.join(dir, "data")));
+
+  const own = path.join(dir, "own");
+  const data = path.join(dir, "own-data");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: own,
+    data,
+    port: 0,
+    gitUrl: "",
+    allowReset: true,
+  });
+  try {
+    await fs.writeFile(path.join(own, ".aidanos", "relay-folder"), "relay\n");
+    await fs.mkdir(path.join(own, "log"), { recursive: true });
+    await fs.writeFile(path.join(own, "log", "keep.md"), "keep\n");
+    await fs.mkdir(path.join(own, ".git"), { recursive: true });
+    await fs.writeFile(path.join(own, ".git", "config"), '[remote "origin"]\n\turl = /tmp/own.git\n');
+    await fs.writeFile(path.join(own, ".git", "HEAD"), "ref: refs/heads/main\n");
+    const denied = await fetch(relay.healthURL.replace("/health", "/reset"), {
+      method: "POST",
+      headers: { Authorization: "Bearer " + TOKEN },
+    });
+    assert.equal(denied.status, 409);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(await fs.readFile(path.join(own, "log", "keep.md"), "utf8"), "keep\n");
+    assert.match(await fs.readFile(path.join(own, ".git", "config"), "utf8"), /\[remote /);
+    assert.equal(await fs.readFile(path.join(own, ".git", "HEAD"), "utf8"), "ref: refs/heads/main\n");
+    assert.equal(await fs.readFile(path.join(own, ".aidanos", "relay-folder"), "utf8"), "relay\n");
+  } finally {
+    await relay.close();
+  }
+});
+
+test("git does not see an unrelated secret", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const bare = path.join(dir, "empty.git");
+  const bin = path.join(dir, "bin");
+  const log = path.join(dir, "git-env.txt");
+  const realGit = (await exec("which", ["git"])).stdout.trim();
+  await fs.mkdir(bin);
+  const script =
+    "#!/bin/sh\nenv >> " + JSON.stringify(log) + "\nexec " + JSON.stringify(realGit) + ' "$@"\n';
+  await fs.writeFile(path.join(bin, "git"), script, { mode: 0o755 });
+  await git(["init", "--bare", "-b", "main", bare]);
+  const previousPath = process.env.PATH;
+  const previousSecret = process.env.UNRELATED_SECRET;
+  const previousVaultToken = process.env.AIDANOS_VAULT_GIT_TOKEN;
+  process.env.PATH = bin + path.delimiter + (previousPath || "");
+  process.env.UNRELATED_SECRET = "unrelated-secret-not-for-git";
+  process.env.AIDANOS_VAULT_GIT_TOKEN = "hosted-vault-token-should-stay-out";
+  const relay = await startRelay({
+    token: TOKEN,
+    vault,
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: bare,
+    gitIntervalMs: 0,
+  });
+  try {
+    await fs.writeFile(path.join(vault, "day.md"), "today\n");
+    const result = await relay.backupNow();
+    assert.equal(result.pushed, true);
+    const seen = await fs.readFile(log, "utf8");
+    assert.equal(seen.includes("unrelated-secret-not-for-git"), false);
+    assert.equal(seen.includes("hosted-vault-token-should-stay-out"), false);
+    assert.match(seen, /^PATH=/m);
+  } finally {
+    if (previousPath == null) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousSecret == null) delete process.env.UNRELATED_SECRET;
+    else process.env.UNRELATED_SECRET = previousSecret;
+    if (previousVaultToken == null) delete process.env.AIDANOS_VAULT_GIT_TOKEN;
+    else process.env.AIDANOS_VAULT_GIT_TOKEN = previousVaultToken;
+    await relay.close();
+  }
 });
 
 test("a token with spaces is refused before the relay listens", async () => {

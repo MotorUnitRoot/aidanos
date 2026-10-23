@@ -2,7 +2,7 @@ import http from "node:http";
 import { writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { WebSocketServer } from "ws";
 import { Repo, isValidDocumentId } from "@automerge/automerge-repo";
@@ -45,7 +45,8 @@ export function bearerToken(header) {
 
 // The apps store a lowercase UUID. Anything else, including ".." , is not a storage id.
 const STORAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const RELAY_MARKER_TEXT = "relay\n";
+const MARKER_HEADER = "aidanos-relay-folder v2";
+const MARKER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const DOC_MESSAGE = new Set(["sync", "request", "doc-unavailable"]);
 
 export function tokenWithoutTrailingNewline(raw) {
@@ -251,32 +252,72 @@ function foreignFolderError(found) {
   return parts.join(" ");
 }
 
-// An empty folder is marked the first time. A folder that already has the
-// marker is the relay's, even after it has written notes or a git backup.
-// Anything else with files in it is refused.
-async function claimFolder(dir, markerFile) {
-  let stat = null;
+// v2 is a header the old relay never wrote, plus an id. The same id is in the
+// vault, the data folder, and a file next to the vault. An old "relay" marker
+// does not match. A folder that has any files and no matching id is refused.
+export function relayMarkerText(id) {
+  return MARKER_HEADER + "\n" + id + "\n";
+}
+
+export function relayMarkerId(text) {
+  if (typeof text !== "string") return "";
+  const lines = text.split("\n");
+  if (lines.length !== 3 || lines[2] !== "") return "";
+  if (lines[0] !== MARKER_HEADER || !MARKER_ID.test(lines[1])) return "";
+  return lines[1];
+}
+
+export function relayIdFile(vault) {
+  const resolved = path.resolve(vault);
+  return path.join(path.dirname(resolved), "." + path.basename(resolved) + ".aidanos-relay-id");
+}
+
+async function hasAnyEntry(dir) {
   try {
-    stat = await fs.stat(dir);
+    const names = await fs.readdir(dir);
+    return names.length > 0;
   } catch (error) {
-    if (!error || error.code !== "ENOENT") throw error;
+    if (error && error.code === "ENOENT") return false;
+    throw error;
   }
-  if (stat && !stat.isDirectory()) {
-    throw new Error("The relay folder has to be a directory.");
+}
+
+async function claimRelayFolders(vault, dataDir) {
+  for (const dir of [vault, dataDir]) {
+    try {
+      const stat = await fs.stat(dir);
+      if (!stat.isDirectory()) throw new Error("The relay folder has to be a directory.");
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
   }
-  if (!stat) {
-    await fs.mkdir(path.dirname(markerFile), { recursive: true });
-    await fs.writeFile(markerFile, RELAY_MARKER_TEXT);
-    return;
+  const vaultMarker = path.join(vault, ".aidanos", "relay-folder");
+  const dataMarker = path.join(dataDir, "relay-folder");
+  const outside = relayIdFile(vault);
+  const vaultId = relayMarkerId(await readMarker(vaultMarker));
+  const dataId = relayMarkerId(await readMarker(dataMarker));
+  const outsideId = relayMarkerId(await readMarker(outside));
+  if (vaultId && vaultId === dataId && vaultId === outsideId) return vaultId;
+  if ((await hasAnyEntry(vault)) || (await hasAnyEntry(dataDir))) {
+    const found = await describeForeign((await hasAnyEntry(vault)) ? vault : dataDir);
+    throw new Error(foreignFolderError(found));
   }
-  if ((await readMarker(markerFile)) === RELAY_MARKER_TEXT) return;
-  const found = await describeForeign(dir);
-  if (found.empty) {
-    await fs.mkdir(path.dirname(markerFile), { recursive: true });
-    await fs.writeFile(markerFile, RELAY_MARKER_TEXT);
-    return;
-  }
-  throw new Error(foreignFolderError(found));
+  const id = randomUUID();
+  const text = relayMarkerText(id);
+  await fs.mkdir(path.dirname(vaultMarker), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(vaultMarker, text);
+  await fs.writeFile(dataMarker, text);
+  await fs.writeFile(outside, text, { mode: 0o600 });
+  return id;
+}
+
+async function ownedMarkerId(vault, dataDir) {
+  const vaultId = relayMarkerId(await readMarker(path.join(vault, ".aidanos", "relay-folder")));
+  const dataId = relayMarkerId(await readMarker(path.join(dataDir, "relay-folder")));
+  const outsideId = relayMarkerId(await readMarker(relayIdFile(vault)));
+  if (!vaultId || vaultId !== dataId || vaultId !== outsideId) return "";
+  return vaultId;
 }
 
 async function assertNotClientVault(vault) {
@@ -339,8 +380,7 @@ export async function startRelay(options = {}) {
   const gitToken = String(options.gitToken ?? env.AIDANOS_RELAY_GIT_TOKEN ?? "").trim();
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
   await assertNotClientVault(vault);
-  await claimFolder(vault, path.join(vault, ".aidanos", "relay-folder"));
-  await claimFolder(dataDir, path.join(dataDir, "relay-folder"));
+  await claimRelayFolders(vault, dataDir);
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
   const failures = new Map();
@@ -451,16 +491,22 @@ export async function startRelay(options = {}) {
   }
 
   async function rotate() {
+    const markerId = await ownedMarkerId(vault, dataDir);
+    if (!markerId) {
+      logSafe(secrets, "reset refused: the folder has no current relay marker");
+      return;
+    }
     await disposeSession(live);
     live = null;
     let lastError;
+    const marker = relayMarkerText(markerId);
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
         await emptyDirectory(vault);
         await emptyDirectory(dataDir);
         await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
-        await fs.writeFile(path.join(vault, ".aidanos", "relay-folder"), "relay\n");
-        await fs.writeFile(path.join(dataDir, "relay-folder"), "relay\n");
+        await fs.writeFile(path.join(vault, ".aidanos", "relay-folder"), marker);
+        await fs.writeFile(path.join(dataDir, "relay-folder"), marker);
         live = await openSession();
         bootedAt = new Date().toISOString();
         if (api) api.repo = live.repo;
@@ -507,18 +553,39 @@ export async function startRelay(options = {}) {
           res.end();
           return;
         }
-        const body = JSON.stringify({ ok: true, resetting: true });
-        res.writeHead(200, {
-          "content-type": "application/json",
-          "content-length": Buffer.byteLength(body),
-          "cache-control": "no-store",
-        });
-        res.end(body);
-        logSafe(secrets, "resetting");
-        // The iOS simulator shares this process. Empty the folder here instead
-        // of exiting: starting Node again while the simulator is up takes
-        // longer than the tests will wait. Off unless allowReset is set.
-        scheduleReset();
+        ownedMarkerId(vault, dataDir)
+          .then((markerId) => {
+            if (res.writableEnded) return;
+            if (!markerId) {
+              const refused = "reset refused";
+              res.writeHead(409, {
+                "content-type": "text/plain",
+                "content-length": Buffer.byteLength(refused),
+                "cache-control": "no-store",
+              });
+              res.end(refused);
+              return;
+            }
+            const body = JSON.stringify({ ok: true, resetting: true });
+            res.writeHead(200, {
+              "content-type": "application/json",
+              "content-length": Buffer.byteLength(body),
+              "cache-control": "no-store",
+            });
+            res.end(body);
+            logSafe(secrets, "resetting");
+            // The iOS simulator shares this process. Empty the folder here instead
+            // of exiting: starting Node again while the simulator is up takes
+            // longer than the tests will wait. Off unless allowReset is set.
+            scheduleReset();
+          })
+          .catch((error) => {
+            logSafe(secrets, "reset failed:", error instanceof Error ? error.message : error);
+            if (!res.headersSent) {
+              res.writeHead(500, { "content-length": 0 });
+              res.end();
+            }
+          });
         return;
       }
       res.writeHead(404, { "content-length": 0 });

@@ -23,16 +23,38 @@ export function authenticatedGitUrl(url, token) {
   return parsed.href;
 }
 
+const GIT_ENV_KEYS = [
+  "PATH",
+  "HOME",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "SSH_AUTH_SOCK",
+  "GIT_EXEC_PATH",
+  "GIT_TEMPLATE_DIR",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GNUPGHOME",
+];
+
+// Git gets a fresh environment. A vault token sitting in this process is not copied across.
+export function gitChildEnv(extra = {}) {
+  const env = { GIT_TERMINAL_PROMPT: "0", GIT_EDITOR: "true" };
+  for (const key of GIT_ENV_KEYS) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
+  for (const [key, value] of Object.entries(extra)) {
+    if (value != null && value !== "") env[key] = String(value);
+  }
+  return env;
+}
+
 function runGit(args, cwd, secrets, timeoutMs = 20000, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, {
       cwd,
-      env: {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: "0",
-        GIT_EDITOR: "true",
-        ...extraEnv,
-      },
+      env: gitChildEnv(extraEnv),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";

@@ -628,12 +628,13 @@ test("reset is off unless a supervisor asked for it", async () => {
   }
 });
 
-test("an allowed reset checks the token and then asks to exit", async () => {
+test("an allowed reset checks the token and empties the folder", async () => {
   const dir = await tempDir();
+  const vault = path.join(dir, "vault");
   let resets = 0;
   const relay = await startRelay({
     token: TOKEN,
-    vault: path.join(dir, "vault"),
+    vault,
     data: path.join(dir, "data"),
     port: 0,
     gitUrl: "",
@@ -646,6 +647,11 @@ test("an allowed reset checks the token and then asks to exit", async () => {
     const health = await fetch(relay.healthURL);
     const body = await health.json();
     assert.equal(typeof body.bootedAt, "string");
+    const id = noteId("notes/reset.md");
+    await importDoc(relay.repo, id, { kind: "note", text: "secret-before-reset" });
+    await relay.repo.flush();
+    const previous = relay.repo;
+    await fs.writeFile(path.join(vault, "leftover.txt"), "still here");
     const denied = await fetch(relay.healthURL.replace("/health", "/reset"), {
       method: "POST",
       headers: { Authorization: "Bearer nope" },
@@ -658,8 +664,24 @@ test("an allowed reset checks the token and then asks to exit", async () => {
     });
     assert.equal(accepted.status, 200);
     assert.deepEqual(await accepted.json(), { ok: true, resetting: true });
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    const deadline = Date.now() + 5000;
+    let booted = body.bootedAt;
+    while (Date.now() < deadline && booted === body.bootedAt) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const again = await fetch(relay.healthURL + "?n=" + Date.now());
+      booted = (await again.json()).bootedAt;
+    }
+    assert.notEqual(booted, body.bootedAt);
     assert.equal(resets, 1);
+    assert.notEqual(relay.repo, previous);
+    await assert.rejects(fs.stat(path.join(vault, "leftover.txt")));
+    assert.equal(await relay.repo.storageSubsystem.loadDoc(id), null);
+    const opened = await Promise.race([
+      connect(relay.url, TOKEN),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("connect timed out")), 2000)),
+    ]);
+    assert.equal(opened.opened, true);
+    opened.socket.close();
   } finally {
     await relay.close();
   }

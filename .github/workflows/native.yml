@@ -76,9 +76,9 @@ jobs:
           log="$RUNNER_TEMP/relay-ios.log"
           : > "$log"
           # The simulator cannot start its own relay, so every iOS test shares
-          # this process. POST /reset exits 75 and this loop starts a new
-          # process on empty folders. That keeps one test's notes from making
-          # the next test sync the whole pile.
+          # this process. POST /reset empties the folder in that process.
+          # Starting Node again while the simulator is up is too slow.
+          # This loop only starts a new process if the current one dies.
           (
             set +e
             while true; do
@@ -89,10 +89,7 @@ jobs:
                 node src/server.mjs --port 3757 \
                 --vault "$vault" --data "$data" >> "$log" 2>&1
               code=$?
-              if [ "$code" -ne 75 ]; then
-                echo "relay stopped ($code)" >> "$log"
-                exit "$code"
-              fi
+              echo "relay stopped ($code)" >> "$log"
               sleep 0.2
             done
           ) &

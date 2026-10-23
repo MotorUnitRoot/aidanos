@@ -783,9 +783,9 @@ private final class TestRelay {
         self.vault = vault
     }
 
-    /// The simulator uses the relay CI started. Ask that process to exit so the
-    /// next test syncs an empty folder. A relay that does not offer reset is
-    /// left as it is.
+    /// The simulator uses the relay CI started. Ask that process to empty its
+    /// folder so the next test does not sync the previous test's notes. A
+    /// relay that does not offer reset is left as it is.
     private func resetSharedRelay() throws {
         guard let resetURL = URL(string: "http://127.0.0.1:3757/reset?n=\(UUID().uuidString)"),
               let healthURL = URL(string: "http://127.0.0.1:3757/health?n=\(UUID().uuidString)") else {

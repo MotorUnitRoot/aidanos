@@ -99,7 +99,7 @@ async function pushBranch(vault, url, token, branch, secrets) {
   }
 }
 
-export async function backupOnce({ vault, gitUrl, gitToken, secrets }) {
+export async function backupOnce({ vault, gitUrl, gitToken, secrets, env = process.env }) {
   const url = String(gitUrl || "").trim();
   if (!url) return { skipped: true, committed: false, pushed: false };
   const token = String(gitToken || "").trim();
@@ -112,8 +112,8 @@ export async function backupOnce({ vault, gitUrl, gitToken, secrets }) {
   } catch {
     await runGit(["init", "-b", "main"], vault, hidden);
   }
-  const name = process.env.AIDANOS_VAULT_GIT_NAME || "AidanOS";
-  const email = process.env.AIDANOS_VAULT_GIT_EMAIL || "aidanos@local";
+  const name = env.AIDANOS_RELAY_GIT_NAME || "AidanOS";
+  const email = env.AIDANOS_RELAY_GIT_EMAIL || "aidanos@local";
   await runGit(["config", "user.name", name], vault, hidden);
   await runGit(["config", "user.email", email], vault, hidden);
   // The remote URL stays clean. The token is only in the push process environment.

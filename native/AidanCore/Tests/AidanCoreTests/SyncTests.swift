@@ -648,6 +648,13 @@ final class SyncTests: XCTestCase {
         XCTAssertNoThrow(try session.connect(relayURL: relay.url, token: relay.token))
         session.disconnect()
     }
+
+    func testRelayPortAbove65535IsRefused() throws {
+        XCTAssertThrowsError(try RelayAddress("ws://127.0.0.1:65536")) { error in
+            XCTAssertEqual(error as? AidanError, .protocol("The relay port must be between 1 and 65535."))
+        }
+        XCTAssertEqual(try RelayAddress("ws://127.0.0.1:65535").port, 65535)
+    }
 }
 
 private func rebuiltSession(path: String, text: String) throws -> (URL, AidanSession) {
@@ -904,7 +911,7 @@ private final class TestRelay {
         var environment = ProcessInfo.processInfo.environment
         environment["AIDANOS_RELAY_TOKEN"] = token
         environment["AIDANOS_MIRROR_DEBOUNCE_MS"] = "30"
-        environment["AIDANOS_VAULT_GIT_URL"] = ""
+        environment["AIDANOS_RELAY_GIT_URL"] = ""
         process.environment = environment
         process.currentDirectoryURL = server.deletingLastPathComponent().deletingLastPathComponent()
         let log = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)

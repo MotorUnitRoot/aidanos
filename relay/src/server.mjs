@@ -5,7 +5,8 @@ import path from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { WebSocketServer } from "ws";
-import { Repo } from "@automerge/automerge-repo";
+import { Repo, isValidDocumentId } from "@automerge/automerge-repo";
+import { decode } from "@automerge/automerge-repo/helpers/cbor.js";
 import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import { listenHosts } from "./bind.mjs";
@@ -40,6 +41,63 @@ export function tokensMatch(expected, got) {
 export function bearerToken(header) {
   const match = String(header || "").match(/^Bearer\s+(\S+)\s*$/i);
   return match ? match[1] : "";
+}
+
+// The apps store a lowercase UUID. Anything else, including ".." , is not a storage id.
+const STORAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const RELAY_MARKER_TEXT = "relay\n";
+const DOC_MESSAGE = new Set(["sync", "request", "doc-unavailable"]);
+
+export function tokenWithoutTrailingNewline(raw) {
+  let token = String(raw ?? "");
+  if (token.endsWith("\r\n")) token = token.slice(0, -2);
+  else if (token.endsWith("\n") || token.endsWith("\r")) token = token.slice(0, -1);
+  if (/\s/.test(token)) {
+    throw new Error(
+      "The relay token must not contain spaces or other whitespace. Generate one with openssl rand -base64 32 and store it in the token file.",
+    );
+  }
+  return token;
+}
+
+export function payloadLimit(value) {
+  if (value == null || value === "") return MAX_PAYLOAD;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return MAX_PAYLOAD;
+  return n;
+}
+
+function asFrame(value) {
+  if (value == null) return null;
+  if (Buffer.isBuffer(value)) return value;
+  if (value instanceof ArrayBuffer) return Buffer.from(value);
+  if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  if (typeof value === "string") return Buffer.from(value);
+  return null;
+}
+
+// Close unless a storage id is a UUID and every document id is one Automerge accepts.
+// The disk adapter joins both into a path and does not check them.
+export function syncFrameAllowed(value) {
+  const raw = asFrame(value);
+  if (!raw || raw.length === 0) return false;
+  let message;
+  try {
+    message = decode(raw);
+  } catch {
+    return false;
+  }
+  if (!message || typeof message !== "object") return false;
+  const type = typeof message.type === "string" ? message.type : "";
+  const meta = message.peerMetadata;
+  const storageId = meta && typeof meta === "object" ? meta.storageId : message.storageId;
+  if (type === "join" || storageId !== undefined) {
+    if (typeof storageId !== "string" || !STORAGE_ID.test(storageId)) return false;
+  }
+  if (DOC_MESSAGE.has(type) || message.documentId !== undefined) {
+    if (!isValidDocumentId(message.documentId)) return false;
+  }
+  return true;
 }
 
 function rejectUpgrade(socket) {
@@ -84,18 +142,18 @@ export function parseArgs(argv) {
 }
 
 export async function loadToken(env = process.env) {
-  const fromEnv = String(env.AIDANOS_RELAY_TOKEN || "").trim();
+  const fromEnv = env.AIDANOS_RELAY_TOKEN == null ? "" : String(env.AIDANOS_RELAY_TOKEN);
   const file = String(env.AIDANOS_RELAY_TOKEN_FILE || "").trim();
   if (fromEnv && file) {
     throw new Error("Set only one of AIDANOS_RELAY_TOKEN and AIDANOS_RELAY_TOKEN_FILE.");
   }
-  let token = fromEnv;
+  let token = fromEnv ? tokenWithoutTrailingNewline(fromEnv) : "";
   if (file) {
     const stat = await fs.stat(file);
     if ((stat.mode & 0o777) !== 0o600) {
       throw new Error("The token file must be readable only by you (mode 0600).");
     }
-    token = String(await fs.readFile(file, "utf8")).trim();
+    token = tokenWithoutTrailingNewline(await fs.readFile(file, "utf8"));
   }
   if (!token) {
     throw new Error("Set AIDANOS_RELAY_TOKEN or AIDANOS_RELAY_TOKEN_FILE. The relay will not start without one.");
@@ -126,6 +184,99 @@ async function emptyDirectory(dir) {
   for (const name of names) {
     await fs.rm(path.join(dir, name), { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
   }
+}
+
+async function readMarker(file) {
+  try {
+    return await fs.readFile(file, "utf8");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function directoryHasGitRemote(dir) {
+  try {
+    const text = await fs.readFile(path.join(dir, ".git", "config"), "utf8");
+    return /\[remote\s+"/.test(text);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function describeForeign(dir) {
+  const notes = [];
+  let gitRemote = false;
+  let other = false;
+  async function walk(current) {
+    const entries = await fs.readdir(current, { withFileTypes: true });
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.name === ".git" && entry.isDirectory()) {
+        gitRemote = (await directoryHasGitRemote(dir)) || gitRemote;
+        other = true;
+        continue;
+      }
+      if (entry.isDirectory()) {
+        if (entry.name === "log") {
+          const inner = await fs.readdir(full);
+          if (inner.length > 0) notes.push("log/");
+          else other = true;
+        } else {
+          await walk(full);
+        }
+        continue;
+      }
+      if (entry.name.endsWith(".md") || entry.name.endsWith(".txt")) notes.push(path.relative(dir, full));
+      else other = true;
+    }
+  }
+  const names = await fs.readdir(dir);
+  if (names.length === 0) return { empty: true, notes, gitRemote, other };
+  await walk(dir);
+  return { empty: false, notes, gitRemote, other };
+}
+
+function foreignFolderError(found) {
+  const parts = ["This folder is not the relay's own folder."];
+  if (found.notes.length) {
+    parts.push("It contains notes (" + found.notes.slice(0, 3).join(", ") + ").");
+  }
+  if (found.gitRemote) parts.push("It has a git remote.");
+  if (!found.notes.length && !found.gitRemote) {
+    parts.push("It already has files, and it has no relay marker.");
+  }
+  parts.push("Pass an empty folder, or the folder the relay marked earlier.");
+  return parts.join(" ");
+}
+
+// An empty folder is marked the first time. A folder that already has the
+// marker is the relay's, even after it has written notes or a git backup.
+// Anything else with files in it is refused.
+async function claimFolder(dir, markerFile) {
+  let stat = null;
+  try {
+    stat = await fs.stat(dir);
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  if (stat && !stat.isDirectory()) {
+    throw new Error("The relay folder has to be a directory.");
+  }
+  if (!stat) {
+    await fs.mkdir(path.dirname(markerFile), { recursive: true });
+    await fs.writeFile(markerFile, RELAY_MARKER_TEXT);
+    return;
+  }
+  if ((await readMarker(markerFile)) === RELAY_MARKER_TEXT) return;
+  const found = await describeForeign(dir);
+  if (found.empty) {
+    await fs.mkdir(path.dirname(markerFile), { recursive: true });
+    await fs.writeFile(markerFile, RELAY_MARKER_TEXT);
+    return;
+  }
+  throw new Error(foreignFolderError(found));
 }
 
 async function assertNotClientVault(vault) {
@@ -162,27 +313,34 @@ function listen(server, host, port) {
 }
 
 export async function startRelay(options = {}) {
-  const token = String(options.token || "").trim() || (await loadToken(options.env || process.env));
+  const env = options.env || process.env;
+  const token =
+    options.token != null && String(options.token) !== ""
+      ? tokenWithoutTrailingNewline(options.token)
+      : await loadToken(env);
   if (token.length < MIN_TOKEN_LENGTH) {
     throw new Error("The relay token must be at least 32 characters.");
   }
-  const vault = path.resolve(options.vault || process.env.AIDANOS_VAULT || path.join(process.cwd(), "vault"));
-  const dataDir = path.resolve(options.data || process.env.AIDANOS_RELAY_DATA || path.join(vault, ".aidanos", "relay"));
-  const port = options.port == null ? portFromEnv() : Number(options.port);
+  const vaultArg = options.vault || env.AIDANOS_RELAY_VAULT || "";
+  if (!String(vaultArg).trim()) {
+    throw new Error(
+      "Set --vault or AIDANOS_RELAY_VAULT. The relay will not use AIDANOS_VAULT or another app's folder.",
+    );
+  }
+  const vault = path.resolve(String(vaultArg));
+  const dataDir = path.resolve(options.data || env.AIDANOS_RELAY_DATA || path.join(vault, ".aidanos", "relay"));
+  const port = options.port == null ? portFromEnv(env) : Number(options.port);
   const { hosts, phone } = listenHosts({
     lan: Boolean(options.lan) || Boolean(options.lanAddress),
     interfaces: options.interfaces,
     choose: options.lanAddress || "",
   });
-  const gitUrl = String(options.gitUrl ?? process.env.AIDANOS_VAULT_GIT_URL ?? "").trim();
-  const gitToken = String(options.gitToken ?? process.env.AIDANOS_VAULT_GIT_TOKEN ?? "").trim();
+  const gitUrl = String(options.gitUrl ?? env.AIDANOS_RELAY_GIT_URL ?? "").trim();
+  const gitToken = String(options.gitToken ?? env.AIDANOS_RELAY_GIT_TOKEN ?? "").trim();
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
-  await fs.mkdir(vault, { recursive: true });
   await assertNotClientVault(vault);
-  await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
-  await fs.writeFile(path.join(vault, ".aidanos", "relay-folder"), "relay\n");
-  await fs.mkdir(dataDir, { recursive: true });
-  await fs.writeFile(path.join(dataDir, "relay-folder"), "relay\n");
+  await claimFolder(vault, path.join(vault, ".aidanos", "relay-folder"));
+  await claimFolder(dataDir, path.join(dataDir, "relay-folder"));
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
   const failures = new Map();
@@ -342,7 +500,9 @@ export async function startRelay(options = {}) {
           res.end();
           return;
         }
-        if (!tokensMatch(token, bearerToken(req.headers.authorization))) {
+        const ip = clientAddress(req);
+        if (blocked(ip) || !tokensMatch(token, bearerToken(req.headers.authorization))) {
+          if (!blocked(ip)) noteFailure(ip);
           res.writeHead(401, { "content-length": 0 });
           res.end();
           return;
@@ -364,7 +524,8 @@ export async function startRelay(options = {}) {
       res.writeHead(404, { "content-length": 0 });
       res.end();
     });
-    const cap = Number(options.maxPayload ?? process.env.AIDANOS_MAX_PAYLOAD ?? MAX_PAYLOAD);
+    const rawCap = options.maxPayload != null ? options.maxPayload : env.AIDANOS_MAX_PAYLOAD;
+    const cap = payloadLimit(rawCap);
     const wss = new WebSocketServer({ noServer: true, maxPayload: cap });
     const entry = { httpServer, host, wss };
     httpServer.on("upgrade", (req, socket, head) => {
@@ -381,6 +542,30 @@ export async function startRelay(options = {}) {
       }
       failures.delete(ip);
       entry.wss.handleUpgrade(req, socket, head, (ws) => {
+        const addListener = ws.addListener.bind(ws);
+        let rejectedFrame = false;
+        function listen(event, handler) {
+          if (event !== "message" || typeof handler !== "function") return addListener(event, handler);
+          return addListener(event, function guarded(data, ...rest) {
+            let allowed = false;
+            try {
+              allowed = syncFrameAllowed(data);
+            } catch {
+              allowed = false;
+            }
+            if (!allowed) {
+              if (!rejectedFrame) {
+                rejectedFrame = true;
+                logSafe(secrets, "closed a sync connection");
+                ws.terminate();
+              }
+              return;
+            }
+            return handler.call(this, data, ...rest);
+          });
+        }
+        ws.on = listen;
+        ws.addListener = listen;
         ws.on("error", (error) => {
           logSafe(secrets, "sync connection closed:", error instanceof Error ? error.message : error);
         });
@@ -406,11 +591,11 @@ export async function startRelay(options = {}) {
     boundPort = await listen(entry.httpServer, entry.host, port);
   }
 
-  const interval = gitInterval(options.gitIntervalMs);
+  const interval = gitInterval(options.gitIntervalMs, env);
   let gitTimer = null;
   async function runBackup() {
     try {
-      const result = await backupOnce({ vault, gitUrl, gitToken, secrets });
+      const result = await backupOnce({ vault, gitUrl, gitToken, secrets, env });
       noteGit(result);
       return result;
     } catch (error) {
@@ -487,14 +672,14 @@ async function preloadStoredNotes(repo) {
   }
 }
 
-function portFromEnv() {
-  if (process.env.AIDANOS_RELAY_PORT == null || process.env.AIDANOS_RELAY_PORT === "") return DEFAULT_PORT;
-  return Number(process.env.AIDANOS_RELAY_PORT);
+function portFromEnv(env = process.env) {
+  if (env.AIDANOS_RELAY_PORT == null || env.AIDANOS_RELAY_PORT === "") return DEFAULT_PORT;
+  return Number(env.AIDANOS_RELAY_PORT);
 }
 
-function gitInterval(override) {
+function gitInterval(override, env = process.env) {
   if (override != null) return Number(override);
-  const raw = process.env.AIDANOS_VAULT_GIT_INTERVAL_MS;
+  const raw = env.AIDANOS_RELAY_GIT_INTERVAL_MS;
   if (raw == null || String(raw).trim() === "") return 300000;
   return Number(raw);
 }
@@ -518,7 +703,7 @@ async function main() {
     });
   } catch (error) {
     logSafe(
-      [process.env.AIDANOS_RELAY_TOKEN, process.env.AIDANOS_VAULT_GIT_TOKEN],
+      [process.env.AIDANOS_RELAY_TOKEN, process.env.AIDANOS_RELAY_GIT_TOKEN],
       error instanceof Error ? error.message : error,
     );
     process.exit(1);

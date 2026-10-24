@@ -10,7 +10,11 @@ public enum ExternalFormatReader {
         }
         let prefix = "Day "
         guard label.hasPrefix(prefix) else { return nil }
-        let rest = String(label.dropFirst(prefix.count))
+        var rest = String(label.dropFirst(prefix.count))
+        let viewed = ", viewed on session day"
+        if rest.hasSuffix(viewed) {
+            rest.removeLast(viewed.count)
+        }
         guard let day = ExternalDate.parse(rest) else { return nil }
         return .day(day)
     }
@@ -35,20 +39,39 @@ public enum ExternalFormatReader {
         return ExternalNoteReading(context: context, lines: lines)
     }
 
-    /// Overdue is a past date. Upcoming is the session day or a later date.
+    /// Overdue is a past schedule date, or an open task with no date in a past day note.
+    /// Upcoming is the session day or a later schedule date.
     /// Checklist items are left out of both. A task with no date is unlisted.
-    public static func placement(of line: ExternalLine, on sessionDay: ExternalDate) -> ExternalListPlacement {
+    public static func placement(
+        of line: ExternalLine,
+        on sessionDay: ExternalDate,
+        in context: ExternalNoteContext? = nil
+    ) -> ExternalListPlacement {
         if line.leftOutOfOverdue {
             return .unlisted
         }
-        let eligible = line.countsAsOpen || line.kind == .scheduledTask
-        guard eligible, let date = line.scheduleDates.first else {
+        // AidanOS choice, pending case 87
+        if line.kind == .scheduledTask, let day = day(in: context), day < sessionDay {
             return .unlisted
         }
-        if date < sessionDay {
+        let eligible = line.countsAsOpen || line.kind == .scheduledTask
+        if eligible, let date = line.scheduleDates.first {
+            if date < sessionDay {
+                return .overdue
+            }
+            return .upcoming
+        }
+        if line.countsAsOpen, let day = day(in: context), day < sessionDay {
             return .overdue
         }
-        return .upcoming
+        return .unlisted
+    }
+
+    fileprivate static func day(in context: ExternalNoteContext?) -> ExternalDate? {
+        if case .day(let day) = context {
+            return day
+        }
+        return nil
     }
 }
 
@@ -280,6 +303,12 @@ private struct InlineMarks {
     var unsettled = false
 }
 
+private enum TagIssue {
+    case none
+    case hyphen
+    case digitsOnly
+}
+
 private enum BracketRead<Value> {
     case found(Value)
     case noCloser
@@ -437,7 +466,11 @@ extension ExternalFormatReader {
         context: ExternalNoteContext
     ) -> ExternalLine {
         let marks = scan(content)
-        let unsettled = kind == .unsettled || marks.unsettled
+        var unsettled = kind == .unsettled || marks.unsettled
+        // AidanOS choice, pending case 97
+        if !unsettled, kind == .doneTask, findClock(blanked(content, blocking: marks.blocked)) != nil {
+            unsettled = true
+        }
         let resolved: ExternalLineKind = unsettled ? .unsettled : kind
         let block = unsettled ? nil : timeBlock(in: content, marks: marks, kind: resolved, context: context)
         let completion = unsettled ? nil : marks.mentions.first { $0.name == "done" }?.value.flatMap(readCompletion)
@@ -601,8 +634,17 @@ extension ExternalFormatReader {
                     }
                 }
             }
-            if chars[index] == "#", !wordBefore(chars, index), let (tag, range) = readTag(chars, at: index) {
-                marks.tags.append(tag)
+            if chars[index] == "#", !wordBefore(chars, index), let (tag, range, issue) = readTag(chars, at: index) {
+                switch issue {
+                case .hyphen:
+                    // AidanOS choice, pending case 95
+                    marks.unsettled = true
+                case .digitsOnly:
+                    // AidanOS choice, pending case 39
+                    marks.unsettled = true
+                case .none:
+                    marks.tags.append(tag)
+                }
                 index = range.upperBound
                 continue
             }
@@ -695,24 +737,41 @@ extension ExternalFormatReader {
         return .found((link, start..<index, addressStart..<index))
     }
 
-    fileprivate static func readTag(_ chars: [Character], at start: Int) -> (ExternalTag, Range<Int>)? {
+    fileprivate static func readTag(_ chars: [Character], at start: Int) -> (ExternalTag, Range<Int>, TagIssue)? {
         guard chars[start] == "#" else { return nil }
         var index = start + 1
-        guard let first = readName(chars, from: &index) else { return nil }
+        guard let first = readTagGroup(chars, from: &index) else { return nil }
         var groups = [first]
-        while index < chars.count, chars[index] == "/" {
+        var hyphen = false
+        while index < chars.count {
             let saved = index
+            let separator = chars[index]
+            guard separator == "/" || separator == "-" else { break }
             index += 1
-            if let next = readName(chars, from: &index) {
+            if let next = readTagGroup(chars, from: &index) {
+                if separator == "-" {
+                    hyphen = true
+                }
                 groups.append(next)
             } else {
                 index = saved
                 break
             }
         }
+        let digitsOnly = groups.allSatisfy { group in group.allSatisfy(isASCIIDigit) }
+        let issue: TagIssue = hyphen ? .hyphen : (digitsOnly ? .digitsOnly : .none)
         let name = groups.joined(separator: "/")
-        let parent = groups.count > 1 ? groups.dropLast().joined(separator: "/") : nil
-        return (ExternalTag(name: name, parent: parent), start..<index)
+        let parent = groups.count > 1 && issue == .none ? groups.dropLast().joined(separator: "/") : nil
+        return (ExternalTag(name: name, parent: parent), start..<index, issue)
+    }
+
+    fileprivate static func readTagGroup(_ chars: [Character], from index: inout Int) -> String? {
+        let start = index
+        while index < chars.count, isTagChar(chars[index]) {
+            index += 1
+        }
+        guard index > start else { return nil }
+        return String(chars[start..<index])
     }
 
     fileprivate static func readMention(
@@ -878,6 +937,14 @@ extension ExternalFormatReader {
 
     fileprivate static func isNameChar(_ char: Character) -> Bool {
         char.isLetter || isASCIIDigit(char) || char == "_"
+    }
+
+    /// Emoji may sit inside a tag, including at the top of a nested tag.
+    /// ASCII digits and marks are not emoji here.
+    fileprivate static func isTagChar(_ char: Character) -> Bool {
+        if isNameChar(char) { return true }
+        guard char.asciiValue == nil else { return false }
+        return char.unicodeScalars.contains { $0.properties.isEmoji }
     }
 
     fileprivate static func isASCIIDigit(_ char: Character) -> Bool {

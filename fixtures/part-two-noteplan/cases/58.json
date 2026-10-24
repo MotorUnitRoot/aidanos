@@ -1,0 +1,7 @@
+{
+  "number": 58,
+  "context": "First open of an empty day 2017-01-13",
+  "input": "(nothing typed)",
+  "expected": "If an auto-insert daily template exists, it is inserted; otherwise empty; no tasks from earlier days appear by themselves",
+  "label": "Seen"
+}

@@ -2,13 +2,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { checkExternalFormatCases } from "./external-format-cases-check.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const fixture = path.join(root, "fixtures", "sample-notes");
 const vault = path.join(fixture, "vault");
 const manifestPath = path.join(fixture, "manifest.json");
 const screensPath = path.join(fixture, "screens.json");
-const partTwo = path.join(root, "fixtures", "part-two-noteplan");
 
 const DAY_FILE = /^\d{4}-\d{2}-\d{2}\.md$/;
 const REQUIRED_KINDS = [
@@ -221,16 +221,8 @@ check("broken files are actually broken", () => {
   assert(!realDay(base.slice(0, 10)), "impossible day is a real date");
 });
 
-check("part two placeholder is empty and labeled", () => {
-  assert(fs.statSync(partTwo).isDirectory(), "missing part two folder");
-  const names = fs.readdirSync(partTwo).filter((name) => !name.startsWith("."));
-  assert(names.length === 1 && names[0] === "README.md", "part two must stay empty except the README: " + names.join(", "));
-  const readme = fs.readFileSync(path.join(partTwo, "README.md"), "utf8");
-  assert(/NotePlan-format line cases/.test(readme), "placeholder names the line cases");
-  assert(/day-note layout/.test(readme), "placeholder names the day-note layout");
-  assert(/Legal-approved/.test(readme), "placeholder says the cases wait for a Legal-approved description");
-  assert(/40-case/.test(readme), "placeholder says the cases count toward the 40-case target");
-  assert(/Do not invent/.test(readme), "placeholder says not to invent that format");
+check("external-format cases are listed", () => {
+  checkExternalFormatCases(root);
 });
 
 check("screen list cannot drop a state", () => {

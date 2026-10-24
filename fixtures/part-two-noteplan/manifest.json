@@ -1,0 +1,397 @@
+{
+  "notes": [
+    {
+      "id": "regular-lines",
+      "path": "notes/regular-lines.md",
+      "title": "ZZ REA Test Lines",
+      "where": "New regular note in a new folder \"ZZ REA Test\""
+    },
+    {
+      "id": "regular-frontmatter",
+      "path": "notes/regular-frontmatter.md",
+      "title": "ZZ REA Frontmatter",
+      "where": "New regular note, same folder"
+    },
+    {
+      "id": "linked-note",
+      "path": "notes/linked-note.md",
+      "title": "ZZ REA Linked Note",
+      "where": "Created by clicking the c41 link, then filled in"
+    },
+    {
+      "id": "monday-text",
+      "path": "notes/monday-text.md",
+      "title": "Daily note, Monday Jan 9, 2017",
+      "where": "That day's calendar note"
+    },
+    {
+      "id": "week-text",
+      "path": "notes/week-text.md",
+      "title": "Weekly note, 2017-W02 (Jan 9 to 15, 2017)",
+      "where": "That week's calendar note"
+    },
+    {
+      "id": "friday-empty",
+      "path": "notes/friday-empty.md",
+      "title": "Daily note, Friday Jan 13, 2017",
+      "where": "Open only, type nothing"
+    }
+  ],
+  "active": [
+    {
+      "number": 1,
+      "path": "cases/1.json"
+    },
+    {
+      "number": 2,
+      "path": "cases/2.json"
+    },
+    {
+      "number": 3,
+      "path": "cases/3.json"
+    },
+    {
+      "number": 4,
+      "path": "cases/4.json"
+    },
+    {
+      "number": 5,
+      "path": "cases/5.json"
+    },
+    {
+      "number": 6,
+      "path": "cases/6.json"
+    },
+    {
+      "number": 7,
+      "path": "cases/7.json"
+    },
+    {
+      "number": 8,
+      "path": "cases/8.json"
+    },
+    {
+      "number": 11,
+      "path": "cases/11.json"
+    },
+    {
+      "number": 15,
+      "path": "cases/15.json"
+    },
+    {
+      "number": 16,
+      "path": "cases/16.json"
+    },
+    {
+      "number": 17,
+      "path": "cases/17.json"
+    },
+    {
+      "number": 18,
+      "path": "cases/18.json"
+    },
+    {
+      "number": 25,
+      "path": "cases/25.json"
+    },
+    {
+      "number": 26,
+      "path": "cases/26.json"
+    },
+    {
+      "number": 27,
+      "path": "cases/27.json"
+    },
+    {
+      "number": 28,
+      "path": "cases/28.json"
+    },
+    {
+      "number": 29,
+      "path": "cases/29.json"
+    },
+    {
+      "number": 30,
+      "path": "cases/30.json"
+    },
+    {
+      "number": 31,
+      "path": "cases/31.json"
+    },
+    {
+      "number": 34,
+      "path": "cases/34.json"
+    },
+    {
+      "number": 35,
+      "path": "cases/35.json"
+    },
+    {
+      "number": 41,
+      "path": "cases/41.json"
+    },
+    {
+      "number": 42,
+      "path": "cases/42.json"
+    },
+    {
+      "number": 43,
+      "path": "cases/43.json"
+    },
+    {
+      "number": 47,
+      "path": "cases/47.json"
+    },
+    {
+      "number": 52,
+      "path": "cases/52.json"
+    },
+    {
+      "number": 55,
+      "path": "cases/55.json"
+    },
+    {
+      "number": 58,
+      "path": "cases/58.json"
+    },
+    {
+      "number": 59,
+      "path": "cases/59.json"
+    },
+    {
+      "number": 61,
+      "path": "cases/61.json"
+    },
+    {
+      "number": 62,
+      "path": "cases/62.json"
+    },
+    {
+      "number": 64,
+      "path": "cases/64.json"
+    },
+    {
+      "number": 65,
+      "path": "cases/65.json"
+    }
+  ],
+  "pending": [
+    {
+      "number": 9,
+      "title": "+ [x] Pack fake socks",
+      "label": "Guessed",
+      "path": "pending/9.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 10,
+      "title": "Tick * Mail the fake parcel",
+      "label": "Unknown",
+      "path": "pending/10.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 12,
+      "title": "1. Call the fake plumber",
+      "label": "Guessed",
+      "path": "pending/12.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 13,
+      "title": "*italic start* of a sentence",
+      "label": "Guessed",
+      "path": "pending/13.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 14,
+      "title": "* [X] Capital X box",
+      "label": "Unknown",
+      "path": "pending/14.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 19,
+      "title": "Type * Fake review >nextweek, pick the first autocomplete item",
+      "label": "Unknown",
+      "path": "pending/19.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 20,
+      "title": "* Fake week task >2017-W02",
+      "label": "Guessed",
+      "path": "pending/20.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 21,
+      "title": "* Fake month task >2017-01",
+      "label": "Guessed",
+      "path": "pending/21.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 22,
+      "title": "* Fake meeting prep @2017-01-10",
+      "label": "Unknown",
+      "path": "pending/22.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 23,
+      "title": "* Fake trip >2017-01-10 to >2017-01-12",
+      "label": "Unknown",
+      "path": "pending/23.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 24,
+      "title": "* Fake bad date >2017-13-45",
+      "label": "Guessed",
+      "path": "pending/24.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 32,
+      "title": "* Fake lunch 2pm",
+      "label": "Guessed",
+      "path": "pending/32.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 33,
+      "title": "* Fake lunch 2p",
+      "label": "Guessed",
+      "path": "pending/33.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 36,
+      "title": "* Fake ask @Zed/Team",
+      "label": "Guessed",
+      "path": "pending/36.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 37,
+      "title": "* Fake end #zztag.",
+      "label": "Guessed",
+      "path": "pending/37.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 38,
+      "title": "* Write to pat@example.test",
+      "label": "Guessed",
+      "path": "pending/38.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 39,
+      "title": "* Fake count #123",
+      "label": "Unknown",
+      "path": "pending/39.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 40,
+      "title": "#zzidea at line start",
+      "label": "Guessed",
+      "path": "pending/40.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 44,
+      "title": "* Fake synced task ^zz1abc",
+      "label": "Guessed",
+      "path": "pending/44.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 45,
+      "title": "Read www.example.test today",
+      "label": "Unknown",
+      "path": "pending/45.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 46,
+      "title": "Parent * Fake parent with a tab-indented * Fake child, then a space-indented * Fake child 2",
+      "label": "Unknown",
+      "path": "pending/46.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 48,
+      "title": "> fake quote and >2017-01-10 fake",
+      "label": "Guessed",
+      "path": "pending/48.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 49,
+      "title": "A fenced code block holding * fake task #zzcode >2017-01-10",
+      "label": "Unknown",
+      "path": "pending/49.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 50,
+      "title": "\\#zzescaped and \\* not a task",
+      "label": "Unknown",
+      "path": "pending/50.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 51,
+      "title": "Frontmatter --- / title: x / --- at top, and a typed --- lower down",
+      "label": "Guessed",
+      "path": "pending/51.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 53,
+      "title": "Schedule the Jan 10 copy from case 52 on to Jan 11",
+      "label": "Unknown",
+      "path": "pending/53.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 54,
+      "title": "Schedule * Fake parent (open child and done child) to Jan 10",
+      "label": "Guessed",
+      "path": "pending/54.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 56,
+      "title": "Plain drag of a task onto Jan 12, 2017 in the calendar",
+      "label": "Unknown",
+      "path": "pending/56.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 57,
+      "title": "Command-1 on * Fake shortcut task",
+      "label": "Unknown",
+      "path": "pending/57.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 60,
+      "title": "* [x] Fake done and * [-] Fake cancelled",
+      "label": "Guessed",
+      "path": "pending/60.json",
+      "status": "waits for spec v0.3"
+    },
+    {
+      "number": 63,
+      "title": "* [x] Fake done project >2017-01-10",
+      "label": "Guessed",
+      "path": "pending/63.json",
+      "status": "waits for spec v0.3"
+    }
+  ]
+}

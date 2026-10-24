@@ -1,0 +1,7 @@
+{
+  "number": 17,
+  "context": "Day 2017-01-09",
+  "input": "* Fake task linked [[2017-01-11]]",
+  "expected": "Appears in Jan 11, 2017 references",
+  "label": "Seen"
+}

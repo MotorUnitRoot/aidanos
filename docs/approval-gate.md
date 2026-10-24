@@ -13,7 +13,7 @@ Anything else leaves the check waiting: `Waiting for Colby on <short commit>`. W
 
 These turn the check red. A red result stays red for that commit even if Colby also approved. The gate reads earlier `approval-gate` statuses on that commit and counts one only when the gate App's own bot wrote it. A failure from the shared App or from the Actions token does not stick. If the gate itself wrote a failure for a BLOCK or for a bot approval, it stays red after the comment or review is gone.
 
-- An approving review, a PASS comment for this commit, or a PASS line in a review body, from any bot or app. That includes `motorunit-aidanos-bots`, the gate App itself, `motorunitbots`, `cursor[bot]`, any account whose name ends in `[bot]`, and a PASS or approval posted through a GitHub App even when the account looks like Colby. An ordinary comment posted through an app is not an approval and does not by itself turn the gate red.
+- An approving review, a PASS comment for this commit, or a PASS line in a review body, from any bot or app. That includes `motorunit-aidanos-bots`, the gate App itself, `motorunitbots` (user id `347528074`), `cursor[bot]`, any account whose name ends in `[bot]`, and a PASS or approval posted through a GitHub App even when the account looks like Colby. An ordinary comment posted through an app is not an approval and does not by itself turn the gate red.
 - A bot or app comment that was edited, when GitHub will not return the edit history. The gate cannot prove that comment was never a PASS, so it goes red.
 - A comment whose first line is `Independent review: BLOCK`, with or without the commit id, from Colby, from the App, or from anyone else. A bot can make the gate stricter. A bot cannot make it green. AidanOS is a public repository, so an outsider can post that BLOCK. Because red sticks for that commit, the commit stays red after the comment is deleted. Only a new push, which is a new commit, clears it. This gate does not limit who may BLOCK. Limiting it is Colby's call.
 
@@ -73,7 +73,7 @@ The workflow reads those two secrets only when it runs from `main`. A pull reque
 
 After the App exists, look up the bot account GitHub created for it (the login ends in `[bot]`). On the `approval-gate` environment, add an environment variable named `APPROVAL_GATE_BOT_USER_ID` with that account's numeric id. It is not a secret. Do not create it as a repository variable. Until that environment variable is set, the gate matches the bot login only. Once it is set, the creator's id has to match too. The creator also has to be a bot account.
 
-The machine account that opens pull requests is `motorunitbots`. Its numeric user id is not pinned yet. When that id is known, it goes in `MOTORUNIT_BOT_USER_ID` in `.github/approval-gate.mjs`. Do not guess the number.
+The machine account that opens pull requests is `motorunitbots`, GitHub user id `347528074`, type User. That id is `MOTORUNIT_BOT_USER_ID` in `.github/approval-gate.mjs`. An account named `motorunitbots` with a different id is not this bot.
 
 After any change to the gate App's slug or id, re-run the gate on every open pull request into main. Statuses written before the change stop matching the new bot, so an older green can sit until that run.
 

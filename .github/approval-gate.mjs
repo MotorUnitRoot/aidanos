@@ -59,10 +59,10 @@ export const SHARED_APP_BOT_USER_ID = 345922838;
 export const CURSOR_BOT_USER_ID = 206951365;
 export const DEPENDABOT_BOT_USER_ID = 49699333;
 
-// The machine account login is motorunitbots. Pin its numeric user id
-// on the next line once it is known. Until then the gate matches the
-// login only. Do not put a guessed id here, and do not match a null id.
-export const MOTORUNIT_BOT_USER_ID = null;
+// motorunitbots is Colby's bot account. GitHub's public user is login
+// motorunitbots, id 347528074, type User. The login alone is not enough.
+// A different id with that name is not this bot.
+export const MOTORUNIT_BOT_USER_ID = 347528074;
 export const NAMED_MACHINE_LOGINS = Object.freeze(["motorunitbots"]);
 
 export const KNOWN_BOT_USER_IDS = Object.freeze([
@@ -92,11 +92,16 @@ export function isMachine(user, viaApp) {
   if (user.type === "Bot") return true;
   const login = typeof user.login === "string" ? user.login : "";
   if (login.endsWith("[bot]")) return true;
-  if (NAMED_MACHINE_LOGINS.includes(login)) return true;
+  if (NAMED_MACHINE_LOGINS.includes(login)) return isPinnedMachineUser(user);
+  if (isPinnedMachineUser(user)) return true;
   const id = Number(user.id);
-  if (MOTORUNIT_BOT_USER_ID != null && id === Number(MOTORUNIT_BOT_USER_ID)) return true;
   if (KNOWN_BOT_USER_IDS.includes(id)) return true;
   return false;
+}
+
+function isPinnedMachineUser(user) {
+  if (!user || user.type !== "User") return false;
+  return Number(user.id) === MOTORUNIT_BOT_USER_ID;
 }
 
 function sameSha(left, right) {
@@ -863,7 +868,20 @@ export async function selfTest() {
     ],
     ["Colby matched by id when the login differs", [review({ login: "renamed-colby", id: String(COLBY_USER_ID), type: "User" }, "APPROVED", sha)], [], "success", null],
     ["shared App approval", [review(appBot, "APPROVED", sha)], [], "failure", "Blocked: bot approval from motorunit-aidanos-bots[bot]"],
-    ["motorunitbots approval", [review({ login: "motorunitbots", type: "User" }, "APPROVED", sha)], [], "failure", "Blocked: bot approval from motorunitbots"],
+    [
+      "motorunitbots approval",
+      [review({ login: "motorunitbots", id: MOTORUNIT_BOT_USER_ID, type: "User" }, "APPROVED", sha)],
+      [],
+      "failure",
+      "Blocked: bot approval from motorunitbots",
+    ],
+    [
+      "motorunitbots login with another id",
+      [review({ login: "motorunitbots", id: 999, type: "User" }, "APPROVED", sha)],
+      [],
+      "pending",
+      `Waiting for Colby on ${sha.slice(0, 7)}`,
+    ],
     ["cursor bot approval", [review(cursorBot, "APPROVED", sha)], [], "failure", "Blocked: bot approval from cursor[bot]"],
     ["future gate App approval", [review(gateBot, "APPROVED", sha)], [], "failure", "Blocked: bot approval from motorunit-approval-gate[bot]"],
     [
@@ -1473,7 +1491,10 @@ export async function selfTest() {
     "an empty slug matches no creator, so an approval-gate page is judged",
   );
   assert(NAMED_MACHINE_LOGINS.includes("motorunitbots") && !NAMED_MACHINE_LOGINS.includes("motorunit-bot"), "the machine login is motorunitbots");
-  assert(MOTORUNIT_BOT_USER_ID == null, "the motorunitbots user id is not guessed");
+  assert(MOTORUNIT_BOT_USER_ID === 347528074, "motorunitbots is pinned to the confirmed user id");
+  assert(isMachine({ login: "motorunitbots", id: MOTORUNIT_BOT_USER_ID, type: "User" }), "the pinned motorunitbots account is a machine");
+  assert(!isMachine({ login: "motorunitbots", id: 999, type: "User" }), "a different id with the motorunitbots login is not the bot");
+  assert(isMachine({ login: "renamed-bots", id: MOTORUNIT_BOT_USER_ID, type: "User" }), "the pinned id still matches after a login change");
 
   const sweepWrites = [];
   const sweepSeen = [];

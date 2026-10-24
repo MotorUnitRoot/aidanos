@@ -506,6 +506,9 @@ final class ExternalFormatReaderTests: XCTestCase {
         let copy = ExternalFormatReader.read("* Item #brand©", in: .project).lines[0]
         XCTAssertEqual(copy.tags, [ExternalTag(name: "brand", parent: nil)])
         XCTAssertTrue(copy.flaggedTokens.isEmpty)
+        let registered = ExternalFormatReader.read("* Item #brand®", in: .project).lines[0]
+        XCTAssertEqual(registered.tags, [ExternalTag(name: "brand", parent: nil)])
+        XCTAssertTrue(registered.flaggedTokens.isEmpty)
     }
 
     func testHyphenatedTagIsFlaggedAndTheLineStays() {
@@ -583,6 +586,75 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertTrue(open.lines[2].tags.isEmpty)
         XCTAssertTrue(open.lines[2].scheduleDates.isEmpty)
         XCTAssertEqual(ExternalFormatReader.placement(of: open.lines[2], on: sessionDay, in: .project), .unlisted)
+    }
+
+    func testFenceUnsettlesHeadingsAndChecklistItems() {
+        let day = date(2017, 1, 9)
+        let heading = ExternalFormatReader.read("```\n## h #zz 09:00\n```\n", in: .day(day))
+        XCTAssertEqual(heading.lines[1].kind, .unsettled)
+        XCTAssertNil(heading.lines[1].timeBlock)
+        XCTAssertTrue(heading.lines[1].tags.isEmpty)
+        XCTAssertTrue(heading.lines[1].flaggedTokens.isEmpty)
+        XCTAssertEqual(ExternalFormatReader.placement(of: heading.lines[1], on: sessionDay, in: .day(day)), .unlisted)
+
+        let check = ExternalFormatReader.read("```\n+ c #zz\n+ c #zz >2017-01-10\n```\n", in: .project)
+        XCTAssertEqual(check.lines[1].kind, .unsettled)
+        XCTAssertTrue(check.lines[1].tags.isEmpty)
+        XCTAssertTrue(check.lines[1].scheduleDates.isEmpty)
+        XCTAssertNil(check.lines[1].timeBlock)
+        XCTAssertEqual(check.lines[2].kind, .unsettled)
+        XCTAssertTrue(check.lines[2].tags.isEmpty)
+        XCTAssertTrue(check.lines[2].scheduleDates.isEmpty)
+        XCTAssertTrue(check.lines[2].referencedDays.isEmpty)
+        XCTAssertNil(check.lines[2].timeBlock)
+        XCTAssertEqual(ExternalFormatReader.placement(of: check.lines[2], on: sessionDay, in: .project), .unlisted)
+    }
+
+    func testFenceClosesOnlyOnTheSameMarker() {
+        let tilde = ExternalFormatReader.read(
+            "```\n* inside #zz\n~~~\n* still #zz >2017-01-10\n```\n* Outside >2017-01-10\n",
+            in: .project
+        )
+        XCTAssertEqual(tilde.lines[1].kind, .unsettled)
+        XCTAssertTrue(tilde.lines[1].tags.isEmpty)
+        XCTAssertEqual(tilde.lines[2].kind, .unsettled)
+        XCTAssertEqual(tilde.lines[3].kind, .unsettled)
+        XCTAssertTrue(tilde.lines[3].tags.isEmpty)
+        XCTAssertTrue(tilde.lines[3].scheduleDates.isEmpty)
+        XCTAssertEqual(tilde.lines[5].kind, .openTask)
+        XCTAssertEqual(tilde.lines[5].scheduleDates, [date(2017, 1, 10)])
+
+        let shorter = ExternalFormatReader.read(
+            "````\nplain #zz\n```\nplain #yy >2017-01-11\n````\n* Out >2017-01-10\n",
+            in: .project
+        )
+        XCTAssertEqual(shorter.lines[1].kind, .unsettled)
+        XCTAssertTrue(shorter.lines[1].tags.isEmpty)
+        XCTAssertEqual(shorter.lines[2].kind, .unsettled)
+        XCTAssertEqual(shorter.lines[3].kind, .unsettled)
+        XCTAssertTrue(shorter.lines[3].tags.isEmpty)
+        XCTAssertTrue(shorter.lines[3].scheduleDates.isEmpty)
+        XCTAssertEqual(shorter.lines[5].kind, .openTask)
+        XCTAssertEqual(shorter.lines[5].scheduleDates, [date(2017, 1, 10)])
+
+        let longer = ExternalFormatReader.read("```\nplain #zz\n````\n* Out >2017-01-10\n", in: .project)
+        XCTAssertEqual(longer.lines[1].kind, .unsettled)
+        XCTAssertTrue(longer.lines[1].tags.isEmpty)
+        XCTAssertEqual(longer.lines[3].kind, .openTask)
+        XCTAssertEqual(longer.lines[3].scheduleDates, [date(2017, 1, 10)])
+    }
+
+    func testUnclosedMentionDoesNotSwallowALaterParen() {
+        let line = ExternalFormatReader.read("See @a( then #zz and @b(ok)", in: .project).lines[0]
+        XCTAssertEqual(line.mentions, [
+            ExternalMention(name: "a", value: nil),
+            ExternalMention(name: "b", value: "ok"),
+        ])
+        XCTAssertEqual(line.tags, [ExternalTag(name: "zz", parent: nil)])
+        XCTAssertTrue(line.flaggedTokens.isEmpty)
+        let stray = ExternalFormatReader.read("See @a( #zz )", in: .project).lines[0]
+        XCTAssertEqual(stray.mentions, [ExternalMention(name: "a", value: nil)])
+        XCTAssertEqual(stray.tags, [ExternalTag(name: "zz", parent: nil)])
     }
 
     func testRejectedWikiDoesNotHideALaterLink() {

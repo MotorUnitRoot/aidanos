@@ -17,21 +17,32 @@ public enum ExternalFormatReader {
 
     public static func read(_ text: String, in context: ExternalNoteContext) -> ExternalNoteReading {
         var lines: [ExternalLine] = []
-        var inFence = false
+        // marker and the number of marker characters that opened the block.
+        var openFence: (marker: Character, length: Int)?
         for piece in splitLines(text) {
-            if isCodeFence(piece) {
-                // An opening fence with no closer stays open for the rest of the note.
-                inFence.toggle()
-                lines.append(readLine(piece, in: context))
-                continue
+            if let fence = codeFence(piece) {
+                if let open = openFence {
+                    if fence.marker == open.marker, fence.length >= open.length {
+                        openFence = nil
+                        lines.append(readLine(piece, in: context))
+                        continue
+                    }
+                } else {
+                    // An opening fence with no closer stays open for the rest of the note.
+                    openFence = fence
+                    lines.append(readLine(piece, in: context))
+                    continue
+                }
             }
             var line = readLine(piece, in: context)
-            if inFence, line.kind.isTask {
-                // AidanOS choice, pending case 49
-                line = leaveOutOfLists(line)
-            } else if inFence, line.kind == .plain || line.kind == .bullet {
-                // AidanOS choice, pending case 93
-                line = leaveOutOfLists(line)
+            if openFence != nil, line.kind != .empty {
+                if line.kind.isTask {
+                    // AidanOS choice, pending case 49
+                    line = leaveOutOfLists(line)
+                } else {
+                    // AidanOS choice, pending case 93
+                    line = leaveOutOfLists(line)
+                }
             }
             lines.append(line)
         }
@@ -545,28 +556,31 @@ extension ExternalFormatReader {
         return line
     }
 
-    fileprivate static func isCodeFence(_ line: String) -> Bool {
+    /// A fence is three or more backticks, or three or more tildes. The two
+    /// markers are different. A closer must be the same marker and at least as long.
+    fileprivate static func codeFence(_ line: String) -> (marker: Character, length: Int)? {
         let (_, body) = indentAndBody(line)
         let chars = Array(body)
         var index = 0
         while index < chars.count, chars[index] == " " {
             index += 1
         }
-        guard index < chars.count else { return false }
+        guard index < chars.count else { return nil }
         let marker = chars[index]
-        guard marker == "`" || marker == "~" else { return false }
+        guard marker == "`" || marker == "~" else { return nil }
         let start = index
         while index < chars.count, chars[index] == marker {
             index += 1
         }
-        guard index - start >= 3 else { return false }
-        if index == chars.count { return true }
-        guard chars[index] == " " else { return false }
+        let length = index - start
+        guard length >= 3 else { return nil }
+        if index == chars.count { return (marker, length) }
+        guard chars[index] == " " else { return nil }
         while index < chars.count {
-            if chars[index] == marker { return false }
+            if chars[index] == marker { return nil }
             index += 1
         }
-        return true
+        return (marker, length)
     }
 
     /// A `>YYYY-MM-DD` on a task in a project note is also listed on that day.
@@ -856,6 +870,12 @@ extension ExternalFormatReader {
             index += 1
             let valueStart = index
             while index < chars.count, chars[index] != ")" {
+                // A mark that starts before any closing parenthesis means this
+                // mention has no value. The following text, including a later
+                // ")", stays available to read.
+                if chars[index] == "@" || chars[index] == "#", !wordBefore(chars, index) {
+                    return (ExternalMention(name: name, value: nil), start..<open, nil, false)
+                }
                 index += 1
             }
             if index < chars.count, chars[index] == ")" {
@@ -1009,12 +1029,13 @@ extension ExternalFormatReader {
     }
 
     /// Emoji may sit inside a tag or a mention, including at the top of a nested tag.
-    /// ASCII digits and marks are not emoji here. Trademark and copyright signs are not either.
+    /// ASCII digits and marks are not emoji here. Trademark, registered, and copyright signs are not either.
     fileprivate static func isTagChar(_ char: Character) -> Bool {
         if isNameChar(char) { return true }
         guard char.asciiValue == nil else { return false }
         for scalar in char.unicodeScalars {
-            if scalar.value == 0x00A9 || scalar.value == 0x2122 {
+            // Copyright, registered, and trademark signs.
+            if scalar.value == 0x00A9 || scalar.value == 0x00AE || scalar.value == 0x2122 {
                 return false
             }
         }

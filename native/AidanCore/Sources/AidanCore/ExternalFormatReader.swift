@@ -334,6 +334,14 @@ private enum BracketRead<Value> {
     case rejectedClosed(resume: Int)
 }
 
+/// How far a search for one closer has read. `read` is the first index not yet examined.
+private struct CloserSearch {
+    var read: Int = 0
+    var closer: Int? = nil
+    /// The bracket closer was found and the link was not kept.
+    var rejected = false
+}
+
 private struct FoundClock {
     var start: ExternalClockTime
     var end: ExternalClockTime?
@@ -625,47 +633,43 @@ extension ExternalFormatReader {
         let chars = Array(content)
         var marks = InlineMarks()
         var index = 0
-        // An unclosed opener has no closer later in the line. Remember that
-        // so the next opener does not walk to the end again.
-        var wikiHasNoCloser = false
-        var markdownHasNoCloser = false
-        var mentionParenHasNoCloser = false
+        // How far a search for each closer has already read. A later opener
+        // continues from that point and does not read behind it.
+        var wiki = CloserSearch()
+        var markdown = CloserSearch()
+        var mentionParen = CloserSearch()
         while index < chars.count {
             if chars[index] == "[", index + 1 < chars.count, chars[index + 1] == "[" {
-                if !wikiHasNoCloser {
-                    switch readWiki(chars, at: index) {
-                    case .found((let link, let range)):
-                        marks.wikiLinks.append(link)
-                        marks.blocked.append(range)
-                        index = range.upperBound
+                switch readWiki(chars, at: index, search: &wiki) {
+                case .found((let link, let range)):
+                    marks.wikiLinks.append(link)
+                    marks.blocked.append(range)
+                    index = range.upperBound
+                    continue
+                case .noCloser:
+                    break
+                case .rejectedClosed(let resume):
+                    // The closer was found and the link was not kept. Skip the span
+                    // so a later opener does not walk to that same closer.
+                    if resume > index {
+                        index = resume
                         continue
-                    case .noCloser:
-                        wikiHasNoCloser = true
-                    case .rejectedClosed(let resume):
-                        // The closer was found and the link was not kept. Skip the span
-                        // so a later opener does not walk to that same closer.
-                        if resume > index {
-                            index = resume
-                            continue
-                        }
-                    case .rejected:
-                        break
                     }
+                case .rejected:
+                    break
                 }
             }
             if chars[index] == "[" {
-                if !markdownHasNoCloser {
-                    switch readMarkdown(chars, at: index) {
-                    case .found((let link, let range, let address)):
-                        marks.markdownLinks.append(link)
-                        marks.blocked.append(address)
-                        index = range.upperBound
-                        continue
-                    case .noCloser:
-                        markdownHasNoCloser = true
-                    case .rejected, .rejectedClosed:
-                        break
-                    }
+                switch readMarkdown(chars, at: index, search: &markdown) {
+                case .found((let link, let range, let address)):
+                    marks.markdownLinks.append(link)
+                    marks.blocked.append(address)
+                    index = range.upperBound
+                    continue
+                case .noCloser:
+                    break
+                case .rejected, .rejectedClosed:
+                    break
                 }
             }
             if chars[index] == "#", !wordBefore(chars, index), let (tag, range, issue) = readTag(chars, at: index) {
@@ -683,6 +687,7 @@ extension ExternalFormatReader {
                 continue
             }
             if chars[index] == "@", !wordBefore(chars, index),
+               index + 1 < chars.count, isASCIIDigit(chars[index + 1]),
                let (_, end) = readISODate(chars, at: index + 1) {
                 // AidanOS choice, pending case 22
                 marks.flaggedTokens.append(String(chars[index..<end]))
@@ -690,14 +695,11 @@ extension ExternalFormatReader {
                 continue
             }
             if chars[index] == "@", !wordBefore(chars, index),
-               let (mention, range, valueRange, unclosedParen) = readMention(
+               let (mention, range, valueRange) = readMention(
                    chars,
                    at: index,
-                   parenHasNoCloser: mentionParenHasNoCloser
+                   paren: &mentionParen
                ) {
-                if unclosedParen {
-                    mentionParenHasNoCloser = true
-                }
                 marks.mentions.append(mention)
                 if let valueRange {
                     marks.blocked.append(valueRange)
@@ -718,19 +720,34 @@ extension ExternalFormatReader {
 
     fileprivate static func readWiki(
         _ chars: [Character],
-        at start: Int
+        at start: Int,
+        search: inout CloserSearch
     ) -> BracketRead<(ExternalWikiLink, Range<Int>)> {
         guard start + 1 < chars.count, chars[start] == "[", chars[start + 1] == "[" else { return .rejected }
+        if search.closer == nil, search.read >= chars.count, search.read > start {
+            return .noCloser
+        }
+        if let closer = search.closer {
+            if start > closer {
+                search = CloserSearch()
+            } else {
+                return .rejectedClosed(resume: search.read)
+            }
+        }
         var index = start + 2
         var inner: [Character] = []
         while index + 1 < chars.count {
             if chars[index] == "]", chars[index + 1] == "]" {
+                search.read = index + 2
+                search.closer = index
                 guard let link = makeWiki(String(inner)) else { return .rejectedClosed(resume: index + 2) }
                 return .found((link, start..<(index + 2)))
             }
             inner.append(chars[index])
             index += 1
         }
+        search.read = chars.count
+        search.closer = nil
         return .noCloser
     }
 
@@ -749,19 +766,40 @@ extension ExternalFormatReader {
 
     fileprivate static func readMarkdown(
         _ chars: [Character],
-        at start: Int
+        at start: Int,
+        search: inout CloserSearch
     ) -> BracketRead<(ExternalMarkdownLink, Range<Int>, Range<Int>)> {
         guard chars[start] == "[" else { return .rejected }
         if start + 1 < chars.count, chars[start + 1] == "[" { return .rejected }
+        if search.closer == nil, search.read >= chars.count, search.read > start {
+            return .noCloser
+        }
+        if search.rejected, let closer = search.closer, start <= closer {
+            return .rejected
+        }
+        if let closer = search.closer, start > closer {
+            search = CloserSearch()
+        }
         var index = start + 1
         var shown: [Character] = []
         while index < chars.count, chars[index] != "]" {
             shown.append(chars[index])
             index += 1
         }
-        guard index < chars.count, chars[index] == "]" else { return .noCloser }
+        guard index < chars.count, chars[index] == "]" else {
+            search.read = chars.count
+            search.closer = nil
+            search.rejected = false
+            return .noCloser
+        }
+        search.read = index + 1
+        search.closer = index
+        search.rejected = false
         index += 1
-        guard index < chars.count, chars[index] == "(" else { return .rejected }
+        guard index < chars.count, chars[index] == "(" else {
+            search.rejected = true
+            return .rejected
+        }
         let addressStart = index
         index += 1
         var address: [Character] = []
@@ -769,11 +807,20 @@ extension ExternalFormatReader {
             address.append(chars[index])
             index += 1
         }
-        guard index < chars.count, chars[index] == ")" else { return .noCloser }
+        guard index < chars.count, chars[index] == ")" else {
+            // The address has no ")". Nothing later in the line can close one either.
+            search.read = chars.count
+            search.closer = nil
+            search.rejected = false
+            return .noCloser
+        }
         index += 1
         let shownText = trim(String(shown))
         let addr = trim(String(address))
-        guard !shownText.isEmpty, !addr.isEmpty else { return .rejected }
+        guard !shownText.isEmpty, !addr.isEmpty else {
+            search.rejected = true
+            return .rejected
+        }
         let link = ExternalMarkdownLink(shownText: shownText, address: addr)
         return .found((link, start..<index, addressStart..<index))
     }
@@ -818,45 +865,42 @@ extension ExternalFormatReader {
     fileprivate static func readMention(
         _ chars: [Character],
         at start: Int,
-        parenHasNoCloser: Bool
-    ) -> (ExternalMention, Range<Int>, Range<Int>?, Bool)? {
+        paren: inout CloserSearch
+    ) -> (ExternalMention, Range<Int>, Range<Int>?)? {
         guard chars[start] == "@" else { return nil }
         var index = start + 1
         guard let name = readTagGroup(chars, from: &index) else { return nil }
-        if index < chars.count, chars[index] == "(" {
-            if parenHasNoCloser {
-                return (ExternalMention(name: name, value: nil), start..<index, nil, false)
-            }
-            let open = index
-            index += 1
-            let valueStart = index
-            while index < chars.count, chars[index] != ")" {
-                // A mark that starts before any closing parenthesis means this
-                // mention has no value. The following text, including a later
-                // ")", stays available to read. One walk records when no ")"
-                // remains, so the next opener does not walk the line again.
-                if chars[index] == "@" || chars[index] == "#", !wordBefore(chars, index) {
-                    var look = index
-                    var foundParen = false
-                    while look < chars.count {
-                        if chars[look] == ")" {
-                            foundParen = true
-                            break
-                        }
-                        look += 1
-                    }
-                    return (ExternalMention(name: name, value: nil), start..<open, nil, !foundParen)
-                }
-                index += 1
-            }
-            if index < chars.count, chars[index] == ")" {
-                let value = String(chars[valueStart..<index])
-                index += 1
-                return (ExternalMention(name: name, value: value), start..<index, open..<index, false)
-            }
-            return (ExternalMention(name: name, value: nil), start..<open, nil, true)
+        guard index < chars.count, chars[index] == "(" else {
+            return (ExternalMention(name: name, value: nil), start..<index, nil)
         }
-        return (ExternalMention(name: name, value: nil), start..<index, nil, false)
+        let open = index
+        // `read` is the first index this search has not examined. A "(" behind
+        // that point already failed to close, so do not walk those characters again.
+        if paren.read > open {
+            return (ExternalMention(name: name, value: nil), start..<open, nil)
+        }
+        var cursor = open + 1
+        let valueStart = cursor
+        while cursor < chars.count {
+            if chars[cursor] == ")" {
+                paren.read = cursor + 1
+                paren.closer = cursor
+                let value = String(chars[valueStart..<cursor])
+                return (ExternalMention(name: name, value: value), start..<(cursor + 1), open..<(cursor + 1))
+            }
+            // A mark that starts before any closing parenthesis means this
+            // mention has no value. Remember how far the search read so the
+            // next opener does not read behind this point.
+            if chars[cursor] == "@" || chars[cursor] == "#", !wordBefore(chars, cursor) {
+                paren.read = cursor
+                paren.closer = nil
+                return (ExternalMention(name: name, value: nil), start..<open, nil)
+            }
+            cursor += 1
+        }
+        paren.read = chars.count
+        paren.closer = nil
+        return (ExternalMention(name: name, value: nil), start..<open, nil)
     }
 
     fileprivate static func readCompletion(_ value: String) -> ExternalCompletion? {
@@ -981,11 +1025,18 @@ extension ExternalFormatReader {
     }
 
     fileprivate static func isWordChar(_ char: Character) -> Bool {
-        char.isLetter || char.isNumber
+        if let ascii = char.asciiValue {
+            return (ascii >= 65 && ascii <= 90) || (ascii >= 97 && ascii <= 122) || (ascii >= 48 && ascii <= 57)
+        }
+        return char.isLetter || char.isNumber
     }
 
     fileprivate static func isNameChar(_ char: Character) -> Bool {
-        char.isLetter || isASCIIDigit(char) || char == "_"
+        if let ascii = char.asciiValue {
+            return (ascii >= 65 && ascii <= 90) || (ascii >= 97 && ascii <= 122)
+                || (ascii >= 48 && ascii <= 57) || ascii == 95
+        }
+        return char.isLetter
     }
 
     /// Emoji may sit inside a tag or a mention, including at the top of a nested tag.

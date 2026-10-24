@@ -366,7 +366,9 @@ final class ExternalFormatReaderTests: XCTestCase {
         let line = String(repeating: "[", count: 1_000_000)
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        let elapsed = Date().timeIntervalSince(started)
+        print("reader-timing bracket-bound \(elapsed)")
+        XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
@@ -666,7 +668,9 @@ final class ExternalFormatReaderTests: XCTestCase {
         let line = String(repeating: "[[#", count: 350_000) + "]]"
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        let elapsed = Date().timeIntervalSince(started)
+        print("reader-timing wiki-bound \(elapsed)")
+        XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
     }
@@ -675,9 +679,28 @@ final class ExternalFormatReaderTests: XCTestCase {
         let line = String(repeating: "@a(", count: 350_000)
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        let elapsed = Date().timeIntervalSince(started)
+        print("reader-timing mention-bound \(elapsed)")
+        XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
+    }
+
+    /// The same unclosed `@a(` input at N and 2N. A quadratic closer scan grows by about 4x.
+    func testUnclosedMentionParenGrowsLinearly() {
+        let count = 100_000
+        let once = mentionReadTime(String(repeating: "@a(", count: count))
+        let twice = mentionReadTime(String(repeating: "@a(", count: count * 2))
+        print("reader-timing mention-growth \(once) \(twice)")
+        XCTAssertLessThanOrEqual(twice, once * 3)
+    }
+
+    private func mentionReadTime(_ text: String) -> TimeInterval {
+        let started = Date()
+        let note = ExternalFormatReader.read(text, in: .project)
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertFalse(note.lines[0].mentions.isEmpty)
+        return elapsed
     }
 
     func testMovedAwayTaskInAPastDayIsUnlisted() {

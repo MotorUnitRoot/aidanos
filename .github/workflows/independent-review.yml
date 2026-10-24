@@ -1,4 +1,4 @@
-name: approval-gate-advisory
+name: judge-advisory
 
 # Read-only mirror of the approval gate. This workflow does not write
 # approval-gate and does not read the gate App key. approval-gate.yml
@@ -28,7 +28,7 @@ permissions:
 jobs:
   independent-review-advisory:
     if: github.event_name == 'pull_request'
-    name: approval-gate (advisory)
+    name: judge (advisory)
     runs-on: ubuntu-latest
     # Early signal only. A pull request can change this job. It stays
     # read-only. issues: read lists conversation comments.
@@ -58,7 +58,7 @@ jobs:
   # Read-only: this job must not post the binding status.
   independent-review-advisory-from-main:
     if: github.event_name == 'pull_request_target' || (github.event_name == 'issue_comment' && github.event.issue.pull_request)
-    name: approval-gate (advisory, from base)
+    name: judge (advisory, from base)
     runs-on: ubuntu-latest
     permissions:
       contents: read

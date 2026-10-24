@@ -19,7 +19,9 @@
  * requires that latest review to be APPROVED on the current head. An
  * older approval followed by a dismissed changes request stays red.
  * A failure this App already wrote for a BLOCK or a bot approval stays
- * red for that commit.
+ * red for that commit. Only a status whose creator is this App's bot
+ * counts. The login is "<app slug>[bot]" from the token step. The bot
+ * user id is optional until Colby sets APPROVAL_GATE_BOT_USER_ID.
  *
  * The Dependabot path is phase 2 and is off. There is no hardware-key
  * sign-off.
@@ -202,9 +204,36 @@ function dismissedChangesRequest(reviews) {
 
 const STICKY_FAILURE_PREFIXES = Object.freeze(["Blocked: bot approval from ", "Blocked: BLOCK from "]);
 
-function stickingFailure(statuses) {
+// Empty means "not configured yet": match the bot login only.
+// A non-empty value that is not a positive integer matches nothing.
+export function parseGateBotUserId(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  if (!/^[1-9][0-9]*$/.test(raw)) return false;
+  return Number(raw);
+}
+
+export function gateFromEnv(env = process.env) {
+  return {
+    slug: String((env && env.APPROVAL_GATE_APP_SLUG) || "").trim(),
+    botUserId: parseGateBotUserId(env && env.APPROVAL_GATE_BOT_USER_ID),
+  };
+}
+
+function creatorIsGate(creator, gate) {
+  const slug = String((gate && gate.slug) || "").trim();
+  if (!/^[a-z0-9][a-z0-9-]{0,38}$/.test(slug)) return false;
+  if (!creator || creator.login !== `${slug}[bot]`) return false;
+  const botUserId = gate.botUserId;
+  if (botUserId == null) return true;
+  if (botUserId === false) return false;
+  return Number(creator.id) === Number(botUserId);
+}
+
+function stickingFailure(statuses, gate) {
   for (const status of statuses || []) {
     if (!status || status.context !== STATUS_CONTEXT || status.state !== "failure") continue;
+    if (!creatorIsGate(status.creator, gate)) continue;
     const description = String(status.description || "");
     if (!STICKY_FAILURE_PREFIXES.some((prefix) => description.startsWith(prefix))) continue;
     return {
@@ -233,7 +262,7 @@ function colbyPassComments(comments, head) {
 /**
  * @returns {{state: "success"|"failure"|"pending"|null, description: string, reasons: string[], login?: string}}
  */
-export function evaluate({ pr, reviews, comments, statuses } = {}) {
+export function evaluate({ pr, reviews, comments, statuses, gate } = {}) {
   if (!pr || pr.state === "closed") {
     return { state: null, description: "", reasons: ["closed"] };
   }
@@ -269,7 +298,7 @@ export function evaluate({ pr, reviews, comments, statuses } = {}) {
     };
   }
 
-  const stuck = stickingFailure(statuses);
+  const stuck = stickingFailure(statuses, gate);
   if (stuck) return stuck;
 
   const decisive = colbyLatestDecisive(reviews);
@@ -355,6 +384,7 @@ export async function judgeAndWrite({
   readComments,
   readStatuses = async () => [],
   writeStatus,
+  gate = {},
 }) {
   let judgedSha = null;
   try {
@@ -367,7 +397,7 @@ export async function judgeAndWrite({
     const reviews = await readReviews(prNumber);
     const comments = await readComments(prNumber);
     const statuses = await readStatuses(judgedSha);
-    let result = evaluate({ pr, reviews, comments, statuses });
+    let result = evaluate({ pr, reviews, comments, statuses, gate });
     if (advisory) return { wrote: false, reason: "advisory", result, judgedSha };
     const fresh = await readPull(prNumber);
     const freshSha = fresh && fresh.head && fresh.head.sha;
@@ -377,7 +407,7 @@ export async function judgeAndWrite({
     const freshReviews = await readReviews(prNumber);
     const freshComments = await readComments(prNumber);
     const freshStatuses = await readStatuses(judgedSha);
-    result = evaluate({ pr: fresh, reviews: freshReviews, comments: freshComments, statuses: freshStatuses });
+    result = evaluate({ pr: fresh, reviews: freshReviews, comments: freshComments, statuses: freshStatuses, gate });
     if (!result.state) return { wrote: false, reason: result.reasons[0] || "skip", result, judgedSha };
     await writeStatus({
       sha: judgedSha,
@@ -942,11 +972,17 @@ export async function selfTest() {
     "a bot approval that arrives before the write replaces the green",
   );
 
+  const gate = { slug: "motorunit-approval-gate", botUserId: null };
+  const gateCreator = { login: "motorunit-approval-gate[bot]", id: 999001, type: "Bot" };
+  function gateFailure(description, creator) {
+    return { context: STATUS_CONTEXT, state: "failure", description, creator: creator || gateCreator };
+  }
   const stuckBlock = evaluate({
     pr: open,
     reviews: [review(colby, "APPROVED", sha)],
     comments: [],
-    statuses: [{ context: STATUS_CONTEXT, state: "failure", description: "Blocked: BLOCK from octocat" }],
+    statuses: [gateFailure("Blocked: BLOCK from octocat")],
+    gate,
   });
   assert(
     stuckBlock.state === "failure" && stuckBlock.description === "Blocked: BLOCK from octocat" && stuckBlock.reasons[0] === "sticky",
@@ -956,21 +992,66 @@ export async function selfTest() {
     pr: open,
     reviews: [review(colby, "APPROVED", sha)],
     comments: [],
-    statuses: [{ context: STATUS_CONTEXT, state: "failure", description: "Blocked: bot approval from cursor[bot]" }],
+    statuses: [gateFailure("Blocked: bot approval from cursor[bot]")],
+    gate,
   });
   assert(stuckBot.state === "failure" && stuckBot.reasons.includes("bot-approval"), "an earlier bot-approval failure stays red");
+  const foreignBlock = evaluate({
+    pr: open,
+    reviews: [review(colby, "APPROVED", sha)],
+    comments: [],
+    statuses: [gateFailure("Blocked: BLOCK from octocat", { login: "motorunit-aidanos-bots[bot]", id: SHARED_APP_BOT_USER_ID, type: "Bot" })],
+    gate,
+  });
+  assert(foreignBlock.state === "success", "a failure written by the shared App does not stick");
+  const actionsBlock = evaluate({
+    pr: open,
+    reviews: [review(colby, "APPROVED", sha)],
+    comments: [],
+    statuses: [gateFailure("Blocked: BLOCK from octocat", { login: "github-actions[bot]", id: 41898282, type: "Bot" })],
+    gate,
+  });
+  assert(actionsBlock.state === "success", "a failure written by the Actions token does not stick");
+  const matchedId = evaluate({
+    pr: open,
+    reviews: [review(colby, "APPROVED", sha)],
+    comments: [],
+    statuses: [gateFailure("Blocked: BLOCK from octocat")],
+    gate: { slug: "motorunit-approval-gate", botUserId: 999001 },
+  });
+  assert(matchedId.state === "failure", "a configured bot user id sticks when it matches the creator");
+  const otherId = evaluate({
+    pr: open,
+    reviews: [review(colby, "APPROVED", sha)],
+    comments: [],
+    statuses: [gateFailure("Blocked: BLOCK from octocat")],
+    gate: { slug: "motorunit-approval-gate", botUserId: 111 },
+  });
+  assert(otherId.state === "success", "a matching login with a different bot id does not stick");
+  assert(parseGateBotUserId("") === null && parseGateBotUserId("999001") === 999001, "an empty bot id stays unset and a number is kept");
+  assert(parseGateBotUserId("nope") === false, "a bot id that is not a number matches nothing");
+  const badId = evaluate({
+    pr: open,
+    reviews: [review(colby, "APPROVED", sha)],
+    comments: [],
+    statuses: [gateFailure("Blocked: BLOCK from octocat")],
+    gate: { slug: "motorunit-approval-gate", botUserId: parseGateBotUserId("12abc") },
+  });
+  assert(badId.state === "success", "a malformed bot id does not stick a failure");
   const otherContext = evaluate({
     pr: open,
     reviews: [review(colby, "APPROVED", sha)],
     comments: [],
-    statuses: [{ context: "independent-review/approved", state: "failure", description: "Blocked: BLOCK from octocat" }],
+    statuses: [{ context: "independent-review/approved", state: "failure", description: "Blocked: BLOCK from octocat", creator: gateCreator }],
+    gate,
   });
   assert(otherContext.state === "success", "a failure on another context does not stick");
   const priorSuccess = evaluate({
     pr: open,
     reviews: [],
     comments: [],
-    statuses: [{ context: STATUS_CONTEXT, state: "success", description: `Colby approved ${sha.slice(0, 7)}` }],
+    statuses: [{ context: STATUS_CONTEXT, state: "success", description: `Colby approved ${sha.slice(0, 7)}`, creator: gateCreator }],
+    gate,
   });
   assert(priorSuccess.state === "pending", "an earlier success does not stick");
   const priorPending = evaluate({
@@ -1168,16 +1249,24 @@ export async function selfTest() {
   assert(gateYaml.includes("ref: ${{ github.sha }}"), "the gate checks out the base sha");
   assert(gateYaml.includes("persist-credentials: false"), "the gate checkout drops credentials");
   assert(!gateYaml.includes("workflow_run.id"), "review events do not get their own concurrency group");
-  assert(
-    gateYaml.includes(
-      "group: approval-gate-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha }}",
-    ),
-    "every event shares one concurrency group per pull request",
-  );
+  assert(!gateYaml.includes("workflow_run.head_sha"), "the lock does not fall back to a commit id");
+  assert(!gateYaml.includes("github.event.workflow_run"), "the lock does not read the review event");
+  assert(gateYaml.includes("\nconcurrency:\n  group: approval-gate\n  cancel-in-progress: false\n"), "the workflow uses one repo-wide lock");
+  assert(gateYaml.includes("APPROVAL_GATE_APP_SLUG: ${{ steps.app-token.outputs.app-slug }}"), "the gate slug comes from the token step");
+  assert(gateYaml.includes("APPROVAL_GATE_BOT_USER_ID: ${{ vars.APPROVAL_GATE_BOT_USER_ID }}"), "the bot user id is a configurable variable");
   const gateJobs = gateYaml.split("\njobs:\n")[1] || "";
   assert(gateJobs.includes("\n    name: judge\n"), "the binding job is named judge");
   assert(!gateJobs.includes("name: approval-gate"), "the job name is not the status context");
   assert(STATUS_CONTEXT === "approval-gate", "the status context stays approval-gate");
+  const advisoryYaml = fs.readFileSync(`${workflowDir}independent-review.yml`, "utf8");
+  const advisoryJobs = advisoryYaml.split("\njobs:\n")[1] || "";
+  assert(advisoryJobs.includes("\n    name: judge (advisory)\n"), "the pull request advisory job is named judge (advisory)");
+  assert(advisoryJobs.includes("\n    name: judge (advisory, from base)\n"), "the base advisory job is named judge (advisory, from base)");
+  assert(!advisoryJobs.includes("name: approval-gate"), "advisory jobs are not named approval-gate");
+  for (const entry of workflowNames) {
+    const jobs = fs.readFileSync(`${workflowDir}${entry}`, "utf8").split("\njobs:\n")[1] || "";
+    assert(!jobs.includes("name: approval-gate"), `${entry} has no job named approval-gate`);
+  }
   assert(!relayYaml.includes("uses:"), "the relay checks nothing out");
   assert(!relayYaml.includes("secrets."), "the relay has no secrets");
   assert(relayYaml.includes("permissions: {}"), "the relay token has no permissions");
@@ -1282,6 +1371,7 @@ async function main() {
   const outcome = await judgeAndWrite({
     prNumber: number,
     advisory,
+    gate: gateFromEnv(process.env),
     readPull: (pullNumber) => request(`/repos/${owner}/${repo}/pulls/${pullNumber}`),
     readReviews: (pullNumber) =>
       listAll((page) => request(`/repos/${owner}/${repo}/pulls/${pullNumber}/reviews?per_page=100&page=${page}`)),

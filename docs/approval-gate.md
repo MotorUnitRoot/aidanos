@@ -11,21 +11,21 @@ Either of these turns the check green:
 
 Anything else leaves the check waiting: `Waiting for Colby on <short commit>`. Waiting still blocks a required check.
 
-These turn the check red. A red result stays red for that commit even if Colby also approved. The gate reads its own earlier statuses on that commit. If it ever wrote a failure for a BLOCK or for a bot approval, it stays red after the comment or review is gone. Deleting the comment does not clear it.
+These turn the check red. A red result stays red for that commit even if Colby also approved. The gate reads earlier `approval-gate` statuses on that commit and counts one only when the gate App's own bot wrote it. A failure from the shared App or from the Actions token does not stick. If the gate itself wrote a failure for a BLOCK or for a bot approval, it stays red after the comment or review is gone.
 
 - An approving review, a PASS comment for this commit, or a PASS line in a review body, from any bot or app. That includes `motorunit-aidanos-bots`, the gate App itself, `motorunit-bot`, `cursor[bot]`, any account whose name ends in `[bot]`, and a PASS or approval posted through a GitHub App even when the account looks like Colby. An ordinary comment posted through an app is not an approval and does not by itself turn the gate red.
 - A bot or app comment that was edited, when GitHub will not return the edit history. The gate cannot prove that comment was never a PASS, so it goes red.
-- A comment whose first line is `Independent review: BLOCK`, with or without the commit id, from Colby, from the App, or from anyone else. A bot can make the gate stricter. A bot cannot make it green. AidanOS is a public repository, so anyone can post that BLOCK and hold the commit. This gate does not limit who may BLOCK. Limiting it is Colby's decision.
+- A comment whose first line is `Independent review: BLOCK`, with or without the commit id, from Colby, from the App, or from anyone else. A bot can make the gate stricter. A bot cannot make it green. AidanOS is a public repository, so an outsider can post that BLOCK. Because red sticks for that commit, the commit stays red after the comment is deleted. Only a new push, which is a new commit, clears it. This gate does not limit who may BLOCK. Limiting it is Colby's call.
 
 Requesting changes is not a red block. It only means that person's approval no longer counts, so the gate goes back to waiting unless a PASS comment from Colby still qualifies. Dismissing that changes request is different: the older approval stays withdrawn and the gate is red.
 
-The status is written by a new GitHub App that only Colby creates. It is not written by the shared `motorunit-aidanos-bots` App, and it is not written by the normal Actions token. The Actions job that runs the gate is named `judge`. The status context stays `approval-gate`. Do not pick a job named `approval-gate` as the required check. A workflow in a pull request that names a job `approval-gate` and exits successfully does not satisfy this check. The branch protection rule must name this App's id, not "any source".
+The status is written by a new GitHub App that only Colby creates. It is not written by the shared `motorunit-aidanos-bots` App, and it is not written by the normal Actions token. The Actions job that runs the gate is named `judge`. The read-only jobs are named `judge (advisory)` and `judge (advisory, from base)`. The status context stays `approval-gate`. Do not pick a job named `approval-gate` as the required check. A workflow in a pull request that names a job `approval-gate` and exits successfully does not satisfy this check. The branch protection rule must name this App's id, not "any source".
 
 The old status `independent-review/approved` is not this gate. Do not add it to the required checks. A PASS from `motorunit-aidanos-bots[bot]` is not an approval.
 
 The Dependabot shortcut is not built. It stays off. There is no hardware-key sign-off in this step.
 
-The gate reads the reviews, the comments, and the head again from GitHub just before it writes, and it writes that second result only to the commit it judged. If a new commit landed in between, it writes nothing. Push, comment, review, and manual runs for the same pull request share one concurrency group, so two overlapping runs cannot leave an older green in place. If GitHub returns an error after the head commit has been read, the gate writes `pending` with the description `gate error` on that commit. The error text is not copied into the status. An earlier green does not stay up.
+The gate reads the reviews, the comments, and the head again from GitHub just before it writes, and it writes that second result only to the commit it judged. If a new commit landed in between, it writes nothing. The workflow uses one lock for the whole repository, so a review on a fork pull request cannot run at the same time as a push or a comment. If GitHub returns an error after the head commit has been read, the gate writes `pending` with the description `gate error` on that commit. The error text is not copied into the status. If that fallback write also fails, an older green can stay on the commit.
 
 ## What Colby does by hand
 
@@ -63,7 +63,9 @@ On that environment, create two secrets (not repository secrets, and not the sha
 
 Paste the key from your own device straight into the secret field. Then delete the downloaded key file. Do not leave a copy on a computer that bots can read.
 
-The workflow reads those two secrets only when it runs from `main`. A pull request branch cannot read them.
+The workflow reads those two secrets only when it runs from `main`. A pull request branch cannot read them. The token step also supplies the App's slug. The gate trusts an earlier red status only when its creator login is that slug plus `[bot]`.
+
+After the App exists, look up the bot account GitHub created for it (the login ends in `[bot]`). On the `approval-gate` environment, add a variable named `APPROVAL_GATE_BOT_USER_ID` with that account's numeric id. It is not a secret. Until that variable is set, the gate matches the bot login only. Once it is set, the creator's id has to match too.
 
 ### 3. After the live tests, require the check
 

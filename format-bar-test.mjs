@@ -131,12 +131,15 @@ function buttonBlock(act) {
 const indentSvg = buttonBlock("indent");
 const outdentSvg = buttonBlock("outdent");
 assert(indentSvg !== outdentSvg, "indent and outdent are different drawings");
-assert(indentSvg.includes("10.2 12") && indentSvg.includes("M12 5h9.5"), "indent shows lines with an arrow pointing right");
-assert(outdentSvg.includes("13.8 12") && outdentSvg.includes("M2.5 5h9.5"), "outdent shows the same lines with an arrow pointing left");
+assert(indentSvg.includes("9.6 12") && indentSvg.includes("M12 5.25h9"), "indent shows lines with an open arrow pointing right");
+assert(outdentSvg.includes("14.4 12") && outdentSvg.includes("M3 5.25h9"), "outdent shows the same lines with an open arrow pointing left");
+assert(!indentSvg.includes('fill="currentColor"') && !outdentSvg.includes('fill="currentColor"'), "indent and outdent are outline strokes");
+assert(indentSvg.includes('stroke-width="1.25"') && outdentSvg.includes('stroke-width="1.25"'), "indent and outdent use the bar stroke");
 const hideSvg = buttonBlock("hide");
-const keyCaps = (hideSvg.match(/<rect /g) || []).length;
-assert(keyCaps >= 9, "hide keyboard draws key caps, got " + keyCaps);
-assert(hideSvg.includes("M7.5 17.5"), "a down chevron sits under the keyboard");
+assert(!hideSvg.includes('fill="currentColor"'), "hide keyboard is an outline");
+assert(hideSvg.includes('stroke-width="1.25"') && hideSvg.includes("<rect "), "hide keyboard uses the bar stroke");
+assert((hideSvg.match(/h2\.15/g) || []).length === 8, "hide keyboard keeps two rows of key strokes");
+assert(hideSvg.includes("M8.2 17.7"), "a down chevron sits under the keyboard");
 assert(!bar.includes("Wand") && !bar.includes("Command") && !bar.includes("Text style"), "removed buttons stay gone");
 assert(!html.includes("fmt-bar") && !html.includes("fmt-btn"), "old bar classes are gone");
 

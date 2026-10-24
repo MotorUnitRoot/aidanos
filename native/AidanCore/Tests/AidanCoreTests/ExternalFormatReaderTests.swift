@@ -726,9 +726,12 @@ final class ExternalFormatReaderTests: XCTestCase {
     /// The same unclosed `@a(` input at N and 2N. A quadratic closer scan grows by about 4x.
     func testUnclosedMentionParenGrowsLinearly() {
         let count = 100_000
-        let once = mentionReadTime(String(repeating: "@a(", count: count))
-        let twice = mentionReadTime(String(repeating: "@a(", count: count * 2))
-        print("reader-timing mention-growth \(once) \(twice)")
+        let smaller = String(repeating: "@a(", count: count)
+        let larger = String(repeating: "@a(", count: count * 2)
+        let (once, twice) = growthTimes(smaller, larger) { note in
+            XCTAssertFalse(note.lines[0].mentions.isEmpty)
+        }
+        print("reader-timing mention-growth \(once) \(twice) \(twice / once)")
         XCTAssertLessThanOrEqual(twice, once * 3)
     }
 
@@ -745,9 +748,12 @@ final class ExternalFormatReaderTests: XCTestCase {
 
     func testClosedMentionParenGrowsLinearly() {
         let count = 100_000
-        let once = mentionReadTime(String(repeating: "@a(", count: count) + ")")
-        let twice = mentionReadTime(String(repeating: "@a(", count: count * 2) + ")")
-        print("reader-timing mention-closed-growth \(once) \(twice)")
+        let smaller = String(repeating: "@a(", count: count) + ")"
+        let larger = String(repeating: "@a(", count: count * 2) + ")"
+        let (once, twice) = growthTimes(smaller, larger) { note in
+            XCTAssertFalse(note.lines[0].mentions.isEmpty)
+        }
+        print("reader-timing mention-closed-growth \(once) \(twice) \(twice / once)")
         XCTAssertLessThanOrEqual(twice, once * 3)
     }
 
@@ -765,26 +771,37 @@ final class ExternalFormatReaderTests: XCTestCase {
 
     func testClosedBracketLineGrowsLinearly() {
         let count = 100_000
-        let once = readTime(String(repeating: "[a", count: count) + "]")
-        let twice = readTime(String(repeating: "[a", count: count * 2) + "]")
-        print("reader-timing bracket-closed-growth \(once) \(twice)")
+        let smaller = String(repeating: "[a", count: count) + "]"
+        let larger = String(repeating: "[a", count: count * 2) + "]"
+        let (once, twice) = growthTimes(smaller, larger) { note in
+            XCTAssertEqual(note.lines.count, 1)
+        }
+        print("reader-timing bracket-closed-growth \(once) \(twice) \(twice / once)")
         XCTAssertLessThanOrEqual(twice, once * 3)
     }
 
-    private func mentionReadTime(_ text: String) -> TimeInterval {
-        let started = Date()
-        let note = ExternalFormatReader.read(text, in: .project)
-        let elapsed = Date().timeIntervalSince(started)
-        XCTAssertFalse(note.lines[0].mentions.isEmpty)
-        return elapsed
+    /// One unmeasured read, then the fastest of three measured reads at each size.
+    private func growthTimes(
+        _ smaller: String,
+        _ larger: String,
+        check: (ExternalNoteReading) -> Void
+    ) -> (TimeInterval, TimeInterval) {
+        _ = ExternalFormatReader.read(larger, in: .project)
+        return (fastestRead(smaller, check: check), fastestRead(larger, check: check))
     }
 
-    private func readTime(_ text: String) -> TimeInterval {
-        let started = Date()
-        let note = ExternalFormatReader.read(text, in: .project)
-        let elapsed = Date().timeIntervalSince(started)
-        XCTAssertEqual(note.lines.count, 1)
-        return elapsed
+    private func fastestRead(_ text: String, check: (ExternalNoteReading) -> Void) -> TimeInterval {
+        var best = TimeInterval.greatestFiniteMagnitude
+        for _ in 0..<3 {
+            let started = Date()
+            let note = ExternalFormatReader.read(text, in: .project)
+            let elapsed = Date().timeIntervalSince(started)
+            check(note)
+            if elapsed < best {
+                best = elapsed
+            }
+        }
+        return best
     }
 
     func testMovedAwayTaskInAPastDayIsUnlisted() {

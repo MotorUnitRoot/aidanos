@@ -37,6 +37,8 @@ final class ExternalFormatReaderTests: XCTestCase {
             let file = root.appendingPathComponent("cases/\(number).json")
             XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "missing case \(number)")
         }
+        let fixtureOnly = active.subtracting(checkedCaseNumbers)
+        XCTAssertEqual(fixtureOnly, [18, 52, 55, 58, 59, 61, 64])
     }
 
     func testProjectAndDayLabels() {
@@ -282,6 +284,115 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(note.lines[1].mentions, [ExternalMention(name: "repeat", value: "5/10")])
         XCTAssertTrue(note.lines[0].scheduleDates.isEmpty)
         XCTAssertTrue(note.lines[1].scheduleDates.isEmpty)
+    }
+
+    func testCarriageReturnsSplitLines() {
+        let note = ExternalFormatReader.read("* One\r\n* Two\r* Three\r\n", in: .project)
+        XCTAssertEqual(note.lines.count, 3)
+        for line in note.lines {
+            XCTAssertEqual(line.kind, .openTask)
+            XCTAssertTrue(line.countsAsOpen)
+        }
+        let blank = ExternalFormatReader.read("\r\n", in: .project)
+        XCTAssertEqual(blank.lines.count, 1)
+        XCTAssertEqual(blank.lines[0].kind, .empty)
+        let lone = ExternalFormatReader.read("* Left\r* Right", in: .project)
+        XCTAssertEqual(lone.lines.count, 2)
+        XCTAssertEqual(lone.lines[0].kind, .openTask)
+        XCTAssertEqual(lone.lines[1].kind, .openTask)
+    }
+
+    func testAccentedDigitDoesNotCrash() {
+        let accented = "1\u{0301}"
+        let day = ExternalFormatReader.read("* \(accented):00 x", in: .day(date(2017, 1, 9)))
+        XCTAssertEqual(day.lines.count, 1)
+        XCTAssertEqual(day.lines[0].kind, .openTask)
+        XCTAssertNil(day.lines[0].timeBlock)
+        let stamp = ExternalFormatReader.read(
+            "* [x] Item @done(2017-01-09 \(accented)4:05)",
+            in: .project
+        )
+        XCTAssertEqual(stamp.lines[0].kind, .doneTask)
+        XCTAssertNil(stamp.lines[0].completion)
+        XCTAssertEqual(stamp.lines[0].mentions, [ExternalMention(name: "done", value: "2017-01-09 \(accented)4:05")])
+        XCTAssertNil(stamp.lines[0].timeBlock)
+    }
+
+    func testEmptyAndWhitespaceInput() {
+        XCTAssertTrue(ExternalFormatReader.read("", in: .project).lines.isEmpty)
+        let newline = ExternalFormatReader.read("\n", in: .project)
+        XCTAssertEqual(newline.lines.count, 1)
+        XCTAssertEqual(newline.lines[0].kind, .empty)
+        let spaces = ExternalFormatReader.read("  \n\t\t", in: .project)
+        XCTAssertEqual(spaces.lines.count, 2)
+        XCTAssertEqual(spaces.lines[0].kind, .plain)
+        XCTAssertFalse(spaces.lines[0].countsAsOpen)
+        XCTAssertEqual(ExternalFormatReader.placement(of: spaces.lines[0], on: sessionDay), .unlisted)
+        XCTAssertEqual(spaces.lines[1].kind, .empty)
+        XCTAssertEqual(spaces.lines[1].indentTabs, 2)
+    }
+
+    func testUnclosedLinksAreNotLinks() {
+        let note = ExternalFormatReader.read("* See [[No end and [words](no-end", in: .project)
+        XCTAssertEqual(note.lines.count, 1)
+        XCTAssertEqual(note.lines[0].kind, .openTask)
+        XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
+        XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
+    }
+
+    func testUnclosedBracketLineStaysWithinTheTimeBound() {
+        let line = String(repeating: "[", count: 1_000_000)
+        let started = Date()
+        let note = ExternalFormatReader.read(line, in: .project)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        XCTAssertEqual(note.lines.count, 1)
+        XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
+        XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
+    }
+
+    func testCapitalBoxIsUnsettledAndUnlisted() {
+        let line = ExternalFormatReader.read("* [X] Capital X box >2017-01-10", in: .project).lines[0]
+        XCTAssertEqual(line.kind, .unsettled)
+        XCTAssertFalse(line.countsAsOpen)
+        XCTAssertTrue(line.leftOutOfOverdue)
+        XCTAssertTrue(line.scheduleDates.isEmpty)
+        XCTAssertTrue(line.referencedDays.isEmpty)
+        XCTAssertNil(line.timeBlock)
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay), .unlisted)
+    }
+
+    func testCheckedChecklistBoxIsUnsettledAndUnlisted() {
+        let line = ExternalFormatReader.read("+ [x] Pack fake socks >2017-01-10", in: .project).lines[0]
+        XCTAssertEqual(line.kind, .unsettled)
+        XCTAssertFalse(line.countsAsOpen)
+        XCTAssertTrue(line.scheduleDates.isEmpty)
+        XCTAssertTrue(line.referencedDays.isEmpty)
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay), .unlisted)
+    }
+
+    func testAtDateIsUnsettledAndUnlisted() {
+        let line = ExternalFormatReader.read("* Fake meeting prep @2017-01-10", in: .project).lines[0]
+        XCTAssertEqual(line.kind, .unsettled)
+        XCTAssertFalse(line.countsAsOpen)
+        XCTAssertTrue(line.mentions.isEmpty)
+        XCTAssertTrue(line.scheduleDates.isEmpty)
+        XCTAssertTrue(line.referencedDays.isEmpty)
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay), .unlisted)
+    }
+
+    func testTaskInsideCodeFenceIsUnsettledAndUnlisted() {
+        let text = "```\n* fake task #zzcode >2017-01-10\n```\n* Outside >2017-01-10\n"
+        let note = ExternalFormatReader.read(text, in: .project)
+        XCTAssertEqual(note.lines.count, 4)
+        XCTAssertEqual(note.lines[1].kind, .unsettled)
+        XCTAssertFalse(note.lines[1].countsAsOpen)
+        XCTAssertTrue(note.lines[1].tags.isEmpty)
+        XCTAssertTrue(note.lines[1].scheduleDates.isEmpty)
+        XCTAssertTrue(note.lines[1].referencedDays.isEmpty)
+        XCTAssertEqual(ExternalFormatReader.placement(of: note.lines[1], on: sessionDay), .unlisted)
+        XCTAssertEqual(note.lines[3].kind, .openTask)
+        XCTAssertEqual(note.lines[3].scheduleDates, [date(2017, 1, 10)])
+        XCTAssertEqual(ExternalFormatReader.placement(of: note.lines[3], on: sessionDay), .overdue)
     }
 
     private func assertOpenTask(_ number: Int) throws {

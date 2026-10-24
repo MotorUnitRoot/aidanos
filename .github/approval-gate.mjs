@@ -1,0 +1,1033 @@
+#!/usr/bin/env node
+/**
+ * Approval gate for aidanos main.
+ *
+ * The commit status context is "approval-gate". It is green only when
+ * Colby (GitHub user id 146015017, type User) has, on the exact current
+ * head:
+ * - an approving review that is still his latest decisive review, or
+ * - an unedited comment whose first line is
+ *   "Independent review: PASS <40-hex head sha>"
+ *   and performed_via_github_app is null.
+ *
+ * Any APPROVED review or PASS comment for that head from a bot or an app
+ * turns the status red, even when Colby also approved. A BLOCK comment
+ * for that head from anyone turns it red. Bots cannot make it green.
+ *
+ * The Dependabot path is phase 2 and is off. There is no hardware-key
+ * sign-off.
+ *
+ * This file does not read an App private key. The workflow mints a token
+ * for the gate-only App and passes it as GITHUB_TOKEN. That token is not
+ * Actions' default token and not the shared motorunit-aidanos-bots key.
+ * Comment and title text is never passed to a shell.
+ */
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import {
+  attachEditHistory,
+  commentKind,
+  commentListComplete,
+  commentWasEdited,
+} from "./independent-review.mjs";
+
+export const COLBY_USER_ID = 146015017;
+export const SHARED_APP_ID = 5413571;
+export const SHARED_APP_BOT_USER_ID = 345922838;
+export const CURSOR_BOT_USER_ID = 206951365;
+export const DEPENDABOT_BOT_USER_ID = 49699333;
+
+// motorunit-bot returned 404 on 2026-10-24. Step 10 has not published an id.
+// The login is matched until that id is set. Do not match a null id.
+export const MOTORUNIT_BOT_USER_ID = null;
+export const NAMED_MACHINE_LOGINS = Object.freeze(["motorunit-bot"]);
+
+export const KNOWN_BOT_USER_IDS = Object.freeze([
+  SHARED_APP_BOT_USER_ID,
+  CURSOR_BOT_USER_ID,
+  DEPENDABOT_BOT_USER_ID,
+]);
+
+// Phase 2 is not built. Leaving this false is the launch switch.
+export const DEPENDABOT_PATH_ENABLED = false;
+
+export const STATUS_CONTEXT = "approval-gate";
+export const STATUS_DESCRIPTION_LIMIT = 140;
+
+export function dependabotSecurityUpdate() {
+  return false;
+}
+
+export function isColby(user) {
+  if (!user || user.type !== "User") return false;
+  return Number(user.id) === COLBY_USER_ID;
+}
+
+export function isMachine(user, viaApp) {
+  if (viaApp != null) return true;
+  if (!user) return false;
+  if (user.type === "Bot") return true;
+  const login = typeof user.login === "string" ? user.login : "";
+  if (login.endsWith("[bot]")) return true;
+  if (NAMED_MACHINE_LOGINS.includes(login)) return true;
+  const id = Number(user.id);
+  if (MOTORUNIT_BOT_USER_ID != null && id === Number(MOTORUNIT_BOT_USER_ID)) return true;
+  if (KNOWN_BOT_USER_IDS.includes(id)) return true;
+  return false;
+}
+
+function sameSha(left, right) {
+  const a = String(left || "").toLowerCase();
+  const b = String(right || "").toLowerCase();
+  return /^[0-9a-f]{40}$/.test(a) && a === b;
+}
+
+function safeLogin(value) {
+  const login = String(value || "");
+  if (/^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?$/.test(login)) return login;
+  return "unknown";
+}
+
+function sourceLogin(user, viaApp) {
+  if (viaApp && typeof viaApp.slug === "string" && viaApp.slug) return safeLogin(viaApp.slug);
+  if (viaApp && typeof viaApp.name === "string" && viaApp.name) return safeLogin(viaApp.name);
+  return safeLogin(user && user.login);
+}
+
+function clip(text) {
+  const value = String(text || "");
+  if (value.length <= STATUS_DESCRIPTION_LIMIT) return value;
+  return value.slice(0, STATUS_DESCRIPTION_LIMIT);
+}
+
+function byTimeThenId(left, right) {
+  const time = String(left.at || "").localeCompare(String(right.at || ""));
+  if (time !== 0) return time;
+  return Number(left.id || 0) - Number(right.id || 0);
+}
+
+function commentBodies(comment) {
+  const bodies = [];
+  if (comment && Array.isArray(comment.versions)) {
+    for (const version of comment.versions) bodies.push(version && version.body);
+  }
+  if (comment) bodies.push(comment.body);
+  return bodies;
+}
+
+function machineApprovals(reviews, comments, head) {
+  const found = [];
+  for (const review of reviews || []) {
+    if (!review || review.state !== "APPROVED" || !sameSha(review.commit_id, head)) continue;
+    if (!isMachine(review.user, review.performed_via_github_app)) continue;
+    found.push({
+      login: sourceLogin(review.user, review.performed_via_github_app),
+      at: review.submitted_at || "",
+      id: review.id || 0,
+    });
+  }
+  for (const comment of comments || []) {
+    if (!comment || !isMachine(comment.user, comment.performed_via_github_app)) continue;
+    const pass = commentBodies(comment).some((body) => commentKind(body, head) === "pass");
+    if (!pass) continue;
+    found.push({
+      login: sourceLogin(comment.user, comment.performed_via_github_app),
+      at: comment.created_at || "",
+      id: comment.id || 0,
+    });
+  }
+  found.sort(byTimeThenId);
+  return found;
+}
+
+export function commentBlocks(comment, head) {
+  if (!comment) return false;
+  if (comment.historyUnavailable && isMachine(comment.user, comment.performed_via_github_app)) return true;
+  return commentBodies(comment).some((body) => commentKind(body, head) === "block");
+}
+
+function blockFrom(comments, head) {
+  const blocks = [];
+  for (const comment of comments || []) {
+    if (!commentBlocks(comment, head)) continue;
+    blocks.push({
+      login: sourceLogin(comment.user, comment.performed_via_github_app),
+      at: comment.updated_at || comment.created_at || "",
+      id: comment.id || 0,
+    });
+  }
+  blocks.sort(byTimeThenId);
+  return blocks;
+}
+
+function colbyLatestDecisive(reviews) {
+  const rows = [];
+  for (const review of reviews || []) {
+    if (!review || !isColby(review.user)) continue;
+    if (review.performed_via_github_app != null) continue;
+    if (review.state !== "APPROVED" && review.state !== "CHANGES_REQUESTED") continue;
+    rows.push(review);
+  }
+  rows.sort((left, right) => {
+    const time = String(left.submitted_at || "").localeCompare(String(right.submitted_at || ""));
+    if (time !== 0) return time;
+    return Number(left.id || 0) - Number(right.id || 0);
+  });
+  return rows.length ? rows[rows.length - 1] : null;
+}
+
+function colbyPassComments(comments, head) {
+  const found = [];
+  for (const comment of comments || []) {
+    if (!comment || comment.deleted) continue;
+    if (!isColby(comment.user)) continue;
+    if (comment.performed_via_github_app != null) continue;
+    if (!comment.created_at || comment.created_at !== comment.updated_at) continue;
+    if (commentWasEdited(comment) || comment.historyUnavailable || comment.originalUnseen) continue;
+    if (commentKind(comment.body, head) !== "pass") continue;
+    found.push(comment);
+  }
+  return found;
+}
+
+/**
+ * @returns {{state: "success"|"failure"|"pending"|null, description: string, reasons: string[], login?: string}}
+ */
+export function evaluate({ pr, reviews, comments } = {}) {
+  if (!pr || pr.state === "closed") {
+    return { state: null, description: "", reasons: ["closed"] };
+  }
+  const head = pr.head && pr.head.sha;
+  if (!/^[0-9a-fA-F]{40}$/.test(String(head || ""))) {
+    return { state: null, description: "", reasons: ["bad-head"] };
+  }
+  if (!pr.base || pr.base.ref !== "main") {
+    return { state: null, description: "", reasons: ["base"] };
+  }
+  const sha = String(head).toLowerCase();
+  const short = sha.slice(0, 7);
+
+  const machines = machineApprovals(reviews, comments, sha);
+  if (machines.length) {
+    const login = machines[0].login;
+    return {
+      state: "failure",
+      description: clip(`Blocked: bot approval from ${login}`),
+      reasons: ["bot-approval"],
+      login,
+    };
+  }
+
+  const blocks = blockFrom(comments, sha);
+  if (blocks.length) {
+    const login = blocks[0].login;
+    return {
+      state: "failure",
+      description: clip(`Blocked: BLOCK from ${login}`),
+      reasons: ["block"],
+      login,
+    };
+  }
+
+  const decisive = colbyLatestDecisive(reviews);
+  if (decisive && decisive.state === "APPROVED" && sameSha(decisive.commit_id, sha)) {
+    return {
+      state: "success",
+      description: clip(`Colby approved ${short}`),
+      reasons: ["colby-review"],
+    };
+  }
+
+  const passes = colbyPassComments(comments, sha);
+  if (passes.length) {
+    return {
+      state: "success",
+      description: clip(`Colby PASS ${short}`),
+      reasons: ["colby-pass"],
+    };
+  }
+
+  // Phase 2 stays off. dependabotSecurityUpdate() is a stub that
+  // returns false, and the flag is false, so this cannot succeed.
+  if (DEPENDABOT_PATH_ENABLED && dependabotSecurityUpdate()) {
+    return {
+      state: "success",
+      description: clip("Dependabot security update approved"),
+      reasons: ["dependabot"],
+    };
+  }
+
+  return {
+    state: "pending",
+    description: clip(`Waiting for Colby on ${short}`),
+    reasons: ["waiting"],
+  };
+}
+
+export async function listAll(fetchPage) {
+  const items = [];
+  for (let page = 1; ; page += 1) {
+    const batch = await fetchPage(page);
+    if (!Array.isArray(batch)) throw new Error("page is not a list");
+    items.push(...batch);
+    if (commentListComplete(page, batch.length)) return items;
+  }
+}
+
+export async function prepareComments(comments, event, listEditsFn, log = () => {}) {
+  const list = [...(comments || [])];
+  if (event && event.action === "deleted" && event.comment) {
+    const deleted = { ...event.comment, deleted: true };
+    const already = deleted.id != null && list.some((item) => item && item.id === deleted.id);
+    if (!already) list.push(deleted);
+  }
+  for (const comment of list) {
+    if (!commentWasEdited(comment)) {
+      comment.versions = [{ body: comment && comment.body, at: comment && comment.created_at }];
+      continue;
+    }
+    try {
+      if (!comment.node_id) throw new Error("edited comment has no node id");
+      attachEditHistory(comment, await listEditsFn(comment.node_id));
+    } catch (error) {
+      comment.historyUnavailable = true;
+      log(`Could not read edit history for comment ${comment && comment.id ? comment.id : "unknown"}.`);
+    }
+  }
+  return list;
+}
+
+export async function judgeAndWrite({
+  prNumber,
+  advisory = false,
+  readPull,
+  readReviews,
+  readComments,
+  writeStatus,
+}) {
+  const pr = await readPull(prNumber);
+  const early = evaluate({ pr, reviews: [], comments: [] });
+  if (!pr || early.reasons[0] === "closed" || early.reasons[0] === "bad-head" || early.reasons[0] === "base") {
+    return { wrote: false, reason: early.reasons[0] || "skip", result: early, judgedSha: null };
+  }
+  const judgedSha = String(pr.head.sha).toLowerCase();
+  const reviews = await readReviews(prNumber);
+  const comments = await readComments(prNumber);
+  const result = evaluate({ pr, reviews, comments });
+  if (advisory) return { wrote: false, reason: "advisory", result, judgedSha };
+  const fresh = await readPull(prNumber);
+  const freshSha = fresh && fresh.head && fresh.head.sha;
+  if (!sameSha(freshSha, judgedSha)) {
+    return { wrote: false, reason: "head-moved", result, judgedSha };
+  }
+  if (!result.state) return { wrote: false, reason: result.reasons[0] || "skip", result, judgedSha };
+  await writeStatus({
+    sha: judgedSha,
+    state: result.state,
+    description: result.description,
+    context: STATUS_CONTEXT,
+  });
+  return { wrote: true, reason: "wrote", result, judgedSha };
+}
+
+export function pullNumberFromEvent(eventName, event, envPr) {
+  if (eventName === "workflow_dispatch") {
+    const value = String(envPr || "").trim();
+    if (!/^[1-9][0-9]*$/.test(value)) return { number: null, reason: "bad-pr" };
+    return { number: Number(value) };
+  }
+  if (eventName === "pull_request" || eventName === "pull_request_target") {
+    const number = event && event.pull_request && event.pull_request.number;
+    return number ? { number } : { number: null, reason: "missing-pr" };
+  }
+  if (eventName === "issue_comment") {
+    if (!(event && event.issue && event.issue.pull_request)) return { number: null, reason: "not-pr" };
+    return { number: event.issue.number };
+  }
+  if (eventName === "workflow_run") {
+    const prs = event && event.workflow_run && event.workflow_run.pull_requests;
+    const number = prs && prs[0] && prs[0].number;
+    if (number) return { number };
+    const headSha = event && event.workflow_run && event.workflow_run.head_sha;
+    return { number: null, headSha: headSha || null, reason: headSha ? "lookup" : "missing-pr" };
+  }
+  return { number: null, reason: "event" };
+}
+
+export function summaryText(outcome) {
+  const result = outcome && outcome.result;
+  const lines = [
+    `Judged SHA: ${outcome && outcome.judgedSha ? outcome.judgedSha : "(none)"}`,
+    `Result: ${result && result.state ? result.state : outcome && outcome.reason}`,
+  ];
+  if (result && result.description) lines.push(result.description);
+  if (outcome && outcome.wrote) lines.push(`Status write: approval-gate on ${outcome.judgedSha}`);
+  else lines.push(`Status write: no (${outcome && outcome.reason ? outcome.reason : "skip"})`);
+  return lines.join("\n");
+}
+
+export function runScriptBodies(text) {
+  const lines = String(text || "").split(/\n/);
+  const scripts = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const match = /^(\s*)run:\s*(.*)$/.exec(line);
+    if (!match) continue;
+    const indent = match[1].length;
+    const rest = match[2];
+    if (rest === "|" || rest === "|-" || rest === "|+" || rest === ">" || rest === ">-" || rest === ">+") {
+      const body = [];
+      for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+        const next = lines[cursor];
+        if (next.trim() === "") {
+          body.push(next);
+          continue;
+        }
+        const nextIndent = /^(\s*)/.exec(next)[1].length;
+        if (nextIndent <= indent) break;
+        body.push(next);
+      }
+      scripts.push(body.join("\n"));
+    } else {
+      scripts.push(rest);
+    }
+  }
+  return scripts;
+}
+
+const FORBIDDEN_WORKFLOW_SNIPPETS = [
+  "github.event.pull_request.head",
+  "github.event.comment.body",
+  "github.event.pull_request.title",
+  "github.event.pull_request.body",
+  "github.event.issue.title",
+  "github.event.issue.body",
+  "github.head_ref",
+];
+
+export function lintWorkflow(name, text) {
+  const errors = [];
+  const source = String(text || "");
+  for (const script of runScriptBodies(source)) {
+    if (script.includes("${{")) errors.push(`${name} interpolates an expression inside run`);
+  }
+  const uses = source.matchAll(/^\s*uses:\s*['"]?([^'"\s#]+)/gm);
+  for (const match of uses) {
+    const spec = match[1];
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[0-9a-f]{40}$/.test(spec)) {
+      errors.push(`${name} action is not pinned to a full commit: ${spec}`);
+    }
+  }
+  for (const snippet of FORBIDDEN_WORKFLOW_SNIPPETS) {
+    if (source.includes(snippet)) errors.push(`${name} contains ${snippet}`);
+  }
+  if (source.includes("pull_request_target:")) {
+    if (!source.includes("ref: ${{ github.sha }}")) {
+      errors.push(`${name} pull_request_target checkout is not pinned to github.sha`);
+    }
+    if (!source.includes("persist-credentials: false")) {
+      errors.push(`${name} checkout keeps credentials`);
+    }
+  }
+  return errors;
+}
+
+export function scrubToken(text, token) {
+  const source = String(text ?? "");
+  if (!token) return source;
+  return source.split(token).join("[redacted]");
+}
+
+function assert(cond, message) {
+  if (!cond) throw new Error(message);
+}
+
+export async function selfTest() {
+  const sha = "a".repeat(40);
+  const other = "b".repeat(40);
+  const t0 = "2026-10-24T00:00:00Z";
+  const t1 = "2026-10-24T00:00:01Z";
+  const t2 = "2026-10-24T00:00:02Z";
+  const colby = { login: "MotorUnitRoot", id: COLBY_USER_ID, type: "User" };
+  const appBot = { login: "motorunit-aidanos-bots[bot]", id: SHARED_APP_BOT_USER_ID, type: "Bot" };
+  const cursorBot = { login: "cursor[bot]", id: CURSOR_BOT_USER_ID, type: "Bot" };
+  const gateBot = { login: "motorunit-approval-gate[bot]", id: 999001, type: "Bot" };
+  const open = { state: "open", base: { ref: "main" }, head: { sha } };
+
+  function review(user, state, commit, extra) {
+    return {
+      id: 1,
+      user,
+      state,
+      commit_id: commit,
+      submitted_at: t0,
+      ...extra,
+    };
+  }
+  function note(body, user, extra) {
+    return {
+      id: 1,
+      body,
+      user,
+      created_at: t0,
+      updated_at: t0,
+      performed_via_github_app: null,
+      ...extra,
+    };
+  }
+  function judge(reviews, comments, pr) {
+    return evaluate({ pr: pr || open, reviews, comments });
+  }
+
+  const fixtures = [
+    ["Colby approval on head", [review(colby, "APPROVED", sha)], [], "success", `Colby approved ${sha.slice(0, 7)}`],
+    ["stale approval on an old sha", [review(colby, "APPROVED", other)], [], "pending", `Waiting for Colby on ${sha.slice(0, 7)}`],
+    [
+      "approval then changes requested",
+      [review(colby, "APPROVED", sha, { id: 1, submitted_at: t0 }), review(colby, "CHANGES_REQUESTED", sha, { id: 2, submitted_at: t1 })],
+      [],
+      "pending",
+      `Waiting for Colby on ${sha.slice(0, 7)}`,
+    ],
+    [
+      "changes requested then a later approval",
+      [review(colby, "CHANGES_REQUESTED", sha, { id: 1, submitted_at: t0 }), review(colby, "APPROVED", sha, { id: 2, submitted_at: t1 })],
+      [],
+      "success",
+      `Colby approved ${sha.slice(0, 7)}`,
+    ],
+    ["dismissed approval", [review(colby, "DISMISSED", sha)], [], "pending", `Waiting for Colby on ${sha.slice(0, 7)}`],
+    ["PASS for the exact head", [], [note(`Independent review: PASS ${sha}`, colby)], "success", `Colby PASS ${sha.slice(0, 7)}`],
+    ["PASS with a leading space and a note", [], [note(`  Independent review: PASS ${sha}\nlooks good`, colby)], "success", `Colby PASS ${sha.slice(0, 7)}`],
+    ["PASS with a short sha", [], [note(`Independent review: PASS ${sha.slice(0, 7)}`, colby)], "pending", null],
+    ["PASS with the wrong sha", [], [note(`Independent review: PASS ${other}`, colby)], "pending", null],
+    ["PASS with the sha only on the second line", [], [note(`Independent review: PASS\n${sha}`, colby)], "pending", null],
+    ["edited PASS", [], [note(`Independent review: PASS ${sha}`, colby, { updated_at: t1, originalUnseen: true })], "pending", null],
+    ["deleted PASS", [], [note(`Independent review: PASS ${sha}`, colby, { deleted: true })], "pending", null],
+    [
+      "PASS made through an app",
+      [],
+      [note(`Independent review: PASS ${sha}`, colby, { performed_via_github_app: { id: 1210556, slug: "cursor" } })],
+      "failure",
+      "Blocked: bot approval from cursor",
+    ],
+    [
+      "look-alike login with another id",
+      [],
+      [note(`Independent review: PASS ${sha}`, { login: "MotorUnitRoot", id: 999, type: "User" })],
+      "pending",
+      null,
+    ],
+    [
+      "look-alike login with type Bot",
+      [],
+      [note(`Independent review: PASS ${sha}`, { login: "MotorUnitRoot", id: COLBY_USER_ID, type: "Bot" })],
+      "failure",
+      "Blocked: bot approval from MotorUnitRoot",
+    ],
+    ["Colby matched by id when the login differs", [review({ login: "renamed-colby", id: String(COLBY_USER_ID), type: "User" }, "APPROVED", sha)], [], "success", null],
+    ["shared App approval", [review(appBot, "APPROVED", sha)], [], "failure", "Blocked: bot approval from motorunit-aidanos-bots[bot]"],
+    ["motorunit-bot approval", [review({ login: "motorunit-bot", id: 42, type: "User" }, "APPROVED", sha)], [], "failure", "Blocked: bot approval from motorunit-bot"],
+    ["cursor bot approval", [review(cursorBot, "APPROVED", sha)], [], "failure", "Blocked: bot approval from cursor[bot]"],
+    ["future gate App approval", [review(gateBot, "APPROVED", sha)], [], "failure", "Blocked: bot approval from motorunit-approval-gate[bot]"],
+    [
+      "bot approval plus Colby approval",
+      [review(colby, "APPROVED", sha, { id: 1 }), review(appBot, "APPROVED", sha, { id: 2, submitted_at: t1 })],
+      [],
+      "failure",
+      "Blocked: bot approval from motorunit-aidanos-bots[bot]",
+    ],
+    [
+      "a later bot changes-requested does not clear its approval",
+      [
+        review(appBot, "APPROVED", sha, { id: 1, submitted_at: t0 }),
+        review(appBot, "CHANGES_REQUESTED", sha, { id: 2, submitted_at: t1 }),
+        review(colby, "APPROVED", sha, { id: 3, submitted_at: t2 }),
+      ],
+      [],
+      "failure",
+      "Blocked: bot approval from motorunit-aidanos-bots[bot]",
+    ],
+    [
+      "App PASS plus Colby PASS",
+      [],
+      [note(`Independent review: PASS ${sha}`, colby, { id: 1 }), note(`Independent review: PASS ${sha}`, appBot, { id: 2 })],
+      "failure",
+      "Blocked: bot approval from motorunit-aidanos-bots[bot]",
+    ],
+    [
+      "dismissed bot approval does not trip",
+      [review(cursorBot, "DISMISSED", sha, { id: 1 }), review(colby, "APPROVED", sha, { id: 2 })],
+      [],
+      "success",
+      null,
+    ],
+    [
+      "bot approval of an older sha does not trip",
+      [review(cursorBot, "APPROVED", other, { id: 1 }), review(colby, "APPROVED", sha, { id: 2 })],
+      [],
+      "success",
+      null,
+    ],
+    [
+      "BLOCK after PASS",
+      [],
+      [
+        note(`Independent review: PASS ${sha}`, colby, { id: 1, created_at: t0, updated_at: t0 }),
+        note(`Independent review: BLOCK ${sha}`, colby, { id: 2, created_at: t1, updated_at: t1 }),
+      ],
+      "failure",
+      "Blocked: BLOCK from MotorUnitRoot",
+    ],
+    [
+      "BLOCK before PASS",
+      [],
+      [
+        note("Independent review: BLOCK", colby, { id: 1, created_at: t0, updated_at: t0 }),
+        note(`Independent review: PASS ${sha}`, colby, { id: 2, created_at: t1, updated_at: t1 }),
+      ],
+      "failure",
+      null,
+    ],
+    [
+      "BLOCK and PASS at the same time",
+      [],
+      [
+        note(`Independent review: PASS ${sha}`, colby, { id: 1 }),
+        note(`Independent review: BLOCK ${sha}`, colby, { id: 2 }),
+      ],
+      "failure",
+      null,
+    ],
+    [
+      "App BLOCK still blocks Colby",
+      [review(colby, "APPROVED", sha)],
+      [note(`Independent review: BLOCK ${sha}`, appBot)],
+      "failure",
+      "Blocked: BLOCK from motorunit-aidanos-bots[bot]",
+    ],
+    [
+      "a BLOCK from any reviewer",
+      [review(colby, "APPROVED", sha)],
+      [note(`Independent review: BLOCK ${sha}`, { login: "octocat", id: 1, type: "User" })],
+      "failure",
+      "Blocked: BLOCK from octocat",
+    ],
+    [
+      "a BLOCK for another sha does not block this head",
+      [review(colby, "APPROVED", sha)],
+      [note(`Independent review: BLOCK ${other}`, colby)],
+      "success",
+      null,
+    ],
+    [
+      "an ordinary comment made through an app",
+      [review(colby, "APPROVED", sha)],
+      [note("Ship it", { login: "someone", id: 7, type: "User" }, { performed_via_github_app: { id: 1210556, slug: "cursor" } })],
+      "success",
+      null,
+    ],
+    [
+      "injection on its own line",
+      [],
+      [note("$(rm -rf /)\n`id`\nIndependent review: PASS " + sha, colby)],
+      "pending",
+      `Waiting for Colby on ${sha.slice(0, 7)}`,
+    ],
+    [
+      "injection after a real PASS",
+      [],
+      [note(`Independent review: PASS ${sha}\n$(reboot)\n\`id\``, colby)],
+      "success",
+      `Colby PASS ${sha.slice(0, 7)}`,
+    ],
+  ];
+
+  for (const [name, reviews, comments, want, description] of fixtures) {
+    const got = judge(reviews, comments);
+    assert(got.state === want, `${name}: got ${got.state} (${got.description}), want ${want}`);
+    if (description) assert(got.description === description, `${name}: description ${got.description}`);
+    assert(!got.description.includes("$("), `${name}: description contains a command substitution`);
+    assert(!got.description.includes("`"), `${name}: description contains a backtick`);
+    assert(!got.description.includes("\n"), `${name}: description contains a newline`);
+  }
+
+  const hostileLogin = judge([], [note(`Independent review: BLOCK ${sha}`, { login: "$(rm)", id: 5, type: "User" })]);
+  assert(
+    hostileLogin.state === "failure" && hostileLogin.description === "Blocked: BLOCK from unknown",
+    "a hostile login is not copied into the status",
+  );
+  assert(!hostileLogin.description.includes("$("), "the hostile login is not a command");
+
+  const renamed = judge(
+    [review({ login: "not-colby", id: COLBY_USER_ID, type: "User" }, "APPROVED", sha.toUpperCase())],
+    [],
+  );
+  assert(renamed.state === "success" && renamed.reasons[0] === "colby-review", "uppercase head sha still matches Colby");
+
+  const phase2 = evaluate({
+    pr: {
+      ...open,
+      user: { login: "dependabot[bot]", id: DEPENDABOT_BOT_USER_ID, type: "Bot" },
+    },
+    reviews: [review(appBot, "APPROVED", sha)],
+    comments: [],
+    commits: [{ verification: { verified: true } }],
+    activity: [{ actor: "dependabot[bot]" }],
+    alerts: [{ package: "example" }],
+    checks: [{ name: "tests", state: "success" }],
+    config: { dependabotEnabled: true },
+  });
+  assert(DEPENDABOT_PATH_ENABLED === false, "dependabot path is off");
+  assert(dependabotSecurityUpdate() === false, "dependabot stub never approves");
+  assert(phase2.state === "failure" && phase2.reasons[0] === "bot-approval", "phase 2 cannot turn an App approval green");
+
+  assert(evaluate({ pr: { state: "closed", head: { sha }, base: { ref: "main" } } }).state === null, "a closed pull request writes nothing");
+  assert(evaluate({ pr: { state: "open", head: { sha: "abc" }, base: { ref: "main" } } }).reasons[0] === "bad-head", "a short head is not judged");
+  assert(evaluate({ pr: { state: "open", head: { sha }, base: { ref: "feature" } } }).reasons[0] === "base", "only main is gated");
+
+  const page2 = await listAll(async (page) => {
+    if (page === 1) {
+      return Array.from({ length: 100 }, (_, index) =>
+        review({ login: "octocat", id: 50 + index, type: "User" }, "COMMENTED", sha, { id: index + 1 }),
+      );
+    }
+    if (page === 2) return [review(colby, "APPROVED", sha, { id: 500 })];
+    return [];
+  });
+  assert(page2.length === 101, "pagination keeps the second page");
+  assert(judge(page2, []).state === "success", "Colby's approval on page 2 of reviews counts");
+
+  const commentPage = await listAll(async (page) => {
+    if (page === 1) return Array.from({ length: 100 }, (_, index) => note("thanks", { login: "octocat", id: index + 2, type: "User" }, { id: index + 1 }));
+    if (page === 2) return [note(`Independent review: PASS ${sha}`, colby, { id: 250 })];
+    return [];
+  });
+  assert(judge([], commentPage).state === "success", "Colby's PASS on page 2 of comments counts");
+
+  let pulls = 0;
+  const movedWrites = [];
+  const moved = await judgeAndWrite({
+    prNumber: 12,
+    readPull: async () => {
+      pulls += 1;
+      return { state: "open", base: { ref: "main" }, head: { sha: pulls === 1 ? sha : other } };
+    },
+    readReviews: async () => [review(colby, "APPROVED", sha)],
+    readComments: async () => [],
+    writeStatus: async (body) => {
+      movedWrites.push(body);
+    },
+  });
+  assert(moved.wrote === false && moved.reason === "head-moved", "a moved head does not write");
+  assert(movedWrites.length === 0, "a moved head posts no status");
+  assert(moved.judgedSha === sha, "the judged sha stays the sha that was evaluated");
+
+  const stableWrites = [];
+  const stable = await judgeAndWrite({
+    prNumber: 12,
+    readPull: async () => open,
+    readReviews: async () => [review(colby, "APPROVED", sha, { id: 7 })],
+    readComments: async () => [],
+    writeStatus: async (body) => {
+      stableWrites.push(body);
+    },
+  });
+  assert(stable.wrote === true && stableWrites.length === 1, "a stable head writes one status");
+  assert(stableWrites[0].sha === sha, "the status is written only to the judged sha");
+  assert(stableWrites[0].context === STATUS_CONTEXT && stableWrites[0].state === "success", "the status is approval-gate success");
+  assert(stableWrites[0].description === `Colby approved ${sha.slice(0, 7)}`, "the written description is the judged one");
+
+  const waitingWrites = [];
+  const waiting = await judgeAndWrite({
+    prNumber: 12,
+    readPull: async () => open,
+    readReviews: async () => [],
+    readComments: async () => [],
+    writeStatus: async (body) => {
+      waitingWrites.push(body);
+    },
+  });
+  assert(waiting.wrote === true && waitingWrites.length === 1 && waitingWrites[0].state === "pending", "waiting writes one pending status");
+  assert(waitingWrites[0].sha === sha && waitingWrites[0].context === STATUS_CONTEXT, "waiting is written to the judged sha");
+  assert(waitingWrites[0].description === `Waiting for Colby on ${sha.slice(0, 7)}`, "waiting description");
+
+  const redWrites = [];
+  const red = await judgeAndWrite({
+    prNumber: 12,
+    readPull: async () => open,
+    readReviews: async () => [review(appBot, "APPROVED", sha)],
+    readComments: async () => [note(`Independent review: PASS ${sha}`, colby)],
+    writeStatus: async (body) => {
+      redWrites.push(body);
+    },
+  });
+  assert(red.wrote === true && redWrites[0].state === "failure", "a bot approval writes failure");
+  assert(redWrites[0].sha === sha && redWrites[0].description === "Blocked: bot approval from motorunit-aidanos-bots[bot]", "failure stays on the judged sha");
+
+  const advisoryWrites = [];
+  const advisory = await judgeAndWrite({
+    prNumber: 12,
+    advisory: true,
+    readPull: async () => open,
+    readReviews: async () => [review(colby, "APPROVED", sha)],
+    readComments: async () => [],
+    writeStatus: async (body) => {
+      advisoryWrites.push(body);
+    },
+  });
+  assert(advisory.wrote === false && advisory.reason === "advisory" && advisoryWrites.length === 0, "advisory mode does not write");
+
+  const closedWrites = [];
+  const closed = await judgeAndWrite({
+    prNumber: 12,
+    readPull: async () => ({ state: "closed", base: { ref: "main" }, head: { sha } }),
+    readReviews: async () => {
+      throw new Error("should not list reviews");
+    },
+    readComments: async () => [],
+    writeStatus: async (body) => {
+      closedWrites.push(body);
+    },
+  });
+  assert(closed.wrote === false && closed.reason === "closed" && closedWrites.length === 0, "a closed pull request does not write");
+
+  const failedHistory = await prepareComments(
+    [note("hello", cursorBot, { id: 9, updated_at: t1, node_id: "BOT" })],
+    {},
+    async () => {
+      throw new Error("history missing");
+    },
+  );
+  const failedClosed = judge([review(colby, "APPROVED", sha)], failedHistory);
+  assert(failedClosed.state === "failure" && failedClosed.reasons[0] === "block", "unreadable bot edit history fails closed");
+
+  const humanHistory = await prepareComments(
+    [note("thanks", { login: "octocat", id: 3, type: "User" }, { id: 11, updated_at: t1, node_id: "HUMAN" })],
+    {},
+    async () => {
+      throw new Error("history missing");
+    },
+  );
+  assert(judge([review(colby, "APPROVED", sha)], humanHistory).state === "success", "an ordinary edited human comment does not block");
+
+  const helloBot = note("hello", cursorBot, {
+    id: 12,
+    updated_at: t1,
+    originalUnseen: true,
+    versions: [{ body: "hello", at: t1 }],
+  });
+  assert(judge([review(colby, "APPROVED", sha)], [helloBot]).state === "success", "an edited bot note that is not a PASS does not trip");
+
+  const hiddenPass = note("hello", appBot, {
+    id: 13,
+    updated_at: t1,
+    versions: [
+      { body: `Independent review: PASS ${sha}`, at: t0 },
+      { body: "hello", at: t1 },
+    ],
+  });
+  const hidden = judge([review(colby, "APPROVED", sha)], [hiddenPass]);
+  assert(hidden.state === "failure" && hidden.reasons[0] === "bot-approval", "a bot cannot edit a PASS away");
+
+  const editedBlock = note(`Independent review: PASS ${sha}`, colby, {
+    id: 14,
+    updated_at: t2,
+    versions: [
+      { body: `Independent review: BLOCK ${sha}`, at: t1 },
+      { body: `Independent review: PASS ${sha}`, at: t2 },
+    ],
+  });
+  assert(judge([], [editedBlock]).state === "failure", "editing a BLOCK into a PASS does not lift it");
+
+  const deletedBotPass = note(`Independent review: PASS ${sha}`, appBot, { deleted: true });
+  assert(judge([review(colby, "APPROVED", sha)], [deletedBotPass]).state === "failure", "deleting a bot PASS does not clear it");
+
+  const deletedEvent = await prepareComments([], {
+    action: "deleted",
+    comment: note(`Independent review: BLOCK ${sha}\n$(reboot)`, { login: "octocat", id: 1, type: "User" }, { id: 77 }),
+  }, async () => []);
+  const deletedBlock = judge([review(colby, "APPROVED", sha)], deletedEvent);
+  assert(deletedBlock.state === "failure" && !deletedBlock.description.includes("$("), "a deleted BLOCK still blocks and its text is not echoed");
+
+  assert(pullNumberFromEvent("workflow_dispatch", {}, "$(rm -rf /)").number === null, "a shell-like PR number is rejected");
+  assert(pullNumberFromEvent("workflow_dispatch", {}, "12\nrm").number === null, "a PR number with a newline is rejected");
+  assert(pullNumberFromEvent("workflow_dispatch", {}, "12").number === 12, "a numeric PR number is accepted");
+  const injectedComment = { comment: { body: "$(rm)\n`id`" }, issue: { number: 4, title: "nope", pull_request: { url: "x" } } };
+  assert(pullNumberFromEvent("issue_comment", injectedComment).number === 4, "comment text is not read as the pull request number");
+  const relayEvent = { workflow_run: { pull_requests: [{ number: 9, title: "$(rm)", body: "`id`" }] } };
+  assert(pullNumberFromEvent("workflow_run", relayEvent).number === 9, "the relay uses the pull request number, not the title");
+
+  const token = "ghs_test_token_value_not_real";
+  assert(scrubToken(`API said ${token}`, token) === "API said [redacted]", "errors redact the token");
+  assert(!summaryText(stable).includes(token), "the summary has no token");
+  assert(!summaryText(stable).includes("$(reboot)"), "the summary has no comment text");
+
+  const source = fs.readFileSync(fileURLToPath(import.meta.url), "utf8");
+  const childImport = ["node", "child_process"].join(":");
+  const execName = ["exec", "Sync"].join("");
+  assert(!source.includes(`from "${childImport}"`) && !source.includes(`from '${childImport}'`), "the gate does not spawn a shell");
+  assert(!source.includes(execName), "the gate does not exec");
+  const sharedKeyName = ["REVIEW_APP", "PRIVATE_KEY"].join("_");
+  assert(!source.includes(sharedKeyName), "the gate does not name the shared App key");
+
+  const workflowDir = fileURLToPath(new URL("./workflows/", import.meta.url));
+  const workflowNames = fs.readdirSync(workflowDir).filter((entry) => entry.endsWith(".yml") || entry.endsWith(".yaml"));
+  assert(workflowNames.includes("approval-gate.yml"), "the binding workflow exists");
+  assert(workflowNames.includes("approval-gate-trigger.yml"), "the review relay exists");
+  const workflowErrors = [];
+  for (const entry of workflowNames) {
+    const body = fs.readFileSync(`${workflowDir}${entry}`, "utf8");
+    workflowErrors.push(...lintWorkflow(entry, body));
+  }
+  assert(workflowErrors.length === 0, `workflow lint: ${workflowErrors.join("; ")}`);
+
+  const gateYaml = fs.readFileSync(`${workflowDir}approval-gate.yml`, "utf8");
+  const relayYaml = fs.readFileSync(`${workflowDir}approval-gate-trigger.yml`, "utf8");
+  assert(gateYaml.includes("environment: approval-gate"), "the gate job uses the approval-gate environment");
+  assert(gateYaml.includes("secrets.APPROVAL_GATE_APP_ID"), "the App id comes from the environment secret");
+  assert(gateYaml.includes("secrets.APPROVAL_GATE_APP_PRIVATE_KEY"), "the App key comes from the environment secret");
+  assert(gateYaml.includes("GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}"), "the status writer uses the gate App token");
+  assert(gateYaml.includes("permission-statuses: write"), "the App token can write statuses");
+  assert(gateYaml.includes("permission-pull-requests: read"), "the App token can read pull requests");
+  assert(gateYaml.includes("permission-contents: read"), "the App token can read contents");
+  assert(!gateYaml.includes("secrets.GITHUB_TOKEN"), "Actions' token is not the status writer");
+  assert(!gateYaml.includes(sharedKeyName), "the shared App key is not used");
+  assert(!gateYaml.includes("vars.REVIEW_APP_ID"), "the shared App id is not used");
+  assert(!/^\s*statuses:\s*write/m.test(gateYaml), "the workflow token is not granted statuses write");
+  assert(gateYaml.includes("ref: ${{ github.sha }}"), "the gate checks out the base sha");
+  assert(gateYaml.includes("persist-credentials: false"), "the gate checkout drops credentials");
+  assert(!relayYaml.includes("uses:"), "the relay checks nothing out");
+  assert(!relayYaml.includes("secrets."), "the relay has no secrets");
+  assert(relayYaml.includes("permissions: {}"), "the relay token has no permissions");
+  assert(!relayYaml.includes("pull_request_target"), "the relay is not a pull_request_target workflow");
+  for (const script of runScriptBodies(relayYaml)) {
+    assert(!script.includes("${{"), "the relay script has no expressions");
+    assert(!script.includes("github.event"), "the relay script does not read the event");
+  }
+
+  console.log("approval-gate self-test ok");
+}
+
+function writeStepSummary(summary) {
+  const path = process.env.GITHUB_STEP_SUMMARY;
+  if (!path) return;
+  fs.appendFileSync(path, `${summary}\n`);
+}
+
+async function githubRequest({ apiBase, token, pathname, method = "GET", body }) {
+  const response = await fetch(apiBase + pathname, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "aidanos-approval-gate",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    const error = new Error(`${method} ${pathname} -> ${response.status} ${scrubToken(text, token).slice(0, 300)}`);
+    error.status = response.status;
+    throw error;
+  }
+  if (!text) return null;
+  return JSON.parse(text);
+}
+
+async function listEdits(request, nodeId) {
+  const edits = [];
+  let cursor = null;
+  for (let page = 0; page < 10; page += 1) {
+    const payload = await request("/graphql", {
+      method: "POST",
+      body: {
+        query: `query($id: ID!, $cursor: String) {
+          node(id: $id) {
+            ... on IssueComment {
+              userContentEdits(first: 100, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
+                nodes { editedAt diff deletedAt }
+              }
+            }
+          }
+        }`,
+        variables: { id: nodeId, cursor },
+      },
+    });
+    const connection = payload && payload.data && payload.data.node && payload.data.node.userContentEdits;
+    if (!connection) throw new Error("edit history is missing");
+    if (payload.errors && payload.errors.length) throw new Error("edit history failed");
+    edits.push(...(connection.nodes || []));
+    if (!connection.pageInfo || !connection.pageInfo.hasNextPage) return edits;
+    cursor = connection.pageInfo.endCursor;
+  }
+  throw new Error("edit history is too long");
+}
+
+async function resolvePullNumber({ eventName, event, request, owner, repo }) {
+  const found = pullNumberFromEvent(eventName, event, process.env.APPROVAL_GATE_PR);
+  if (found.number) return found.number;
+  if (!found.headSha) return null;
+  if (!/^[0-9a-f]{40}$/i.test(found.headSha)) return null;
+  const pulls = await request(`/repos/${owner}/${repo}/commits/${encodeURIComponent(found.headSha)}/pulls`);
+  if (!Array.isArray(pulls)) return null;
+  const openMain = pulls.filter((item) => item && item.state === "open" && item.base && item.base.ref === "main");
+  return openMain.length === 1 ? openMain[0].number : null;
+}
+
+async function main() {
+  if (process.argv.includes("--self-test")) {
+    await selfTest();
+    return;
+  }
+  const advisory = process.argv.includes("--advisory");
+  const token = process.env.GITHUB_TOKEN;
+  if (!token) throw new Error("GITHUB_TOKEN is required");
+  const [owner, repo] = String(process.env.GITHUB_REPOSITORY || "").split("/");
+  if (!owner || !repo) throw new Error("GITHUB_REPOSITORY is required");
+  const eventName = process.env.GITHUB_EVENT_NAME || "";
+  const eventPath = process.env.GITHUB_EVENT_PATH;
+  if (!eventPath) throw new Error("GITHUB_EVENT_PATH is required");
+  const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
+  const apiBase = process.env.GITHUB_API_URL || "https://api.github.com";
+  const request = (pathname, options = {}) => githubRequest({ apiBase, token, pathname, ...options });
+  const number = await resolvePullNumber({ eventName, event, request, owner, repo });
+  if (!number) {
+    console.log("No pull request to judge.");
+    return;
+  }
+  const outcome = await judgeAndWrite({
+    prNumber: number,
+    advisory,
+    readPull: (pullNumber) => request(`/repos/${owner}/${repo}/pulls/${pullNumber}`),
+    readReviews: (pullNumber) =>
+      listAll((page) => request(`/repos/${owner}/${repo}/pulls/${pullNumber}/reviews?per_page=100&page=${page}`)),
+    readComments: async (pullNumber) => {
+      const comments = await listAll((page) =>
+        request(`/repos/${owner}/${repo}/issues/${pullNumber}/comments?per_page=100&page=${page}`),
+      );
+      return prepareComments(comments, event, (nodeId) => listEdits(request, nodeId), (message) => console.log(message));
+    },
+    writeStatus: ({ sha, state, description, context }) =>
+      request(`/repos/${owner}/${repo}/statuses/${encodeURIComponent(sha)}`, {
+        method: "POST",
+        body: { state, description, context },
+      }),
+  });
+  const summary = summaryText(outcome);
+  console.log(summary);
+  writeStepSummary(summary);
+  if (advisory && outcome.result && outcome.result.state === "failure") process.exitCode = 1;
+}
+
+const isDirectRun = process.argv[1] && process.argv[1].endsWith("approval-gate.mjs");
+if (isDirectRun) {
+  main().catch((error) => {
+    const token = process.env.GITHUB_TOKEN;
+    const message = scrubToken(error && error.message ? error.message : error, token);
+    console.error(message);
+    process.exit(1);
+  });
+}

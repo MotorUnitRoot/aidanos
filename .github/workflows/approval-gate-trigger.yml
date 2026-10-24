@@ -1,0 +1,26 @@
+name: approval-gate-trigger
+
+# No-permission relay. pull_request_review on a same-repo branch runs the
+# workflow file from the merge commit, so this file must not judge, must
+# not read secrets, and must not check out code. A pull request that
+# tampers with it can only skip a re-check. It cannot write a green
+# approval-gate status. The real judge is approval-gate.yml on workflow_run,
+# which runs from the default branch.
+#
+# Push and comment events do not use this relay. They run approval-gate.yml
+# from the default branch directly.
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions: {}
+
+jobs:
+  relay:
+    name: relay
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Note the relay
+        run: echo "Review event received. The approval gate judges it from the default branch."

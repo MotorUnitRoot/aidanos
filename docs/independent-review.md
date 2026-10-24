@@ -1,6 +1,10 @@
 # Independent review
 
-The binding gate is the commit status `independent-review/approved`. A PASS is set only by the `post-pass` job, after Colby approves the `independent-review` environment. A BLOCK is set by the `post-block` job in `independent-review-block`, which has no reviewer, so it applies as soon as the job starts. A BLOCK on a commit stays failure. A later PASS for that same commit is refused. Only a new push, which is a new commit with no status, clears it.
+**This is not the approval gate.** The binding check is [`approval-gate`](approval-gate.md). Do not add `independent-review/approved` to the ruleset. A PASS from `motorunit-aidanos-bots[bot]`, or a PASS posted through any GitHub App, is not an approval and does not set a success status.
+
+The rest of this page describes the older status writer. It can still record a BLOCK, and a PASS comment from the MotorUnitRoot login (not through an app) can still set the old status after the `independent-review` environment is approved. That old status is not `approval-gate`.
+
+The older commit status is `independent-review/approved`. A PASS is set only by the `post-pass` job, after Colby approves the `independent-review` environment. A BLOCK is set by the `post-block` job in `independent-review-block`, which has no reviewer, so it applies as soon as the job starts. A BLOCK on a commit stays failure. A later PASS for that same commit is refused. Only a new push, which is a new commit with no status, clears it.
 
 Both jobs mint an installation token for the GitHub App `motorunit-aidanos-bots` (App ID 5413571) and run `tools/post-review-verdict.mjs --status-only`. Each token requests only statuses write and pull requests read. Reading a pull request conversation comment works with pull requests read. Neither token requests checks or issues. A BLOCK never calls the checks API. The App cannot create or update a check run. `REVIEW_MODE` is `status`. The status-mode PASS path does not call checks either.
 
@@ -10,7 +14,7 @@ The advisory workflow reads comments. It does not post the status.
 
 ## Posting a verdict
 
-On the pull request, comment as one of two login names: `MotorUnitRoot` or `motorunit-aidanos-bots[bot]`. That allowlist is `VERDICT_AUTHORS`. It is the comment author's login, not GitHub's author association. The first line is the whole verdict. Later lines are ignored. The line is exactly one of:
+On the pull request, a BLOCK may come from `MotorUnitRoot` or `motorunit-aidanos-bots[bot]`. A PASS may come only from the `MotorUnitRoot` login, and only when the comment was not posted through a GitHub App. A PASS from the App is ignored. That allowlist is `VERDICT_AUTHORS`. It is the comment author's login, not GitHub's author association. The first line is the whole verdict. Later lines are ignored. The line is exactly one of:
 
 ```
 Independent review: PASS <40-character head sha>
@@ -29,7 +33,7 @@ Before `post-pass` writes success, it fetches the PASS comment again. If that co
 
 The jobs do not post a second comment. `--status-only` only writes the commit status. A BLOCK does not read or write check runs. It writes the failure status, reads that status again, and writes failure once more if a success landed in between. It still writes nothing if that failure write does not succeed. An earlier PASS stays green until a BLOCK write succeeds. Once that failure is on the commit, it stays. A PASS will not clear it.
 
-`REVIEW_MODE` in `tools/post-review-verdict.mjs` is `status`. Switching to `check-run` is a change to that constant. The installed App has no checks write, so that mode cannot post a check run with this token. A BLOCK writes the commit status either way and never calls the checks API.
+`REVIEW_MODE` in `tools/post-review-verdict.mjs` is `status`. The check-run mode has been removed. The script never calls the checks API. A BLOCK writes the commit status only.
 
 ## If a BLOCK fails
 
@@ -121,15 +125,15 @@ POST /repos/MotorUnitRoot/aidanos/environments/independent-review-block/variable
 { "name": "REVIEW_APP_ID", "value": "5413571" }
 ```
 
-5. After this merges, add `independent-review/approved` to ruleset 25566271 with `integration_id` 5413571. Keep the rules that are already there, including the required checks `tests`, `syntax`, `typecheck`, `eslint`, `no-runtime-deps`, and `gitleaks` (each pinned to integration id 15368). Add this object to that required-check list:
+5. Do not add `independent-review/approved` to the ruleset. The required check is `approval-gate`, pinned to the new gate App, as described in [approval-gate.md](approval-gate.md). The old plan was to add `independent-review/approved` to ruleset 25566271 with `integration_id` 5413571, beside the checks that are already required (`tests`, `syntax`, `typecheck`, `eslint`, `no-runtime-deps`, and `gitleaks`, each pinned to integration id 15368). That object is retired:
 
 ```json
 { "context": "independent-review/approved", "integration_id": 5413571 }
 ```
 
-A new push then has no status on the new head, so the pull request stays blocked until this job records a PASS for that commit. The status does not merge the pull request. Merging is still Colby's own click.
+Do not send that object. A new push has no `approval-gate` status on the new head, so once that check is required the pull request stays blocked until the gate records Colby's approval of that commit. The status does not merge the pull request. Merging is still Colby's own click.
 
-The ruleset UI lists apps that have recently submitted a check. The REST field is the integer `integration_id`, and the REST docs do not add a recency requirement. If the picker does not list `motorunit-aidanos-bots`, set `integration_id` 5413571 through the API rather than saving the check as "any source".
+Pin `approval-gate` to the new gate App's id. The ruleset UI lists apps that have recently submitted a check. If the picker does not list the gate App, set its `integration_id` through the API rather than saving the check as "any source".
 
 ## What the gate does not do
 

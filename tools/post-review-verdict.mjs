@@ -24,22 +24,22 @@
  * check runs. A failed BLOCK posts no comment, so an earlier PASS stays
  * green until the BLOCK is retried.
  *
- * REVIEW_MODE is "status" or "check-run". Changing it is a code change.
- * "check-run" is a PASS-only alternate. The installed App has no checks
- * write, and the workflow token does not request checks, so the live path
- * stays on "status". A BLOCK writes the commit status in either mode.
- * --parse-request reads an issue_comment event and accepts a verdict only
- * from VERDICT_AUTHORS, and only when the SHA is still the pull request head.
+ * REVIEW_MODE is "status". The check-run mode has been removed. The
+ * installed App has no checks write, and this script never calls the
+ * checks API. A PASS from motorunit-aidanos-bots[bot], from any bot, or
+ * from a comment made through a GitHub App is ignored. That old status
+ * is not approval-gate. The binding check is approval-gate.
+ * --parse-request reads an issue_comment event and accepts a PASS only
+ * from the MotorUnitRoot login when it was not posted through an app,
+ * and only when the SHA is still the pull request head.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { REVIEW_APP_ID, STATUS_CONTEXT, verdictLine } from "../.github/independent-review.mjs";
 
-// "status" posts the commit status. "check-run" posts a check run on PASS
-// only. A BLOCK never calls the checks API: the App has no checks write,
-// and a checks 403 must not stop the failure status. Change this constant
-// to switch PASS; there is no runtime flag.
+// "status" posts the commit status independent-review/approved.
+// check-run mode has been removed. A BLOCK never calls the checks API.
 export const REVIEW_MODE = "status";
 
 export const BLOCK_STATUS_FAILED_MESSAGE =
@@ -73,10 +73,13 @@ export function scrubToken(text, token) {
 
 function selectedMode(mode) {
   const value = mode || REVIEW_MODE;
-  if (value !== "status" && value !== "check-run") {
-    throw new Error("REVIEW_MODE must be status or check-run");
+  if (value === "check-run") {
+    throw new Error("check-run mode has been removed. The gate writes a commit status only.");
   }
-  return value;
+  if (value !== "status") {
+    throw new Error("REVIEW_MODE must be status");
+  }
+  return "status";
 }
 
 function headerValue(headers, name) {
@@ -123,13 +126,21 @@ export function parseVerdictLine(body) {
   return { verdict: match[1], sha: match[2].toLowerCase() };
 }
 
-export function classifyCommentRequest({ login, body, headSha }) {
+export function classifyCommentRequest({ login, body, headSha, viaApp, userType }) {
   if (!VERDICT_AUTHORS.includes(login)) return { action: "ignore" };
   const parsed = parseVerdictLine(body);
   if (!parsed) return { action: "ignore" };
+  if (parsed.verdict === "PASS" && !passAuthorAllowed({ login, viaApp, userType })) return { action: "ignore" };
   const head = String(headSha || "").toLowerCase();
   if (head !== parsed.sha) return { action: "refuse", verdict: parsed.verdict, sha: parsed.sha, head };
   return { action: "accept", verdict: parsed.verdict, sha: parsed.sha };
+}
+
+function passAuthorAllowed({ login, viaApp, userType }) {
+  if (login !== "MotorUnitRoot") return false;
+  if (viaApp != null) return false;
+  if (userType && userType !== "User") return false;
+  return true;
 }
 
 export function blockFailureKeptPass({ exitCode, message, comments, statuses }) {
@@ -170,7 +181,7 @@ export async function postReviewVerdict({
   }
   const prNumber = Number(number);
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error("pull request number is required");
-  const reviewMode = selectedMode(mode);
+  selectedMode(mode);
   const line = verdictLine(verdict, sha);
   const normalized = line.split(" ").pop();
 
@@ -244,18 +255,6 @@ export async function postReviewVerdict({
         description: line.slice(0, 140),
       },
     });
-  const postCheckRun = () =>
-    call(`/repos/${owner}/${repo}/check-runs`, {
-      method: "POST",
-      body: {
-        name: STATUS_CONTEXT,
-        head_sha: head,
-        status: "completed",
-        conclusion: state,
-        completed_at: new Date().toISOString(),
-      },
-    });
-
   const failStatus = async () => {
     try {
       await postStatus();
@@ -284,27 +283,31 @@ export async function postReviewVerdict({
     await failStatus();
     await rewriteFailureIfPassed();
     await writeComment();
-  } else if (reviewMode === "status") {
-    await writeComment();
-    await postStatus();
   } else {
     await writeComment();
-    await postCheckRun();
+    await postStatus();
   }
   log(
     postComment
       ? `Posted ${verdict} for PR #${prNumber} at ${head}.`
       : `Set independent-review/approved to ${state} for PR #${prNumber} at ${head}.`,
   );
-  return { line, state, sha: head, mode: reviewMode, postComment };
+  return { line, state, sha: head, mode: "status", postComment };
 }
 
 export async function parseRequest({ event, request, owner, repo, token, writeOutput, writeSummary, log = () => {} }) {
-  const login = event && event.comment && event.comment.user && event.comment.user.login;
+  const user = event && event.comment && event.comment.user;
+  const login = user && user.login;
   const body = event && event.comment && event.comment.body;
   const number = event && event.issue && event.issue.number;
-  if (!VERDICT_AUTHORS.includes(login) || !parseVerdictLine(body)) {
+  const parsedLine = parseVerdictLine(body);
+  const viaApp = event && event.comment && event.comment.performed_via_github_app;
+  if (!VERDICT_AUTHORS.includes(login) || !parsedLine) {
     log("No allowlisted verdict on the first line. Nothing to post.");
+    return { action: "ignore" };
+  }
+  if (parsedLine.verdict === "PASS" && !passAuthorAllowed({ login, viaApp, userType: user && user.type })) {
+    log("PASS from this author is not an approval. Nothing to post.");
     return { action: "ignore" };
   }
   const pr = await request(`/repos/${owner}/${repo}/pulls/${number}`, { method: "GET", token });
@@ -608,29 +611,8 @@ export function selfTest() {
     );
     assert(passNoChecks.lookups.length === 0, "status mode PASS does not call the checks API");
 
-    const checkModeBlock = memoryApi(sha, token, { denyChecks: true });
-    const checkModeBlockError = await postReviewVerdict({
-      token,
-      owner: "MotorUnitRoot",
-      repo: "aidanos",
-      number: 40,
-      verdict: "BLOCK",
-      sha,
-      mode: "check-run",
-      request: checkModeBlock.request,
-      log: () => {},
-    }).then(
-      () => null,
-      (error) => error,
-    );
-    assert(checkModeBlockError == null, "check-run mode BLOCK does not call checks");
-    const checkPosts = checkModeBlock.posts();
-    assert(checkPosts[0].kind === "status" && checkPosts[0].state === "failure", "check-run mode BLOCK still writes the failure status");
-    assert(checkPosts[1].kind === "comment", "check-run mode BLOCK comments after the status");
-    assert(!checkPosts.some((post) => post.kind === "check-run"), "check-run mode BLOCK writes no check run");
-
-    const checkModePass = memoryApi(sha, token);
-    await postReviewVerdict({
+    const checkModeRemoved = memoryApi(sha, token);
+    const checkModeError = await postReviewVerdict({
       token,
       owner: "MotorUnitRoot",
       repo: "aidanos",
@@ -638,13 +620,17 @@ export function selfTest() {
       verdict: "PASS",
       sha,
       mode: "check-run",
-      request: checkModePass.request,
+      request: checkModeRemoved.request,
       log: () => {},
-    });
-    const passPosts = checkModePass.posts();
-    assert(passPosts[0].kind === "comment", "check-run mode still comments before success");
-    assert(passPosts[1].kind === "check-run" && passPosts[1].conclusion === "success", "check-run mode then posts success");
-    assert(!passPosts.some((post) => post.kind === "status"), "a check-run PASS does not set a status");
+    }).then(
+      () => null,
+      (error) => error,
+    );
+    assert(
+      checkModeError instanceof Error && checkModeError.message.includes("check-run mode has been removed"),
+      "check-run mode is removed",
+    );
+    assert(checkModeRemoved.posts().length === 0, "removed check-run mode writes nothing");
 
     assert(
       VERDICT_AUTHORS.length === 2 &&
@@ -664,6 +650,24 @@ export function selfTest() {
         headSha: sha,
       }).action === "accept",
       "the review App can request a BLOCK",
+    );
+    assert(
+      classifyCommentRequest({
+        login: "motorunit-aidanos-bots[bot]",
+        body: `Independent review: PASS ${sha}`,
+        headSha: sha,
+      }).action === "ignore",
+      "an App PASS is not an approval",
+    );
+    assert(
+      classifyCommentRequest({
+        login: "MotorUnitRoot",
+        body: `Independent review: PASS ${sha}`,
+        headSha: sha,
+        viaApp: { id: 1210556, slug: "cursor" },
+        userType: "User",
+      }).action === "ignore",
+      "a PASS made through an app is not an approval",
     );
     assert(
       classifyCommentRequest({ login: "octocat", body: `Independent review: PASS ${sha}`, headSha: sha }).action === "ignore",
@@ -695,6 +699,27 @@ export function selfTest() {
     });
     assert(ignoredRequest.action === "ignore" && lookups === 0, "ignored comments do not read the pull request");
 
+    let appPassLookups = 0;
+    const appPassIgnored = await parseRequest({
+      event: {
+        comment: {
+          id: 15,
+          user: { login: "motorunit-aidanos-bots[bot]", type: "Bot" },
+          body: `Independent review: PASS ${sha}`,
+          performed_via_github_app: { id: 5413571, slug: "motorunit-aidanos-bots" },
+        },
+        issue: { number: 40 },
+      },
+      request: async () => {
+        appPassLookups += 1;
+        return { head: { sha } };
+      },
+      owner: "MotorUnitRoot",
+      repo: "aidanos",
+      token,
+    });
+    assert(appPassIgnored.action === "ignore" && appPassLookups === 0, "an App PASS does not read the pull request or post");
+
     const refusedRequest = await parseRequest({
       event: {
         comment: { user: { login: "MotorUnitRoot" }, body: `Independent review: BLOCK ${sha}` },
@@ -716,7 +741,7 @@ export function selfTest() {
     let parsedOutput = "";
     const acceptedRequest = await parseRequest({
       event: {
-        comment: { id: 15, user: { login: "motorunit-aidanos-bots[bot]" }, body: `Independent review: PASS ${sha}\nlater` },
+        comment: { id: 15, user: { login: "MotorUnitRoot", type: "User" }, body: `Independent review: PASS ${sha}\nlater` },
         issue: { number: 40 },
       },
       request: async () => ({ head: { sha } }),

@@ -449,14 +449,15 @@ function formatBarTaskLine(text) {
   return "- [ ] " + line.replace(/^\s+/, "");
 }
 
-// Heading and list toggle. An existing heading or list returns to its body.
-// Otherwise a heading is level 1 ("# ") and a list is a bullet ("- ").
+// Heading toggles level 2 ("## "). A level-2 line returns to its body.
+// Any other line, including another heading level, becomes "## " plus that body.
+// List toggles a bullet ("- ").
 function formatBarHeadingLine(text) {
   const line = String(text ?? "");
   const already = line.match(/^(#{1,6})\s+(.*)$/);
-  if (already) return already[2];
-  const body = formatBarBody(line);
-  return body ? "# " + body : "# ";
+  if (already && already[1] === "##") return already[2];
+  const body = already ? already[2] : formatBarBody(line);
+  return body ? "## " + body : "## ";
 }
 
 function formatBarListLine(text) {

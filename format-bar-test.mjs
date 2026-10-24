@@ -65,7 +65,7 @@ function currentOnly(action, middle) {
 }
 
 currentOnly("task", "- [ ] Buy milk");
-currentOnly("heading", "# Buy milk");
+currentOnly("heading", "## Buy milk");
 currentOnly("list", "- Buy milk");
 currentOnly("indent", "  Buy milk");
 assert(formatBarApply(note, 1, "outdent") === note, "outdent leaves a line that is already at the margin");
@@ -85,15 +85,19 @@ assert(formatBarTaskLine("# Buy milk") === "# Buy milk", "a heading stays a head
 assert(formatBarTaskLine("## Why") === "## Why", "a section heading is not turned into a task");
 assert(formatBarTaskLine("") === "- [ ] ", "an empty line becomes an empty task");
 
-assert(formatBarHeadingLine("# Buy milk") === "Buy milk", "a level-1 heading toggles off");
-assert(formatBarHeadingLine("## Why") === "Why", "a deeper heading toggles off to its body");
-assert(formatBarHeadingLine("### Deep") === "Deep", "level 3 toggles off");
+assert(formatBarHeadingLine("Buy milk") === "## Buy milk", "a plain line becomes a level-2 heading");
+assert(formatBarHeadingLine("## Buy milk") === "Buy milk", "pressing heading again on a level-2 heading switches it off");
+assert(formatBarHeadingLine("## Why") === "Why", "a level-2 heading switches off to its body");
+assert(formatBarHeadingLine("## ") === "", "an empty level-2 heading switches off");
+assert(formatBarHeadingLine("# Buy milk") === "## Buy milk", "a level-1 heading becomes level 2");
+assert(formatBarHeadingLine("### Deep") === "## Deep", "a deeper heading becomes level 2");
 assert(formatBarHeadingLine(formatBarHeadingLine("Buy milk")) === "Buy milk", "heading toggles back to the line");
-assert(formatBarHeadingLine("- [ ] Buy milk") === "# Buy milk", "a task's body becomes a heading");
-assert(formatBarHeadingLine("- Buy milk") === "# Buy milk", "a list's body becomes a heading");
-assert(formatBarHeadingLine("1. Buy milk") === "# Buy milk", "a numbered line becomes a heading");
-assert(formatBarHeadingLine("  nested") === "# nested", "an indented line becomes a heading");
-assert(formatBarHeadingLine("") === "# ", "an empty line becomes an empty heading");
+assert(formatBarHeadingLine(formatBarHeadingLine("## Section")) === "## Section", "switching a level-2 heading off and on restores it");
+assert(formatBarHeadingLine("- [ ] Buy milk") === "## Buy milk", "a task's body becomes a level-2 heading");
+assert(formatBarHeadingLine("- Buy milk") === "## Buy milk", "a list's body becomes a level-2 heading");
+assert(formatBarHeadingLine("1. Buy milk") === "## Buy milk", "a numbered line becomes a level-2 heading");
+assert(formatBarHeadingLine("  nested") === "## nested", "an indented line becomes a level-2 heading");
+assert(formatBarHeadingLine("") === "## ", "an empty line becomes an empty level-2 heading");
 
 assert(formatBarListLine("- Buy milk") === "Buy milk", "a bullet toggles off");
 assert(formatBarListLine("* Buy milk") === "Buy milk", "a star bullet toggles off");
@@ -103,6 +107,7 @@ assert(formatBarListLine("2) Buy milk") === "Buy milk", "a parenthesis number to
 assert(formatBarListLine("- [ ] Buy milk") === "- Buy milk", "a task becomes a bullet");
 assert(formatBarListLine("- [x] Buy milk") === "- Buy milk", "a done task becomes a bullet");
 assert(formatBarListLine("# Buy milk") === "- Buy milk", "a heading becomes a bullet");
+assert(formatBarListLine("## Why") === "- Why", "a level-2 heading becomes a bullet");
 assert(formatBarListLine("  Buy milk") === "  - Buy milk", "indent is kept when a line becomes a list");
 assert(formatBarListLine("  - Buy milk") === "  Buy milk", "a nested bullet toggles off and keeps indent");
 assert(formatBarListLine("") === "- ", "an empty line becomes an empty bullet");
@@ -118,6 +123,20 @@ const labels = [...bar.matchAll(/<button[^>]*aria-label="([^"]+)"/g)].map((m) =>
 assert(labels.join(",") === "Task,Heading,List,Indent,Outdent,Undo,Find,Hide keyboard", "button labels: " + labels.join(","));
 const acts = [...bar.matchAll(/data-fmt="([^"]+)"/g)].map((m) => m[1]);
 assert(acts.join(",") === "task,heading,list,indent,outdent,undo,find,hide", "button order: " + acts.join(","));
+function buttonBlock(act) {
+  const m = bar.match(new RegExp('<button[^>]*data-fmt="' + act + '"[\\s\\S]*?</button>'));
+  assert(m, "missing button " + act);
+  return m[0];
+}
+const indentSvg = buttonBlock("indent");
+const outdentSvg = buttonBlock("outdent");
+assert(indentSvg !== outdentSvg, "indent and outdent are different drawings");
+assert(indentSvg.includes("10.2 12") && indentSvg.includes("M12 5h9.5"), "indent shows lines with an arrow pointing right");
+assert(outdentSvg.includes("13.8 12") && outdentSvg.includes("M2.5 5h9.5"), "outdent shows the same lines with an arrow pointing left");
+const hideSvg = buttonBlock("hide");
+const keyCaps = (hideSvg.match(/<rect /g) || []).length;
+assert(keyCaps >= 9, "hide keyboard draws key caps, got " + keyCaps);
+assert(hideSvg.includes("M7.5 17.5"), "a down chevron sits under the keyboard");
 assert(!bar.includes("Wand") && !bar.includes("Command") && !bar.includes("Text style"), "removed buttons stay gone");
 assert(!html.includes("fmt-bar") && !html.includes("fmt-btn"), "old bar classes are gone");
 

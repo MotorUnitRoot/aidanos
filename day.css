@@ -1575,6 +1575,11 @@ body.doc-capture #job-actions {
   display: block;
   pointer-events: none;
 }
+.format-btn[data-fmt="indent"] .format-ico,
+.format-btn[data-fmt="outdent"] .format-ico {
+  width: 1.85rem;
+  height: 1.85rem;
+}
 .format-btn:active,
 .format-btn:focus-visible {
   color: var(--text);

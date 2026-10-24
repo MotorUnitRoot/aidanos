@@ -537,11 +537,26 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
     }
 
+    func testNonASCIILineKeepsAWikiLink() {
+        let line = ExternalFormatReader.read("See [[Café]] today", in: .project).lines[0]
+        XCTAssertEqual(line.wikiLinks.map(\.target), ["Café"])
+        XCTAssertTrue(line.markdownLinks.isEmpty)
+    }
+
+    func testNonASCIILineKeepsAMarkdownLink() {
+        let line = ExternalFormatReader.read("See [café](notes/cafe) today", in: .project).lines[0]
+        XCTAssertEqual(line.markdownLinks.map(\.shownText), ["café"])
+        XCTAssertEqual(line.markdownLinks.map(\.address), ["notes/cafe"])
+        XCTAssertTrue(line.wikiLinks.isEmpty)
+    }
+
     func testUnclosedBracketLineStaysWithinTheTimeBound() {
         let line = String(repeating: "[", count: 1_000_000)
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        let elapsed = Date().timeIntervalSince(started)
+        print("reader-timing bracket-bound \(elapsed)")
+        XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
@@ -819,6 +834,43 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(longer.lines[3].scheduleDates, [date(2017, 1, 10)])
     }
 
+    func testInfoStringDoesNotCloseAFence() {
+        let stays = ExternalFormatReader.read("```\n* inside #zz\n``` js #yy\n* Out #ok >2017-01-10\n", in: .project)
+        XCTAssertEqual(stays.lines[0].kind, .unsettled)
+        XCTAssertTrue(stays.lines[0].tags.isEmpty)
+        XCTAssertEqual(stays.lines[1].kind, .unsettled)
+        XCTAssertTrue(stays.lines[1].tags.isEmpty)
+        XCTAssertEqual(stays.lines[2].kind, .unsettled)
+        XCTAssertTrue(stays.lines[2].tags.isEmpty)
+        XCTAssertEqual(stays.lines[3].kind, .unsettled)
+        XCTAssertTrue(stays.lines[3].tags.isEmpty)
+        XCTAssertTrue(stays.lines[3].scheduleDates.isEmpty)
+        XCTAssertEqual(ExternalFormatReader.placement(of: stays.lines[3], on: sessionDay, in: .project), .unlisted)
+
+        let closed = ExternalFormatReader.read(
+            "``` js #zz\n* inside #yy\n```\n* Out #ok >2017-01-10\n",
+            in: .project
+        )
+        XCTAssertEqual(closed.lines[0].kind, .unsettled)
+        XCTAssertTrue(closed.lines[0].tags.isEmpty)
+        XCTAssertEqual(closed.lines[1].kind, .unsettled)
+        XCTAssertTrue(closed.lines[1].tags.isEmpty)
+        XCTAssertEqual(closed.lines[2].kind, .unsettled)
+        XCTAssertTrue(closed.lines[2].tags.isEmpty)
+        XCTAssertEqual(closed.lines[3].kind, .openTask)
+        XCTAssertEqual(closed.lines[3].tags.map(\.name), ["ok"])
+        XCTAssertEqual(closed.lines[3].scheduleDates, [date(2017, 1, 10)])
+
+        let tilde = ExternalFormatReader.read("~~~\nplain #zz\n~~~ js\nplain #yy\n~~~\n* Out\n", in: .project)
+        XCTAssertEqual(tilde.lines[1].kind, .unsettled)
+        XCTAssertTrue(tilde.lines[1].tags.isEmpty)
+        XCTAssertEqual(tilde.lines[2].kind, .unsettled)
+        XCTAssertTrue(tilde.lines[2].tags.isEmpty)
+        XCTAssertEqual(tilde.lines[3].kind, .unsettled)
+        XCTAssertTrue(tilde.lines[3].tags.isEmpty)
+        XCTAssertEqual(tilde.lines[5].kind, .openTask)
+    }
+
     func testUnclosedMentionDoesNotSwallowALaterParen() {
         let line = ExternalFormatReader.read("See @a( then #zz and @b(ok)", in: .project).lines[0]
         XCTAssertEqual(line.mentions, [
@@ -841,7 +893,9 @@ final class ExternalFormatReaderTests: XCTestCase {
         let line = String(repeating: "[[#", count: 350_000) + "]]"
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        let elapsed = Date().timeIntervalSince(started)
+        print("reader-timing wiki-bound \(elapsed)")
+        XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
     }
@@ -850,7 +904,9 @@ final class ExternalFormatReaderTests: XCTestCase {
         let line = String(repeating: "@a(", count: 350_000)
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        let elapsed = Date().timeIntervalSince(started)
+        print("reader-timing mention-bound \(elapsed)")
+        XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }
@@ -1169,6 +1225,126 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(listed.notes, .scheduled)
         XCTAssertTrue(listed.staysInOverdue)
         XCTAssertEqual(listed.date, date(2017, 1, 10))
+    }
+
+    /// The same unclosed `@a(` input at N and 2N. A quadratic closer scan grows by about 4x.
+    func testUnclosedMentionParenGrowsLinearly() throws {
+        try skipWallClockGrowthOnTheSimulator()
+        let count = 900_000
+        let smaller = String(repeating: "@a(", count: count)
+        let larger = String(repeating: "@a(", count: count * 2)
+        let (once, twice) = growthTimes(smaller, larger) { note in
+            XCTAssertFalse(note.lines[0].mentions.isEmpty)
+        }
+        print("reader-timing mention-growth \(once) \(twice) \(twice / once)")
+        XCTAssertLessThanOrEqual(twice, once * 3)
+    }
+
+    func testClosedMentionParenStaysWithinTheTimeBound() {
+        let line = String(repeating: "@a(", count: 350_000) + ")"
+        let started = Date()
+        let note = ExternalFormatReader.read(line, in: .project)
+        let elapsed = Date().timeIntervalSince(started)
+        print("reader-timing mention-closed-bound \(elapsed)")
+        XCTAssertLessThan(elapsed, 5)
+        XCTAssertEqual(note.lines.count, 1)
+        XCTAssertFalse(note.lines[0].mentions.isEmpty)
+    }
+
+    func testClosedMentionParenGrowsLinearly() throws {
+        try skipWallClockGrowthOnTheSimulator()
+        let count = 900_000
+        let smaller = String(repeating: "@a(", count: count) + ")"
+        let larger = String(repeating: "@a(", count: count * 2) + ")"
+        let (once, twice) = growthTimes(smaller, larger) { note in
+            XCTAssertFalse(note.lines[0].mentions.isEmpty)
+        }
+        print("reader-timing mention-closed-growth \(once) \(twice) \(twice / once)")
+        XCTAssertLessThanOrEqual(twice, once * 3)
+    }
+
+    func testClosedBracketLineStaysWithinTheTimeBound() {
+        let line = String(repeating: "[a", count: 350_000) + "]"
+        let started = Date()
+        let note = ExternalFormatReader.read(line, in: .project)
+        let elapsed = Date().timeIntervalSince(started)
+        print("reader-timing bracket-closed-bound \(elapsed)")
+        XCTAssertLessThan(elapsed, 5)
+        XCTAssertEqual(note.lines.count, 1)
+        XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
+        XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
+    }
+
+    func testClosedBracketLineGrowsLinearly() throws {
+        try skipWallClockGrowthOnTheSimulator()
+        let count = 2_000_000
+        let smaller = String(repeating: "[a", count: count) + "]"
+        let larger = String(repeating: "[a", count: count * 2) + "]"
+        let (once, twice) = growthTimes(smaller, larger) { note in
+            XCTAssertEqual(note.lines.count, 1)
+        }
+        print("reader-timing bracket-closed-growth \(once) \(twice) \(twice / once)")
+        XCTAssertLessThanOrEqual(twice, once * 3)
+    }
+
+    /// simulator wall-clock time varied about 6x on identical input in run 40128432168
+    private func skipWallClockGrowthOnTheSimulator() throws {
+        #if targetEnvironment(simulator)
+        throw XCTSkip("simulator wall-clock time varied about 6x on identical input in run 40128432168")
+        #endif
+    }
+
+    /// Work counted inside the scan at N and 2N. The same 3x limit on every platform.
+    func testScanWorkGrowsLinearly() {
+        let count = 100_000
+        let samples: [(String, (Int) -> String)] = [
+            ("mention", { String(repeating: "@a(", count: $0) }),
+            ("mention-closed", { String(repeating: "@a(", count: $0) + ")" }),
+            ("bracket-closed", { String(repeating: "[a", count: $0) + "]" }),
+            ("wiki", { String(repeating: "[[#", count: $0) + "]]" }),
+            ("bracket", { String(repeating: "[", count: $0) }),
+        ]
+        var measured: [(String, Int, Int)] = []
+        for (name, make) in samples {
+            let once = scanWork(make(count))
+            let twice = scanWork(make(count * 2))
+            print("reader-work \(name) \(once) \(twice) \(Double(twice) / Double(once))")
+            measured.append((name, once, twice))
+        }
+        for (name, once, twice) in measured {
+            XCTAssertGreaterThan(once, 0, name)
+            XCTAssertLessThanOrEqual(twice, once * 3, name)
+        }
+    }
+
+    private func scanWork(_ text: String) -> Int {
+        ExternalFormatScanWork.count = 0
+        _ = ExternalFormatReader.read(text, in: .project)
+        return ExternalFormatScanWork.count
+    }
+
+    /// One unmeasured read, then the fastest of three measured reads at each size.
+    private func growthTimes(
+        _ smaller: String,
+        _ larger: String,
+        check: (ExternalNoteReading) -> Void
+    ) -> (TimeInterval, TimeInterval) {
+        _ = ExternalFormatReader.read(larger, in: .project)
+        return (fastestRead(smaller, check: check), fastestRead(larger, check: check))
+    }
+
+    private func fastestRead(_ text: String, check: (ExternalNoteReading) -> Void) -> TimeInterval {
+        var best = TimeInterval.greatestFiniteMagnitude
+        for _ in 0..<3 {
+            let started = Date()
+            let note = ExternalFormatReader.read(text, in: .project)
+            let elapsed = Date().timeIntervalSince(started)
+            check(note)
+            if elapsed < best {
+                best = elapsed
+            }
+        }
+        return best
     }
 
     func testMovedAwayTaskInAPastDayIsUnlisted() {

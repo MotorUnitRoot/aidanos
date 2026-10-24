@@ -1,0 +1,101 @@
+name: approval-gate
+
+# Binding commit status "approval-gate".
+#
+# pull_request_target, issue_comment, and workflow_dispatch run this file
+# from the default branch. Review events are relayed by
+# approval-gate-trigger.yml; workflow_run then runs this file from the
+# default branch as well. A pull request cannot edit the code that judges it.
+#
+# Checkout is github.sha with persist-credentials false. This file never
+# checks out the pull request head and never puts a title, body, or comment
+# into a run script.
+#
+# The status is written by the gate-only GitHub App. The job reads
+# APPROVAL_GATE_APP_ID and APPROVAL_GATE_APP_PRIVATE_KEY from the
+# approval-gate environment (main only, no reviewers). Colby creates that
+# App and pastes the key from his own device. This workflow does not use
+# the shared App key and does not use the Actions token to write statuses.
+# Do not add set -x. Do not print the key.
+#
+# The lock is on the judge job, not the workflow. A run that skips the
+# job does not join the group. queue: max keeps up to 100 pending judge
+# jobs. Each judge run checks the pull request that started it, plus
+# other open pull requests into main. The cheap check is one page of
+# commit statuses, newest first, because that page includes the creator.
+# A created or edited pull request comment skips the job unless its
+# current text, or the text it had before an edit, contains the review
+# marker. Deleted comments still run. Pushes and reviews always run.
+# If the queue is already full and the App's rate allowance is used up,
+# a cancelled run can leave an older green until a later run both starts
+# and can read GitHub.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, edited]
+    branches: [main]
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_run:
+    workflows: ["approval-gate-trigger"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to re-evaluate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: judge
+    concurrency:
+      group: approval-gate
+      queue: max
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'workflow_run' ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && (github.event.action == 'deleted' || contains(github.event.comment.body, 'Independent review:') || contains(github.event.changes.body.from, 'Independent review:')))
+    runs-on: ubuntu-latest
+    environment: approval-gate
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout default branch
+        # v5.1.0 — github.sha is the default-branch commit for these events.
+        # Never the pull request head.
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js
+        # v6.5.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "22"
+      - name: Self-test
+        run: node .github/approval-gate.mjs --self-test
+      - name: Mint the gate App token
+        id: app-token
+        # v3.3.0. Status permission writes approval-gate. Pull requests read
+        # the pull request, reviews, and conversation comments. Contents read
+        # matches the App and is not used to check out pull request code.
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+        with:
+          app-id: ${{ secrets.APPROVAL_GATE_APP_ID }}
+          private-key: ${{ secrets.APPROVAL_GATE_APP_PRIVATE_KEY }}
+          permission-statuses: write
+          permission-pull-requests: read
+          permission-contents: read
+      - name: Judge and write approval-gate
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          APPROVAL_GATE_PR: ${{ github.event_name == 'workflow_dispatch' && inputs.pr || '' }}
+          APPROVAL_GATE_APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          APPROVAL_GATE_BOT_USER_ID: ${{ vars.APPROVAL_GATE_BOT_USER_ID }}
+        run: node .github/approval-gate.mjs

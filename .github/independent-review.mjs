@@ -1,33 +1,28 @@
 #!/usr/bin/env node
 /**
- * Independent review gate.
+ * Comment parser kept from the independent-review work.
  *
- * A PASS counts only when all of these are true:
- * - The first line is exactly "Independent review: PASS <sha>".
- * - The sha is the pull request's current head. Later lines are not read.
- * - The comment has not been edited, so a later edit cannot retarget the SHA.
- * - The author is the motorunit-aidanos-bots GitHub App: login
- *   motorunit-aidanos-bots[bot] and type Bot. When performed_via_github_app
- *   is present, its id is 5413571. A user account does not count.
+ * A PASS from motorunit-aidanos-bots is not an approval. isQualifyingPass
+ * returns false so this classifier cannot go green on an App PASS.
+ * The binding check is the approval-gate status, judged by
+ * .github/approval-gate.mjs.
  *
- * A BLOCK from that App stays in force until a newer qualifying PASS
- * for this head SHA. Each edit-history entry is the full text after that
- * edit. The most restrictive version wins, so editing a BLOCK into a PASS
- * does not lift it. The text from before the first edit is not in the
- * history, so an edited comment stays a BLOCK. If the history cannot be
- * read, the comment stays a BLOCK. A deleted BLOCK stays a BLOCK.
- * A bare BLOCK names no SHA and applies to the current head.
+ * A BLOCK from the App still fails this advisory classifier. Each
+ * edit-history entry is the full text after that edit. The most restrictive
+ * version wins, so editing a BLOCK into a PASS does not lift it. The text
+ * from before the first edit is not in the history, so an edited comment
+ * stays a BLOCK. If the history cannot be read, the comment stays a BLOCK.
+ * A deleted BLOCK stays a BLOCK. A bare BLOCK names no SHA and applies to
+ * the current head.
  *
- * This file only reads. It does not post independent-review/approved.
- * The binding status is posted by independent-review-post.yml, which runs
- * tools/post-review-verdict.mjs after the independent-review environment
- * is approved. No GitHub App key is read here.
+ * This file only reads. It does not post a status. No GitHub App key is
+ * read here.
  */
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const PASS_PREFIX = "Independent review: PASS";
-const BLOCK_PREFIX = "Independent review: BLOCK";
+export const PASS_PREFIX = "Independent review: PASS";
+export const BLOCK_PREFIX = "Independent review: BLOCK";
 
 // The independent reviewer posts as this GitHub App. Change these together.
 export const REVIEW_APP_LOGIN = "motorunit-aidanos-bots[bot]";
@@ -172,11 +167,10 @@ export function deletedCommentForcesBlock(comment, headSha) {
 }
 
 export function isQualifyingPass(comment, headSha) {
-  if (!comment || comment.historyUnavailable || commentWasEdited(comment)) return false;
-  if (!comment.created_at || timeMs(comment.created_at) === null) return false;
-  const versions = versionsFor(comment);
-  if (versions.length !== 1) return false;
-  return commentKind(comment.body, headSha) === "pass" && commentKind(versions[0].body, headSha) === "pass";
+  // Neutralized. An App PASS is not an approval, so this cannot return true.
+  void comment;
+  void headSha;
+  return false;
 }
 
 export function classifyReview(comments, headSha) {
@@ -212,9 +206,9 @@ export function summaryFor(result, headSha) {
   const lines = [
     `Head SHA: \`${headSha}\`.`,
     "",
-    `Only an unedited PASS from ${REVIEW_APP_LOGIN} counts.`,
-    "A BLOCK stays in force until a newer PASS for this SHA. Editing or deleting a BLOCK does not lift it.",
-    `The binding result is the commit status \`${STATUS_CONTEXT}\`, posted by the App outside Actions.`,
+    `A PASS from ${REVIEW_APP_LOGIN} is not an approval.`,
+    "A BLOCK stays in force for this SHA. Editing or deleting a BLOCK does not lift it.",
+    "The binding result is the commit status `approval-gate`.",
   ];
   if (result.reason === "pass") {
     const ids = result.pass.map((comment) => comment.id).filter(Boolean).join(", ");
@@ -324,7 +318,7 @@ export function selfTest() {
   const t3 = "2026-10-18T00:00:03Z";
 
   const pass = classifyReview([reviewComment(1, `${PASS_PREFIX} ${sha}`, t0)], sha);
-  assert(pass.conclusion === "success" && pass.reason === "pass", "app bot pass for this sha");
+  assert(pass.conclusion === "failure" && pass.reason === "missing", "an App PASS is not an approval");
 
   const missing = classifyReview([reviewComment(2, `see ${sha}`, t0)], sha);
   assert(missing.conclusion === "failure" && missing.reason === "missing", "sha mention is not a review");
@@ -339,7 +333,10 @@ export function selfTest() {
     [reviewComment(5, `${BLOCK_PREFIX} ${other}`, t0), reviewComment(6, `${PASS_PREFIX} ${sha}`, t1)],
     sha,
   );
-  assert(staleBlock.conclusion === "success", "block for another sha does not fail this head");
+  assert(
+    staleBlock.conclusion === "failure" && staleBlock.reason === "missing",
+    "a block for another sha is not a block here, and an App PASS is not an approval",
+  );
 
   const bare = classifyReview(
     [reviewComment(7, BLOCK_PREFIX, t0), reviewComment(8, `${PASS_PREFIX} ${sha}`, t0)],
@@ -351,7 +348,7 @@ export function selfTest() {
     [reviewComment(9, `${BLOCK_PREFIX} ${sha}`, t0), reviewComment(10, `${PASS_PREFIX} ${sha}`, t1)],
     sha,
   );
-  assert(lifted.conclusion === "success" && lifted.reason === "pass", "newer pass lifts an older block");
+  assert(lifted.conclusion === "failure" && lifted.reason === "block", "an App PASS does not lift a BLOCK");
 
   const editedBlock = reviewComment(11, `${PASS_PREFIX} ${sha}`, t0, {
     updated_at: t1,
@@ -364,7 +361,7 @@ export function selfTest() {
   assert(editKeepsBlock.conclusion === "failure" && editKeepsBlock.reason === "block", "editing a block into a pass does not lift it");
 
   const editThenNewer = classifyReview([editedBlock, reviewComment(12, `${PASS_PREFIX} ${sha}`, t2)], sha);
-  assert(editThenNewer.conclusion === "success", "a newer pass lifts a block that was edited away");
+  assert(editThenNewer.conclusion === "failure" && editThenNewer.reason === "block", "an App PASS does not lift a block that was edited away");
 
   const retarget = reviewComment(13, `${PASS_PREFIX} ${sha}`, t0, {
     updated_at: t1,
@@ -391,7 +388,7 @@ export function selfTest() {
   const olderPass = classifyReview([reviewComment(15, `${PASS_PREFIX} ${sha}`, t1), becameBlock], sha);
   assert(olderPass.conclusion === "failure" && olderPass.reason === "block", "a pass older than the blocking edit does not lift it");
   const afterEdit = classifyReview([becameBlock, reviewComment(16, `${PASS_PREFIX} ${sha}`, t3)], sha);
-  assert(afterEdit.conclusion === "success", "a pass after the blocking edit lifts it");
+  assert(afterEdit.conclusion === "failure" && afterEdit.reason === "block", "an App PASS after a blocking edit does not lift it");
 
   const unknown = classifyReview(
     [
@@ -498,7 +495,8 @@ export function selfTest() {
 
   const text = summaryFor(pass, sha);
   assert(text.includes(sha) && text.includes(REVIEW_APP_LOGIN), "summary");
-  assert(text.includes(STATUS_CONTEXT), "summary names the status");
+  assert(text.includes("is not an approval"), "summary refuses an App PASS");
+  assert(text.includes("approval-gate"), "summary names the approval gate");
   console.log("independent-review self-test ok");
 }
 

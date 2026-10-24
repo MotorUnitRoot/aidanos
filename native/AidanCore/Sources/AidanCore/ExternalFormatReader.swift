@@ -1435,16 +1435,7 @@ extension ExternalFormatReader {
     /// The target is empty, or it starts with `#`. Leading spaces and tabs do not count.
     /// A leading `|` leaves the target empty, as in `[[|alias]]`.
     fileprivate static func wikiTargetIsEmpty(_ text: String) -> Bool {
-        let bytes = text.utf8
-        var index = bytes.startIndex
-        while index < bytes.endIndex {
-            let byte = bytes[index]
-            if byte == 32 || byte == 9 {
-                index = bytes.index(after: index)
-                continue
-            }
-            return byte == 35 || byte == 124
-        }
+        for ch in text where ch != " " && ch != "\t" { return ch == "#" || ch == "|" }
         return true
     }
 

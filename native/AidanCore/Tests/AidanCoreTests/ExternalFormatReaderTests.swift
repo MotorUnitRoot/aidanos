@@ -991,7 +991,23 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertTrue(titled.tags.isEmpty)
         XCTAssertTrue(titled.markdownLinks.isEmpty)
 
-        for text in ["[[#heading]]", "[[]]", "[[|alias]]", "[[Market List#Dairy]]"] {
+        let keycap = ExternalFormatReader.read("[[#️⃣ Notes]]", in: .project).lines[0]
+        XCTAssertEqual(
+            keycap.wikiLinks,
+            [ExternalWikiLink(target: "#️⃣ Notes", heading: nil, shownText: nil, day: nil)]
+        )
+        XCTAssertTrue(keycap.tags.isEmpty)
+        XCTAssertTrue(keycap.markdownLinks.isEmpty)
+
+        let combining = ExternalFormatReader.read("[[#\u{301}x]]", in: .project).lines[0]
+        XCTAssertEqual(
+            combining.wikiLinks,
+            [ExternalWikiLink(target: "#\u{301}x", heading: nil, shownText: nil, day: nil)]
+        )
+        XCTAssertTrue(combining.tags.isEmpty)
+        XCTAssertTrue(combining.markdownLinks.isEmpty)
+
+        for text in ["[[#heading]]", "[[]]", "[[|alias]]", "[[Market List#Dairy]]", "[[#️⃣ Notes]]", "[[#\u{301}x]]"] {
             var work: ExternalFormatScanWork?
             let characters = ExternalFormatReader.read(text, in: .project, work: &work, route: .characters).lines[0]
             let bytes = ExternalFormatReader.read(text, in: .project).lines[0]

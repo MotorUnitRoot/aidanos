@@ -25,7 +25,7 @@ The old status `independent-review/approved` is not this gate. Do not add it to 
 
 The Dependabot shortcut is not built. It stays off. There is no hardware-key sign-off in this step.
 
-The gate reads the reviews, the comments, and the head again from GitHub just before it writes, and it writes that second result only to the commit it judged. If a new commit landed in between, it writes nothing. The workflow uses one lock for the whole repository, so a review on a fork pull request cannot run at the same time as a push or a comment. If GitHub returns an error after the head commit has been read, the gate writes `pending` with the description `gate error` on that commit. The error text is not copied into the status. If that fallback write also fails, an older green can stay on the commit.
+The gate reads the reviews, the comments, and the head again from GitHub just before it writes, and it writes that second result only to the commit it judged. If a new commit landed in between, it writes nothing. Every run of the judge re-checks every open pull request into main, so if one run is cancelled while it is waiting, the next run repairs it. The lock sits on the judge job. A comment on a plain issue skips that job and does not take the lock. If GitHub returns an error after a head commit has been read, the gate writes `pending` with the description `gate error` on that commit and continues with the other pull requests. The error text is not copied into the status. If that fallback write also fails, an older green can stay on the commit. If the gate App's slug is missing, the gate writes that same `gate error` instead of judging.
 
 ## What Colby does by hand
 
@@ -65,7 +65,7 @@ Paste the key from your own device straight into the secret field. Then delete t
 
 The workflow reads those two secrets only when it runs from `main`. A pull request branch cannot read them. The token step also supplies the App's slug. The gate trusts an earlier red status only when its creator login is that slug plus `[bot]`.
 
-After the App exists, look up the bot account GitHub created for it (the login ends in `[bot]`). On the `approval-gate` environment, add a variable named `APPROVAL_GATE_BOT_USER_ID` with that account's numeric id. It is not a secret. Until that variable is set, the gate matches the bot login only. Once it is set, the creator's id has to match too.
+After the App exists, look up the bot account GitHub created for it (the login ends in `[bot]`). On the `approval-gate` environment, add an environment variable named `APPROVAL_GATE_BOT_USER_ID` with that account's numeric id. It is not a secret. Do not create it as a repository variable. Until that environment variable is set, the gate matches the bot login only. Once it is set, the creator's id has to match too. The creator also has to be a bot account.
 
 ### 3. After the live tests, require the check
 
@@ -93,7 +93,7 @@ Run these on a throwaway pull request after the App and the environment exist. R
 
 ## Manual re-check
 
-From the Actions tab, on `main`, run the workflow named `approval-gate`. The input is the pull request number. The run uses the workflow on `main` and the `approval-gate` environment. Live test 8 is the check that a run from any other branch is refused.
+From the Actions tab, on `main`, run the workflow named `approval-gate`. The input is a pull request number. The run uses the workflow on `main` and the `approval-gate` environment, and it re-checks every open pull request into main, not only the number you typed. Live test 8 is the check that a run from any other branch is refused.
 
 A review (approve, request changes, or dismiss) is picked up by a small relay workflow that has no secrets and does not check out code. The judgment still runs from `main`. If a pull request breaks that relay, the gate is simply not re-checked until the next push, comment, or manual run. Breaking the relay cannot turn the gate green.
 

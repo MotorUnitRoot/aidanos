@@ -18,9 +18,11 @@ name: approval-gate
 # the shared App key and does not use the Actions token to write statuses.
 # Do not add set -x. Do not print the key.
 #
-# One lock for the whole repository. A review on a fork pull request
-# arrives with no pull request number, so a per-pull-request key would
-# split that run from the same pull request's push and comment runs.
+# The lock is on the judge job, not the workflow. A run that skips the
+# job, such as a comment on a plain issue, does not join the group.
+# queue: max keeps pending judge jobs. Every judge run still re-checks
+# every open pull request into main, so a cancelled run is repaired by
+# the next one.
 
 on:
   pull_request_target:
@@ -41,13 +43,12 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: approval-gate
-  cancel-in-progress: false
-
 jobs:
   gate:
     name: judge
+    concurrency:
+      group: approval-gate
+      queue: max
     if: >-
       github.event_name == 'pull_request_target' ||
       github.event_name == 'workflow_dispatch' ||

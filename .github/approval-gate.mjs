@@ -220,10 +220,16 @@ export function gateFromEnv(env = process.env) {
   };
 }
 
-function creatorIsGate(creator, gate) {
+export function gateSlug(gate) {
   const slug = String((gate && gate.slug) || "").trim();
-  if (!/^[a-z0-9][a-z0-9-]{0,38}$/.test(slug)) return false;
-  if (!creator || creator.login !== `${slug}[bot]`) return false;
+  if (!/^[a-z0-9][a-z0-9-]{0,38}$/.test(slug)) return "";
+  return slug;
+}
+
+function creatorIsGate(creator, gate) {
+  const slug = gateSlug(gate);
+  if (!slug) return false;
+  if (!creator || creator.type !== "Bot" || creator.login !== `${slug}[bot]`) return false;
   const botUserId = gate.botUserId;
   if (botUserId == null) return true;
   if (botUserId === false) return false;
@@ -394,6 +400,20 @@ export async function judgeAndWrite({
       return { wrote: false, reason: early.reasons[0] || "skip", result: early, judgedSha: null };
     }
     judgedSha = String(pr.head.sha).toLowerCase();
+    if (!advisory && !gateSlug(gate)) {
+      await writeStatus({
+        sha: judgedSha,
+        state: "pending",
+        description: "gate error",
+        context: STATUS_CONTEXT,
+      });
+      return {
+        wrote: true,
+        reason: "missing-slug",
+        result: { state: "pending", description: "gate error", reasons: ["missing-slug"] },
+        judgedSha,
+      };
+    }
     const reviews = await readReviews(prNumber);
     const comments = await readComments(prNumber);
     const statuses = await readStatuses(judgedSha);
@@ -431,6 +451,24 @@ export async function judgeAndWrite({
     }
     throw error;
   }
+}
+
+export async function judgeOpenPulls({ listPulls, judgeOne }) {
+  const pulls = await listPulls();
+  if (!Array.isArray(pulls)) throw new Error("pull list is not a list");
+  const outcomes = [];
+  const errors = [];
+  for (const pr of pulls) {
+    if (!pr || pr.state !== "open" || !pr.base || pr.base.ref !== "main") continue;
+    const number = Number(pr.number);
+    if (!Number.isInteger(number) || number <= 0) continue;
+    try {
+      outcomes.push({ number, outcome: await judgeOne(number) });
+    } catch (error) {
+      errors.push({ number, error });
+    }
+  }
+  return { outcomes, errors };
 }
 
 export function pullNumberFromEvent(eventName, event, envPr) {
@@ -860,10 +898,12 @@ export async function selfTest() {
   });
   assert(judge([], commentPage).state === "success", "Colby's PASS on page 2 of comments counts");
 
+  const testGate = { slug: "motorunit-approval-gate", botUserId: null };
   let pulls = 0;
   const movedWrites = [];
   const moved = await judgeAndWrite({
     prNumber: 12,
+    gate: testGate,
     readPull: async () => {
       pulls += 1;
       return { state: "open", base: { ref: "main" }, head: { sha: pulls === 1 ? sha : other } };
@@ -881,6 +921,7 @@ export async function selfTest() {
   const stableWrites = [];
   const stable = await judgeAndWrite({
     prNumber: 12,
+    gate: testGate,
     readPull: async () => open,
     readReviews: async () => [review(colby, "APPROVED", sha, { id: 7 })],
     readComments: async () => [],
@@ -896,6 +937,7 @@ export async function selfTest() {
   const waitingWrites = [];
   const waiting = await judgeAndWrite({
     prNumber: 12,
+    gate: testGate,
     readPull: async () => open,
     readReviews: async () => [],
     readComments: async () => [],
@@ -910,6 +952,7 @@ export async function selfTest() {
   const redWrites = [];
   const red = await judgeAndWrite({
     prNumber: 12,
+    gate: testGate,
     readPull: async () => open,
     readReviews: async () => [review(appBot, "APPROVED", sha)],
     readComments: async () => [note(`Independent review: PASS ${sha}`, colby)],
@@ -951,6 +994,7 @@ export async function selfTest() {
   const overlapWrites = [];
   const overlap = await judgeAndWrite({
     prNumber: 12,
+    gate: testGate,
     readPull: async () => open,
     readReviews: async () => {
       reviewReads += 1;
@@ -1028,6 +1072,14 @@ export async function selfTest() {
     gate: { slug: "motorunit-approval-gate", botUserId: 111 },
   });
   assert(otherId.state === "success", "a matching login with a different bot id does not stick");
+  const humanCreator = evaluate({
+    pr: open,
+    reviews: [review(colby, "APPROVED", sha)],
+    comments: [],
+    statuses: [gateFailure("Blocked: BLOCK from octocat", { login: "motorunit-approval-gate[bot]", id: 999001, type: "User" })],
+    gate,
+  });
+  assert(humanCreator.state === "success", "a creator that is not a bot does not stick");
   assert(parseGateBotUserId("") === null && parseGateBotUserId("999001") === 999001, "an empty bot id stays unset and a number is kept");
   assert(parseGateBotUserId("nope") === false, "a bot id that is not a number matches nothing");
   const badId = evaluate({
@@ -1067,6 +1119,7 @@ export async function selfTest() {
   try {
     await judgeAndWrite({
       prNumber: 12,
+      gate: testGate,
       readPull: async () => open,
       readReviews: async () => {
         throw new Error("reviews failed");
@@ -1129,6 +1182,7 @@ export async function selfTest() {
   try {
     await judgeAndWrite({
       prNumber: 12,
+      gate: testGate,
       readPull: async () => open,
       readReviews: async () => {
         throw new Error("reviews failed");
@@ -1142,6 +1196,97 @@ export async function selfTest() {
     writeError = error;
   }
   assert(writeError instanceof Error && writeError.message === "reviews failed", "a failed gate-error write still surfaces the original error");
+
+  const missingSlugWrites = [];
+  const missingSlug = await judgeAndWrite({
+    prNumber: 12,
+    gate: { slug: "", botUserId: null },
+    readPull: async () => open,
+    readReviews: async () => {
+      throw new Error("should not read reviews");
+    },
+    readComments: async () => [],
+    writeStatus: async (body) => {
+      missingSlugWrites.push(body);
+    },
+  });
+  assert(missingSlug.wrote === true && missingSlug.reason === "missing-slug", "an empty app slug does not judge");
+  assert(
+    missingSlugWrites.length === 1 &&
+      missingSlugWrites[0].sha === sha &&
+      missingSlugWrites[0].state === "pending" &&
+      missingSlugWrites[0].description === "gate error" &&
+      missingSlugWrites[0].context === STATUS_CONTEXT,
+    "an empty app slug writes pending gate error",
+  );
+
+  const sha2 = "c".repeat(40);
+  const sweepWrites = [];
+  const sweepSeen = [];
+  const sweep = await judgeOpenPulls({
+    listPulls: () =>
+      listAll(async (page) => {
+        if (page === 1) {
+          return [
+            { number: 1, state: "open", base: { ref: "main" }, title: "$(rm)" },
+            ...Array.from({ length: 99 }, (_, index) => ({ number: index + 10, state: "closed", base: { ref: "main" } })),
+          ];
+        }
+        if (page === 2) return [{ number: 2, state: "open", base: { ref: "main" } }];
+        return [];
+      }),
+    judgeOne: async (number) => {
+      sweepSeen.push(number);
+      const head = number === 1 ? sha : sha2;
+      return judgeAndWrite({
+        prNumber: number,
+        gate: testGate,
+        readPull: async () => ({ state: "open", base: { ref: "main" }, head: { sha: head } }),
+        readReviews: async () => [review(colby, "APPROVED", head)],
+        readComments: async () =>
+          number === 2 ? [note(`Independent review: BLOCK ${sha2}`, { login: "octocat", id: 9, type: "User" })] : [],
+        readStatuses: async () => [],
+        writeStatus: async (body) => {
+          sweepWrites.push(body);
+        },
+      });
+    },
+  });
+  assert(sweep.errors.length === 0 && sweepSeen.length === 2 && sweepSeen[0] === 1 && sweepSeen[1] === 2, "one run judges every open pull request into main");
+  assert(
+    sweepWrites.some((body) => body.sha === sha && body.state === "success") &&
+      sweepWrites.some((body) => body.sha === sha2 && body.state === "failure" && body.description === "Blocked: BLOCK from octocat"),
+    "a BLOCK on another pull request turns that commit red in the same run",
+  );
+
+  const repairWrites = [];
+  const repair = await judgeOpenPulls({
+    listPulls: async () => [
+      { number: 11, state: "open", base: { ref: "main" } },
+      { number: 12, state: "open", base: { ref: "main" } },
+    ],
+    judgeOne: (number) =>
+      judgeAndWrite({
+        prNumber: number,
+        gate: testGate,
+        readPull: async () => ({ state: "open", base: { ref: "main" }, head: { sha: number === 11 ? sha : sha2 } }),
+        readReviews: async () => {
+          if (number === 11) throw new Error("reviews failed");
+          return [];
+        },
+        readComments: async () =>
+          number === 12 ? [note(`Independent review: BLOCK ${sha2}`, { login: "octocat", id: 9, type: "User" })] : [],
+        writeStatus: async (body) => {
+          repairWrites.push(body);
+        },
+      }),
+  });
+  assert(repair.errors.length === 1 && repair.errors[0].number === 11 && repair.outcomes.length === 1, "one pull request error does not stop the next");
+  assert(
+    repairWrites.some((body) => body.sha === sha && body.state === "pending" && body.description === "gate error") &&
+      repairWrites.some((body) => body.sha === sha2 && body.state === "failure"),
+    "the next pull request still gets its own status",
+  );
 
   const failedHistory = await prepareComments(
     [note("hello", cursorBot, { id: 9, updated_at: t1, node_id: "BOT" })],
@@ -1251,10 +1396,13 @@ export async function selfTest() {
   assert(!gateYaml.includes("workflow_run.id"), "review events do not get their own concurrency group");
   assert(!gateYaml.includes("workflow_run.head_sha"), "the lock does not fall back to a commit id");
   assert(!gateYaml.includes("github.event.workflow_run"), "the lock does not read the review event");
-  assert(gateYaml.includes("\nconcurrency:\n  group: approval-gate\n  cancel-in-progress: false\n"), "the workflow uses one repo-wide lock");
+  const beforeJobs = gateYaml.split("\njobs:\n")[0];
+  assert(!/^concurrency:/m.test(beforeJobs), "the lock is not on the whole workflow");
   assert(gateYaml.includes("APPROVAL_GATE_APP_SLUG: ${{ steps.app-token.outputs.app-slug }}"), "the gate slug comes from the token step");
   assert(gateYaml.includes("APPROVAL_GATE_BOT_USER_ID: ${{ vars.APPROVAL_GATE_BOT_USER_ID }}"), "the bot user id is a configurable variable");
   const gateJobs = gateYaml.split("\njobs:\n")[1] || "";
+  assert(gateJobs.includes("\n    concurrency:\n      group: approval-gate\n      queue: max\n"), "the judge job queues on one group");
+  assert(!gateJobs.includes("cancel-in-progress:"), "the judge job does not cancel the running run");
   assert(gateJobs.includes("\n    name: judge\n"), "the binding job is named judge");
   assert(!gateJobs.includes("name: approval-gate"), "the job name is not the status context");
   assert(STATUS_CONTEXT === "approval-gate", "the status context stays approval-gate");
@@ -1363,38 +1511,59 @@ async function main() {
   const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
   const apiBase = process.env.GITHUB_API_URL || "https://api.github.com";
   const request = (pathname, options = {}) => githubRequest({ apiBase, token, pathname, ...options });
-  const number = await resolvePullNumber({ eventName, event, request, owner, repo });
-  if (!number) {
-    console.log("No pull request to judge.");
-    return;
+  let triggering = null;
+  try {
+    triggering = await resolvePullNumber({ eventName, event, request, owner, repo });
+  } catch (error) {
+    console.log(scrubToken(error && error.message ? error.message : error, token));
   }
-  const outcome = await judgeAndWrite({
-    prNumber: number,
-    advisory,
-    gate: gateFromEnv(process.env),
-    readPull: (pullNumber) => request(`/repos/${owner}/${repo}/pulls/${pullNumber}`),
-    readReviews: (pullNumber) =>
-      listAll((page) => request(`/repos/${owner}/${repo}/pulls/${pullNumber}/reviews?per_page=100&page=${page}`)),
-    readComments: async (pullNumber) => {
-      const comments = await listAll((page) =>
-        request(`/repos/${owner}/${repo}/issues/${pullNumber}/comments?per_page=100&page=${page}`),
-      );
-      return prepareComments(comments, event, (nodeId) => listEdits(request, nodeId), (message) => console.log(message));
-    },
-    readStatuses: (sha) =>
-      listAll((page) =>
-        request(`/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}/statuses?per_page=100&page=${page}`),
-      ),
-    writeStatus: ({ sha, state, description, context }) =>
-      request(`/repos/${owner}/${repo}/statuses/${encodeURIComponent(sha)}`, {
-        method: "POST",
-        body: { state, description, context },
+  const gate = gateFromEnv(process.env);
+  const { outcomes, errors } = await judgeOpenPulls({
+    listPulls: () =>
+      listAll((page) => request(`/repos/${owner}/${repo}/pulls?state=open&base=main&per_page=100&page=${page}`)),
+    judgeOne: (pullNumber) =>
+      judgeAndWrite({
+        prNumber: pullNumber,
+        advisory,
+        gate,
+        readPull: (number) => request(`/repos/${owner}/${repo}/pulls/${number}`),
+        readReviews: (number) =>
+          listAll((page) => request(`/repos/${owner}/${repo}/pulls/${number}/reviews?per_page=100&page=${page}`)),
+        readComments: async (number) => {
+          const comments = await listAll((page) =>
+            request(`/repos/${owner}/${repo}/issues/${number}/comments?per_page=100&page=${page}`),
+          );
+          const commentEvent = number === triggering ? event : null;
+          return prepareComments(comments, commentEvent, (nodeId) => listEdits(request, nodeId), (message) => console.log(message));
+        },
+        readStatuses: (sha) =>
+          listAll((page) =>
+            request(`/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}/statuses?per_page=100&page=${page}`),
+          ),
+        writeStatus: ({ sha, state, description, context }) =>
+          request(`/repos/${owner}/${repo}/statuses/${encodeURIComponent(sha)}`, {
+            method: "POST",
+            body: { state, description, context },
+          }),
       }),
   });
-  const summary = summaryText(outcome);
+  if (!outcomes.length && !errors.length) {
+    console.log("No open pull request into main.");
+    return;
+  }
+  const lines = [];
+  for (const item of outcomes) {
+    lines.push(`PR #${item.number}\n${summaryText(item.outcome)}`);
+  }
+  for (const item of errors) {
+    lines.push(`PR #${item.number}\n${scrubToken(item.error && item.error.message ? item.error.message : item.error, token)}`);
+  }
+  const summary = lines.join("\n\n");
   console.log(summary);
   writeStepSummary(summary);
-  if (advisory && outcome.result && outcome.result.state === "failure") process.exitCode = 1;
+  const missingSlug = outcomes.some((item) => item.outcome && item.outcome.reason === "missing-slug");
+  const advisoryFailure = advisory && outcomes.some((item) => item.outcome && item.outcome.result && item.outcome.result.state === "failure");
+  if (errors.length || missingSlug || advisoryFailure) process.exitCode = 1;
 }
 
 const isDirectRun = process.argv[1] && process.argv[1].endsWith("approval-gate.mjs");

@@ -887,6 +887,47 @@ final class ExternalFormatReaderTests: XCTestCase {
     func testRejectedWikiDoesNotHideALaterLink() {
         let line = ExternalFormatReader.read("See [[#nope]] and [[Note]]", in: .project).lines[0]
         XCTAssertEqual(line.wikiLinks.map(\.target), ["Note"])
+        XCTAssertEqual(line.tags.map(\.name), ["nope"])
+    }
+
+    func testRejectedWikiKeepsItsTag() {
+        let text = "See [[#heading]]"
+        let line = ExternalFormatReader.read(text, in: .project).lines[0]
+        XCTAssertTrue(line.wikiLinks.isEmpty)
+        XCTAssertEqual(line.tags, [ExternalTag(name: "heading", parent: nil)])
+        var work: ExternalFormatScanWork?
+        let characters = ExternalFormatReader.read(text, in: .project, work: &work, route: .characters).lines[0]
+        XCTAssertEqual(characters.tags, line.tags)
+        XCTAssertEqual(characters.wikiLinks, line.wikiLinks)
+        let titled = ExternalFormatReader.read("See [[Market List#Dairy]]", in: .project).lines[0]
+        XCTAssertEqual(titled.wikiLinks.map(\.target), ["Market List"])
+        XCTAssertEqual(titled.wikiLinks.first?.heading, "Dairy")
+        XCTAssertTrue(titled.tags.isEmpty)
+        let nested = ExternalFormatReader.read("See [[ #zz [[Note]]", in: .project).lines[0]
+        XCTAssertEqual(nested.tags.map(\.name), ["zz"])
+        XCTAssertEqual(nested.wikiLinks.map(\.target), ["Note"])
+    }
+
+    func testLooseHashInsideAMentionKeepsTheValue() {
+        let text = "See @a(item # 3)"
+        let line = ExternalFormatReader.read(text, in: .project).lines[0]
+        XCTAssertEqual(line.mentions, [ExternalMention(name: "a", value: "item # 3")])
+        XCTAssertTrue(line.tags.isEmpty)
+        var work: ExternalFormatScanWork?
+        let characters = ExternalFormatReader.read(text, in: .project, work: &work, route: .characters).lines[0]
+        XCTAssertEqual(characters.mentions, line.mentions)
+        XCTAssertEqual(characters.tags, line.tags)
+    }
+
+    func testRealTagInsideAMentionEndsTheValue() {
+        let text = "See @a(item #zz more)"
+        let line = ExternalFormatReader.read(text, in: .project).lines[0]
+        XCTAssertEqual(line.mentions, [ExternalMention(name: "a", value: nil)])
+        XCTAssertEqual(line.tags, [ExternalTag(name: "zz", parent: nil)])
+        var work: ExternalFormatScanWork?
+        let characters = ExternalFormatReader.read(text, in: .project, work: &work, route: .characters).lines[0]
+        XCTAssertEqual(characters.mentions, line.mentions)
+        XCTAssertEqual(characters.tags, line.tags)
     }
 
     func testRejectedWikiLineStaysWithinTheTimeBound() {
@@ -1315,6 +1356,7 @@ final class ExternalFormatReaderTests: XCTestCase {
             ("bracket-closed", { String(repeating: "[a", count: $0) + "]" }),
             ("wiki", { String(repeating: "[[#", count: $0) + "]]" }),
             ("bracket", { String(repeating: "[", count: $0) }),
+            ("non-english", { "é" + String(repeating: "@a(", count: $0) }),
         ]
         var measured: [(String, Int, Int)] = []
         for (name, make) in samples {
@@ -1330,9 +1372,67 @@ final class ExternalFormatReaderTests: XCTestCase {
     }
 
     private func scanWork(_ text: String) -> Int {
-        ExternalFormatScanWork.count = 0
-        _ = ExternalFormatReader.read(text, in: .project)
-        return ExternalFormatScanWork.count
+        var work: ExternalFormatScanWork? = ExternalFormatScanWork()
+        _ = ExternalFormatReader.read(text, in: .project, work: &work, route: .automatic)
+        return work?.count ?? 0
+    }
+
+    func testNonEnglishLineStaysWithinTheTimeBound() {
+        let line = "é" + String(repeating: "@a(", count: 350_000)
+        let started = Date()
+        let note = ExternalFormatReader.read(line, in: .project)
+        let elapsed = Date().timeIntervalSince(started)
+        print("reader-timing non-english-bound \(elapsed)")
+        XCTAssertLessThan(elapsed, 5)
+        XCTAssertEqual(note.lines.count, 1)
+        XCTAssertFalse(note.lines[0].mentions.isEmpty)
+    }
+
+    func testASCIILineMatchesOnTheByteAndCharacterPaths() {
+        let text = "* Buy milk #zz @sam(ok) [[Note]] [words](notes/milk) >2017-01-10"
+        var byteWork: ExternalFormatScanWork?
+        var characterWork: ExternalFormatScanWork?
+        let byteLine = ExternalFormatReader.read(text, in: .project, work: &byteWork, route: .automatic).lines[0]
+        let characterLine = ExternalFormatReader.read(
+            text,
+            in: .project,
+            work: &characterWork,
+            route: .characters
+        ).lines[0]
+        XCTAssertEqual(byteLine, characterLine)
+        XCTAssertEqual(byteLine.kind, .openTask)
+        XCTAssertEqual(byteLine.tags.map(\.name), ["zz"])
+        XCTAssertEqual(byteLine.mentions, [ExternalMention(name: "sam", value: "ok")])
+        XCTAssertEqual(byteLine.wikiLinks.map(\.target), ["Note"])
+        XCTAssertEqual(byteLine.markdownLinks.map(\.shownText), ["words"])
+        XCTAssertEqual(byteLine.markdownLinks.map(\.address), ["notes/milk"])
+        XCTAssertEqual(byteLine.scheduleDates, [date(2017, 1, 10)])
+    }
+
+    func testChineseJapaneseAndKoreanLines() {
+        let chinese = ExternalFormatReader.read("* 买菜 #zz", in: .project).lines[0]
+        let japanese = ExternalFormatReader.read("* 牛乳を買う #zz", in: .project).lines[0]
+        let korean = ExternalFormatReader.read("* 우유 사기 #zz", in: .project).lines[0]
+        for line in [chinese, japanese, korean] {
+            XCTAssertEqual(line.kind, .openTask)
+            XCTAssertTrue(line.countsAsOpen)
+            XCTAssertEqual(line.tags.map(\.name), ["zz"])
+        }
+    }
+
+    func testCarriageReturnBlankLineEndsChildren() {
+        let note = ExternalFormatReader.read("* One\r\n\t- child\r\n\r\n\t* Two\r\n", in: .project)
+        XCTAssertEqual(note.lines.count, 4)
+        XCTAssertEqual(note.lines[0].kind, .openTask)
+        XCTAssertEqual(note.lines[0].childIndexes, [1])
+        XCTAssertEqual(note.lines[1].kind, .bullet)
+        XCTAssertEqual(note.lines[1].indentTabs, 1)
+        XCTAssertEqual(note.lines[2].kind, .empty)
+        XCTAssertEqual(note.lines[3].kind, .openTask)
+        XCTAssertEqual(note.lines[3].indentTabs, 1)
+        XCTAssertFalse(note.lines[0].childIndexes.contains(3))
+        let pair = ExternalFormatReader.read("* One\r\n\r\n* Two\r\n", in: .project)
+        XCTAssertEqual(pair.lines.map(\.kind), [.openTask, .empty, .openTask])
     }
 
     /// One unmeasured read, then the fastest of three measured reads at each size.

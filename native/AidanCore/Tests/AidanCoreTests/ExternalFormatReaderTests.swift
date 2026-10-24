@@ -362,6 +362,19 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
     }
 
+    func testNonASCIILineKeepsAWikiLink() {
+        let line = ExternalFormatReader.read("See [[Café]] today", in: .project).lines[0]
+        XCTAssertEqual(line.wikiLinks.map(\.target), ["Café"])
+        XCTAssertTrue(line.markdownLinks.isEmpty)
+    }
+
+    func testNonASCIILineKeepsAMarkdownLink() {
+        let line = ExternalFormatReader.read("See [café](notes/cafe) today", in: .project).lines[0]
+        XCTAssertEqual(line.markdownLinks.map(\.shownText), ["café"])
+        XCTAssertEqual(line.markdownLinks.map(\.address), ["notes/cafe"])
+        XCTAssertTrue(line.wikiLinks.isEmpty)
+    }
+
     func testUnclosedBracketLineStaysWithinTheTimeBound() {
         let line = String(repeating: "[", count: 1_000_000)
         let started = Date()
@@ -724,7 +737,8 @@ final class ExternalFormatReaderTests: XCTestCase {
     }
 
     /// The same unclosed `@a(` input at N and 2N. A quadratic closer scan grows by about 4x.
-    func testUnclosedMentionParenGrowsLinearly() {
+    func testUnclosedMentionParenGrowsLinearly() throws {
+        try skipWallClockGrowthOnTheSimulator()
         let count = 900_000
         let smaller = String(repeating: "@a(", count: count)
         let larger = String(repeating: "@a(", count: count * 2)
@@ -746,7 +760,8 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }
 
-    func testClosedMentionParenGrowsLinearly() {
+    func testClosedMentionParenGrowsLinearly() throws {
+        try skipWallClockGrowthOnTheSimulator()
         let count = 900_000
         let smaller = String(repeating: "@a(", count: count) + ")"
         let larger = String(repeating: "@a(", count: count * 2) + ")"
@@ -769,7 +784,8 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
     }
 
-    func testClosedBracketLineGrowsLinearly() {
+    func testClosedBracketLineGrowsLinearly() throws {
+        try skipWallClockGrowthOnTheSimulator()
         let count = 2_000_000
         let smaller = String(repeating: "[a", count: count) + "]"
         let larger = String(repeating: "[a", count: count * 2) + "]"
@@ -778,6 +794,42 @@ final class ExternalFormatReaderTests: XCTestCase {
         }
         print("reader-timing bracket-closed-growth \(once) \(twice) \(twice / once)")
         XCTAssertLessThanOrEqual(twice, once * 3)
+    }
+
+    /// simulator wall-clock time varied about 6x on identical input in run 40128432168
+    private func skipWallClockGrowthOnTheSimulator() throws {
+        #if targetEnvironment(simulator)
+        throw XCTSkip("simulator wall-clock time varied about 6x on identical input in run 40128432168")
+        #endif
+    }
+
+    /// Work counted inside the scan at N and 2N. The same 3x limit on every platform.
+    func testScanWorkGrowsLinearly() {
+        let count = 100_000
+        let samples: [(String, (Int) -> String)] = [
+            ("mention", { String(repeating: "@a(", count: $0) }),
+            ("mention-closed", { String(repeating: "@a(", count: $0) + ")" }),
+            ("bracket-closed", { String(repeating: "[a", count: $0) + "]" }),
+            ("wiki", { String(repeating: "[[#", count: $0) + "]]" }),
+            ("bracket", { String(repeating: "[", count: $0) }),
+        ]
+        var measured: [(String, Int, Int)] = []
+        for (name, make) in samples {
+            let once = scanWork(make(count))
+            let twice = scanWork(make(count * 2))
+            print("reader-work \(name) \(once) \(twice) \(Double(twice) / Double(once))")
+            measured.append((name, once, twice))
+        }
+        for (name, once, twice) in measured {
+            XCTAssertGreaterThan(once, 0, name)
+            XCTAssertLessThanOrEqual(twice, once * 3, name)
+        }
+    }
+
+    private func scanWork(_ text: String) -> Int {
+        ExternalFormatScanWork.count = 0
+        _ = ExternalFormatReader.read(text, in: .project)
+        return ExternalFormatScanWork.count
     }
 
     /// One unmeasured read, then the fastest of three measured reads at each size.

@@ -345,6 +345,17 @@ private struct InlineMarks {
     var flaggedTokens: [String] = []
 }
 
+/// Bytes the scan reads, plus each step of a closer search.
+fileprivate var externalFormatScanWork = 0
+
+/// Test hook for `externalFormatScanWork`. Not part of the public interface.
+enum ExternalFormatScanWork {
+    static var count: Int {
+        get { externalFormatScanWork }
+        set { externalFormatScanWork = newValue }
+    }
+}
+
 /// Times recorded while reading one large note. Small notes leave this at zero.
 private struct ScanCost {
     var prepare: TimeInterval = 0
@@ -712,6 +723,7 @@ extension ExternalFormatReader {
         var markdown = CloserSearch()
         var mentionParen = CloserSearch()
         while index < chars.count {
+            externalFormatScanWork += 1
             if chars[index] == "[", index + 1 < chars.count, chars[index + 1] == "[" {
                 switch readWiki(chars, at: index, search: &wiki) {
                 case .found((let link, let range)):
@@ -800,6 +812,7 @@ extension ExternalFormatReader {
         var markdown = CloserSearch()
         var mentionParen = CloserSearch()
         while index < bytes.count {
+            externalFormatScanWork += 1
             if bytes[index] == 91, index + 1 < bytes.count, bytes[index + 1] == 91 {
                 switch readWikiASCII(bytes, at: index, search: &wiki) {
                 case .found((let link, let range)):
@@ -898,6 +911,7 @@ extension ExternalFormatReader {
         var index = start + 2
         var inner: [UInt8] = []
         while index + 1 < bytes.count {
+            externalFormatScanWork += 1
             if bytes[index] == 93, bytes[index + 1] == 93 {
                 search.read = index + 2
                 search.closer = index
@@ -933,6 +947,7 @@ extension ExternalFormatReader {
         var index = start + 1
         var shown: [UInt8] = []
         while index < bytes.count, bytes[index] != 93 {
+            externalFormatScanWork += 1
             shown.append(bytes[index])
             index += 1
         }
@@ -954,6 +969,7 @@ extension ExternalFormatReader {
         index += 1
         var address: [UInt8] = []
         while index < bytes.count, bytes[index] != 41 {
+            externalFormatScanWork += 1
             address.append(bytes[index])
             index += 1
         }
@@ -1008,6 +1024,7 @@ extension ExternalFormatReader {
     fileprivate static func readTagGroupASCII(_ bytes: [UInt8], from index: inout Int) -> String? {
         let start = index
         while index < bytes.count, isNameByte(bytes[index]) {
+            externalFormatScanWork += 1
             index += 1
         }
         guard index > start else { return nil }
@@ -1032,6 +1049,7 @@ extension ExternalFormatReader {
         var cursor = open + 1
         let valueStart = cursor
         while cursor < bytes.count {
+            externalFormatScanWork += 1
             if bytes[cursor] == 41 {
                 paren.read = cursor + 1
                 paren.closer = cursor
@@ -1139,6 +1157,7 @@ extension ExternalFormatReader {
         var index = start + 2
         var inner: [Character] = []
         while index + 1 < chars.count {
+            externalFormatScanWork += 1
             if chars[index] == "]", chars[index + 1] == "]" {
                 search.read = index + 2
                 search.closer = index
@@ -1185,6 +1204,7 @@ extension ExternalFormatReader {
         var index = start + 1
         var shown: [Character] = []
         while index < chars.count, chars[index] != "]" {
+            externalFormatScanWork += 1
             shown.append(chars[index])
             index += 1
         }
@@ -1206,6 +1226,7 @@ extension ExternalFormatReader {
         index += 1
         var address: [Character] = []
         while index < chars.count, chars[index] != ")" {
+            externalFormatScanWork += 1
             address.append(chars[index])
             index += 1
         }
@@ -1258,6 +1279,7 @@ extension ExternalFormatReader {
     fileprivate static func readTagGroup(_ chars: [Character], from index: inout Int) -> String? {
         let start = index
         while index < chars.count, isTagChar(chars[index]) {
+            externalFormatScanWork += 1
             index += 1
         }
         guard index > start else { return nil }
@@ -1284,6 +1306,7 @@ extension ExternalFormatReader {
         var cursor = open + 1
         let valueStart = cursor
         while cursor < chars.count {
+            externalFormatScanWork += 1
             if chars[cursor] == ")" {
                 paren.read = cursor + 1
                 paren.closer = cursor

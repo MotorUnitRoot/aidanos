@@ -54,14 +54,21 @@ public enum ExternalFormatReader {
     /// typed date is upcoming. An open task with no typed date takes the day note's
     /// date: a past day is overdue, and today or a later day is upcoming.
     /// Checklist items are left out of both. A dateless task in a project note is unlisted.
-    /// An open `>today` line has no typed date. In a day note it follows the note's day:
-    /// overdue when that day is past, and upcoming when that day is today or later.
+    /// An open `>today` line has no typed date. It is not placed from the note's day
+    /// or from a day passed in. Its reference is the real current day.
     public static func placement(
         of line: ExternalLine,
         on sessionDay: ExternalDate,
         in context: ExternalNoteContext
     ) -> ExternalListPlacement {
         if line.leftOutOfOverdue {
+            return .unlisted
+        }
+        if line.scheduleDates.count > 1 {
+            // AidanOS choice, pending case 122
+            return .unlisted
+        }
+        if line.carriesToday, line.scheduleDates.isEmpty {
             return .unlisted
         }
         if line.kind == .scheduledTask, case .day(let noteDay) = context, noteDay < sessionDay {
@@ -74,16 +81,12 @@ public enum ExternalFormatReader {
         }
         let eligible = line.countsAsOpen || line.kind == .scheduledTask
         if eligible, let date = line.scheduleDates.first {
-            if line.kind == .scheduledTask, case .project = context, date < sessionDay {
-                // AidanOS choice, pending section 8B.1
-                return .unlisted
-            }
             if date < sessionDay {
                 return .overdue
             }
             return .upcoming
         }
-        if line.countsAsOpen, case .day(let noteDay) = context {
+        if line.countsAsOpen, !line.carriesToday, case .day(let noteDay) = context {
             if noteDay < sessionDay {
                 return .overdue
             }
@@ -91,6 +94,46 @@ public enum ExternalFormatReader {
             return .upcoming
         }
         return .unlisted
+    }
+
+    /// How a dated task in a project note is listed. The calendar keeps it open and dated.
+    /// The notes list shows it only as scheduled. A past date stays overdue.
+    public static func viewListing(
+        of line: ExternalLine,
+        on sessionDay: ExternalDate,
+        in context: ExternalNoteContext
+    ) -> ExternalViewListing {
+        if line.scheduleDates.count > 1 {
+            // AidanOS choice, pending case 122
+            return ExternalViewListing(calendar: .unlisted, notes: .unlisted, staysInOverdue: false, date: nil)
+        }
+        if case .project = context,
+           line.countsAsOpen || line.kind == .scheduledTask,
+           let date = line.scheduleDates.first {
+            return ExternalViewListing(
+                calendar: .open,
+                notes: .scheduled,
+                staysInOverdue: date < sessionDay,
+                date: date
+            )
+        }
+        let place = placement(of: line, on: sessionDay, in: context)
+        let role: ExternalListRole
+        if place == .unlisted {
+            role = .unlisted
+        } else if line.kind == .scheduledTask {
+            role = .scheduled
+        } else if line.countsAsOpen {
+            role = .open
+        } else {
+            role = .unlisted
+        }
+        return ExternalViewListing(
+            calendar: role,
+            notes: role,
+            staysInOverdue: place == .overdue,
+            date: line.scheduleDates.first
+        )
     }
 }
 
@@ -252,7 +295,7 @@ public struct ExternalLine: Equatable, Sendable {
     public var scheduleDates: [ExternalDate]
     /// Days named by `<YYYY-MM-DD`. They mark where a copy came from. They are not a schedule.
     public var broughtFromDays: [ExternalDate]
-    /// `>today` is on the line and the line is not done, so the reference follows the passed day.
+    /// `>today` is on the line and the line is not done, so the reference is the real current day.
     public var carriesToday: Bool
     public var referencedDays: [ExternalDate]
     public var timeBlock: ExternalTimeBlock?
@@ -315,6 +358,31 @@ public enum ExternalListPlacement: Equatable, Sendable {
     case overdue
     case upcoming
     case unlisted
+}
+
+public enum ExternalListRole: Equatable, Sendable {
+    case open
+    case scheduled
+    case unlisted
+}
+
+public struct ExternalViewListing: Equatable, Sendable {
+    public var calendar: ExternalListRole
+    public var notes: ExternalListRole
+    public var staysInOverdue: Bool
+    public var date: ExternalDate?
+
+    public init(
+        calendar: ExternalListRole,
+        notes: ExternalListRole,
+        staysInOverdue: Bool,
+        date: ExternalDate?
+    ) {
+        self.calendar = calendar
+        self.notes = notes
+        self.staysInOverdue = staysInOverdue
+        self.date = date
+    }
 }
 
 private enum BoxState {
@@ -622,7 +690,12 @@ extension ExternalFormatReader {
         case .day(let contextDay):
             day = contextDay
         case .project:
-            day = marks.scheduleDates.first
+            if marks.scheduleDates.count == 1 {
+                day = marks.scheduleDates.first
+            } else {
+                // AidanOS choice, pending case 122
+                day = nil
+            }
         }
         guard let day else { return nil }
         return ExternalTimeBlock(

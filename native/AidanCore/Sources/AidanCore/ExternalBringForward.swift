@@ -1,7 +1,9 @@
 /// How an unfinished task moves to another day, and what a new day receives.
 ///
-/// Today's date is always an argument. Nothing here reads a clock or writes a file.
+/// `>today` follows the real current day from a clock. Tests can pass another clock.
+/// Nothing here writes a file.
 /// The three ways to move a task are one setting, and the caller passes it.
+import Foundation
 public enum ExternalBringForwardMode: Equatable, Sendable {
     /// The original line stays, marked scheduled, and an open copy is added on the target day.
     case scheduleByCopy
@@ -43,13 +45,47 @@ public struct ExternalOpenedDay: Equatable, Sendable {
 }
 
 public struct ExternalWeeklyReading: Equatable, Sendable {
-    /// The days this weekly note covers. The caller passes them.
+    /// The days this weekly note covers, from the week-start setting.
     public var days: [ExternalDate]
     public var lines: [ExternalLine]
 
     public init(days: [ExternalDate], lines: [ExternalLine]) {
         self.days = days
         self.lines = lines
+    }
+}
+
+/// The day `>today` follows. The product clock is the real current day.
+public protocol ExternalDayClock: Sendable {
+    var today: ExternalDate { get }
+}
+
+public struct ExternalSystemDayClock: ExternalDayClock {
+    public init() {}
+
+    public var today: ExternalDate {
+        let parts = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        return ExternalDate(year: parts.year ?? 1, month: parts.month ?? 1, day: parts.day ?? 1)
+    }
+}
+
+/// Sunday is 0, through Saturday at 6.
+public enum ExternalWeekday: Int, Equatable, Sendable {
+    case sunday = 0
+    case monday = 1
+    case tuesday = 2
+    case wednesday = 3
+    case thursday = 4
+    case friday = 5
+    case saturday = 6
+}
+
+/// Which day begins a week. The default is Monday.
+public struct ExternalWeekStart: Equatable, Sendable {
+    public var firstDay: ExternalWeekday
+
+    public init(firstDay: ExternalWeekday = .monday) {
+        self.firstDay = firstDay
     }
 }
 
@@ -66,6 +102,10 @@ extension ExternalFormatReader {
         guard parsedNote.lines.count == 1 else { return .unsettled }
         let parsed = parsedNote.lines[0]
         if parsed.indentTabs > 0 {
+            if !parsed.kind.isTask {
+                // AidanOS choice, pending case 112
+                return .unsettled
+            }
             // AidanOS choice, pending case 54
             return .unsettled
         }
@@ -106,31 +146,49 @@ extension ExternalFormatReader {
         return ExternalOpenedDay(text: template ?? "", broughtLines: [])
     }
 
-    /// An open task in a weekly note is listed on each day the caller says that week covers.
-    public static func readWeekly(_ text: String, covering days: [ExternalDate]) -> ExternalWeeklyReading {
+    /// Every item in a weekly note is listed on each day of the week that contains `day`.
+    /// The week's first day comes from `weekStart`, which defaults to Monday.
+    public static func readWeekly(
+        _ text: String,
+        containing day: ExternalDate,
+        weekStart: ExternalWeekStart = ExternalWeekStart()
+    ) -> ExternalWeeklyReading {
         // AidanOS choice, pending section 4.4: a weekly note is read like a project note for clocks,
         // so a clock with no typed date does not become a time block.
         let note = read(text, in: .project)
+        let covered = daysOfWeek(containing: day, starting: weekStart)
         var lines = note.lines
-        var covered: [ExternalDate] = []
-        for day in days where !covered.contains(day) {
-            covered.append(day)
-        }
         for index in lines.indices {
-            // AidanOS choice, pending section 3.8: the worked line is an open task.
-            // Other kinds are not given the week's days.
-            guard lines[index].kind == .openTask else { continue }
-            for day in covered where !lines[index].referencedDays.contains(day) {
-                lines[index].referencedDays.append(day)
+            let kind = lines[index].kind
+            guard kind != .empty, kind != .unsettled else { continue }
+            // AidanOS choice, pending case 120: done tasks and bullets are shown too.
+            for weekDay in covered where !lines[index].referencedDays.contains(weekDay) {
+                lines[index].referencedDays.append(weekDay)
             }
         }
         return ExternalWeeklyReading(days: covered, lines: lines)
     }
 
-    /// A fixed reference day, or the passed day when the line carries `>today` and is not done.
-    public static func references(_ line: ExternalLine, on day: ExternalDate, today: ExternalDate) -> Bool {
+    /// Seven days beginning on the setting's first day, containing `day`.
+    public static func daysOfWeek(containing day: ExternalDate, starting start: ExternalWeekStart = ExternalWeekStart()) -> [ExternalDate] {
+        let weekday = weekdayIndex(day)
+        let first = start.firstDay.rawValue
+        var back = weekday - first
+        if back < 0 {
+            back += 7
+        }
+        let startDay = day.adding(days: -back)
+        return (0..<7).map { startDay.adding(days: $0) }
+    }
+
+    /// A fixed reference day, or the real current day when the line carries `>today` and is not done.
+    public static func references(
+        _ line: ExternalLine,
+        on day: ExternalDate,
+        clock: any ExternalDayClock = ExternalSystemDayClock()
+    ) -> Bool {
         if line.referencedDays.contains(day) { return true }
-        return line.carriesToday && day == today
+        return line.carriesToday && day == clock.today
     }
 
     /// True when the day has a task that places as overdue. A checklist does not count.
@@ -175,7 +233,10 @@ extension ExternalFormatReader {
                 guard line.kind == .scheduledTask else { continue }
                 // AidanOS choice, pending case 53: the same remaining text is treated as one task.
                 guard matchingBody(raw[offset]) == body else { continue }
-                // AidanOS choice, pending section 7.9: the first typed date is the link.
+                if line.scheduleDates.count > 1 {
+                    // AidanOS choice, pending case 122
+                    return nil
+                }
                 guard let target = line.scheduleDates.first else { continue }
                 let link = Link(from: source.day, to: target)
                 guard seen.insert(link).inserted else { continue }
@@ -217,14 +278,19 @@ extension ExternalFormatReader {
             return .skipped
         }
         guard parsed.kind == .openTask else { return .unsettled }
-        // AidanOS choice, pending section 7.4: the copy names the day it came from,
-        // and a project note has no day of its own to write there.
+        // AidanOS choice, pending case 117: what a copy from a project note writes is not settled.
         guard case .day(let origin) = context else { return .unsettled }
-        // Case 53 and case 75 are not settled. A today tag on a copied line is not settled either.
-        // A sync id, an @remind, and an @done stamp on a copied line are not settled.
+        if !parsed.broughtFromDays.isEmpty {
+            // AidanOS choice, pending case 53
+            return .unsettled
+        }
+        if !parsed.scheduleDates.isEmpty || hasSyncId(line) {
+            // AidanOS choice, pending case 75
+            return .unsettled
+        }
+        // A today tag, an @remind, and an @done stamp on a copied line are not settled.
         // AidanOS choice, pending section 8A.2.
-        if !parsed.scheduleDates.isEmpty || !parsed.broughtFromDays.isEmpty || parsed.carriesToday
-            || hasSyncId(line) || hasMention(parsed, named: "remind") || hasMention(parsed, named: "done") {
+        if parsed.carriesToday || hasMention(parsed, named: "remind") || hasMention(parsed, named: "done") {
             return .unsettled
         }
         guard let rewritten = scheduledAndOpenCopy(line) else { return .unsettled }
@@ -273,27 +339,21 @@ extension ExternalFormatReader {
         line.mentions.contains { $0.name == name }
     }
 
-    /// A caret followed by letters or digits, as in `^zz1abc`.
+    /// A caret and a run of letters or digits at the end of the line.
+    /// AidanOS choice, pending case 113: the run is not required to be six characters.
     fileprivate static func hasSyncId(_ line: String) -> Bool {
         let chars = Array(line)
-        var index = 0
-        while index < chars.count {
-            if chars[index] == "^" {
-                let boundary = index == 0 || chars[index - 1] == " " || chars[index - 1] == "\t"
-                if boundary {
-                    var end = index + 1
-                    while end < chars.count, isSyncChar(chars[end]) {
-                        end += 1
-                    }
-                    let closed = end == chars.count || chars[end] == " " || chars[end] == "\t"
-                    if end > index + 1, closed {
-                        return true
-                    }
-                }
-            }
-            index += 1
+        var end = chars.count
+        while end > 0, chars[end - 1] == " " || chars[end - 1] == "\t" {
+            end -= 1
         }
-        return false
+        var start = end
+        while start > 0, isSyncChar(chars[start - 1]) {
+            start -= 1
+        }
+        guard end > start, start > 0, chars[start - 1] == "^" else { return false }
+        let caret = start - 1
+        return caret == 0 || chars[caret - 1] == " " || chars[caret - 1] == "\t"
     }
 
     fileprivate static func isSyncChar(_ char: Character) -> Bool {
@@ -449,5 +509,47 @@ extension ExternalFormatReader {
             result.append(char)
         }
         return String(result)
+    }
+
+    fileprivate static func weekdayIndex(_ day: ExternalDate) -> Int {
+        let days = ExternalBringForwardDateMath.civilDays(day)
+        let weekday = (days + 4) % 7
+        return weekday >= 0 ? weekday : weekday + 7
+    }
+}
+
+extension ExternalDate {
+    fileprivate func adding(days: Int) -> ExternalDate {
+        ExternalDate.fromCivilDays(ExternalBringForwardDateMath.civilDays(self) + days)
+    }
+}
+
+fileprivate enum ExternalBringForwardDateMath {
+    static func civilDays(_ date: ExternalDate) -> Int {
+        var year = date.year
+        let month = date.month
+        let day = date.day
+        year -= month <= 2 ? 1 : 0
+        let era = (year >= 0 ? year : year - 399) / 400
+        let yearOfEra = year - era * 400
+        let dayOfYear = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1
+        let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+        return era * 146097 + dayOfEra - 719468
+    }
+}
+
+extension ExternalDate {
+    fileprivate static func fromCivilDays(_ days: Int) -> ExternalDate {
+        let shifted = days + 719468
+        let era = (shifted >= 0 ? shifted : shifted - 146096) / 146097
+        let dayOfEra = shifted - era * 146097
+        let yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365
+        var year = yearOfEra + era * 400
+        let dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
+        let monthPrime = (5 * dayOfYear + 2) / 153
+        let day = dayOfYear - (153 * monthPrime + 2) / 5 + 1
+        let month = monthPrime + (monthPrime < 10 ? 3 : -9)
+        year += month <= 2 ? 1 : 0
+        return ExternalDate(year: year, month: month, day: day)
     }
 }

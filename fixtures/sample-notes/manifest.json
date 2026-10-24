@@ -1,0 +1,33 @@
+{
+  "format": "aidanos",
+  "cases": [
+    { "id": "day-2023-11-04", "path": "log/2023-11-04.md", "kind": "day" },
+    { "id": "day-2024-02-14", "path": "log/2024-02-14.md", "kind": "day" },
+    { "id": "day-2024-05-30", "path": "log/2024-05-30.md", "kind": "day" },
+    { "id": "day-2024-09-08", "path": "log/2024-09-08.md", "kind": "day" },
+    { "id": "day-2024-12-21", "path": "log/2024-12-21.md", "kind": "day" },
+    { "id": "day-2025-03-02", "path": "log/2025-03-02.md", "kind": "day" },
+    { "id": "day-2025-06-17", "path": "log/2025-06-17.md", "kind": "day" },
+    { "id": "day-2025-09-11", "path": "log/2025-09-11.md", "kind": "day" },
+    { "id": "day-2025-12-28", "path": "log/2025-12-28.md", "kind": "day" },
+    { "id": "day-2026-01-06", "path": "log/2026-01-06.md", "kind": "day" },
+    { "id": "day-2026-03-09", "path": "log/2026-03-09.md", "kind": "day" },
+    { "id": "day-2026-03-14", "path": "log/2026-03-14.md", "kind": "day" },
+    { "id": "day-2026-03-15", "path": "log/2026-03-15.md", "kind": "day" },
+    { "id": "day-2026-03-16", "path": "log/2026-03-16.md", "kind": "day" },
+    { "id": "day-2026-06-02", "path": "log/2026-06-02.md", "kind": "day" },
+    { "id": "day-2026-10-24", "path": "log/2026-10-24.md", "kind": "day" },
+    { "id": "project-glass-orchard", "path": "projects/glass-orchard.md", "kind": "project" },
+    { "id": "project-harbor-ledger", "path": "projects/harbor-ledger.md", "kind": "project" },
+    { "id": "plan-season", "path": "aidanos/active-horse.md", "kind": "plan" },
+    { "id": "capture", "path": "Capture.md", "kind": "capture" },
+    { "id": "week-2026-03-09", "path": "aidanos/weeks/2026-03-09.md", "kind": "week" },
+    { "id": "map-pack-a-crate", "path": "maps/pack-a-crate.md", "kind": "map" },
+    { "id": "broken-empty", "path": "broken/empty.md", "kind": "broken-empty" },
+    { "id": "broken-encoding", "path": "broken/wrong-encoding.md", "kind": "broken-encoding" },
+    { "id": "broken-front-matter", "path": "broken/malformed-front-matter.md", "kind": "broken-front-matter" },
+    { "id": "broken-binary", "path": "broken/binary-junk.md", "kind": "broken-binary" },
+    { "id": "broken-misnamed-day", "path": "log/14-03-2026.md", "kind": "broken-misnamed" },
+    { "id": "broken-impossible-day", "path": "log/2026-02-31.md", "kind": "broken-impossible-day" }
+  ]
+}

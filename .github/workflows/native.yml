@@ -162,3 +162,44 @@ jobs:
             cat "$RUNNER_TEMP/relay-ios.log" || true
           fi
           exit "$status"
+
+  sample-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22"
+      - name: Chrome for the sample screenshots
+        run: |
+          if ! google-chrome-stable --version >/dev/null 2>&1 && ! google-chrome --version >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get update
+            sudo apt-get install -y /tmp/chrome.deb
+          fi
+      - name: Sample notes and screenshots
+        run: node sample-notes-test.mjs && node sample-screens-test.mjs
+      - name: A screenshot run with no pictures is a failure
+        if: always()
+        run: |
+          node --input-type=module <<'EOF'
+          import fs from "node:fs";
+          const reportPath = "fixtures/sample-notes/screenshots/report.json";
+          if (!fs.existsSync(reportPath)) {
+            console.error("FAIL sample screens: no report. A missing run is a failure.");
+            process.exit(1);
+          }
+          const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+          if (report.ok !== true || !Array.isArray(report.shots) || report.shots.length < 1) {
+            console.error("FAIL sample screens: " + JSON.stringify(report));
+            process.exit(1);
+          }
+          for (const name of report.shots) {
+            const abs = "fixtures/sample-notes/screenshots/" + name;
+            if (!fs.existsSync(abs) || fs.statSync(abs).size < 4000) {
+              console.error("FAIL sample screens: missing picture " + name);
+              process.exit(1);
+            }
+          }
+          console.log("sample screens " + report.shots.length);
+          EOF

@@ -71,12 +71,13 @@ public enum ExternalFormatReader {
     /// typed date is upcoming. An open task with no typed date takes the day note's
     /// date: a past day is overdue, and today or a later day is upcoming.
     /// Checklist items are left out of both. A dateless task in a project note is unlisted.
-    /// An open `>today` line has no typed date. It is not placed from the note's day
-    /// or from a day passed in. Its reference is the real current day.
+    /// An open `>today` line has no typed date. It is listed on the clock's today,
+    /// and it is not placed from the note's day.
     public static func placement(
         of line: ExternalLine,
         on sessionDay: ExternalDate,
-        in context: ExternalNoteContext
+        in context: ExternalNoteContext,
+        clock: any ExternalDayClock = ExternalSystemDayClock()
     ) -> ExternalListPlacement {
         if line.leftOutOfOverdue {
             return .unlisted
@@ -86,6 +87,13 @@ public enum ExternalFormatReader {
             return .unlisted
         }
         if line.carriesToday, line.scheduleDates.isEmpty {
+            if line.countsAsOpen, sessionDay == clock.today {
+                return .upcoming
+            }
+            return .unlisted
+        }
+        if line.kind == .scheduledTask, case .project = context {
+            // AidanOS choice, pending section 8B.1
             return .unlisted
         }
         if line.kind == .scheduledTask, case .day(let noteDay) = context, noteDay < sessionDay {
@@ -98,10 +106,6 @@ public enum ExternalFormatReader {
         }
         let eligible = line.countsAsOpen || line.kind == .scheduledTask
         if eligible, let date = line.scheduleDates.first {
-            if line.kind == .scheduledTask, case .project = context, date < sessionDay {
-                // AidanOS choice, pending section 8B.1
-                return .unlisted
-            }
             if date < sessionDay {
                 return .overdue
             }
@@ -122,7 +126,8 @@ public enum ExternalFormatReader {
     public static func viewListing(
         of line: ExternalLine,
         on sessionDay: ExternalDate,
-        in context: ExternalNoteContext
+        in context: ExternalNoteContext,
+        clock: any ExternalDayClock = ExternalSystemDayClock()
     ) -> ExternalViewListing {
         if line.scheduleDates.count > 1 {
             // AidanOS choice, pending case 122
@@ -136,7 +141,7 @@ public enum ExternalFormatReader {
                 date: date
             )
         }
-        let place = placement(of: line, on: sessionDay, in: context)
+        let place = placement(of: line, on: sessionDay, in: context, clock: clock)
         let role: ExternalListRole
         if place == .unlisted {
             role = .unlisted
@@ -333,8 +338,8 @@ public struct ExternalLine: Equatable, Sendable {
         leftOutOfOverdue: Bool,
         completion: ExternalCompletion?,
         scheduleDates: [ExternalDate],
-        broughtFromDays: [ExternalDate],
-        carriesToday: Bool,
+        broughtFromDays: [ExternalDate] = [],
+        carriesToday: Bool = false,
         referencedDays: [ExternalDate],
         timeBlock: ExternalTimeBlock?,
         tags: [ExternalTag],
@@ -409,6 +414,12 @@ private enum BoxState {
     case done
     case cancelled
     case scheduled
+}
+
+enum ExternalLeadingBox: Equatable {
+    case open
+    case closed
+    case none
 }
 
 private struct InlineMarks {
@@ -592,6 +603,17 @@ extension ExternalFormatReader {
         return (nil, content)
     }
 
+    static func leadingBox(_ content: String) -> ExternalLeadingBox {
+        switch takeBox(content).0 {
+        case .open:
+            return .open
+        case .done, .cancelled, .scheduled:
+            return .closed
+        case nil:
+            return .none
+        }
+    }
+
     fileprivate static func taskKind(_ state: BoxState?) -> ExternalLineKind {
         switch state {
         case .done:
@@ -642,7 +664,7 @@ extension ExternalFormatReader {
         let block = (unsettled || closed) ? nil : timeBlock(in: content, marks: marks, kind: resolved, context: context)
         let completion = unsettled ? nil : marks.mentions.first { $0.name == "done" }?.value.flatMap(readCompletion)
         // AidanOS choice, pending section 3.4: the words name a task or a bullet, and they stop at done.
-        // A cancelled line is not done, so the tag still follows the passed day. A checklist is neither.
+        // A cancelled line is not done, so the tag still follows the real current day. A checklist is neither.
         let carriesToday = !unsettled
             && marks.carriesToday
             && resolved != .doneTask
@@ -731,7 +753,8 @@ extension ExternalFormatReader {
             }
         }
         if kind.isTask, case .project = context {
-            for date in marks.scheduleDates where !days.contains(date) {
+            // AidanOS choice, pending case 122: two or more schedule dates add no reference days.
+            if marks.scheduleDates.count == 1, let date = marks.scheduleDates.first, !days.contains(date) {
                 days.append(date)
             }
         }

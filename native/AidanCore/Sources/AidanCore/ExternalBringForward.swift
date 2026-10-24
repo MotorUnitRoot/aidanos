@@ -64,7 +64,9 @@ public struct ExternalSystemDayClock: ExternalDayClock {
     public init() {}
 
     public var today: ExternalDate {
-        let parts = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let parts = calendar.dateComponents([.year, .month, .day], from: Date())
         return ExternalDate(year: parts.year ?? 1, month: parts.month ?? 1, day: parts.day ?? 1)
     }
 }
@@ -100,7 +102,39 @@ extension ExternalFormatReader {
         guard parts.count == 1 else { return .unsettled }
         let parsedNote = read(parts[0], in: context)
         guard parsedNote.lines.count == 1 else { return .unsettled }
-        let parsed = parsedNote.lines[0]
+        return bringForward(line: parts[0], parsed: parsedNote.lines[0], in: context, to: target, mode: mode)
+    }
+
+    public static func bringForward(
+        lines: [String],
+        in context: ExternalNoteContext,
+        to target: ExternalDate,
+        mode: ExternalBringForwardMode
+    ) -> [ExternalBringForwardResult] {
+        let note = read(lines.joined(separator: "\n"), in: context)
+        guard note.lines.count == lines.count else {
+            return Array(repeating: .unsettled, count: lines.count)
+        }
+        return lines.indices.map { index in
+            bringForward(line: lines[index], parsed: note.lines[index], in: context, to: target, mode: mode)
+        }
+    }
+
+    fileprivate static func bringForward(
+        line: String,
+        parsed: ExternalLine,
+        in context: ExternalNoteContext,
+        to target: ExternalDate,
+        mode: ExternalBringForwardMode
+    ) -> ExternalBringForwardResult {
+        if parsed.kind == .unsettled {
+            // AidanOS choice, pending case 92 and 93
+            return .unsettled
+        }
+        if parsed.kind.isTask, !parsed.childIndexes.isEmpty {
+            // AidanOS choice, pending case 54
+            return .unsettled
+        }
         if parsed.indentTabs > 0 {
             if !parsed.kind.isTask {
                 // AidanOS choice, pending case 112
@@ -115,25 +149,17 @@ extension ExternalFormatReader {
         }
         switch mode {
         case .scheduleByCopy:
-            return scheduleByCopy(parts[0], parsed: parsed, in: context, to: target)
+            return scheduleByCopy(line, parsed: parsed, in: context, to: target)
         case .scheduleByLink:
-            return scheduleByLink(parts[0], parsed: parsed, in: context, to: target)
+            return scheduleByLink(line, parsed: parsed, in: context, to: target)
         case .cutAndPaste:
-            return cutAndPaste(parts[0], parsed: parsed)
+            return cutAndPaste(line, parsed: parsed)
         }
-    }
-
-    public static func bringForward(
-        lines: [String],
-        in context: ExternalNoteContext,
-        to target: ExternalDate,
-        mode: ExternalBringForwardMode
-    ) -> [ExternalBringForwardResult] {
-        lines.map { bringForward(line: $0, in: context, to: target, mode: mode) }
     }
 
     /// The first time a day note is created, the caller's template is the whole note.
     /// A note that already has text is left as it is. Earlier notes are not copied in.
+    /// `earlierNotes` and `today` stay in the signature until a later rule copies notes in.
     public static func openDay(
         existingText: String?,
         template: String?,
@@ -161,7 +187,7 @@ extension ExternalFormatReader {
         for index in lines.indices {
             let kind = lines[index].kind
             guard kind != .empty, kind != .unsettled else { continue }
-            // AidanOS choice, pending case 120: done tasks and bullets are shown too.
+            // AidanOS choice, pending case 120: all non-empty items are shown.
             for weekDay in covered where !lines[index].referencedDays.contains(weekDay) {
                 lines[index].referencedDays.append(weekDay)
             }
@@ -197,7 +223,8 @@ extension ExternalFormatReader {
     }
 
     /// How many times the task was put off. Each `[>]` line in the chain counts once.
-    /// `<` marks on one copy do not. Nil means the line is a task inside a code block.
+    /// `<` marks on one copy do not. Nil means the line is a task inside a code block,
+    /// or a line in the chain has more than one `>date` (pending case 122).
     public static func moveCount(
         ofLineAt index: Int,
         on day: ExternalDate,
@@ -272,6 +299,10 @@ extension ExternalFormatReader {
         to target: ExternalDate
     ) -> ExternalBringForwardResult {
         if parsed.kind.isHeading {
+            guard case .day = context else {
+                // AidanOS choice, pending case 117
+                return .unsettled
+            }
             return .edited(sourceLine: line, addedLine: line)
         }
         if parsed.kind == .doneTask || parsed.kind == .cancelledTask || parsed.kind == .scheduledTask {
@@ -291,6 +322,10 @@ extension ExternalFormatReader {
         // A today tag, an @remind, and an @done stamp on a copied line are not settled.
         // AidanOS choice, pending section 8A.2.
         if parsed.carriesToday || hasMention(parsed, named: "remind") || hasMention(parsed, named: "done") {
+            return .unsettled
+        }
+        if parsed.timeBlock != nil {
+            // AidanOS choice, pending case 104
             return .unsettled
         }
         guard let rewritten = scheduledAndOpenCopy(line) else { return .unsettled }
@@ -314,6 +349,14 @@ extension ExternalFormatReader {
             return .skipped
         }
         guard parsed.kind == .openTask else { return .unsettled }
+        if hasSyncId(line) {
+            // AidanOS choice, pending case 106
+            return .unsettled
+        }
+        if hasMention(parsed, named: "done") {
+            // AidanOS choice, pending section 8A.2
+            return .unsettled
+        }
         if !parsed.broughtFromDays.isEmpty || parsed.carriesToday {
             return .unsettled
         }
@@ -339,7 +382,8 @@ extension ExternalFormatReader {
         line.mentions.contains { $0.name == name }
     }
 
-    /// A caret and a run of letters or digits at the end of the line.
+    /// A caret and a run of ASCII letters or digits at the end of the line.
+    /// A space before the caret is not required.
     /// AidanOS choice, pending case 113: the run is not required to be six characters.
     fileprivate static func hasSyncId(_ line: String) -> Bool {
         let chars = Array(line)
@@ -352,16 +396,15 @@ extension ExternalFormatReader {
             start -= 1
         }
         guard end > start, start > 0, chars[start - 1] == "^" else { return false }
-        let caret = start - 1
-        return caret == 0 || chars[caret - 1] == " " || chars[caret - 1] == "\t"
+        return true
     }
 
     fileprivate static func isSyncChar(_ char: Character) -> Bool {
-        if char.isLetter { return true }
-        guard let ascii = char.asciiValue, let zero = Character("0").asciiValue, let nine = Character("9").asciiValue else {
-            return false
-        }
-        return ascii >= zero && ascii <= nine
+        guard let ascii = char.asciiValue else { return false }
+        let digit = ascii >= 48 && ascii <= 57
+        let upper = ascii >= 65 && ascii <= 90
+        let lower = ascii >= 97 && ascii <= 122
+        return digit || upper || lower
     }
 
     fileprivate static func cutAndPaste(_ line: String, parsed: ExternalLine) -> ExternalBringForwardResult {
@@ -390,16 +433,16 @@ extension ExternalFormatReader {
         index += 1
         guard index < chars.count, chars[index] == " " else { return nil }
         index += 1
-        if index + 2 < chars.count, chars[index] == "[" {
-            let box = String(chars[index..<(index + 3)])
-            if box == "[ ]" {
-                let scheduled = indent + marker + " [>]" + String(chars[(index + 3)...])
-                return RewrittenTask(scheduled: scheduled, copy: line)
-            }
+        let content = String(chars[index...])
+        switch leadingBox(content) {
+        case .open:
+            let scheduled = indent + marker + " [>]" + String(chars[(index + 3)...])
+            return RewrittenTask(scheduled: scheduled, copy: line)
+        case .closed:
             return nil
+        case .none:
+            return RewrittenTask(scheduled: indent + marker + " [>] " + content, copy: line)
         }
-        let rest = String(chars[index...])
-        return RewrittenTask(scheduled: indent + marker + " [>] " + rest, copy: line)
     }
 
     fileprivate static func appendMark(_ line: String, _ mark: String) -> String {

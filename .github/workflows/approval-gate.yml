@@ -19,10 +19,15 @@ name: approval-gate
 # Do not add set -x. Do not print the key.
 #
 # The lock is on the judge job, not the workflow. A run that skips the
-# job, such as a comment on a plain issue, does not join the group.
-# queue: max keeps pending judge jobs. Every judge run still re-checks
-# every open pull request into main, so a cancelled run is repaired by
-# the next one.
+# job does not join the group. queue: max keeps up to 100 pending judge
+# jobs. Each judge run checks the pull request that started it, plus
+# other open pull requests into main whose latest approval-gate status
+# is still a success written by the gate bot. A created or edited pull
+# request comment skips the job unless its text contains the review
+# marker. Deleted comments still run. Pushes and reviews always run.
+# If the queue is already full and the App's rate allowance is used up,
+# a cancelled run can leave an older green until a later run both starts
+# and can read GitHub.
 
 on:
   pull_request_target:
@@ -53,7 +58,7 @@ jobs:
       github.event_name == 'pull_request_target' ||
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'workflow_run' ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request)
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && (github.event.action == 'deleted' || contains(github.event.comment.body, 'Independent review:') || contains(github.event.comment.body, 'Independent review: BLOCK')))
     runs-on: ubuntu-latest
     environment: approval-gate
     permissions:

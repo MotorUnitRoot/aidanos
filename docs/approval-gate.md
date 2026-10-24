@@ -25,7 +25,13 @@ The old status `independent-review/approved` is not this gate. Do not add it to 
 
 The Dependabot shortcut is not built. It stays off. There is no hardware-key sign-off in this step.
 
-The gate reads the reviews, the comments, and the head again from GitHub just before it writes, and it writes that second result only to the commit it judged. If a new commit landed in between, it writes nothing. Every run of the judge re-checks every open pull request into main, so if one run is cancelled while it is waiting, the next run repairs it. The lock sits on the judge job. A comment on a plain issue skips that job and does not take the lock. If GitHub returns an error after a head commit has been read, the gate writes `pending` with the description `gate error` on that commit and continues with the other pull requests. The error text is not copied into the status. If that fallback write also fails, an older green can stay on the commit. If the gate App's slug is missing, the gate writes that same `gate error` instead of judging.
+The gate reads the reviews, the comments, and the head again from GitHub just before it writes, and it writes that second result only to the commit it judged. If a new commit landed in between, it writes nothing.
+
+Each judge run checks the pull request that started the run. It also checks any other open pull request into main whose latest `approval-gate` status is still success and was written by the gate App's bot. That check is one combined-status read per other pull request. A pending, red, or missing status already blocks, so those pull requests are left alone, and their reviews and comments are not read. The read-only advisory jobs judge only the pull request that started the run. They do not write a status.
+
+If the list of pull requests cannot be read, the run judges only the pull request that started it. If that judgment also fails, and the head commit is already known, the gate writes `pending` with the description `gate error` on that commit. A rate-limit response does the same wherever a head is already known: HTTP 403, HTTP 429, or `x-ratelimit-remaining` of 0. The error text is not copied into the status. That pending status replaces an older green instead of leaving it in place. The run then continues with the other pull requests it can still reach. If that fallback write also fails, an older green can stay on the commit. If the gate App's slug is missing, the gate writes that same `gate error` instead of judging.
+
+The lock sits on the judge job, with `queue: max` (up to 100 pending jobs; [GitHub's concurrency rules](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)). A comment on a plain issue skips that job and does not take the lock. A comment on a pull request also skips the job when it was created or edited and its text contains neither `Independent review:` nor `Independent review: BLOCK`. A deleted comment still runs, because a red status has to stick after the comment is gone. Pushes and reviews always run. If the queue is already full and the App's rate allowance is used up, a run that never starts, or a run that starts and cannot read GitHub, can leave an older green in place until a later run both starts and can read GitHub.
 
 ## What Colby does by hand
 
@@ -93,7 +99,7 @@ Run these on a throwaway pull request after the App and the environment exist. R
 
 ## Manual re-check
 
-From the Actions tab, on `main`, run the workflow named `approval-gate`. The input is a pull request number. The run uses the workflow on `main` and the `approval-gate` environment, and it re-checks every open pull request into main, not only the number you typed. Live test 8 is the check that a run from any other branch is refused.
+From the Actions tab, on `main`, run the workflow named `approval-gate`. The input is a pull request number. The run uses the workflow on `main` and the `approval-gate` environment. It judges that pull request, and any other open pull request into main whose latest `approval-gate` status is still a success written by the gate bot. Live test 8 is the check that a run from any other branch is refused.
 
 A review (approve, request changes, or dismiss) is picked up by a small relay workflow that has no secrets and does not check out code. The judgment still runs from `main`. If a pull request breaks that relay, the gate is simply not re-checked until the next push, comment, or manual run. Breaking the relay cannot turn the gate green.
 

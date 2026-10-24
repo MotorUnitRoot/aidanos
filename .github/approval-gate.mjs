@@ -23,6 +23,12 @@
  * counts. The login is "<app slug>[bot]" from the token step. The bot
  * user id is optional until Colby sets APPROVAL_GATE_BOT_USER_ID.
  *
+ * Each run judges the pull request that started it, plus other open
+ * pull requests into main whose latest approval-gate status is still
+ * success from this App's bot. Pending, red, and missing statuses
+ * already block, so they are not re-judged. A rate-limit error writes
+ * pending "gate error" when that head is already known.
+ *
  * The Dependabot path is phase 2 and is off. There is no hardware-key
  * sign-off.
  *
@@ -34,6 +40,7 @@
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
+  BLOCK_PREFIX,
   attachEditHistory,
   commentKind,
   commentListComplete,
@@ -391,6 +398,8 @@ export async function judgeAndWrite({
   readStatuses = async () => [],
   writeStatus,
   gate = {},
+  knownSha = null,
+  writeErrorWithoutHead = false,
 }) {
   let judgedSha = null;
   try {
@@ -437,10 +446,11 @@ export async function judgeAndWrite({
     });
     return { wrote: true, reason: "wrote", result, judgedSha };
   } catch (error) {
-    if (!advisory && judgedSha && writeStatus) {
+    const fallbackSha = judgedSha || ((writeErrorWithoutHead || isRateLimitError(error)) ? validHeadSha(knownSha) : null);
+    if (!advisory && fallbackSha && writeStatus) {
       try {
         await writeStatus({
-          sha: judgedSha,
+          sha: fallbackSha,
           state: "pending",
           description: "gate error",
           context: STATUS_CONTEXT,
@@ -453,22 +463,157 @@ export async function judgeAndWrite({
   }
 }
 
-export async function judgeOpenPulls({ listPulls, judgeOne }) {
-  const pulls = await listPulls();
-  if (!Array.isArray(pulls)) throw new Error("pull list is not a list");
-  const outcomes = [];
-  const errors = [];
+export function validHeadSha(value) {
+  const sha = String(value || "");
+  if (!/^[0-9a-fA-F]{40}$/.test(sha)) return null;
+  return sha.toLowerCase();
+}
+
+export function headShaOf(pr) {
+  return validHeadSha(pr && pr.head && pr.head.sha);
+}
+
+// The head comes from the event payload GitHub already stored. A comment
+// body is not a commit id, even when it contains one.
+export function headShaFromEvent(eventName, event) {
+  if (eventName === "pull_request" || eventName === "pull_request_target") {
+    return headShaOf(event && event.pull_request);
+  }
+  if (eventName === "workflow_run") {
+    return validHeadSha(event && event.workflow_run && event.workflow_run.head_sha);
+  }
+  return null;
+}
+
+function headerValue(headers, name) {
+  if (!headers) return "";
+  const raw = typeof headers.get === "function" ? headers.get(name) : headers[name];
+  if (raw == null) return "";
+  return String(raw).trim();
+}
+
+// 403 and 429 are the rate-limit statuses. A used-up allowance also
+// reports x-ratelimit-remaining 0, including on another status code.
+export function isRateLimitError(error) {
+  if (!error || typeof error !== "object") return false;
+  const status = Number(error.status);
+  if (status === 403 || status === 429) return true;
+  return headerValue(error.headers, "x-ratelimit-remaining") === "0";
+}
+
+// Combined status is one row per context. The statuses list is newest
+// first, so the first approval-gate row is the latest in either shape.
+export function gateLatestIsSuccess(payload, gate) {
+  const statuses = Array.isArray(payload) ? payload : payload && Array.isArray(payload.statuses) ? payload.statuses : [];
+  for (const status of statuses) {
+    if (!status || status.context !== STATUS_CONTEXT) continue;
+    return status.state === "success" && creatorIsGate(status.creator, gate);
+  }
+  return false;
+}
+
+function openMainPulls(pulls) {
+  const rows = [];
   for (const pr of pulls) {
     if (!pr || pr.state !== "open" || !pr.base || pr.base.ref !== "main") continue;
     const number = Number(pr.number);
     if (!Number.isInteger(number) || number <= 0) continue;
+    rows.push({ number, sha: headShaOf(pr) });
+  }
+  return rows;
+}
+
+export async function judgeRelevantPulls({
+  listPulls,
+  readCombined,
+  judgeOne,
+  writeGateError,
+  triggering = null,
+  triggeringSha = null,
+  advisory = false,
+  gate = {},
+}) {
+  const outcomes = [];
+  const errors = [];
+  const selected = [];
+  const triggerSha = validHeadSha(triggeringSha);
+  const trigger = Number(triggering);
+  const triggerIsNumber = Number.isInteger(trigger) && trigger > 0;
+
+  async function judgeNumber(number, knownSha, writeErrorWithoutHead) {
+    selected.push(number);
     try {
-      outcomes.push({ number, outcome: await judgeOne(number) });
+      outcomes.push({ number, outcome: await judgeOne(number, { knownSha, writeErrorWithoutHead }) });
     } catch (error) {
       errors.push({ number, error });
     }
   }
-  return { outcomes, errors };
+
+  async function protectSha(number, sha, error) {
+    if (sha && writeGateError) {
+      try {
+        await writeGateError(sha);
+      } catch (writeError) {
+        errors.push({ number, error: writeError });
+        return;
+      }
+    }
+    errors.push({ number, error });
+  }
+
+  if (advisory) {
+    if (!triggerIsNumber) return { outcomes, errors, selected, listFailed: false, listError: null };
+    await judgeNumber(trigger, triggerSha, false);
+    return { outcomes, errors, selected, listFailed: false, listError: null };
+  }
+
+  let pulls;
+  try {
+    pulls = await listPulls();
+    if (!Array.isArray(pulls)) throw new Error("pull list is not a list");
+  } catch (error) {
+    if (!triggerIsNumber) {
+      if (triggerSha) await protectSha(null, triggerSha, error);
+      else errors.push({ number: null, error });
+      return { outcomes, errors, selected, listFailed: true, listError: error };
+    }
+    await judgeNumber(trigger, triggerSha, true);
+    return { outcomes, errors, selected, listFailed: true, listError: error };
+  }
+
+  const openMain = openMainPulls(pulls);
+  if (triggerIsNumber) {
+    const listed = openMain.find((item) => item.number === trigger);
+    await judgeNumber(trigger, (listed && listed.sha) || triggerSha, false);
+  }
+
+  let rateLimited = errors.some((item) => isRateLimitError(item.error));
+  for (const item of openMain) {
+    if (triggerIsNumber && item.number === trigger) continue;
+    if (!item.sha) continue;
+    if (rateLimited) {
+      await protectSha(item.number, item.sha, new Error("rate limit"));
+      continue;
+    }
+    let combined;
+    try {
+      combined = await readCombined(item.sha);
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        rateLimited = true;
+        await protectSha(item.number, item.sha, error);
+        continue;
+      }
+      errors.push({ number: item.number, error });
+      continue;
+    }
+    if (!gateLatestIsSuccess(combined, gate)) continue;
+    await judgeNumber(item.number, item.sha, false);
+    const latest = errors[errors.length - 1];
+    if (latest && latest.number === item.number && isRateLimitError(latest.error)) rateLimited = true;
+  }
+
+  return { outcomes, errors, selected, listFailed: false, listError: null };
 }
 
 export function pullNumberFromEvent(eventName, event, envPr) {
@@ -538,7 +683,6 @@ export function runScriptBodies(text) {
 
 const FORBIDDEN_WORKFLOW_SNIPPETS = [
   "github.event.pull_request.head",
-  "github.event.comment.body",
   "github.event.pull_request.title",
   "github.event.pull_request.body",
   "github.event.issue.title",
@@ -546,11 +690,18 @@ const FORBIDDEN_WORKFLOW_SNIPPETS = [
   "github.head_ref",
 ];
 
+// Comment text may appear in a job `if` (GitHub evaluates it, not a shell).
+// It must never appear inside a run script.
+const FORBIDDEN_RUN_SNIPPETS = ["github.event.comment.body"];
+
 export function lintWorkflow(name, text) {
   const errors = [];
   const source = String(text || "");
   for (const script of runScriptBodies(source)) {
     if (script.includes("${{")) errors.push(`${name} interpolates an expression inside run`);
+    for (const snippet of FORBIDDEN_RUN_SNIPPETS) {
+      if (script.includes(snippet)) errors.push(`${name} run script contains ${snippet}`);
+    }
   }
   const uses = source.matchAll(/^\s*uses:\s*['"]?([^'"\s#]+)/gm);
   for (const match of uses) {
@@ -1221,28 +1372,89 @@ export async function selfTest() {
   );
 
   const sha2 = "c".repeat(40);
+  const sharedSha = "d".repeat(40);
+  const pendingSha = "e".repeat(40);
+  const missingSha = "f".repeat(40);
+  const actionsSha = "1".repeat(40);
+  const actionsBot = { login: "github-actions[bot]", id: 41898282, type: "Bot" };
+  const greenStatus = (creator) => ({ context: STATUS_CONTEXT, state: "success", description: "Colby approved", creator });
+  assert(gateLatestIsSuccess({ statuses: [greenStatus(gateCreator)] }, testGate), "a gate-bot success is still green");
+  assert(
+    gateLatestIsSuccess([greenStatus(gateCreator), { context: STATUS_CONTEXT, state: "failure", creator: gateCreator }], testGate),
+    "the newest approval-gate row in a statuses list is the one that counts",
+  );
+  assert(
+    !gateLatestIsSuccess([{ context: STATUS_CONTEXT, state: "failure", description: "Blocked: BLOCK from octocat", creator: gateCreator }], testGate),
+    "a red status is not re-judged",
+  );
+  assert(!gateLatestIsSuccess({ statuses: [greenStatus(appBot)] }, testGate), "a success from the shared App is not the gate bot");
+  assert(!gateLatestIsSuccess({ statuses: [greenStatus(actionsBot)] }, testGate), "a success from the Actions token is not the gate bot");
+  assert(
+    !gateLatestIsSuccess({ statuses: [{ context: STATUS_CONTEXT, state: "pending", description: "gate error", creator: gateCreator }] }, testGate),
+    "a pending status is not re-judged",
+  );
+  assert(!gateLatestIsSuccess({ statuses: [] }, testGate), "a missing status is not re-judged");
+  assert(
+    !gateLatestIsSuccess({ statuses: [greenStatus(gateCreator)] }, { slug: "", botUserId: null }),
+    "an empty slug does not treat a success as the gate bot",
+  );
+
   const sweepWrites = [];
   const sweepSeen = [];
-  const sweep = await judgeOpenPulls({
+  const combinedReads = [];
+  const sweep = await judgeRelevantPulls({
+    triggering: 1,
+    triggeringSha: sha,
+    gate: testGate,
     listPulls: () =>
       listAll(async (page) => {
         if (page === 1) {
           return [
-            { number: 1, state: "open", base: { ref: "main" }, title: "$(rm)" },
-            ...Array.from({ length: 99 }, (_, index) => ({ number: index + 10, state: "closed", base: { ref: "main" } })),
+            { number: 1, state: "open", base: { ref: "main" }, head: { sha }, title: "$(rm)" },
+            ...Array.from({ length: 99 }, (_, index) => ({ number: index + 10, state: "closed", base: { ref: "main" }, head: { sha } })),
           ];
         }
-        if (page === 2) return [{ number: 2, state: "open", base: { ref: "main" } }];
+        if (page === 2) {
+          return [
+            { number: 2, state: "open", base: { ref: "main" }, head: { sha: sha2 } },
+            { number: 3, state: "open", base: { ref: "main" }, head: { sha: other } },
+            { number: 4, state: "open", base: { ref: "main" }, head: { sha: sharedSha } },
+            { number: 5, state: "open", base: { ref: "main" }, head: { sha: pendingSha } },
+            { number: 6, state: "open", base: { ref: "main" }, head: { sha: missingSha } },
+            { number: 7, state: "open", base: { ref: "main" }, head: { sha: actionsSha } },
+            { number: 8, state: "open", base: { ref: "feature" }, head: { sha } },
+          ];
+        }
         return [];
       }),
-    judgeOne: async (number) => {
+    readCombined: async (head) => {
+      combinedReads.push(head);
+      if (head === sha2) return { statuses: [greenStatus(gateCreator)] };
+      if (head === other) {
+        return { statuses: [{ context: STATUS_CONTEXT, state: "failure", description: "Blocked: BLOCK from octocat", creator: gateCreator }] };
+      }
+      if (head === sharedSha) return { statuses: [greenStatus(appBot)] };
+      if (head === pendingSha) return { statuses: [{ context: STATUS_CONTEXT, state: "pending", description: "Waiting", creator: gateCreator }] };
+      if (head === missingSha) return { statuses: [{ context: "tests", state: "success" }] };
+      if (head === actionsSha) return [greenStatus(actionsBot)];
+      throw new Error(`unexpected combined read ${head}`);
+    },
+    writeGateError: async () => {
+      throw new Error("should not write gate error while selecting");
+    },
+    judgeOne: async (number, options) => {
       sweepSeen.push(number);
+      if (number !== 1 && number !== 2) throw new Error(`should not judge ${number}`);
       const head = number === 1 ? sha : sha2;
       return judgeAndWrite({
         prNumber: number,
         gate: testGate,
+        knownSha: options.knownSha,
         readPull: async () => ({ state: "open", base: { ref: "main" }, head: { sha: head } }),
-        readReviews: async () => [review(colby, "APPROVED", head)],
+        readReviews: async () => {
+          if (number !== 1 && number !== 2) throw new Error(`reviews for ${number}`);
+          return [review(colby, "APPROVED", head)];
+        },
         readComments: async () =>
           number === 2 ? [note(`Independent review: BLOCK ${sha2}`, { login: "octocat", id: 9, type: "User" })] : [],
         readStatuses: async () => [],
@@ -1252,23 +1464,27 @@ export async function selfTest() {
       });
     },
   });
-  assert(sweep.errors.length === 0 && sweepSeen.length === 2 && sweepSeen[0] === 1 && sweepSeen[1] === 2, "one run judges every open pull request into main");
+  assert(sweep.errors.length === 0 && sweepSeen.length === 2 && sweepSeen[0] === 1 && sweepSeen[1] === 2, "one run judges the triggering pull request and the still-green one");
+  assert(!combinedReads.includes(sha) && combinedReads.includes(sha2) && combinedReads.includes(other), "the triggering pull request skips the cheap status read");
   assert(
     sweepWrites.some((body) => body.sha === sha && body.state === "success") &&
       sweepWrites.some((body) => body.sha === sha2 && body.state === "failure" && body.description === "Blocked: BLOCK from octocat"),
-    "a BLOCK on another pull request turns that commit red in the same run",
+    "a BLOCK on another still-green pull request turns that commit red in the same run",
   );
 
   const repairWrites = [];
-  const repair = await judgeOpenPulls({
+  const repair = await judgeRelevantPulls({
+    gate: testGate,
     listPulls: async () => [
-      { number: 11, state: "open", base: { ref: "main" } },
-      { number: 12, state: "open", base: { ref: "main" } },
+      { number: 11, state: "open", base: { ref: "main" }, head: { sha } },
+      { number: 12, state: "open", base: { ref: "main" }, head: { sha: sha2 } },
     ],
-    judgeOne: (number) =>
+    readCombined: async () => ({ statuses: [greenStatus(gateCreator)] }),
+    judgeOne: (number, options) =>
       judgeAndWrite({
         prNumber: number,
         gate: testGate,
+        knownSha: options.knownSha,
         readPull: async () => ({ state: "open", base: { ref: "main" }, head: { sha: number === 11 ? sha : sha2 } }),
         readReviews: async () => {
           if (number === 11) throw new Error("reviews failed");
@@ -1287,6 +1503,223 @@ export async function selfTest() {
       repairWrites.some((body) => body.sha === sha2 && body.state === "failure"),
     "the next pull request still gets its own status",
   );
+
+  let fallbackListed = false;
+  let fallbackCombined = false;
+  const fallbackWrites = [];
+  const fallbackJudged = [];
+  const fallback = await judgeRelevantPulls({
+    triggering: 8,
+    triggeringSha: sha,
+    gate: testGate,
+    listPulls: async () => {
+      fallbackListed = true;
+      throw new Error("list failed");
+    },
+    readCombined: async () => {
+      fallbackCombined = true;
+      throw new Error("should not read combined status");
+    },
+    writeGateError: async () => {
+      throw new Error("should not write outside the judgment");
+    },
+    judgeOne: (number, options) => {
+      fallbackJudged.push({ number, knownSha: options.knownSha, writeErrorWithoutHead: options.writeErrorWithoutHead });
+      return judgeAndWrite({
+        prNumber: number,
+        gate: testGate,
+        knownSha: options.knownSha,
+        writeErrorWithoutHead: options.writeErrorWithoutHead,
+        readPull: async () => {
+          throw new Error("pull failed");
+        },
+        readReviews: async () => {
+          throw new Error("should not read reviews");
+        },
+        readComments: async () => [],
+        writeStatus: async (body) => {
+          fallbackWrites.push(body);
+        },
+      });
+    },
+  });
+  assert(fallbackListed && !fallbackCombined && fallback.listFailed === true, "a pull list failure does not read other pull requests");
+  assert(
+    fallbackJudged.length === 1 && fallbackJudged[0].number === 8 && fallbackJudged[0].knownSha === sha && fallbackJudged[0].writeErrorWithoutHead === true,
+    "a pull list failure judges the triggering pull request",
+  );
+  assert(fallback.errors.length === 1 && fallback.errors[0].number === 8 && fallback.outcomes.length === 0, "no other pull request is judged when the list fails");
+  assert(
+    fallbackWrites.length === 1 &&
+      fallbackWrites[0].sha === sha &&
+      fallbackWrites[0].state === "pending" &&
+      fallbackWrites[0].description === "gate error" &&
+      fallbackWrites[0].context === STATUS_CONTEXT,
+    "a pull list failure writes gate error on the known triggering head",
+  );
+
+  const orphanWrites = [];
+  let orphanJudged = false;
+  const orphan = await judgeRelevantPulls({
+    triggering: null,
+    triggeringSha: sha,
+    gate: testGate,
+    listPulls: async () => {
+      throw new Error("list failed");
+    },
+    readCombined: async () => {
+      throw new Error("should not read combined status");
+    },
+    writeGateError: async (head) => {
+      orphanWrites.push(head);
+    },
+    judgeOne: async () => {
+      orphanJudged = true;
+    },
+  });
+  assert(!orphanJudged && orphanWrites.length === 1 && orphanWrites[0] === sha && orphan.errors.length === 1, "a list failure with only a known head still writes gate error");
+
+  function rateError(status, remaining) {
+    const error = new Error(`GET /pulls/12 -> ${status}`);
+    error.status = status;
+    if (typeof remaining === "string") {
+      error.headers = {
+        get(name) {
+          return String(name).toLowerCase() === "x-ratelimit-remaining" ? remaining : null;
+        },
+      };
+    } else if (remaining != null) {
+      error.headers = { "x-ratelimit-remaining": remaining };
+    }
+    return error;
+  }
+  assert(isRateLimitError(rateError(429, "0")) && isRateLimitError(rateError(403, "0")) && isRateLimitError(rateError(500, 0)), "403, 429, and a remaining allowance of 0 are rate limits");
+  assert(!isRateLimitError(rateError(500, "50")) && !isRateLimitError(new Error("pull failed")), "an ordinary API error is not a rate limit");
+
+  const limitCases = [
+    ["a 429 before the head is read", rateError(429, "0")],
+    ["a 403 before the head is read", rateError(403, "0")],
+    ["a used-up allowance before the head is read", rateError(500, "0")],
+  ];
+  for (const [label, error] of limitCases) {
+    const limitWrites = [];
+    let limitError = null;
+    try {
+      await judgeAndWrite({
+        prNumber: 12,
+        gate: testGate,
+        knownSha: sha,
+        readPull: async () => {
+          throw error;
+        },
+        readReviews: async () => {
+          throw new Error("should not read reviews");
+        },
+        readComments: async () => [],
+        writeStatus: async (body) => {
+          limitWrites.push(body);
+        },
+      });
+    } catch (caught) {
+      limitError = caught;
+    }
+    assert(limitError === error, `${label} still fails the run`);
+    assert(
+      limitWrites.length === 1 &&
+        limitWrites[0].sha === sha &&
+        limitWrites[0].state === "pending" &&
+        limitWrites[0].description === "gate error" &&
+        limitWrites[0].context === STATUS_CONTEXT,
+      `${label} writes pending gate error when the head is known`,
+    );
+  }
+
+  const plainWrites = [];
+  let plainError = null;
+  try {
+    await judgeAndWrite({
+      prNumber: 12,
+      gate: testGate,
+      knownSha: sha,
+      readPull: async () => {
+        throw rateError(500, "50");
+      },
+      readReviews: async () => [],
+      readComments: async () => [],
+      writeStatus: async (body) => {
+        plainWrites.push(body);
+      },
+    });
+  } catch (error) {
+    plainError = error;
+  }
+  assert(plainError instanceof Error && plainWrites.length === 0, "a non-rate-limit failure before the head is read writes nothing");
+
+  const protectedWrites = [];
+  const protectedReads = [];
+  const protectedJudged = [];
+  const protectedRun = await judgeRelevantPulls({
+    triggering: 1,
+    triggeringSha: sha,
+    gate: testGate,
+    listPulls: async () => [
+      { number: 1, state: "open", base: { ref: "main" }, head: { sha } },
+      { number: 2, state: "open", base: { ref: "main" }, head: { sha: other } },
+      { number: 3, state: "open", base: { ref: "main" }, head: { sha: sha2 } },
+    ],
+    readCombined: async (head) => {
+      protectedReads.push(head);
+      throw rateError(403, "0");
+    },
+    writeGateError: async (head) => {
+      protectedWrites.push(head);
+    },
+    judgeOne: async (number) => {
+      protectedJudged.push(number);
+      return { wrote: true, reason: "wrote", judgedSha: sha, result: { state: "success", description: "ok" } };
+    },
+  });
+  assert(protectedJudged.length === 1 && protectedJudged[0] === 1, "a rate limit does not spend a full judgment on the other pull requests");
+  assert(protectedReads.length === 1 && protectedReads[0] === other, "a rate limit stops further status reads");
+  assert(
+    protectedWrites.length === 2 && protectedWrites[0] === other && protectedWrites[1] === sha2 && protectedRun.errors.length === 2,
+    "a rate limit writes gate error on each known head",
+  );
+
+  let advisoryListed = false;
+  const advisoryJudged = [];
+  const advisoryRun = await judgeRelevantPulls({
+    advisory: true,
+    triggering: 4,
+    triggeringSha: sha,
+    gate: testGate,
+    listPulls: async () => {
+      advisoryListed = true;
+      return [
+        { number: 4, state: "open", base: { ref: "main" }, head: { sha } },
+        { number: 5, state: "open", base: { ref: "main" }, head: { sha: other } },
+      ];
+    },
+    readCombined: async () => {
+      throw new Error("advisory should not read combined status");
+    },
+    writeGateError: async () => {
+      throw new Error("advisory should not write");
+    },
+    judgeOne: async (number) => {
+      advisoryJudged.push(number);
+      return { wrote: false, reason: "advisory", judgedSha: sha, result: { state: "pending", description: "waiting" } };
+    },
+  });
+  assert(!advisoryListed && advisoryJudged.length === 1 && advisoryJudged[0] === 4 && advisoryRun.selected.length === 1, "advisory mode judges only the triggering pull request");
+
+  assert(headShaFromEvent("pull_request_target", { pull_request: { head: { sha } } }) === sha, "a pull request event carries the head");
+  assert(headShaFromEvent("workflow_run", { workflow_run: { head_sha: sha.toUpperCase() } }) === sha, "a review relay event carries the head");
+  assert(
+    headShaFromEvent("issue_comment", { comment: { body: `Independent review: BLOCK ${sha}` }, issue: { number: 4, pull_request: {} } }) === null,
+    "a comment body is not read as a head sha",
+  );
+  assert(headShaFromEvent("workflow_dispatch", {}) === null, "a manual run has no head sha");
 
   const failedHistory = await prepareComments(
     [note("hello", cursorBot, { id: 9, updated_at: t1, node_id: "BOT" })],
@@ -1403,6 +1836,15 @@ export async function selfTest() {
   const gateJobs = gateYaml.split("\njobs:\n")[1] || "";
   assert(gateJobs.includes("\n    concurrency:\n      group: approval-gate\n      queue: max\n"), "the judge job queues on one group");
   assert(!gateJobs.includes("cancel-in-progress:"), "the judge job does not cancel the running run");
+  assert(gateJobs.includes("github.event_name == 'pull_request_target'"), "a push still runs the judge job");
+  assert(gateJobs.includes("github.event_name == 'workflow_run'"), "a review event still runs the judge job");
+  assert(gateJobs.includes("github.event.action == 'deleted'"), "a deleted comment still runs the judge job");
+  assert(BLOCK_PREFIX === "Independent review: BLOCK", "the BLOCK marker is the parser's marker");
+  assert(gateJobs.includes("contains(github.event.comment.body, 'Independent review:')"), "the job if uses the review marker");
+  assert(gateJobs.includes(`contains(github.event.comment.body, '${BLOCK_PREFIX}')`), "the job if uses the BLOCK marker");
+  for (const script of runScriptBodies(gateYaml)) {
+    assert(!script.includes("github.event.comment.body"), "comment text stays out of the judge shell");
+  }
   assert(gateJobs.includes("\n    name: judge\n"), "the binding job is named judge");
   assert(!gateJobs.includes("name: approval-gate"), "the job name is not the status context");
   assert(STATUS_CONTEXT === "approval-gate", "the status context stays approval-gate");
@@ -1448,6 +1890,7 @@ async function githubRequest({ apiBase, token, pathname, method = "GET", body })
   if (!response.ok) {
     const error = new Error(`${method} ${pathname} -> ${response.status} ${scrubToken(text, token).slice(0, 300)}`);
     error.status = response.status;
+    error.headers = response.headers;
     throw error;
   }
   if (!text) return null;
@@ -1518,14 +1961,28 @@ async function main() {
     console.log(scrubToken(error && error.message ? error.message : error, token));
   }
   const gate = gateFromEnv(process.env);
-  const { outcomes, errors } = await judgeOpenPulls({
+  const triggeringSha = headShaFromEvent(eventName, event);
+  const postStatus = (sha, state, description) =>
+    request(`/repos/${owner}/${repo}/statuses/${encodeURIComponent(sha)}`, {
+      method: "POST",
+      body: { state, description, context: STATUS_CONTEXT },
+    });
+  const { outcomes, errors, listFailed, listError } = await judgeRelevantPulls({
+    advisory,
+    gate,
+    triggering,
+    triggeringSha,
     listPulls: () =>
       listAll((page) => request(`/repos/${owner}/${repo}/pulls?state=open&base=main&per_page=100&page=${page}`)),
-    judgeOne: (pullNumber) =>
+    readCombined: (sha) => request(`/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}/status`),
+    writeGateError: (sha) => postStatus(sha, "pending", "gate error"),
+    judgeOne: (pullNumber, options = {}) =>
       judgeAndWrite({
         prNumber: pullNumber,
         advisory,
         gate,
+        knownSha: options.knownSha || null,
+        writeErrorWithoutHead: Boolean(options.writeErrorWithoutHead),
         readPull: (number) => request(`/repos/${owner}/${repo}/pulls/${number}`),
         readReviews: (number) =>
           listAll((page) => request(`/repos/${owner}/${repo}/pulls/${number}/reviews?per_page=100&page=${page}`)),
@@ -1540,13 +1997,17 @@ async function main() {
           listAll((page) =>
             request(`/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}/statuses?per_page=100&page=${page}`),
           ),
-        writeStatus: ({ sha, state, description, context }) =>
-          request(`/repos/${owner}/${repo}/statuses/${encodeURIComponent(sha)}`, {
-            method: "POST",
-            body: { state, description, context },
-          }),
+        writeStatus: ({ sha, state, description }) => postStatus(sha, state, description),
       }),
   });
+  if (listFailed) {
+    const detail = listError && listError.message ? scrubToken(listError.message, token) : "";
+    console.log(
+      detail
+        ? `Could not read the pull request list (${detail}). Judging the triggering pull request only.`
+        : "Could not read the pull request list. Judging the triggering pull request only.",
+    );
+  }
   if (!outcomes.length && !errors.length) {
     console.log("No open pull request into main.");
     return;
@@ -1556,7 +2017,8 @@ async function main() {
     lines.push(`PR #${item.number}\n${summaryText(item.outcome)}`);
   }
   for (const item of errors) {
-    lines.push(`PR #${item.number}\n${scrubToken(item.error && item.error.message ? item.error.message : item.error, token)}`);
+    const label = item.number ? `PR #${item.number}` : "pull request list";
+    lines.push(`${label}\n${scrubToken(item.error && item.error.message ? item.error.message : item.error, token)}`);
   }
   const summary = lines.join("\n\n");
   console.log(summary);

@@ -21,8 +21,8 @@
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const PASS_PREFIX = "Independent review: PASS";
-const BLOCK_PREFIX = "Independent review: BLOCK";
+export const PASS_PREFIX = "Independent review: PASS";
+export const BLOCK_PREFIX = "Independent review: BLOCK";
 
 // The independent reviewer posts as this GitHub App. Change these together.
 export const REVIEW_APP_LOGIN = "motorunit-aidanos-bots[bot]";

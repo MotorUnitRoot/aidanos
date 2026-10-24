@@ -1214,17 +1214,29 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertTrue(ExternalFormatReader.dayCountsAsOverdue(note, on: sessionDay))
     }
 
-    func testMovedAwayTaskInAProjectNoteStaysOpenInTheCalendarAndOverdue() {
+    func testMovedAwayTaskInAProjectNoteWithAPastDateStaysUnlisted() {
         let line = ExternalFormatReader.read("* [>] Stay in the note >2017-01-10", in: .project).lines[0]
         XCTAssertEqual(line.kind, .scheduledTask)
         XCTAssertFalse(line.countsAsOpen)
         XCTAssertEqual(line.scheduleDates, [date(2017, 1, 10)])
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .unlisted)
+        let listed = ExternalFormatReader.viewListing(of: line, on: sessionDay, in: .project)
+        XCTAssertEqual(listed.calendar, .unlisted)
+        XCTAssertEqual(listed.notes, .unlisted)
+        XCTAssertFalse(listed.staysInOverdue)
+    }
+
+    func testCase123OpenPastProjectTaskIsOpenInTheCalendarAndScheduledInNotes() {
+        let line = ExternalFormatReader.read("* c123 zzrea past project >2017-01-24", in: .project).lines[0]
+        XCTAssertEqual(line.kind, .openTask)
+        XCTAssertTrue(line.countsAsOpen)
+        XCTAssertEqual(line.scheduleDates, [date(2017, 1, 24)])
         XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .overdue)
         let listed = ExternalFormatReader.viewListing(of: line, on: sessionDay, in: .project)
         XCTAssertEqual(listed.calendar, .open)
         XCTAssertEqual(listed.notes, .scheduled)
         XCTAssertTrue(listed.staysInOverdue)
-        XCTAssertEqual(listed.date, date(2017, 1, 10))
+        XCTAssertEqual(listed.date, date(2017, 1, 24))
     }
 
     /// The same unclosed `@a(` input at N and 2N. A quadratic closer scan grows by about 4x.

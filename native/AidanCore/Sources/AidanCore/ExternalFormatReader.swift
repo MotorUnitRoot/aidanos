@@ -106,6 +106,10 @@ public enum ExternalFormatReader {
         }
         let eligible = line.countsAsOpen || line.kind == .scheduledTask
         if eligible, let date = line.scheduleDates.first {
+            if line.kind == .scheduledTask, case .project = context, date < sessionDay {
+                // AidanOS choice, pending section 8B.1
+                return .unlisted
+            }
             if date < sessionDay {
                 return .overdue
             }
@@ -121,7 +125,7 @@ public enum ExternalFormatReader {
         return .unlisted
     }
 
-    /// How a dated task in a project note is listed. The calendar keeps it open and dated.
+    /// How an open dated task in a project note is listed. The calendar keeps it open and dated.
     /// The notes list shows it only as scheduled. A past date stays overdue.
     public static func viewListing(
         of line: ExternalLine,
@@ -132,9 +136,7 @@ public enum ExternalFormatReader {
             // AidanOS choice, pending case 122
             return ExternalViewListing(calendar: .unlisted, notes: .unlisted, staysInOverdue: false, date: nil)
         }
-        if case .project = context,
-           line.countsAsOpen || line.kind == .scheduledTask,
-           let date = line.scheduleDates.first {
+        if case .project = context, line.countsAsOpen, let date = line.scheduleDates.first {
             return ExternalViewListing(
                 calendar: .open,
                 notes: .scheduled,

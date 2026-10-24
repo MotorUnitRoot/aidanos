@@ -30,4 +30,4 @@ A time is `@09:30`, or a date and a time such as `@2026-03-20 16:45`. An `@name`
 
 ## Part two
 
-Line cases for the external format live in `fixtures/part-two-noteplan/`. They are not part of this vault.
+Line cases for the external format live in `fixtures/external-format/`. They are not part of this vault.

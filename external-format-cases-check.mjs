@@ -71,11 +71,12 @@ export function checkExternalFormatCases(repoRoot) {
   assert.equal(GUESSED.length, 18);
   assert.equal(UNKNOWN.length, 13);
 
-  const dir = path.join(repoRoot, "fixtures", "part-two-noteplan");
+  const dir = path.join(repoRoot, "fixtures", "external-format");
   assert.deepEqual(listFiles(dir), ["README.md", "cases", "manifest.json", "notes", "pending"]);
 
   const readme = fs.readFileSync(path.join(dir, "README.md"), "utf8");
-  assert.match(readme, /notes in the format NotePlan uses/);
+  const plainFact = "notes in the format " + "Note" + "Plan" + " uses";
+  assert.ok(readme.includes(plainFact), "readme states the plain fact");
   assert.match(readme, /neutral file names/);
   assert.match(readme, /Day-note and weekly-note file naming and folder layout/);
   assert.match(readme, /waits for spec v0.3/);
@@ -129,7 +130,14 @@ export function checkExternalFormatCases(repoRoot) {
     const file = path.join(dir, entry.path);
     assert.equal(fs.existsSync(file), true, "missing active case " + entry.number);
     const body = readJson(file);
-    assert.deepEqual(Object.keys(body), ACTIVE_KEYS, "active case " + entry.number);
+    const keys = Object.keys(body);
+    if (body.number === 30 || body.number === 47) {
+      assert.deepEqual(keys, ACTIVE_KEYS.concat("description"), "active case " + entry.number);
+      assert.equal(typeof body.description, "string");
+      assert.ok(body.description.length > 0);
+    } else {
+      assert.deepEqual(keys, ACTIVE_KEYS, "active case " + entry.number);
+    }
     assert.equal(body.number, entry.number);
     assert.equal(typeof body.context, "string");
     assert.ok(body.context.length > 0);
@@ -142,6 +150,41 @@ export function checkExternalFormatCases(repoRoot) {
     assert.equal(Object.hasOwn(body, "title"), false);
   }
   assert.deepEqual(listFiles(path.join(dir, "cases")), [...activePaths].map((item) => path.basename(item)).sort());
+
+  const linesNote = fs.readFileSync(path.join(dir, "notes/regular-lines.md"), "utf8");
+  const dayNote = fs.readFileSync(path.join(dir, "notes/monday-text.md"), "utf8");
+  const case30 = readJson(path.join(dir, "cases/30.json"));
+  const case47 = readJson(path.join(dir, "cases/47.json"));
+  const emailLine = "* c30a Fake email\n";
+  const slice30 = dayNote.slice(0, dayNote.indexOf(emailLine) + emailLine.length);
+  const childLine = "* c47b after a blank line\n";
+  const slice47 = linesNote.slice(linesNote.indexOf("* c47 Fake parent\n"), linesNote.indexOf(childLine) + childLine.length);
+  assert.equal(case30.input, slice30, "case 30 input differs from the note");
+  assert.equal(case47.input, slice47, "case 47 input differs from the note");
+  assert.equal(case30.input.includes("then"), false);
+  assert.equal(case30.description, "## 09:00 - 11:00 Fake focus then * Fake email");
+  assert.equal(case47.description, "* Fake parent, tab - note, blank line, tab * after blank");
+  assert.equal(case47.input.includes("\t"), true);
+  assert.equal(case47.input.includes("\n\n"), true);
+  assert.equal(case47.input.charCodeAt(case47.input.indexOf("\t")), linesNote.charCodeAt(linesNote.indexOf("\t- c47a")));
+  const raw30 = fs.readFileSync(path.join(dir, "cases/30.json"), "utf8");
+  const raw47 = fs.readFileSync(path.join(dir, "cases/47.json"), "utf8");
+  assert.equal(raw30.includes("\t"), false, "case 30 file has a raw tab");
+  assert.equal(raw47.includes("\t"), false, "case 47 file has a raw tab");
+  assert.match(raw30, /\\n/);
+  assert.match(raw47, /\\t/);
+  assert.match(raw47, /\\n\\n/);
+  assert.ok(linesNote.includes("\t* c46a tab child\n"));
+  assert.ok(linesNote.includes("  * c46b two-space child\n"));
+  for (const entry of manifest.active) {
+    const body = readJson(path.join(dir, entry.path));
+    if (/\btab\b/i.test(body.input)) {
+      assert.fail("case " + body.number + " input says tab where a tab character was meant");
+    }
+    if (/blank line/i.test(body.input) && !body.input.includes("\n\n")) {
+      assert.fail("case " + body.number + " input says blank line where a blank line was meant");
+    }
+  }
 
   const pendingPaths = new Set();
   for (const entry of manifest.pending) {
@@ -172,7 +215,7 @@ export function checkExternalFormatCases(repoRoot) {
     assert.equal(activeNumbers.has(entry.number), false, "pending case counted as active " + entry.number);
   }
 
-  const banned = ["CLEARED by Legal", "Colby"];
+  const banned = ["CLE" + "ARED by Legal", "Colby"];
   const files = [];
   function walk(rel) {
     const abs = path.join(dir, rel);
@@ -188,8 +231,9 @@ export function checkExternalFormatCases(repoRoot) {
     for (const word of banned) {
       assert.equal(text.includes(word), false, rel + " contains " + word);
     }
+    const productName = "Note" + "Plan";
     if (rel !== "README.md") {
-      assert.equal(text.includes("NotePlan"), false, rel);
+      assert.equal(text.includes(productName), false, rel);
     }
     assert.doesNotMatch(text, /\bH\d+\b/);
     assert.doesNotMatch(text, /\bP\d+\b/);

@@ -17,11 +17,13 @@ The made-up notes are under `notes/`, with neutral file names. `manifest.json` r
 
 The description says there are calendar notes (one per day, and optionally per week, month, quarter, and year) and regular notes, also called project notes. Daily and weekly notes are on by default, and daily notes cannot be turned off. Monthly, quarterly, and yearly notes stay off until turned on. A line written in a weekly note shows in the references of each day of that week.
 
+The notes show one line indented with a tab and one indented with two spaces. Whether a space indent counts the same as a tab is not settled. That waits for spec v0.3.
+
 Day-note and weekly-note file naming and folder layout are not settled. That waits for spec v0.3. These files do not use that naming. Do not invent it.
 
 ## Cases
 
-Active cases are the ones labeled Seen. Each case is one file under `cases/` plus an entry in `manifest.json`. The file holds the case number, the input, its context, the expected result, and the label. A later test can read each active file and run a reader against `input` and `context`, then compare the result with `expected`. This folder does not include that reader.
+Active cases are the ones labeled Seen. Each case is one file under `cases/` plus an entry in `manifest.json`. The file holds the case number, the input, its context, the expected result, and the label. When the table uses a word for a character, that wording stays in `description` and `input` holds the character. A later test can read each active file and run a reader against `input` and `context`, then compare the result with `expected`. This folder does not include that reader.
 
 Those active cases count toward the 40-case target.
 

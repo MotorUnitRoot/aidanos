@@ -1,7 +1,0 @@
-{
-  "number": 30,
-  "context": "Day 2017-01-09",
-  "input": "## 09:00 - 11:00 Fake focus then * Fake email",
-  "expected": "9 to 11 block from the heading",
-  "label": "Seen"
-}

@@ -6,7 +6,7 @@ import { checkExternalFormatCases } from "./external-format-cases-check.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const manifest = JSON.parse(
-  fs.readFileSync(path.join(root, "fixtures", "part-two-noteplan", "manifest.json"), "utf8"),
+  fs.readFileSync(path.join(root, "fixtures", "external-format", "manifest.json"), "utf8"),
 );
 
 test("active external-format cases are listed and present", () => {

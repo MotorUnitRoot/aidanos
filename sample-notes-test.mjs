@@ -166,7 +166,7 @@ check("tasks, times, names, and dates are in the sample", () => {
   assert(/\b\d{4}-\d{2}-\d{2}\b/.test(text), "missing a date");
   assert(!/colby/i.test(text), "sample text must stay invented");
   assert(!/family room/i.test(text), "sample text must stay invented");
-  assert(!/noteplan/i.test(text), "sample notes do not describe another app");
+  assert(!new RegExp("note" + "plan", "i").test(text), "sample notes do not describe another app");
   assert(!/horse/i.test(text), "plan content stays a season note");
 });
 

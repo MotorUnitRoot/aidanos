@@ -20,14 +20,17 @@ public enum ExternalFormatReader {
         var inFence = false
         for piece in splitLines(text) {
             if isCodeFence(piece) {
-                // AidanOS choice, pending case 93. An opening fence with no closer stays open for the rest of the note. Lines that are not tasks keep their tags and dates.
+                // An opening fence with no closer stays open for the rest of the note.
                 inFence.toggle()
                 lines.append(readLine(piece, in: context))
                 continue
             }
             var line = readLine(piece, in: context)
-            // AidanOS choice, pending case 49
             if inFence, line.kind.isTask {
+                // AidanOS choice, pending case 49
+                line = leaveOutOfLists(line)
+            } else if inFence, line.kind == .plain || line.kind == .bullet {
+                // AidanOS choice, pending case 93
                 line = leaveOutOfLists(line)
             }
             lines.append(line)

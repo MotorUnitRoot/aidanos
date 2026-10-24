@@ -560,23 +560,29 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(ExternalFormatReader.placement(of: moved, on: sessionDay, in: .project), .upcoming)
     }
 
-    func testTildeFenceKeepsPlainLinesAndBullets() {
+    func testFenceUnsettlesPlainLinesAndBullets() {
         let text = "~~~\n* task #zzcode >2017-01-10\n- bullet #zzhome >2017-01-11\nplain #zzhome\n~~~\n* Outside >2017-01-10\n"
         let note = ExternalFormatReader.read(text, in: .project)
         XCTAssertEqual(note.lines[1].kind, .unsettled)
         XCTAssertTrue(note.lines[1].tags.isEmpty)
         XCTAssertTrue(note.lines[1].scheduleDates.isEmpty)
-        XCTAssertEqual(note.lines[2].kind, .bullet)
-        XCTAssertEqual(note.lines[2].tags, [ExternalTag(name: "zzhome", parent: nil)])
-        XCTAssertEqual(note.lines[2].scheduleDates, [date(2017, 1, 11)])
-        XCTAssertEqual(note.lines[3].kind, .plain)
-        XCTAssertEqual(note.lines[3].tags, [ExternalTag(name: "zzhome", parent: nil)])
+        XCTAssertEqual(note.lines[2].kind, .unsettled)
+        XCTAssertTrue(note.lines[2].tags.isEmpty)
+        XCTAssertTrue(note.lines[2].scheduleDates.isEmpty)
+        XCTAssertTrue(note.lines[2].referencedDays.isEmpty)
+        XCTAssertEqual(ExternalFormatReader.placement(of: note.lines[2], on: sessionDay, in: .project), .unlisted)
+        XCTAssertEqual(note.lines[3].kind, .unsettled)
+        XCTAssertTrue(note.lines[3].tags.isEmpty)
+        XCTAssertEqual(ExternalFormatReader.placement(of: note.lines[3], on: sessionDay, in: .project), .unlisted)
         XCTAssertEqual(note.lines[5].kind, .openTask)
+        XCTAssertEqual(note.lines[5].scheduleDates, [date(2017, 1, 10)])
         XCTAssertEqual(ExternalFormatReader.placement(of: note.lines[5], on: sessionDay, in: .project), .overdue)
-        let open = ExternalFormatReader.read("```\n* inside\n- kept #zzhome\n", in: .project)
+        let open = ExternalFormatReader.read("```\n* inside\n- kept #zzhome >2017-01-11\n", in: .project)
         XCTAssertEqual(open.lines[1].kind, .unsettled)
-        XCTAssertEqual(open.lines[2].kind, .bullet)
-        XCTAssertEqual(open.lines[2].tags, [ExternalTag(name: "zzhome", parent: nil)])
+        XCTAssertEqual(open.lines[2].kind, .unsettled)
+        XCTAssertTrue(open.lines[2].tags.isEmpty)
+        XCTAssertTrue(open.lines[2].scheduleDates.isEmpty)
+        XCTAssertEqual(ExternalFormatReader.placement(of: open.lines[2], on: sessionDay, in: .project), .unlisted)
     }
 
     func testRejectedWikiDoesNotHideALaterLink() {

@@ -1417,6 +1417,9 @@ extension ExternalFormatReader {
     }
 
     fileprivate static func makeWiki(_ inner: String) -> ExternalWikiLink? {
+        // An empty target, or one that starts with `#`, is not a link. Decide that
+        // before trim and the split copies.
+        if wikiTargetIsEmpty(inner) { return nil }
         let trimmed = trim(inner)
         guard !trimmed.isEmpty else { return nil }
         let pipe = trimmed.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
@@ -1427,6 +1430,22 @@ extension ExternalFormatReader {
         guard !target.isEmpty else { return nil }
         let heading = hash.count == 2 ? emptyToNil(trim(hash[1])) : nil
         return ExternalWikiLink(target: target, heading: heading, shownText: shown, day: ExternalDate.parse(target))
+    }
+
+    /// The target is empty, or it starts with `#`. Leading spaces and tabs do not count.
+    /// A leading `|` leaves the target empty, as in `[[|alias]]`.
+    fileprivate static func wikiTargetIsEmpty(_ text: String) -> Bool {
+        let bytes = text.utf8
+        var index = bytes.startIndex
+        while index < bytes.endIndex {
+            let byte = bytes[index]
+            if byte == 32 || byte == 9 {
+                index = bytes.index(after: index)
+                continue
+            }
+            return byte == 35 || byte == 124
+        }
+        return true
     }
 
     fileprivate static func readMarkdown(

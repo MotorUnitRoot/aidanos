@@ -384,6 +384,26 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertNotEqual(real.year, japanese.component(.year, from: instant))
     }
 
+    func testGregorianDayIgnoresABuddhistOrJapaneseCalendar() {
+        let instant = Date()
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = .current
+        var buddhist = Calendar(identifier: .buddhist)
+        buddhist.timeZone = .current
+        buddhist.locale = Locale(identifier: "th_TH")
+        var japanese = Calendar(identifier: .japanese)
+        japanese.timeZone = .current
+        japanese.locale = Locale(identifier: "ja_JP")
+        let expected = gregorian.dateComponents([.year, .month, .day], from: instant)
+        for foreign in [buddhist, japanese] {
+            let day = ExternalSystemDayClock.gregorianDay(of: instant, in: .current, ignoring: foreign)
+            XCTAssertEqual(day.year, expected.year)
+            XCTAssertEqual(day.month, expected.month)
+            XCTAssertEqual(day.day, expected.day)
+            XCTAssertNotEqual(day.year, foreign.component(.year, from: instant))
+        }
+    }
+
     func testCase52ScheduleByCopyWritesBothLines() throws {
         let fixture = try loadFixture(52)
         XCTAssertEqual(fixture.expected, "Jan 9: [>] with >2017-01-10; Jan 10: open copy with <2017-01-09")
@@ -939,6 +959,44 @@ final class ExternalFormatReaderTests: XCTestCase {
         let nested = ExternalFormatReader.read("See [[ #zz [[Note]]", in: .project).lines[0]
         XCTAssertEqual(nested.tags.map(\.name), ["zz"])
         XCTAssertEqual(nested.wikiLinks.map(\.target), ["Note"])
+    }
+
+    /// `[[#heading]]` and an empty target stay rejected. `[[Market List#Dairy]]` stays a link.
+    func testEmptyOrHashedWikiTargetKeepsTheSameReading() {
+        let hashed = ExternalFormatReader.read("[[#heading]]", in: .project).lines[0]
+        XCTAssertEqual(hashed.kind, .plain)
+        XCTAssertTrue(hashed.wikiLinks.isEmpty)
+        XCTAssertTrue(hashed.markdownLinks.isEmpty)
+        XCTAssertEqual(hashed.tags, [ExternalTag(name: "heading", parent: nil)])
+
+        let empty = ExternalFormatReader.read("[[]]", in: .project).lines[0]
+        XCTAssertEqual(empty.kind, .plain)
+        XCTAssertTrue(empty.wikiLinks.isEmpty)
+        XCTAssertTrue(empty.tags.isEmpty)
+        XCTAssertTrue(empty.markdownLinks.isEmpty)
+        XCTAssertTrue(empty.flaggedTokens.isEmpty)
+
+        let alias = ExternalFormatReader.read("[[|alias]]", in: .project).lines[0]
+        XCTAssertEqual(alias.kind, .plain)
+        XCTAssertTrue(alias.wikiLinks.isEmpty)
+        XCTAssertTrue(alias.tags.isEmpty)
+        XCTAssertTrue(alias.markdownLinks.isEmpty)
+        XCTAssertTrue(alias.flaggedTokens.isEmpty)
+
+        let titled = ExternalFormatReader.read("[[Market List#Dairy]]", in: .project).lines[0]
+        XCTAssertEqual(
+            titled.wikiLinks,
+            [ExternalWikiLink(target: "Market List", heading: "Dairy", shownText: nil, day: nil)]
+        )
+        XCTAssertTrue(titled.tags.isEmpty)
+        XCTAssertTrue(titled.markdownLinks.isEmpty)
+
+        for text in ["[[#heading]]", "[[]]", "[[|alias]]", "[[Market List#Dairy]]"] {
+            var work: ExternalFormatScanWork?
+            let characters = ExternalFormatReader.read(text, in: .project, work: &work, route: .characters).lines[0]
+            let bytes = ExternalFormatReader.read(text, in: .project).lines[0]
+            XCTAssertEqual(characters, bytes, text)
+        }
     }
 
     func testLooseHashInsideAMentionKeepsTheValue() {

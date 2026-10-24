@@ -64,9 +64,15 @@ public struct ExternalSystemDayClock: ExternalDayClock {
     public init() {}
 
     public var today: ExternalDate {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = .current
-        let parts = calendar.dateComponents([.year, .month, .day], from: Date())
+        Self.gregorianDay(of: Date(), in: .current, ignoring: Calendar.current)
+    }
+
+    /// The day is Gregorian. `calendar` is ignored, so a Buddhist or Japanese calendar cannot change it.
+    static func gregorianDay(of instant: Date, in timeZone: TimeZone, ignoring calendar: Calendar) -> ExternalDate {
+        _ = calendar
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = timeZone
+        let parts = gregorian.dateComponents([.year, .month, .day], from: instant)
         return ExternalDate(year: parts.year ?? 1, month: parts.month ?? 1, day: parts.day ?? 1)
     }
 }
@@ -92,6 +98,7 @@ public struct ExternalWeekStart: Equatable, Sendable {
 }
 
 extension ExternalFormatReader {
+    /// Callers pass a parent together with its children, and the whole note when a fence is possible.
     public static func bringForward(
         line: String,
         in context: ExternalNoteContext,
@@ -105,6 +112,7 @@ extension ExternalFormatReader {
         return bringForward(line: parts[0], parsed: parsedNote.lines[0], in: context, to: target, mode: mode)
     }
 
+    /// Callers pass a parent together with its children, and the whole note when a fence is possible.
     public static func bringForward(
         lines: [String],
         in context: ExternalNoteContext,

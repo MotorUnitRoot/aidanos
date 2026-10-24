@@ -17,20 +17,22 @@ public enum ExternalFormatReader {
 
     public static func read(_ text: String, in context: ExternalNoteContext) -> ExternalNoteReading {
         var lines: [ExternalLine] = []
-        // marker and the number of marker characters that opened the block.
-        var openFence: (marker: Character, length: Int)?
+        // Marker, length, and whether the opening line is only that marker.
+        var openFence: (marker: Character, length: Int, bare: Bool)?
         for piece in splitLines(text) {
             if let fence = codeFence(piece) {
                 if let open = openFence {
-                    if fence.marker == open.marker, fence.length >= open.length {
+                    if fence.bare, fence.marker == open.marker, fence.length >= open.length {
                         openFence = nil
-                        lines.append(readLine(piece, in: context))
+                        // AidanOS choice, pending case 93
+                        lines.append(leaveOutOfLists(readLine(piece, in: context)))
                         continue
                     }
                 } else {
                     // An opening fence with no closer stays open for the rest of the note.
                     openFence = fence
-                    lines.append(readLine(piece, in: context))
+                    // AidanOS choice, pending case 93
+                    lines.append(leaveOutOfLists(readLine(piece, in: context)))
                     continue
                 }
             }
@@ -537,8 +539,9 @@ extension ExternalFormatReader {
     }
 
     /// A fence is three or more backticks, or three or more tildes. The two
-    /// markers are different. A closer must be the same marker and at least as long.
-    fileprivate static func codeFence(_ line: String) -> (marker: Character, length: Int)? {
+    /// markers are different. Text after the marker can open a block. Only a
+    /// bare marker, at least as long as the opener, closes one.
+    fileprivate static func codeFence(_ line: String) -> (marker: Character, length: Int, bare: Bool)? {
         let (_, body) = indentAndBody(line)
         let chars = Array(body)
         var index = 0
@@ -554,13 +557,15 @@ extension ExternalFormatReader {
         }
         let length = index - start
         guard length >= 3 else { return nil }
-        if index == chars.count { return (marker, length) }
+        if index == chars.count { return (marker, length, true) }
         guard chars[index] == " " else { return nil }
+        var sawInfo = false
         while index < chars.count {
             if chars[index] == marker { return nil }
+            if chars[index] != " " { sawInfo = true }
             index += 1
         }
-        return (marker, length)
+        return (marker, length, !sawInfo)
     }
 
     /// A `>YYYY-MM-DD` on a task in a project note is also listed on that day.

@@ -1,6 +1,8 @@
 # External-format cases
 
-These are notes in the format NotePlan uses. The behavior description is not stored in this repo.
+These are notes in the format NotePlan uses.
+NotePlan is a trademark of NotePlan LLC. AidanOS is not affiliated with or endorsed by NotePlan.
+The behavior description is not stored in this repo.
 
 ## Notes
 

@@ -14,7 +14,12 @@ test("active external-format cases are listed and present", () => {
 });
 
 for (const entry of manifest.pending) {
-  test("case " + entry.number + " waits for spec v0.3", { skip: "waiting for v0.3" }, () => {
+  const guessedPending = entry.number === 39;
+  const name = guessedPending
+    ? "case 39 is Guessed in v0.3 and still pending"
+    : "case " + entry.number + " waits for spec v0.3";
+  const skip = guessedPending ? "Guessed in v0.3; still pending" : "waiting for v0.3";
+  test(name, { skip }, () => {
     throw new Error("pending case " + entry.number + " ran");
   });
 }

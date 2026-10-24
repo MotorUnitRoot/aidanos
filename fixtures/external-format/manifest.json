@@ -291,9 +291,9 @@
     {
       "number": 39,
       "title": "* Fake count #123",
-      "label": "Unknown",
+      "label": "Guessed",
       "path": "pending/39.json",
-      "status": "waits for spec v0.3"
+      "status": "Guessed in v0.3; still pending"
     },
     {
       "number": 40,

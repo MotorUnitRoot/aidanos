@@ -16,25 +16,92 @@ public enum ExternalFormatReader {
     }
 
     public static func read(_ text: String, in context: ExternalNoteContext) -> ExternalNoteReading {
-        var lines = splitLines(text).map { readLine($0, in: context) }
+        var work: ExternalFormatScanWork?
+        return read(text, in: context, work: &work, route: .automatic)
+    }
+
+    /// `work` counts scan steps when a test passes one in. `nil` counts nothing.
+    /// Release builds do not increment it. `route` stays `.automatic` outside tests.
+    static func read(
+        _ text: String,
+        in context: ExternalNoteContext,
+        work: inout ExternalFormatScanWork?,
+        route: ExternalFormatScanRoute
+    ) -> ExternalNoteReading {
+        var lines: [ExternalLine] = []
+        // Marker, length, and whether the opening line is only that marker.
+        var openFence: (marker: Character, length: Int, bare: Bool)?
+        let pieces = splitLines(text)
+        for piece in pieces {
+            if let fence = codeFence(piece) {
+                if let open = openFence {
+                    if fence.bare, fence.marker == open.marker, fence.length >= open.length {
+                        openFence = nil
+                        let line = readLine(piece, in: context, work: &work, route: route)
+                        // AidanOS choice, pending case 93
+                        lines.append(leaveOutOfLists(line))
+                        continue
+                    }
+                } else {
+                    // An opening fence with no closer stays open for the rest of the note.
+                    openFence = fence
+                    let line = readLine(piece, in: context, work: &work, route: route)
+                    // AidanOS choice, pending case 93
+                    lines.append(leaveOutOfLists(line))
+                    continue
+                }
+            }
+            var line = readLine(piece, in: context, work: &work, route: route)
+            if openFence != nil, line.kind != .empty {
+                if line.kind.isTask {
+                    // AidanOS choice, pending case 49
+                    line = leaveOutOfLists(line)
+                } else {
+                    // AidanOS choice, pending case 93
+                    line = leaveOutOfLists(line)
+                }
+            }
+            lines.append(line)
+        }
         attachChildren(&lines)
         return ExternalNoteReading(context: context, lines: lines)
     }
 
-    /// Overdue is a past date. Upcoming is the session day or a later date.
-    /// Checklist items are left out of both. A task with no date is unlisted.
-    public static func placement(of line: ExternalLine, on sessionDay: ExternalDate) -> ExternalListPlacement {
+    /// A typed date before the session day is overdue. The session day or a later
+    /// typed date is upcoming. An open task with no typed date takes the day note's
+    /// date: a past day is overdue, and today or a later day is upcoming.
+    /// Checklist items are left out of both. A dateless task in a project note is unlisted.
+    public static func placement(
+        of line: ExternalLine,
+        on sessionDay: ExternalDate,
+        in context: ExternalNoteContext
+    ) -> ExternalListPlacement {
         if line.leftOutOfOverdue {
             return .unlisted
         }
-        let eligible = line.countsAsOpen || line.kind == .scheduledTask
-        guard eligible, let date = line.scheduleDates.first else {
+        if line.kind == .scheduledTask, case .day(let noteDay) = context, noteDay < sessionDay {
+            if let date = line.scheduleDates.first, date >= sessionDay {
+                // AidanOS choice, pending section 8B.1
+                return .unlisted
+            }
+            // AidanOS choice, pending case 87
             return .unlisted
         }
-        if date < sessionDay {
-            return .overdue
+        let eligible = line.countsAsOpen || line.kind == .scheduledTask
+        if eligible, let date = line.scheduleDates.first {
+            if date < sessionDay {
+                return .overdue
+            }
+            return .upcoming
         }
-        return .upcoming
+        if line.countsAsOpen, case .day(let noteDay) = context {
+            if noteDay < sessionDay {
+                return .overdue
+            }
+            // AidanOS choice, pending case 82
+            return .upcoming
+        }
+        return .unlisted
     }
 }
 
@@ -160,6 +227,8 @@ public enum ExternalLineKind: Equatable, Sendable {
     case cancelledTask
     case scheduledTask
     case openChecklist
+    /// The form is not settled, so this line stays out of the lists.
+    case unsettled
 
     var isTask: Bool {
         switch self {
@@ -195,6 +264,8 @@ public struct ExternalLine: Equatable, Sendable {
     public var referencedDays: [ExternalDate]
     public var timeBlock: ExternalTimeBlock?
     public var tags: [ExternalTag]
+    /// A tag or `@` date that stays out of the lists while the line itself stays.
+    public var flaggedTokens: [String]
     public var mentions: [ExternalMention]
     public var wikiLinks: [ExternalWikiLink]
     public var markdownLinks: [ExternalMarkdownLink]
@@ -210,6 +281,7 @@ public struct ExternalLine: Equatable, Sendable {
         referencedDays: [ExternalDate],
         timeBlock: ExternalTimeBlock?,
         tags: [ExternalTag],
+        flaggedTokens: [String],
         mentions: [ExternalMention],
         wikiLinks: [ExternalWikiLink],
         markdownLinks: [ExternalMarkdownLink],
@@ -224,6 +296,7 @@ public struct ExternalLine: Equatable, Sendable {
         self.referencedDays = referencedDays
         self.timeBlock = timeBlock
         self.tags = tags
+        self.flaggedTokens = flaggedTokens
         self.mentions = mentions
         self.wikiLinks = wikiLinks
         self.markdownLinks = markdownLinks
@@ -261,6 +334,38 @@ private struct InlineMarks {
     var markdownLinks: [ExternalMarkdownLink] = []
     var scheduleDates: [ExternalDate] = []
     var blocked: [Range<Int>] = []
+    var flaggedTokens: [String] = []
+}
+
+/// Step count for one read. The caller owns it, so two reads do not share state.
+struct ExternalFormatScanWork: Sendable {
+    var count = 0
+}
+
+/// `.characters` forces the character walk so a test can compare it with the byte walk.
+enum ExternalFormatScanRoute {
+    case automatic
+    case characters
+}
+
+private enum TagIssue {
+    case none
+    case hyphen
+    case digitsOnly
+}
+
+private enum BracketRead<Value> {
+    case found(Value)
+    case noCloser
+    case rejected
+}
+
+/// How far a search for one closer has read. `read` is the first index not yet examined.
+private struct CloserSearch {
+    var read: Int = 0
+    var closer: Int? = nil
+    /// The bracket closer was found and the link was not kept.
+    var rejected = false
 }
 
 private struct FoundClock {
@@ -269,35 +374,72 @@ private struct FoundClock {
 }
 
 extension ExternalFormatReader {
+    /// `\r\n` is one Swift character, so a split on `"\n"` leaves that pair intact.
+    /// Walk the scalars and break on `\n`, `\r\n`, and a lone `\r`.
     fileprivate static func splitLines(_ text: String) -> [String] {
         if text.isEmpty { return [] }
-        var body = text
-        if body.hasSuffix("\n") { body.removeLast() }
-        if body.hasSuffix("\r") { body.removeLast() }
-        if body.isEmpty { return [""] }
-        return body.split(separator: "\n", omittingEmptySubsequences: false).map { piece in
-            var line = String(piece)
-            if line.hasSuffix("\r") { line.removeLast() }
-            return line
+        // UTF-8 never hides a CR or LF inside another scalar. A note with no
+        // line break is already one line, so do not copy its scalars.
+        let breaks = text.utf8.contains { $0 == 10 || $0 == 13 }
+        if !breaks { return [text] }
+        let scalars = Array(text.unicodeScalars)
+        var lines: [String] = []
+        var current: [Unicode.Scalar] = []
+        var index = 0
+        while index < scalars.count {
+            let scalar = scalars[index]
+            if scalar == "\n" || scalar == "\r" {
+                lines.append(String(String.UnicodeScalarView(current)))
+                current.removeAll(keepingCapacity: true)
+                if scalar == "\r", index + 1 < scalars.count, scalars[index + 1] == "\n" {
+                    index += 2
+                } else {
+                    index += 1
+                }
+                continue
+            }
+            current.append(scalar)
+            index += 1
         }
+        if !current.isEmpty {
+            lines.append(String(String.UnicodeScalarView(current)))
+        }
+        return lines
     }
 
-    fileprivate static func readLine(_ line: String, in context: ExternalNoteContext) -> ExternalLine {
+    fileprivate static func readLine(
+        _ line: String,
+        in context: ExternalNoteContext,
+        work: inout ExternalFormatScanWork?,
+        route: ExternalFormatScanRoute
+    ) -> ExternalLine {
         let (indent, body) = indentAndBody(line)
         if body.isEmpty {
             return blankLine(indent: indent)
         }
         let (kind, content) = classify(body)
-        return interpret(content: content, kind: kind, indent: indent, context: context)
+        return interpret(
+            content: content,
+            kind: kind,
+            indent: indent,
+            context: context,
+            work: &work,
+            route: route
+        )
     }
 
+    /// Leading tabs are ASCII, so the indent is a UTF-8 prefix. A line with no
+    /// tabs keeps its original storage instead of copying every character.
     fileprivate static func indentAndBody(_ line: String) -> (Int, String) {
-        let chars = Array(line)
-        var index = 0
-        while index < chars.count, chars[index] == "\t" {
-            index += 1
+        var indent = 0
+        let utf8 = line.utf8
+        var index = utf8.startIndex
+        while index < utf8.endIndex, utf8[index] == 9 {
+            indent += 1
+            index = utf8.index(after: index)
         }
-        return (index, String(chars[index...]))
+        if indent == 0 { return (0, line) }
+        return (indent, String(line[index...]))
     }
 
     fileprivate static func classify(_ body: String) -> (ExternalLineKind, String) {
@@ -305,7 +447,12 @@ extension ExternalFormatReader {
             return heading
         }
         if body.hasPrefix("* ") {
-            let (state, rest) = takeBox(String(body.dropFirst(2)))
+            let content = String(body.dropFirst(2))
+            // AidanOS choice, pending case 14
+            if content.hasPrefix("[X]") {
+                return (.unsettled, content)
+            }
+            let (state, rest) = takeBox(content)
             return (taskKind(state), rest)
         }
         if body.hasPrefix("- ") {
@@ -317,7 +464,12 @@ extension ExternalFormatReader {
             return (taskKind(state), rest)
         }
         if body.hasPrefix("+ ") {
-            return (.openChecklist, String(body.dropFirst(2)))
+            let content = String(body.dropFirst(2))
+            // AidanOS choice, pending case 9
+            if content.hasPrefix("[x]") {
+                return (.unsettled, content)
+            }
+            return (.openChecklist, content)
         }
         return (.plain, body)
     }
@@ -374,6 +526,7 @@ extension ExternalFormatReader {
             referencedDays: [],
             timeBlock: nil,
             tags: [],
+            flaggedTokens: [],
             mentions: [],
             wikiLinks: [],
             markdownLinks: [],
@@ -385,26 +538,81 @@ extension ExternalFormatReader {
         content: String,
         kind: ExternalLineKind,
         indent: Int,
-        context: ExternalNoteContext
+        context: ExternalNoteContext,
+        work: inout ExternalFormatScanWork?,
+        route: ExternalFormatScanRoute
     ) -> ExternalLine {
-        let marks = scan(content)
-        let block = timeBlock(in: content, marks: marks, kind: kind, context: context)
-        let completion = marks.mentions.first { $0.name == "done" }?.value.flatMap(readCompletion)
+        let marks = scan(content, work: &work, route: route)
+        let unsettled = kind == .unsettled
+        let resolved: ExternalLineKind = unsettled ? .unsettled : kind
+        // AidanOS choice, pending case 97
+        let closed = resolved == .doneTask || resolved == .cancelledTask || resolved == .scheduledTask
+        let block = (unsettled || closed) ? nil : timeBlock(in: content, marks: marks, kind: resolved, context: context)
+        let completion = unsettled ? nil : marks.mentions.first { $0.name == "done" }?.value.flatMap(readCompletion)
         return ExternalLine(
-            kind: kind,
+            kind: resolved,
             indentTabs: indent,
-            countsAsOpen: kind == .openTask,
-            leftOutOfOverdue: kind == .openChecklist,
+            countsAsOpen: resolved == .openTask,
+            leftOutOfOverdue: resolved == .openChecklist || resolved == .unsettled,
             completion: completion,
-            scheduleDates: marks.scheduleDates,
-            referencedDays: references(marks: marks, kind: kind, context: context),
+            scheduleDates: unsettled ? [] : marks.scheduleDates,
+            referencedDays: unsettled ? [] : references(marks: marks, kind: resolved, context: context),
             timeBlock: block,
-            tags: marks.tags,
-            mentions: marks.mentions,
-            wikiLinks: marks.wikiLinks,
-            markdownLinks: marks.markdownLinks,
+            tags: unsettled ? [] : marks.tags,
+            flaggedTokens: unsettled ? [] : marks.flaggedTokens,
+            mentions: unsettled ? [] : marks.mentions,
+            wikiLinks: unsettled ? [] : marks.wikiLinks,
+            markdownLinks: unsettled ? [] : marks.markdownLinks,
             childIndexes: []
         )
+    }
+
+    /// Drops every field a list could read. The line stays in the note as unsettled.
+    fileprivate static func leaveOutOfLists(_ line: ExternalLine) -> ExternalLine {
+        var line = line
+        line.kind = .unsettled
+        line.countsAsOpen = false
+        line.leftOutOfOverdue = true
+        line.completion = nil
+        line.scheduleDates = []
+        line.referencedDays = []
+        line.timeBlock = nil
+        line.tags = []
+        line.flaggedTokens = []
+        line.mentions = []
+        line.wikiLinks = []
+        line.markdownLinks = []
+        return line
+    }
+
+    /// A fence is three or more backticks, or three or more tildes. The two
+    /// markers are different. Text after the marker can open a block. Only a
+    /// bare marker, at least as long as the opener, closes one.
+    fileprivate static func codeFence(_ line: String) -> (marker: Character, length: Int, bare: Bool)? {
+        let (_, body) = indentAndBody(line)
+        let chars = Array(body)
+        var index = 0
+        while index < chars.count, chars[index] == " " {
+            index += 1
+        }
+        guard index < chars.count else { return nil }
+        let marker = chars[index]
+        guard marker == "`" || marker == "~" else { return nil }
+        let start = index
+        while index < chars.count, chars[index] == marker {
+            index += 1
+        }
+        let length = index - start
+        guard length >= 3 else { return nil }
+        if index == chars.count { return (marker, length, true) }
+        guard chars[index] == " " else { return nil }
+        var sawInfo = false
+        while index < chars.count {
+            if chars[index] == marker { return nil }
+            if chars[index] != " " { sawInfo = true }
+            index += 1
+        }
+        return (marker, length, !sawInfo)
     }
 
     /// A `>YYYY-MM-DD` on a task in a project note is also listed on that day.
@@ -473,38 +681,96 @@ extension ExternalFormatReader {
 }
 
 extension ExternalFormatReader {
-    fileprivate static func scan(_ content: String) -> InlineMarks {
-        let chars = Array(content)
+    /// ASCII lines are walked as stored UTF-8 bytes. Other lines use characters,
+    /// because a tag can hold an emoji and the closer indexes have to match that.
+    fileprivate static func scan(
+        _ content: String,
+        work: inout ExternalFormatScanWork?,
+        route: ExternalFormatScanRoute
+    ) -> InlineMarks {
+        if route == .characters {
+            return scanCharacters(Array(content), work: &work)
+        }
+        let bytes = Array(content.utf8)
+        if bytes.allSatisfy({ $0 < 128 }) {
+            return scanASCII(bytes, work: &work)
+        }
+        return scanCharacters(Array(content), work: &work)
+    }
+
+    fileprivate static func scanCharacters(
+        _ chars: [Character],
+        work: inout ExternalFormatScanWork?
+    ) -> InlineMarks {
         var marks = InlineMarks()
         var index = 0
+        // How far a search for each closer has already read. A later opener
+        // continues from that point and does not read behind it.
+        var wiki = CloserSearch()
+        var markdown = CloserSearch()
+        var mentionParen = CloserSearch()
         while index < chars.count {
+            #if DEBUG
+            work?.count += 1
+            #endif
             if chars[index] == "[", index + 1 < chars.count, chars[index + 1] == "[" {
-                if let (link, range) = readWiki(chars, at: index) {
+                switch readWiki(chars, at: index, search: &wiki, work: &work) {
+                case .found((let link, let range)):
                     marks.wikiLinks.append(link)
                     marks.blocked.append(range)
                     index = range.upperBound
                     continue
+                case .noCloser, .rejected:
+                    break
                 }
             }
-            if chars[index] == "[", let (link, range, address) = readMarkdown(chars, at: index) {
-                marks.markdownLinks.append(link)
-                marks.blocked.append(address)
-                index = range.upperBound
-                continue
+            if chars[index] == "[" {
+                switch readMarkdown(chars, at: index, search: &markdown, work: &work) {
+                case .found((let link, let range, let address)):
+                    marks.markdownLinks.append(link)
+                    marks.blocked.append(address)
+                    index = range.upperBound
+                    continue
+                case .noCloser, .rejected:
+                    break
+                }
             }
-            if chars[index] == "#", !wordBefore(chars, index), let (tag, range) = readTag(chars, at: index) {
-                marks.tags.append(tag)
+            if chars[index] == "#", !wordBefore(chars, index), let (tag, range, issue) = readTag(chars, at: index, work: &work) {
+                switch issue {
+                case .hyphen:
+                    // AidanOS choice, pending case 95
+                    marks.flaggedTokens.append(String(chars[range]))
+                case .digitsOnly:
+                    // AidanOS choice, pending case 39
+                    marks.flaggedTokens.append(String(chars[range]))
+                case .none:
+                    marks.tags.append(tag)
+                }
                 index = range.upperBound
                 continue
             }
             if chars[index] == "@", !wordBefore(chars, index),
-               let (mention, range, valueRange) = readMention(chars, at: index) {
-                marks.mentions.append(mention)
-                if let valueRange {
-                    marks.blocked.append(valueRange)
-                }
-                index = range.upperBound
+               index + 1 < chars.count, isASCIIDigit(chars[index + 1]),
+               let (_, end) = readISODate(chars, at: index + 1) {
+                // AidanOS choice, pending case 22
+                marks.flaggedTokens.append(String(chars[index..<end]))
+                index = end
                 continue
+            }
+            if chars[index] == "@", !wordBefore(chars, index) {
+                if let (mention, range, valueRange) = readMention(
+                    chars,
+                    at: index,
+                    paren: &mentionParen,
+                    work: &work
+                ) {
+                    marks.mentions.append(mention)
+                    if let valueRange {
+                        marks.blocked.append(valueRange)
+                    }
+                    index = range.upperBound
+                    continue
+                }
             }
             if chars[index] == ">", boundaryBefore(chars, index),
                let (date, end) = readISODate(chars, at: index + 1) {
@@ -517,19 +783,474 @@ extension ExternalFormatReader {
         return marks
     }
 
-    fileprivate static func readWiki(_ chars: [Character], at start: Int) -> (ExternalWikiLink, Range<Int>)? {
-        guard start + 1 < chars.count, chars[start] == "[", chars[start + 1] == "[" else { return nil }
+    /// One pass over UTF-8 bytes. Indexes match characters because every byte is ASCII.
+    fileprivate static func scanASCII(
+        _ bytes: [UInt8],
+        work: inout ExternalFormatScanWork?
+    ) -> InlineMarks {
+        var marks = InlineMarks()
+        var index = 0
+        var wiki = CloserSearch()
+        var markdown = CloserSearch()
+        var mentionParen = CloserSearch()
+        while index < bytes.count {
+            #if DEBUG
+            work?.count += 1
+            #endif
+            if bytes[index] == 91, index + 1 < bytes.count, bytes[index + 1] == 91 {
+                switch readWikiASCII(bytes, at: index, search: &wiki, work: &work) {
+                case .found((let link, let range)):
+                    marks.wikiLinks.append(link)
+                    marks.blocked.append(range)
+                    index = range.upperBound
+                    continue
+                case .noCloser, .rejected:
+                    break
+                }
+            }
+            if bytes[index] == 91 {
+                switch readMarkdownASCII(bytes, at: index, search: &markdown, work: &work) {
+                case .found((let link, let range, let address)):
+                    marks.markdownLinks.append(link)
+                    marks.blocked.append(address)
+                    index = range.upperBound
+                    continue
+                case .noCloser, .rejected:
+                    break
+                }
+            }
+            if bytes[index] == 35, !wordBeforeASCII(bytes, index),
+               let (tag, range, issue) = readTagASCII(bytes, at: index, work: &work) {
+                switch issue {
+                case .hyphen:
+                    // AidanOS choice, pending case 95
+                    marks.flaggedTokens.append(asciiText(bytes, range))
+                case .digitsOnly:
+                    // AidanOS choice, pending case 39
+                    marks.flaggedTokens.append(asciiText(bytes, range))
+                case .none:
+                    marks.tags.append(tag)
+                }
+                index = range.upperBound
+                continue
+            }
+            if bytes[index] == 64, !wordBeforeASCII(bytes, index),
+               index + 1 < bytes.count, isDigitByte(bytes[index + 1]),
+               let (_, end) = readISODateASCII(bytes, at: index + 1) {
+                // AidanOS choice, pending case 22
+                marks.flaggedTokens.append(asciiText(bytes, index..<end))
+                index = end
+                continue
+            }
+            if bytes[index] == 64, !wordBeforeASCII(bytes, index) {
+                if let (mention, range, valueRange) = readMentionASCII(
+                    bytes,
+                    at: index,
+                    paren: &mentionParen,
+                    work: &work
+                ) {
+                    marks.mentions.append(mention)
+                    if let valueRange {
+                        marks.blocked.append(valueRange)
+                    }
+                    index = range.upperBound
+                    continue
+                }
+            }
+            if bytes[index] == 62, boundaryBeforeASCII(bytes, index),
+               let (date, end) = readISODateASCII(bytes, at: index + 1) {
+                marks.scheduleDates.append(date)
+                index = end
+                continue
+            }
+            index += 1
+        }
+        return marks
+    }
+
+    fileprivate static func readWikiASCII(
+        _ bytes: [UInt8],
+        at start: Int,
+        search: inout CloserSearch,
+        work: inout ExternalFormatScanWork?
+    ) -> BracketRead<(ExternalWikiLink, Range<Int>)> {
+        #if !DEBUG
+        _ = work
+        #endif
+        guard start + 1 < bytes.count, bytes[start] == 91, bytes[start + 1] == 91 else { return .rejected }
+        if search.closer == nil, search.read >= bytes.count, search.read > start {
+            return .noCloser
+        }
+        if let closer = search.closer {
+            if start > closer {
+                search = CloserSearch()
+            } else {
+                return wikiInsideKnownCloserASCII(bytes, start: start, closer: closer, work: &work)
+            }
+        }
+        var index = start + 2
+        var inner: [UInt8] = []
+        while index + 1 < bytes.count {
+            #if DEBUG
+            work?.count += 1
+            #endif
+            if bytes[index] == 93, bytes[index + 1] == 93 {
+                search.read = index + 2
+                search.closer = index
+                // Brackets with no link leave the interior to be read, including a tag.
+                guard let link = makeWiki(asciiText(inner)) else { return .rejected }
+                return .found((link, start..<(index + 2)))
+            }
+            inner.append(bytes[index])
+            index += 1
+        }
+        search.read = bytes.count
+        search.closer = nil
+        return .noCloser
+    }
+
+    /// This opener sits inside a span whose closer is already known. Do not walk
+    /// to that closer again. A link is kept only when the interior has no `[`.
+    fileprivate static func wikiInsideKnownCloserASCII(
+        _ bytes: [UInt8],
+        start: Int,
+        closer: Int,
+        work: inout ExternalFormatScanWork?
+    ) -> BracketRead<(ExternalWikiLink, Range<Int>)> {
+        #if !DEBUG
+        _ = work
+        #endif
+        var cursor = start + 2
+        while cursor < closer {
+            #if DEBUG
+            work?.count += 1
+            #endif
+            if bytes[cursor] == 91 { return .rejected }
+            cursor += 1
+        }
+        guard start + 2 <= closer, let link = makeWiki(asciiText(bytes, (start + 2)..<closer)) else {
+            return .rejected
+        }
+        return .found((link, start..<(closer + 2)))
+    }
+
+    fileprivate static func readMarkdownASCII(
+        _ bytes: [UInt8],
+        at start: Int,
+        search: inout CloserSearch,
+        work: inout ExternalFormatScanWork?
+    ) -> BracketRead<(ExternalMarkdownLink, Range<Int>, Range<Int>)> {
+        #if !DEBUG
+        _ = work
+        #endif
+        guard bytes[start] == 91 else { return .rejected }
+        if start + 1 < bytes.count, bytes[start + 1] == 91 { return .rejected }
+        if search.closer == nil, search.read >= bytes.count, search.read > start {
+            return .noCloser
+        }
+        if search.rejected, let closer = search.closer, start <= closer {
+            return .rejected
+        }
+        if let closer = search.closer, start > closer {
+            search = CloserSearch()
+        }
+        var index = start + 1
+        var shown: [UInt8] = []
+        while index < bytes.count, bytes[index] != 93 {
+            #if DEBUG
+            work?.count += 1
+            #endif
+            shown.append(bytes[index])
+            index += 1
+        }
+        guard index < bytes.count, bytes[index] == 93 else {
+            search.read = bytes.count
+            search.closer = nil
+            search.rejected = false
+            return .noCloser
+        }
+        search.read = index + 1
+        search.closer = index
+        search.rejected = false
+        index += 1
+        guard index < bytes.count, bytes[index] == 40 else {
+            search.rejected = true
+            return .rejected
+        }
+        let addressStart = index
+        index += 1
+        var address: [UInt8] = []
+        while index < bytes.count, bytes[index] != 41 {
+            #if DEBUG
+            work?.count += 1
+            #endif
+            address.append(bytes[index])
+            index += 1
+        }
+        guard index < bytes.count, bytes[index] == 41 else {
+            search.read = bytes.count
+            search.closer = nil
+            search.rejected = false
+            return .noCloser
+        }
+        index += 1
+        let shownText = trim(asciiText(shown))
+        let addr = trim(asciiText(address))
+        guard !shownText.isEmpty, !addr.isEmpty else {
+            search.rejected = true
+            return .rejected
+        }
+        let link = ExternalMarkdownLink(shownText: shownText, address: addr)
+        return .found((link, start..<index, addressStart..<index))
+    }
+
+    fileprivate static func readTagASCII(
+        _ bytes: [UInt8],
+        at start: Int,
+        work: inout ExternalFormatScanWork?
+    ) -> (ExternalTag, Range<Int>, TagIssue)? {
+        guard bytes[start] == 35 else { return nil }
+        var index = start + 1
+        guard let first = readTagGroupASCII(bytes, from: &index, work: &work) else { return nil }
+        var groups = [first]
+        var hyphen = false
+        while index < bytes.count {
+            let saved = index
+            let separator = bytes[index]
+            guard separator == 47 || separator == 45 else { break }
+            index += 1
+            if let next = readTagGroupASCII(bytes, from: &index, work: &work) {
+                if separator == 45 {
+                    hyphen = true
+                }
+                groups.append(next)
+            } else {
+                index = saved
+                break
+            }
+        }
+        let digitsOnly = groups.allSatisfy { group in group.utf8.allSatisfy(isDigitByte) }
+        let issue: TagIssue = hyphen ? .hyphen : (digitsOnly ? .digitsOnly : .none)
+        let name = groups.joined(separator: "/")
+        let parent = groups.count > 1 && issue == .none ? groups.dropLast().joined(separator: "/") : nil
+        return (ExternalTag(name: name, parent: parent), start..<index, issue)
+    }
+
+    fileprivate static func readTagGroupASCII(
+        _ bytes: [UInt8],
+        from index: inout Int,
+        work: inout ExternalFormatScanWork?
+    ) -> String? {
+        #if !DEBUG
+        _ = work
+        #endif
+        let start = index
+        while index < bytes.count, isNameByte(bytes[index]) {
+            #if DEBUG
+            work?.count += 1
+            #endif
+            index += 1
+        }
+        guard index > start else { return nil }
+        return asciiText(bytes, start..<index)
+    }
+
+    fileprivate static func readMentionASCII(
+        _ bytes: [UInt8],
+        at start: Int,
+        paren: inout CloserSearch,
+        work: inout ExternalFormatScanWork?
+    ) -> (ExternalMention, Range<Int>, Range<Int>?)? {
+        #if !DEBUG
+        _ = work
+        #endif
+        guard bytes[start] == 64 else { return nil }
+        var index = start + 1
+        guard let name = readTagGroupASCII(bytes, from: &index, work: &work) else { return nil }
+        guard index < bytes.count, bytes[index] == 40 else {
+            return (ExternalMention(name: name, value: nil), start..<index, nil)
+        }
+        let open = index
+        if paren.read > open {
+            return (ExternalMention(name: name, value: nil), start..<open, nil)
+        }
+        var cursor = open + 1
+        let valueStart = cursor
+        while cursor < bytes.count {
+            #if DEBUG
+            work?.count += 1
+            #endif
+            if bytes[cursor] == 41 {
+                paren.read = cursor + 1
+                paren.closer = cursor
+                let value = asciiText(bytes, valueStart..<cursor)
+                return (ExternalMention(name: name, value: value), start..<(cursor + 1), open..<(cursor + 1))
+            }
+            // Stop only where a tag, a mention, or an @date would start.
+            if bytes[cursor] == 35 || bytes[cursor] == 64, markStartsASCII(bytes, cursor) {
+                paren.read = cursor
+                paren.closer = nil
+                return (ExternalMention(name: name, value: nil), start..<open, nil)
+            }
+            cursor += 1
+        }
+        paren.read = bytes.count
+        paren.closer = nil
+        return (ExternalMention(name: name, value: nil), start..<open, nil)
+    }
+
+    fileprivate static func readISODateASCII(_ bytes: [UInt8], at start: Int) -> (ExternalDate, Int)? {
+        guard let year = readDigitsASCII(4, bytes, start) else { return nil }
+        var index = year.end
+        guard index < bytes.count, bytes[index] == 45 else { return nil }
+        index += 1
+        guard let month = readDigitsASCII(2, bytes, index) else { return nil }
+        index = month.end
+        guard index < bytes.count, bytes[index] == 45 else { return nil }
+        index += 1
+        guard let day = readDigitsASCII(2, bytes, index) else { return nil }
+        index = day.end
+        if index < bytes.count, isDigitByte(bytes[index]) { return nil }
+        guard let date = calendarDate(year: year.value, month: month.value, day: day.value) else { return nil }
+        return (date, index)
+    }
+
+    fileprivate static func readDigitsASCII(
+        _ count: Int,
+        _ bytes: [UInt8],
+        _ start: Int
+    ) -> (value: Int, end: Int)? {
+        guard start + count <= bytes.count else { return nil }
+        var value = 0
+        for offset in 0..<count {
+            let byte = bytes[start + offset]
+            guard isDigitByte(byte) else { return nil }
+            value = value * 10 + Int(byte - 48)
+        }
+        return (value, start + count)
+    }
+
+    fileprivate static func asciiText(_ bytes: [UInt8], _ range: Range<Int>) -> String {
+        if range.count == 1 {
+            return String(Unicode.Scalar(bytes[range.lowerBound]))
+        }
+        return String(decoding: bytes[range], as: UTF8.self)
+    }
+
+    fileprivate static func asciiText(_ bytes: [UInt8]) -> String {
+        if bytes.count == 1 {
+            return String(Unicode.Scalar(bytes[0]))
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    @inline(__always)
+    fileprivate static func isDigitByte(_ byte: UInt8) -> Bool {
+        byte >= 48 && byte <= 57
+    }
+
+    @inline(__always)
+    fileprivate static func isWordByte(_ byte: UInt8) -> Bool {
+        isDigitByte(byte) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+    }
+
+    @inline(__always)
+    fileprivate static func isNameByte(_ byte: UInt8) -> Bool {
+        byte == 95 || isWordByte(byte)
+    }
+
+    @inline(__always)
+    fileprivate static func wordBeforeASCII(_ bytes: [UInt8], _ index: Int) -> Bool {
+        index > 0 && isWordByte(bytes[index - 1])
+    }
+
+    /// Same start rule as the byte scan: a tag needs a name byte, and `@` needs a name or an ISO date.
+    @inline(__always)
+    fileprivate static func markStartsASCII(_ bytes: [UInt8], _ index: Int) -> Bool {
+        if wordBeforeASCII(bytes, index) { return false }
+        guard index + 1 < bytes.count else { return false }
+        let mark = bytes[index]
+        let next = bytes[index + 1]
+        if mark == 35 {
+            return isNameByte(next)
+        }
+        if mark == 64 {
+            if isDigitByte(next), readISODateASCII(bytes, at: index + 1) != nil {
+                return true
+            }
+            return isNameByte(next)
+        }
+        return false
+    }
+
+    @inline(__always)
+    fileprivate static func boundaryBeforeASCII(_ bytes: [UInt8], _ index: Int) -> Bool {
+        index == 0 || bytes[index - 1] == 32 || bytes[index - 1] == 9
+    }
+
+    fileprivate static func readWiki(
+        _ chars: [Character],
+        at start: Int,
+        search: inout CloserSearch,
+        work: inout ExternalFormatScanWork?
+    ) -> BracketRead<(ExternalWikiLink, Range<Int>)> {
+        #if !DEBUG
+        _ = work
+        #endif
+        guard start + 1 < chars.count, chars[start] == "[", chars[start + 1] == "[" else { return .rejected }
+        if search.closer == nil, search.read >= chars.count, search.read > start {
+            return .noCloser
+        }
+        if let closer = search.closer {
+            if start > closer {
+                search = CloserSearch()
+            } else {
+                return wikiInsideKnownCloser(chars, start: start, closer: closer, work: &work)
+            }
+        }
         var index = start + 2
         var inner: [Character] = []
         while index + 1 < chars.count {
+            #if DEBUG
+            work?.count += 1
+            #endif
             if chars[index] == "]", chars[index + 1] == "]" {
-                guard let link = makeWiki(String(inner)) else { return nil }
-                return (link, start..<(index + 2))
+                search.read = index + 2
+                search.closer = index
+                // Brackets with no link leave the interior to be read, including a tag.
+                guard let link = makeWiki(String(inner)) else { return .rejected }
+                return .found((link, start..<(index + 2)))
             }
             inner.append(chars[index])
             index += 1
         }
-        return nil
+        search.read = chars.count
+        search.closer = nil
+        return .noCloser
+    }
+
+    /// This opener sits inside a span whose closer is already known. Do not walk
+    /// to that closer again. A link is kept only when the interior has no `[`.
+    fileprivate static func wikiInsideKnownCloser(
+        _ chars: [Character],
+        start: Int,
+        closer: Int,
+        work: inout ExternalFormatScanWork?
+    ) -> BracketRead<(ExternalWikiLink, Range<Int>)> {
+        #if !DEBUG
+        _ = work
+        #endif
+        var cursor = start + 2
+        while cursor < closer {
+            #if DEBUG
+            work?.count += 1
+            #endif
+            if chars[cursor] == "[" { return .rejected }
+            cursor += 1
+        }
+        guard start + 2 <= closer else { return .rejected }
+        guard let link = makeWiki(String(chars[(start + 2)..<closer])) else { return .rejected }
+        return .found((link, start..<(closer + 2)))
     }
 
     fileprivate static func makeWiki(_ inner: String) -> ExternalWikiLink? {
@@ -547,89 +1268,171 @@ extension ExternalFormatReader {
 
     fileprivate static func readMarkdown(
         _ chars: [Character],
-        at start: Int
-    ) -> (ExternalMarkdownLink, Range<Int>, Range<Int>)? {
-        guard chars[start] == "[" else { return nil }
-        if start + 1 < chars.count, chars[start + 1] == "[" { return nil }
+        at start: Int,
+        search: inout CloserSearch,
+        work: inout ExternalFormatScanWork?
+    ) -> BracketRead<(ExternalMarkdownLink, Range<Int>, Range<Int>)> {
+        #if !DEBUG
+        _ = work
+        #endif
+        guard chars[start] == "[" else { return .rejected }
+        if start + 1 < chars.count, chars[start + 1] == "[" { return .rejected }
+        if search.closer == nil, search.read >= chars.count, search.read > start {
+            return .noCloser
+        }
+        if search.rejected, let closer = search.closer, start <= closer {
+            return .rejected
+        }
+        if let closer = search.closer, start > closer {
+            search = CloserSearch()
+        }
         var index = start + 1
         var shown: [Character] = []
         while index < chars.count, chars[index] != "]" {
+            #if DEBUG
+            work?.count += 1
+            #endif
             shown.append(chars[index])
             index += 1
         }
-        guard index < chars.count, chars[index] == "]" else { return nil }
+        guard index < chars.count, chars[index] == "]" else {
+            search.read = chars.count
+            search.closer = nil
+            search.rejected = false
+            return .noCloser
+        }
+        search.read = index + 1
+        search.closer = index
+        search.rejected = false
         index += 1
-        guard index < chars.count, chars[index] == "(" else { return nil }
+        guard index < chars.count, chars[index] == "(" else {
+            search.rejected = true
+            return .rejected
+        }
         let addressStart = index
         index += 1
         var address: [Character] = []
         while index < chars.count, chars[index] != ")" {
+            #if DEBUG
+            work?.count += 1
+            #endif
             address.append(chars[index])
             index += 1
         }
-        guard index < chars.count, chars[index] == ")" else { return nil }
+        guard index < chars.count, chars[index] == ")" else {
+            // The address has no ")". Nothing later in the line can close one either.
+            search.read = chars.count
+            search.closer = nil
+            search.rejected = false
+            return .noCloser
+        }
         index += 1
         let shownText = trim(String(shown))
         let addr = trim(String(address))
-        guard !shownText.isEmpty, !addr.isEmpty else { return nil }
+        guard !shownText.isEmpty, !addr.isEmpty else {
+            search.rejected = true
+            return .rejected
+        }
         let link = ExternalMarkdownLink(shownText: shownText, address: addr)
-        return (link, start..<index, addressStart..<index)
+        return .found((link, start..<index, addressStart..<index))
     }
 
-    fileprivate static func readTag(_ chars: [Character], at start: Int) -> (ExternalTag, Range<Int>)? {
+    fileprivate static func readTag(
+        _ chars: [Character],
+        at start: Int,
+        work: inout ExternalFormatScanWork?
+    ) -> (ExternalTag, Range<Int>, TagIssue)? {
         guard chars[start] == "#" else { return nil }
         var index = start + 1
-        guard let first = readName(chars, from: &index) else { return nil }
+        guard let first = readTagGroup(chars, from: &index, work: &work) else { return nil }
         var groups = [first]
-        while index < chars.count, chars[index] == "/" {
+        var hyphen = false
+        while index < chars.count {
             let saved = index
+            let separator = chars[index]
+            guard separator == "/" || separator == "-" else { break }
             index += 1
-            if let next = readName(chars, from: &index) {
+            if let next = readTagGroup(chars, from: &index, work: &work) {
+                if separator == "-" {
+                    hyphen = true
+                }
                 groups.append(next)
             } else {
                 index = saved
                 break
             }
         }
+        let digitsOnly = groups.allSatisfy { group in group.allSatisfy(isASCIIDigit) }
+        let issue: TagIssue = hyphen ? .hyphen : (digitsOnly ? .digitsOnly : .none)
         let name = groups.joined(separator: "/")
-        let parent = groups.count > 1 ? groups.dropLast().joined(separator: "/") : nil
-        return (ExternalTag(name: name, parent: parent), start..<index)
+        let parent = groups.count > 1 && issue == .none ? groups.dropLast().joined(separator: "/") : nil
+        return (ExternalTag(name: name, parent: parent), start..<index, issue)
     }
 
-    fileprivate static func readMention(
+    fileprivate static func readTagGroup(
         _ chars: [Character],
-        at start: Int
-    ) -> (ExternalMention, Range<Int>, Range<Int>?)? {
-        guard chars[start] == "@" else { return nil }
-        var index = start + 1
-        guard let name = readName(chars, from: &index) else { return nil }
-        var value: String?
-        var valueRange: Range<Int>?
-        if index < chars.count, chars[index] == "(" {
-            let open = index
-            index += 1
-            let valueStart = index
-            while index < chars.count, chars[index] != ")" {
-                index += 1
-            }
-            if index < chars.count, chars[index] == ")" {
-                value = String(chars[valueStart..<index])
-                index += 1
-                valueRange = open..<index
-            } else {
-                index = open
-            }
-        }
-        return (ExternalMention(name: name, value: value), start..<index, valueRange)
-    }
-
-    fileprivate static func readName(_ chars: [Character], from index: inout Int) -> String? {
+        from index: inout Int,
+        work: inout ExternalFormatScanWork?
+    ) -> String? {
+        #if !DEBUG
+        _ = work
+        #endif
         let start = index
-        while index < chars.count, isNameChar(chars[index]) {
+        while index < chars.count, isTagChar(chars[index]) {
+            #if DEBUG
+            work?.count += 1
+            #endif
             index += 1
         }
         guard index > start else { return nil }
         return String(chars[start..<index])
+    }
+
+    fileprivate static func readMention(
+        _ chars: [Character],
+        at start: Int,
+        paren: inout CloserSearch,
+        work: inout ExternalFormatScanWork?
+    ) -> (ExternalMention, Range<Int>, Range<Int>?)? {
+        #if !DEBUG
+        _ = work
+        #endif
+        guard chars[start] == "@" else { return nil }
+        var index = start + 1
+        guard let name = readTagGroup(chars, from: &index, work: &work) else { return nil }
+        guard index < chars.count, chars[index] == "(" else {
+            return (ExternalMention(name: name, value: nil), start..<index, nil)
+        }
+        let open = index
+        // `read` is the first index this search has not examined. A "(" behind
+        // that point already failed to close, so do not walk those characters again.
+        if paren.read > open {
+            return (ExternalMention(name: name, value: nil), start..<open, nil)
+        }
+        var cursor = open + 1
+        let valueStart = cursor
+        while cursor < chars.count {
+            #if DEBUG
+            work?.count += 1
+            #endif
+            if chars[cursor] == ")" {
+                paren.read = cursor + 1
+                paren.closer = cursor
+                let value = String(chars[valueStart..<cursor])
+                return (ExternalMention(name: name, value: value), start..<(cursor + 1), open..<(cursor + 1))
+            }
+            // Stop only where a tag, a mention, or an @date would start.
+            // Remember how far the search read so the next opener does not read behind this point.
+            if chars[cursor] == "@" || chars[cursor] == "#", markStarts(chars, cursor) {
+                paren.read = cursor
+                paren.closer = nil
+                return (ExternalMention(name: name, value: nil), start..<open, nil)
+            }
+            cursor += 1
+        }
+        paren.read = chars.count
+        paren.closer = nil
+        return (ExternalMention(name: name, value: nil), start..<open, nil)
     }
 
     fileprivate static func readCompletion(_ value: String) -> ExternalCompletion? {
@@ -749,24 +1552,67 @@ extension ExternalFormatReader {
         index > 0 && isWordChar(chars[index - 1])
     }
 
+    /// Same start rule as the character scan: a tag or mention needs a tag character, and `@` plus digits can be a date.
+    fileprivate static func markStarts(_ chars: [Character], _ index: Int) -> Bool {
+        if wordBefore(chars, index) { return false }
+        guard index + 1 < chars.count else { return false }
+        let mark = chars[index]
+        let next = chars[index + 1]
+        if mark == "#" {
+            return isTagChar(next)
+        }
+        if mark == "@" {
+            if isASCIIDigit(next), readISODate(chars, at: index + 1) != nil {
+                return true
+            }
+            return isTagChar(next)
+        }
+        return false
+    }
+
     fileprivate static func boundaryBefore(_ chars: [Character], _ index: Int) -> Bool {
         index == 0 || chars[index - 1] == " " || chars[index - 1] == "\t"
     }
 
     fileprivate static func isWordChar(_ char: Character) -> Bool {
-        char.isLetter || char.isNumber
+        if let ascii = char.asciiValue {
+            return (ascii >= 65 && ascii <= 90) || (ascii >= 97 && ascii <= 122) || (ascii >= 48 && ascii <= 57)
+        }
+        return char.isLetter || char.isNumber
     }
 
     fileprivate static func isNameChar(_ char: Character) -> Bool {
-        char.isLetter || isASCIIDigit(char) || char == "_"
+        if let ascii = char.asciiValue {
+            return (ascii >= 65 && ascii <= 90) || (ascii >= 97 && ascii <= 122)
+                || (ascii >= 48 && ascii <= 57) || ascii == 95
+        }
+        return char.isLetter
+    }
+
+    /// Emoji may sit inside a tag or a mention, including at the top of a nested tag.
+    /// ASCII digits and marks are not emoji here. Trademark, registered, and copyright signs are not either.
+    fileprivate static func isTagChar(_ char: Character) -> Bool {
+        if isNameChar(char) { return true }
+        guard char.asciiValue == nil else { return false }
+        for scalar in char.unicodeScalars {
+            // Copyright, registered, and trademark signs.
+            if scalar.value == 0x00A9 || scalar.value == 0x00AE || scalar.value == 0x2122 {
+                return false
+            }
+        }
+        return char.unicodeScalars.contains { $0.properties.isEmoji }
     }
 
     fileprivate static func isASCIIDigit(_ char: Character) -> Bool {
-        char >= "0" && char <= "9"
+        guard let ascii = char.asciiValue, let zero = Character("0").asciiValue, let nine = Character("9").asciiValue else {
+            return false
+        }
+        return ascii >= zero && ascii <= nine
     }
 
     fileprivate static func digitValue(_ char: Character) -> Int {
-        Int(char.asciiValue! - Character("0").asciiValue!)
+        guard let ascii = char.asciiValue, let zero = Character("0").asciiValue else { return 0 }
+        return Int(ascii - zero)
     }
 
     fileprivate static func trim(_ text: String) -> String {

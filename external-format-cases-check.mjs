@@ -6,8 +6,8 @@ const SEEN = [
   1, 2, 3, 4, 5, 6, 7, 8, 11, 15, 16, 17, 18, 25, 26, 27, 28, 29, 30, 31, 34, 35,
   41, 42, 43, 47, 52, 55, 58, 59, 61, 62, 64, 65,
 ];
-const GUESSED = [9, 12, 13, 20, 21, 24, 32, 33, 36, 37, 38, 40, 44, 48, 51, 54, 60, 63];
-const UNKNOWN = [10, 14, 19, 22, 23, 39, 45, 46, 49, 50, 53, 56, 57];
+const GUESSED = [9, 12, 13, 20, 21, 24, 32, 33, 36, 37, 38, 39, 40, 44, 48, 51, 54, 60, 63];
+const UNKNOWN = [10, 14, 19, 22, 23, 45, 46, 49, 50, 53, 56, 57];
 
 const NOTES = [
   {
@@ -68,8 +68,8 @@ function listFiles(dir) {
 
 export function checkExternalFormatCases(repoRoot) {
   assert.equal(SEEN.length, 34);
-  assert.equal(GUESSED.length, 18);
-  assert.equal(UNKNOWN.length, 13);
+  assert.equal(GUESSED.length, 19);
+  assert.equal(UNKNOWN.length, 12);
 
   const dir = path.join(repoRoot, "fixtures", "external-format");
   assert.deepEqual(listFiles(dir), ["README.md", "cases", "manifest.json", "notes", "pending"]);
@@ -190,7 +190,10 @@ export function checkExternalFormatCases(repoRoot) {
   for (const entry of manifest.pending) {
     assert.deepEqual(Object.keys(entry), PENDING_LIST_KEYS, "pending list " + entry.number);
     assert.equal(entry.path, "pending/" + entry.number + ".json");
-    assert.equal(entry.status, "waits for spec v0.3");
+    const pendingStatus = entry.number === 39
+      ? "Guessed in v0.3; still pending"
+      : "waits for spec v0.3";
+    assert.equal(entry.status, pendingStatus);
     const expectedLabel = GUESSED.includes(entry.number) ? "Guessed" : "Unknown";
     assert.equal(entry.label, expectedLabel);
     assert.equal(typeof entry.title, "string");
@@ -203,7 +206,9 @@ export function checkExternalFormatCases(repoRoot) {
     assert.equal(body.number, entry.number);
     assert.equal(body.title, entry.title);
     assert.equal(body.label, entry.label);
-    assert.equal(body.status, "waits for spec v0.3");
+    assert.equal(body.status, entry.number === 39
+      ? "Guessed in v0.3; still pending"
+      : "waits for spec v0.3");
     assert.equal(Object.hasOwn(body, "expected"), false);
     assert.equal(Object.hasOwn(body, "input"), false);
     assert.equal(Object.hasOwn(body, "context"), false);

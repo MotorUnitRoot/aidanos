@@ -29,7 +29,7 @@ Active cases are the ones labeled Seen. Each case is one file under `cases/` plu
 
 Those active cases count toward the 40-case target.
 
-Guessed and Unknown cases are listed under `pending/`. Each entry has a number, a title, and its label, and is marked "waits for spec v0.3". They have no expected result. They are not active, and they do not count toward the 40-case target.
+Guessed and Unknown cases are listed under `pending/`. Each entry has a number, a title, and its label. Case 39 is Guessed in v0.3 and still pending. The others are marked "waits for spec v0.3". They have no expected result. They are not active, and they do not count toward the 40-case target.
 
 ## How to add a case
 

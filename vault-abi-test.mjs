@@ -80,7 +80,7 @@ check("dockerignore keeps tests and git out of a future broad COPY", () => {
 
 check("npm test only names files that exist", () => {
   const script = pkg.scripts.test;
-  const files = [...script.matchAll(/node\s+(\S+)/g)].map((m) => m[1]);
+  const files = [...script.matchAll(/node\s+(?:--\S+\s+)*(\S+)/g)].map((m) => m[1]);
   assert(files.length > 0, "has tests");
   for (const file of files) {
     assert(fs.existsSync(path.join(root, file)), "missing " + file);

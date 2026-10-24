@@ -1,0 +1,7 @@
+{
+  "number": 35,
+  "context": "Project note",
+  "input": "* Fake chore @Zed_Tester",
+  "expected": "Mention Zed_Tester",
+  "label": "Seen"
+}

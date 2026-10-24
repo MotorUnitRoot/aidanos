@@ -1,0 +1,7 @@
+{
+  "number": 34,
+  "context": "Project note",
+  "input": "* Fake chore #zzhome/garden",
+  "expected": "Tag zzhome/garden, shown under zzhome in the sidebar",
+  "label": "Seen"
+}

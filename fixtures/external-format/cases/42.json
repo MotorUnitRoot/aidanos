@@ -1,0 +1,7 @@
+{
+  "number": 42,
+  "context": "Project note",
+  "input": "* See [[ZZ REA Linked Note#Fake Heading]]",
+  "expected": "Link to that heading",
+  "label": "Seen"
+}

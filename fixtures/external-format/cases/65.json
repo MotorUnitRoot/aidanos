@@ -1,0 +1,7 @@
+{
+  "number": 65,
+  "context": "Project note",
+  "input": "Read [fake site](https://example.test)",
+  "expected": "Markdown link showing the words \"fake site\"",
+  "label": "Seen"
+}

@@ -1,0 +1,7 @@
+{
+  "number": 18,
+  "context": "Project note",
+  "input": "* Water fake plants >today",
+  "expected": "Shows in the session day's references, and on each later day until done",
+  "label": "Seen"
+}

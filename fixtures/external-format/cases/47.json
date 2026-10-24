@@ -1,0 +1,8 @@
+{
+  "number": 47,
+  "context": "Project note",
+  "input": "* c47 Fake parent\n\t- c47a note under parent\n\n\t* c47b after a blank line\n",
+  "expected": "First indented line is a child; the line after the blank line is not",
+  "label": "Seen",
+  "description": "* Fake parent, tab - note, blank line, tab * after blank"
+}

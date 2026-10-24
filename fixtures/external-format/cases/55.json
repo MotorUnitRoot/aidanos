@@ -1,0 +1,7 @@
+{
+  "number": 55,
+  "context": "Day 2017-01-09, viewed on session day",
+  "input": "* Fake left behind left open",
+  "expected": "Not copied anywhere; Jan 9 shows red in the month calendar; listed in Overdue",
+  "label": "Seen"
+}

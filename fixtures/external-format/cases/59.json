@@ -1,0 +1,7 @@
+{
+  "number": 59,
+  "context": "Weekly note 2017-W02",
+  "input": "* Fake weekly task",
+  "expected": "Shows in references of each day Jan 9 to 15, 2017",
+  "label": "Seen"
+}

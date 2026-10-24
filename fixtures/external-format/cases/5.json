@@ -1,0 +1,7 @@
+{
+  "number": 5,
+  "context": "Project note",
+  "input": "* [>] Pay the fake water bill >2031-03-03",
+  "expected": "Scheduled task (moved); not counted as open",
+  "label": "Seen"
+}

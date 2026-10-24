@@ -1,0 +1,7 @@
+{
+  "number": 64,
+  "context": "Project note",
+  "input": "Repeat * Fake weekly chore >2031-03-03 3 times weekly with the Repeat option",
+  "expected": "Copies in later daily notes tagged @repeat(1/3) to @repeat(3/3), starting Mar 3, 2031",
+  "label": "Seen"
+}

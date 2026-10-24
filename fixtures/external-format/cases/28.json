@@ -1,0 +1,7 @@
+{
+  "number": 28,
+  "context": "Day 2017-01-09",
+  "input": "* Fake meeting at 15",
+  "expected": "No time block",
+  "label": "Seen"
+}

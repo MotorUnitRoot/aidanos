@@ -1,0 +1,7 @@
+{
+  "number": 15,
+  "context": "Project note",
+  "input": "* Send fake invoice >2017-01-10",
+  "expected": "Task stays here; appears in Jan 10, 2017 references; overdue on session day",
+  "label": "Seen"
+}

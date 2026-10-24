@@ -1,0 +1,7 @@
+{
+  "number": 4,
+  "context": "Project note",
+  "input": "* [-] Pay the fake water bill",
+  "expected": "Cancelled task",
+  "label": "Seen"
+}

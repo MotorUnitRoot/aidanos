@@ -1,0 +1,18 @@
+{
+  "widths": [1280, 390],
+  "states": [
+    "door",
+    "door-proposals",
+    "today",
+    "timeline",
+    "month",
+    "plan",
+    "capture",
+    "ask",
+    "project",
+    "map",
+    "stage",
+    "conflict",
+    "conflict-edit"
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "number": 52,
+  "context": "Days 2017-01-09 to 01-10",
+  "input": "Schedule * Fake move once from Jan 9 to Jan 10 with the schedule dialog",
+  "expected": "Jan 9: [>] with >2017-01-10; Jan 10: open copy with <2017-01-09",
+  "label": "Seen"
+}

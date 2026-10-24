@@ -949,9 +949,19 @@ extension ExternalFormatReader {
             while index < chars.count, chars[index] != ")" {
                 // A mark that starts before any closing parenthesis means this
                 // mention has no value. The following text, including a later
-                // ")", stays available to read.
+                // ")", stays available to read. One walk records when no ")"
+                // remains, so the next opener does not walk the line again.
                 if chars[index] == "@" || chars[index] == "#", !wordBefore(chars, index) {
-                    return (ExternalMention(name: name, value: nil), start..<open, nil, false)
+                    var look = index
+                    var foundParen = false
+                    while look < chars.count {
+                        if chars[look] == ")" {
+                            foundParen = true
+                            break
+                        }
+                        look += 1
+                    }
+                    return (ExternalMention(name: name, value: nil), start..<open, nil, !foundParen)
                 }
                 index += 1
             }

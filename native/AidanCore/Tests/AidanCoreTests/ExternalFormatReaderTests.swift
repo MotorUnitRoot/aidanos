@@ -725,7 +725,7 @@ final class ExternalFormatReaderTests: XCTestCase {
 
     /// The same unclosed `@a(` input at N and 2N. A quadratic closer scan grows by about 4x.
     func testUnclosedMentionParenGrowsLinearly() {
-        let count = 100_000
+        let count = 900_000
         let smaller = String(repeating: "@a(", count: count)
         let larger = String(repeating: "@a(", count: count * 2)
         let (once, twice) = growthTimes(smaller, larger) { note in
@@ -747,7 +747,7 @@ final class ExternalFormatReaderTests: XCTestCase {
     }
 
     func testClosedMentionParenGrowsLinearly() {
-        let count = 100_000
+        let count = 900_000
         let smaller = String(repeating: "@a(", count: count) + ")"
         let larger = String(repeating: "@a(", count: count * 2) + ")"
         let (once, twice) = growthTimes(smaller, larger) { note in
@@ -770,7 +770,7 @@ final class ExternalFormatReaderTests: XCTestCase {
     }
 
     func testClosedBracketLineGrowsLinearly() {
-        let count = 100_000
+        let count = 2_000_000
         let smaller = String(repeating: "[a", count: count) + "]"
         let larger = String(repeating: "[a", count: count * 2) + "]"
         let (once, twice) = growthTimes(smaller, larger) { note in

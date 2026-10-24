@@ -43,6 +43,8 @@ public enum ExternalFormatReader {
     /// typed date is upcoming. An open task with no typed date takes the day note's
     /// date: a past day is overdue, and today or a later day is upcoming.
     /// Checklist items are left out of both. A dateless task in a project note is unlisted.
+    /// A `>today` tag is not a fixed date, so it does not land in either list.
+    /// AidanOS choice, pending case 18.
     public static func placement(
         of line: ExternalLine,
         on sessionDay: ExternalDate,
@@ -82,7 +84,7 @@ public enum ExternalNoteContext: Equatable, Sendable {
     case day(ExternalDate)
 }
 
-public struct ExternalDate: Equatable, Comparable, Sendable {
+public struct ExternalDate: Equatable, Hashable, Comparable, Sendable {
     public var year: Int
     public var month: Int
     public var day: Int
@@ -233,6 +235,10 @@ public struct ExternalLine: Equatable, Sendable {
     public var leftOutOfOverdue: Bool
     public var completion: ExternalCompletion?
     public var scheduleDates: [ExternalDate]
+    /// Days named by `<YYYY-MM-DD`. They mark where a copy came from. They are not a schedule.
+    public var broughtFromDays: [ExternalDate]
+    /// `>today` is on the line and the line is not done, so the reference follows the passed day.
+    public var carriesToday: Bool
     public var referencedDays: [ExternalDate]
     public var timeBlock: ExternalTimeBlock?
     public var tags: [ExternalTag]
@@ -250,6 +256,8 @@ public struct ExternalLine: Equatable, Sendable {
         leftOutOfOverdue: Bool,
         completion: ExternalCompletion?,
         scheduleDates: [ExternalDate],
+        broughtFromDays: [ExternalDate],
+        carriesToday: Bool,
         referencedDays: [ExternalDate],
         timeBlock: ExternalTimeBlock?,
         tags: [ExternalTag],
@@ -265,6 +273,8 @@ public struct ExternalLine: Equatable, Sendable {
         self.leftOutOfOverdue = leftOutOfOverdue
         self.completion = completion
         self.scheduleDates = scheduleDates
+        self.broughtFromDays = broughtFromDays
+        self.carriesToday = carriesToday
         self.referencedDays = referencedDays
         self.timeBlock = timeBlock
         self.tags = tags
@@ -305,6 +315,8 @@ private struct InlineMarks {
     var wikiLinks: [ExternalWikiLink] = []
     var markdownLinks: [ExternalMarkdownLink] = []
     var scheduleDates: [ExternalDate] = []
+    var broughtFrom: [ExternalDate] = []
+    var carriesToday = false
     var blocked: [Range<Int>] = []
     var flaggedTokens: [String] = []
 }
@@ -329,6 +341,10 @@ private struct FoundClock {
 }
 
 extension ExternalFormatReader {
+    static func paragraphs(in text: String) -> [String] {
+        splitLines(text)
+    }
+
     /// `\r\n` is one Swift character, so a split on `"\n"` leaves that pair intact.
     /// Walk the scalars and break on `\n`, `\r\n`, and a lone `\r`.
     fileprivate static func splitLines(_ text: String) -> [String] {
@@ -457,6 +473,8 @@ extension ExternalFormatReader {
             leftOutOfOverdue: false,
             completion: nil,
             scheduleDates: [],
+            broughtFromDays: [],
+            carriesToday: false,
             referencedDays: [],
             timeBlock: nil,
             tags: [],
@@ -481,6 +499,12 @@ extension ExternalFormatReader {
         let closed = resolved == .doneTask || resolved == .cancelledTask || resolved == .scheduledTask
         let block = (unsettled || closed) ? nil : timeBlock(in: content, marks: marks, kind: resolved, context: context)
         let completion = unsettled ? nil : marks.mentions.first { $0.name == "done" }?.value.flatMap(readCompletion)
+        // AidanOS choice, pending section 3.4: the words name a task or a bullet, and they stop at done.
+        // A cancelled line is not done, so the tag still follows the passed day. A checklist is neither.
+        let carriesToday = !unsettled
+            && marks.carriesToday
+            && resolved != .doneTask
+            && (resolved.isTask || resolved == .bullet)
         return ExternalLine(
             kind: resolved,
             indentTabs: indent,
@@ -488,6 +512,8 @@ extension ExternalFormatReader {
             leftOutOfOverdue: resolved == .openChecklist || resolved == .unsettled,
             completion: completion,
             scheduleDates: unsettled ? [] : marks.scheduleDates,
+            broughtFromDays: unsettled ? [] : marks.broughtFrom,
+            carriesToday: carriesToday,
             referencedDays: unsettled ? [] : references(marks: marks, kind: resolved, context: context),
             timeBlock: block,
             tags: unsettled ? [] : marks.tags,
@@ -507,6 +533,8 @@ extension ExternalFormatReader {
         line.leftOutOfOverdue = true
         line.completion = nil
         line.scheduleDates = []
+        line.broughtFromDays = []
+        line.carriesToday = false
         line.referencedDays = []
         line.timeBlock = nil
         line.tags = []
@@ -689,6 +717,17 @@ extension ExternalFormatReader {
                     marks.blocked.append(valueRange)
                 }
                 index = range.upperBound
+                continue
+            }
+            if chars[index] == ">", boundaryBefore(chars, index), isTodayWord(chars, at: index + 1) {
+                marks.carriesToday = true
+                index += 1 + "today".count
+                continue
+            }
+            if chars[index] == "<", boundaryBefore(chars, index),
+               let (date, end) = readISODate(chars, at: index + 1) {
+                marks.broughtFrom.append(date)
+                index = end
                 continue
             }
             if chars[index] == ">", boundaryBefore(chars, index),
@@ -948,6 +987,17 @@ extension ExternalFormatReader {
 
     fileprivate static func boundaryBefore(_ chars: [Character], _ index: Int) -> Bool {
         index == 0 || chars[index - 1] == " " || chars[index - 1] == "\t"
+    }
+
+    fileprivate static func isTodayWord(_ chars: [Character], at start: Int) -> Bool {
+        let word = Array("today")
+        guard start + word.count <= chars.count else { return false }
+        for offset in word.indices where chars[start + offset] != word[offset] {
+            return false
+        }
+        let end = start + word.count
+        if end < chars.count, isWordChar(chars[end]) { return false }
+        return true
     }
 
     fileprivate static func isWordChar(_ char: Character) -> Bool {

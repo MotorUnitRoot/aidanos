@@ -2,11 +2,9 @@
 
 Weekend path: Progressive Web App via Safari **Add to Home Screen**. Not App Store. Vault stays markdown (`AIDANOS_VAULT` / sibling `vault/`). One web app on desktop and phone — same Door, same Capture.
 
-## Live sit URL (tonight)
+## Quick tunnel
 
-https://beach-candy-projects-retained.trycloudflare.com
-
-Shop tunnel in front of 3847. Quick tunnel — fine for a sit and overnight while it stays up; not the forever host.
+There is no fixed public URL. A Cloudflare quick tunnel in front of port 3847 is for a sit while it stays up. It is not the forever host. The link changes every time the tunnel starts. `keep-tunnel.sh` needs `cloudflared` installed.
 
 ## Door locks (both surfaces)
 
@@ -16,20 +14,24 @@ Shop tunnel in front of 3847. Quick tunnel — fine for a sit and overnight whil
 
 ## Add to Home Screen (iPhone)
 
-1. Open the URL above in **Safari** (not Chrome).
+1. Open the current tunnel URL, the LAN address, or the Cloud Run URL in **Safari** (not Chrome).
 2. Tap **Share** → **Add to Home Screen**.
 3. Name stays **AidanOS**; tap **Add**.
 4. Launch from the home screen icon — runs standalone.
 
-## LAN bind (his Mac, his vault) — usable tonight without GCP
+The home-screen icons `icon-180.png`, `icon-192.png`, and `apple-touch-icon.png` are in the repo at the root, next to `server.mjs`, so a local `npm start` serves them too.
 
-Default bind is localhost only. For phone on the same Wi‑Fi against `~/Grok/motorunit`:
+## LAN bind — usable without GCP
+
+Default bind is localhost only. From the repo root, for a phone on the same Wi‑Fi:
 
 ```bash
-AIDANOS_HOST=0.0.0.0 AIDANOS_VAULT=~/Grok/motorunit PORT=3847 node server.mjs
+AIDANOS_HOST=0.0.0.0 AIDANOS_VAULT=/path/to/vault PORT=3847 node server.mjs
 ```
 
-Open `http://<mac-lan-ip>:3847` in Safari → Add to Home Screen.
+`/path/to/vault` is the markdown vault. Leave `AIDANOS_VAULT` unset to use the `vault/` folder next to `server.mjs`.
+
+Open `http://<lan-ip>:3847` in Safari → Add to Home Screen.
 
 ## Cloud Run (ready when Colby says go)
 
@@ -60,11 +62,11 @@ Then point Safari / Add to Home Screen at the Cloud Run HTTPS URL. Until then: k
 
 ## Morning sit (Designer)
 
-1. Safari on iPhone → open the HTTPS URL → Share → Add to Home Screen → launch AidanOS.
+1. Safari on iPhone → open the current HTTPS URL → Share → Add to Home Screen → launch AidanOS.
 2. Door: buttons side by side, same hairline; Capture → blank note; Get to Work → Today.
 3. Type a line on Today; leave and return — it stays.
 4. Bounce if buttons are stacked, Capture lands on Today week chrome, or a CRM screen shows.
 
 ## Note for Aide-de-camp
 
-Overnight cut is a PWA (not TestFlight). Code has LAN bind (`AIDANOS_HOST`), responsive Door/Today, Capture blank note, manifest, service worker, and a Cloud Run Dockerfile. Live sit URL is the Cloudflare quick tunnel above. His MotorUnit vault on the Mac remains the real disk for day-to-day. Not blocked on Apple Developer. Durable public host = Cloud Run when a GCP project is ready; until then tunnel + LAN keep the phone usable.
+Overnight cut is a PWA (not TestFlight). Code has LAN bind (`AIDANOS_HOST`), responsive Door/Today, Capture blank note, manifest, service worker, and a Cloud Run Dockerfile. The quick-tunnel link changes every time the tunnel starts. The day-to-day disk is the folder in `AIDANOS_VAULT`, or the sibling `vault/` when that variable is unset. Not blocked on Apple Developer. Durable public host = Cloud Run when a GCP project is ready; until then tunnel + LAN keep the phone usable.

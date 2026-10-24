@@ -10,9 +10,16 @@
  *   "Independent review: PASS <40-hex head sha>"
  *   and performed_via_github_app is null.
  *
- * Any APPROVED review or PASS comment for that head from a bot or an app
- * turns the status red, even when Colby also approved. A BLOCK comment
- * for that head from anyone turns it red. Bots cannot make it green.
+ * Any APPROVED review, PASS comment, or PASS line in a review body for
+ * that head from a bot or an app turns the status red, even when Colby
+ * also approved. A BLOCK comment for that head from anyone turns it red.
+ * Bots cannot make it green.
+ *
+ * Colby's latest review includes dismissed reviews. Green from a review
+ * requires that latest review to be APPROVED on the current head. An
+ * older approval followed by a dismissed changes request stays red.
+ * A failure this App already wrote for a BLOCK or a bot approval stays
+ * red for that commit.
  *
  * The Dependabot path is phase 2 and is off. There is no hardware-key
  * sign-off.
@@ -118,8 +125,10 @@ function commentBodies(comment) {
 function machineApprovals(reviews, comments, head) {
   const found = [];
   for (const review of reviews || []) {
-    if (!review || review.state !== "APPROVED" || !sameSha(review.commit_id, head)) continue;
-    if (!isMachine(review.user, review.performed_via_github_app)) continue;
+    if (!review || !isMachine(review.user, review.performed_via_github_app)) continue;
+    const approved = review.state === "APPROVED" && sameSha(review.commit_id, head);
+    const passInBody = commentKind(review.body, head) === "pass";
+    if (!approved && !passInBody) continue;
     found.push({
       login: sourceLogin(review.user, review.performed_via_github_app),
       at: review.submitted_at || "",
@@ -160,12 +169,12 @@ function blockFrom(comments, head) {
   return blocks;
 }
 
-function colbyLatestDecisive(reviews) {
+function colbyReviews(reviews) {
   const rows = [];
   for (const review of reviews || []) {
     if (!review || !isColby(review.user)) continue;
     if (review.performed_via_github_app != null) continue;
-    if (review.state !== "APPROVED" && review.state !== "CHANGES_REQUESTED") continue;
+    if (review.state !== "APPROVED" && review.state !== "CHANGES_REQUESTED" && review.state !== "DISMISSED") continue;
     rows.push(review);
   }
   rows.sort((left, right) => {
@@ -173,7 +182,38 @@ function colbyLatestDecisive(reviews) {
     if (time !== 0) return time;
     return Number(left.id || 0) - Number(right.id || 0);
   });
+  return rows;
+}
+
+function colbyLatestDecisive(reviews) {
+  const rows = colbyReviews(reviews);
   return rows.length ? rows[rows.length - 1] : null;
+}
+
+// Dismissing a review changes that review to DISMISSED and leaves older
+// reviews in place. An older APPROVED must not become the latest again.
+function dismissedChangesRequest(reviews) {
+  const rows = colbyReviews(reviews);
+  if (!rows.length) return false;
+  const latest = rows[rows.length - 1];
+  if (latest.state !== "DISMISSED") return false;
+  return rows.slice(0, -1).some((review) => review.state === "APPROVED");
+}
+
+const STICKY_FAILURE_PREFIXES = Object.freeze(["Blocked: bot approval from ", "Blocked: BLOCK from "]);
+
+function stickingFailure(statuses) {
+  for (const status of statuses || []) {
+    if (!status || status.context !== STATUS_CONTEXT || status.state !== "failure") continue;
+    const description = String(status.description || "");
+    if (!STICKY_FAILURE_PREFIXES.some((prefix) => description.startsWith(prefix))) continue;
+    return {
+      state: "failure",
+      description: clip(description),
+      reasons: ["sticky", description.startsWith("Blocked: bot approval from ") ? "bot-approval" : "block"],
+    };
+  }
+  return null;
 }
 
 function colbyPassComments(comments, head) {
@@ -193,7 +233,7 @@ function colbyPassComments(comments, head) {
 /**
  * @returns {{state: "success"|"failure"|"pending"|null, description: string, reasons: string[], login?: string}}
  */
-export function evaluate({ pr, reviews, comments } = {}) {
+export function evaluate({ pr, reviews, comments, statuses } = {}) {
   if (!pr || pr.state === "closed") {
     return { state: null, description: "", reasons: ["closed"] };
   }
@@ -229,7 +269,17 @@ export function evaluate({ pr, reviews, comments } = {}) {
     };
   }
 
+  const stuck = stickingFailure(statuses);
+  if (stuck) return stuck;
+
   const decisive = colbyLatestDecisive(reviews);
+  if (dismissedChangesRequest(reviews)) {
+    return {
+      state: "failure",
+      description: clip("Blocked: dismissed review"),
+      reasons: ["dismissed"],
+    };
+  }
   if (decisive && decisive.state === "APPROVED" && sameSha(decisive.commit_id, sha)) {
     return {
       state: "success",
@@ -303,31 +353,54 @@ export async function judgeAndWrite({
   readPull,
   readReviews,
   readComments,
+  readStatuses = async () => [],
   writeStatus,
 }) {
-  const pr = await readPull(prNumber);
-  const early = evaluate({ pr, reviews: [], comments: [] });
-  if (!pr || early.reasons[0] === "closed" || early.reasons[0] === "bad-head" || early.reasons[0] === "base") {
-    return { wrote: false, reason: early.reasons[0] || "skip", result: early, judgedSha: null };
+  let judgedSha = null;
+  try {
+    const pr = await readPull(prNumber);
+    const early = evaluate({ pr, reviews: [], comments: [], statuses: [] });
+    if (!pr || early.reasons[0] === "closed" || early.reasons[0] === "bad-head" || early.reasons[0] === "base") {
+      return { wrote: false, reason: early.reasons[0] || "skip", result: early, judgedSha: null };
+    }
+    judgedSha = String(pr.head.sha).toLowerCase();
+    const reviews = await readReviews(prNumber);
+    const comments = await readComments(prNumber);
+    const statuses = await readStatuses(judgedSha);
+    let result = evaluate({ pr, reviews, comments, statuses });
+    if (advisory) return { wrote: false, reason: "advisory", result, judgedSha };
+    const fresh = await readPull(prNumber);
+    const freshSha = fresh && fresh.head && fresh.head.sha;
+    if (!sameSha(freshSha, judgedSha)) {
+      return { wrote: false, reason: "head-moved", result, judgedSha };
+    }
+    const freshReviews = await readReviews(prNumber);
+    const freshComments = await readComments(prNumber);
+    const freshStatuses = await readStatuses(judgedSha);
+    result = evaluate({ pr: fresh, reviews: freshReviews, comments: freshComments, statuses: freshStatuses });
+    if (!result.state) return { wrote: false, reason: result.reasons[0] || "skip", result, judgedSha };
+    await writeStatus({
+      sha: judgedSha,
+      state: result.state,
+      description: result.description,
+      context: STATUS_CONTEXT,
+    });
+    return { wrote: true, reason: "wrote", result, judgedSha };
+  } catch (error) {
+    if (!advisory && judgedSha && writeStatus) {
+      try {
+        await writeStatus({
+          sha: judgedSha,
+          state: "pending",
+          description: "gate error",
+          context: STATUS_CONTEXT,
+        });
+      } catch {
+        // The original error is the one that failed the run.
+      }
+    }
+    throw error;
   }
-  const judgedSha = String(pr.head.sha).toLowerCase();
-  const reviews = await readReviews(prNumber);
-  const comments = await readComments(prNumber);
-  const result = evaluate({ pr, reviews, comments });
-  if (advisory) return { wrote: false, reason: "advisory", result, judgedSha };
-  const fresh = await readPull(prNumber);
-  const freshSha = fresh && fresh.head && fresh.head.sha;
-  if (!sameSha(freshSha, judgedSha)) {
-    return { wrote: false, reason: "head-moved", result, judgedSha };
-  }
-  if (!result.state) return { wrote: false, reason: result.reasons[0] || "skip", result, judgedSha };
-  await writeStatus({
-    sha: judgedSha,
-    state: result.state,
-    description: result.description,
-    context: STATUS_CONTEXT,
-  });
-  return { wrote: true, reason: "wrote", result, judgedSha };
 }
 
 export function pullNumberFromEvent(eventName, event, envPr) {
@@ -497,6 +570,31 @@ export async function selfTest() {
       `Colby approved ${sha.slice(0, 7)}`,
     ],
     ["dismissed approval", [review(colby, "DISMISSED", sha)], [], "pending", `Waiting for Colby on ${sha.slice(0, 7)}`],
+    [
+      "approve, request changes, dismiss",
+      [review(colby, "APPROVED", sha, { id: 1, submitted_at: t0 }), review(colby, "DISMISSED", sha, { id: 2, submitted_at: t1 })],
+      [],
+      "failure",
+      "Blocked: dismissed review",
+    ],
+    [
+      "a PASS comment does not restore a dismissed changes request",
+      [review(colby, "APPROVED", sha, { id: 1, submitted_at: t0 }), review(colby, "DISMISSED", sha, { id: 2, submitted_at: t1 })],
+      [note(`Independent review: PASS ${sha}`, colby)],
+      "failure",
+      "Blocked: dismissed review",
+    ],
+    [
+      "a new approval after a dismissed changes request",
+      [
+        review(colby, "APPROVED", sha, { id: 1, submitted_at: t0 }),
+        review(colby, "DISMISSED", sha, { id: 2, submitted_at: t1 }),
+        review(colby, "APPROVED", sha, { id: 3, submitted_at: t2 }),
+      ],
+      [],
+      "success",
+      `Colby approved ${sha.slice(0, 7)}`,
+    ],
     ["PASS for the exact head", [], [note(`Independent review: PASS ${sha}`, colby)], "success", `Colby PASS ${sha.slice(0, 7)}`],
     ["PASS with a leading space and a note", [], [note(`  Independent review: PASS ${sha}\nlooks good`, colby)], "success", `Colby PASS ${sha.slice(0, 7)}`],
     ["PASS with a short sha", [], [note(`Independent review: PASS ${sha.slice(0, 7)}`, colby)], "pending", null],
@@ -567,6 +665,33 @@ export async function selfTest() {
       [review(cursorBot, "APPROVED", other, { id: 1 }), review(colby, "APPROVED", sha, { id: 2 })],
       [],
       "success",
+      null,
+    ],
+    [
+      "bot PASS in a review body",
+      [
+        review(colby, "APPROVED", sha, { id: 1 }),
+        review(cursorBot, "COMMENTED", sha, { id: 2, submitted_at: t1, body: `Independent review: PASS ${sha}` }),
+      ],
+      [],
+      "failure",
+      "Blocked: bot approval from cursor[bot]",
+    ],
+    [
+      "bot PASS in a review body for another sha",
+      [
+        review(colby, "APPROVED", sha, { id: 1 }),
+        review(cursorBot, "COMMENTED", other, { id: 2, body: `Independent review: PASS ${other}` }),
+      ],
+      [],
+      "success",
+      null,
+    ],
+    [
+      "Colby PASS in a review body is not a comment",
+      [review(colby, "COMMENTED", sha, { body: `Independent review: PASS ${sha}` })],
+      [],
+      "pending",
       null,
     ],
     [
@@ -792,6 +917,151 @@ export async function selfTest() {
   });
   assert(closed.wrote === false && closed.reason === "closed" && closedWrites.length === 0, "a closed pull request does not write");
 
+  let reviewReads = 0;
+  const overlapWrites = [];
+  const overlap = await judgeAndWrite({
+    prNumber: 12,
+    readPull: async () => open,
+    readReviews: async () => {
+      reviewReads += 1;
+      if (reviewReads === 1) return [review(colby, "APPROVED", sha, { id: 1 })];
+      return [review(colby, "APPROVED", sha, { id: 1 }), review(appBot, "APPROVED", sha, { id: 2, submitted_at: t1 })];
+    },
+    readComments: async () => [],
+    readStatuses: async () => [],
+    writeStatus: async (body) => {
+      overlapWrites.push(body);
+    },
+  });
+  assert(reviewReads === 2, "reviews are read again immediately before the write");
+  assert(overlap.wrote === true && overlapWrites.length === 1, "the second read is what gets written");
+  assert(
+    overlapWrites[0].state === "failure" &&
+      overlapWrites[0].description === "Blocked: bot approval from motorunit-aidanos-bots[bot]" &&
+      overlapWrites[0].sha === sha,
+    "a bot approval that arrives before the write replaces the green",
+  );
+
+  const stuckBlock = evaluate({
+    pr: open,
+    reviews: [review(colby, "APPROVED", sha)],
+    comments: [],
+    statuses: [{ context: STATUS_CONTEXT, state: "failure", description: "Blocked: BLOCK from octocat" }],
+  });
+  assert(
+    stuckBlock.state === "failure" && stuckBlock.description === "Blocked: BLOCK from octocat" && stuckBlock.reasons[0] === "sticky",
+    "a deleted BLOCK stays red from the gate's earlier failure",
+  );
+  const stuckBot = evaluate({
+    pr: open,
+    reviews: [review(colby, "APPROVED", sha)],
+    comments: [],
+    statuses: [{ context: STATUS_CONTEXT, state: "failure", description: "Blocked: bot approval from cursor[bot]" }],
+  });
+  assert(stuckBot.state === "failure" && stuckBot.reasons.includes("bot-approval"), "an earlier bot-approval failure stays red");
+  const otherContext = evaluate({
+    pr: open,
+    reviews: [review(colby, "APPROVED", sha)],
+    comments: [],
+    statuses: [{ context: "independent-review/approved", state: "failure", description: "Blocked: BLOCK from octocat" }],
+  });
+  assert(otherContext.state === "success", "a failure on another context does not stick");
+  const priorSuccess = evaluate({
+    pr: open,
+    reviews: [],
+    comments: [],
+    statuses: [{ context: STATUS_CONTEXT, state: "success", description: `Colby approved ${sha.slice(0, 7)}` }],
+  });
+  assert(priorSuccess.state === "pending", "an earlier success does not stick");
+  const priorPending = evaluate({
+    pr: open,
+    reviews: [review(colby, "APPROVED", sha)],
+    comments: [],
+    statuses: [{ context: STATUS_CONTEXT, state: "pending", description: "gate error" }],
+  });
+  assert(priorPending.state === "success", "a gate error does not stick");
+
+  const errorWrites = [];
+  let reviewError = null;
+  try {
+    await judgeAndWrite({
+      prNumber: 12,
+      readPull: async () => open,
+      readReviews: async () => {
+        throw new Error("reviews failed");
+      },
+      readComments: async () => [],
+      writeStatus: async (body) => {
+        errorWrites.push(body);
+      },
+    });
+  } catch (error) {
+    reviewError = error;
+  }
+  assert(reviewError instanceof Error && reviewError.message === "reviews failed", "an API error still fails the run");
+  assert(errorWrites.length === 1, "an API error writes one status");
+  assert(
+    errorWrites[0].sha === sha && errorWrites[0].state === "pending" && errorWrites[0].description === "gate error" && errorWrites[0].context === STATUS_CONTEXT,
+    "an API error writes pending gate error on the head that was read",
+  );
+
+  const advisoryErrorWrites = [];
+  let advisoryError = null;
+  try {
+    await judgeAndWrite({
+      prNumber: 12,
+      advisory: true,
+      readPull: async () => open,
+      readReviews: async () => {
+        throw new Error("reviews failed");
+      },
+      readComments: async () => [],
+      writeStatus: async (body) => {
+        advisoryErrorWrites.push(body);
+      },
+    });
+  } catch (error) {
+    advisoryError = error;
+  }
+  assert(advisoryError instanceof Error && advisoryErrorWrites.length === 0, "advisory mode does not write gate error");
+
+  const earlyWrites = [];
+  let earlyError = null;
+  try {
+    await judgeAndWrite({
+      prNumber: 12,
+      readPull: async () => {
+        throw new Error("pull failed");
+      },
+      readReviews: async () => [],
+      readComments: async () => [],
+      writeStatus: async (body) => {
+        earlyWrites.push(body);
+      },
+    });
+  } catch (error) {
+    earlyError = error;
+  }
+  assert(earlyError instanceof Error && earlyError.message === "pull failed" && earlyWrites.length === 0, "a failure before the head is read writes nothing");
+
+  let writeError = null;
+  try {
+    await judgeAndWrite({
+      prNumber: 12,
+      readPull: async () => open,
+      readReviews: async () => {
+        throw new Error("reviews failed");
+      },
+      readComments: async () => [],
+      writeStatus: async () => {
+        throw new Error("status failed");
+      },
+    });
+  } catch (error) {
+    writeError = error;
+  }
+  assert(writeError instanceof Error && writeError.message === "reviews failed", "a failed gate-error write still surfaces the original error");
+
   const failedHistory = await prepareComments(
     [note("hello", cursorBot, { id: 9, updated_at: t1, node_id: "BOT" })],
     {},
@@ -897,6 +1167,17 @@ export async function selfTest() {
   assert(!/^\s*statuses:\s*write/m.test(gateYaml), "the workflow token is not granted statuses write");
   assert(gateYaml.includes("ref: ${{ github.sha }}"), "the gate checks out the base sha");
   assert(gateYaml.includes("persist-credentials: false"), "the gate checkout drops credentials");
+  assert(!gateYaml.includes("workflow_run.id"), "review events do not get their own concurrency group");
+  assert(
+    gateYaml.includes(
+      "group: approval-gate-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha }}",
+    ),
+    "every event shares one concurrency group per pull request",
+  );
+  const gateJobs = gateYaml.split("\njobs:\n")[1] || "";
+  assert(gateJobs.includes("\n    name: judge\n"), "the binding job is named judge");
+  assert(!gateJobs.includes("name: approval-gate"), "the job name is not the status context");
+  assert(STATUS_CONTEXT === "approval-gate", "the status context stays approval-gate");
   assert(!relayYaml.includes("uses:"), "the relay checks nothing out");
   assert(!relayYaml.includes("secrets."), "the relay has no secrets");
   assert(relayYaml.includes("permissions: {}"), "the relay token has no permissions");
@@ -1010,6 +1291,10 @@ async function main() {
       );
       return prepareComments(comments, event, (nodeId) => listEdits(request, nodeId), (message) => console.log(message));
     },
+    readStatuses: (sha) =>
+      listAll((page) =>
+        request(`/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}/statuses?per_page=100&page=${page}`),
+      ),
     writeStatus: ({ sha, state, description, context }) =>
       request(`/repos/${owner}/${repo}/statuses/${encodeURIComponent(sha)}`, {
         method: "POST",

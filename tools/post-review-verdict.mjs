@@ -2,36 +2,28 @@
 /**
  * Post an independent-review verdict as the motorunit-aidanos-bots App.
  *
- * The App private key is pasted into each review environment as
- * REVIEW_APP_PRIVATE_KEY. The gated workflow mints an installation token
- * and passes it as GITHUB_TOKEN. This file never reads the key and never
- * prints the token. A PASS also requires REVIEW_GATE_PASS_ENV=1, which is
- * set only on the independent-review environment. A PASS fetches its
- * comment again and writes nothing if that comment changed or a BLOCK for
- * the same commit exists. A BLOCK still writes if its comment changed.
- * A BLOCK never calls the checks API. The status-mode PASS path does not
- * either. The minted token can write statuses and read pull requests only.
+ * Nothing in this repository starts this script. The post workflow has
+ * been removed. This file never reads an App private key and never prints
+ * a token. PASS is not posted. BLOCK, if someone runs this script by
+ * hand, writes a failure status and does not call the checks API.
  *
  *   GITHUB_TOKEN=... GITHUB_REPOSITORY=owner/repo \
- *     node tools/post-review-verdict.mjs <pr> PASS <head-sha>
+ *     node tools/post-review-verdict.mjs <pr> BLOCK <head-sha>
  *
- * --status-only sets the status and does not post a comment. The gated
- * workflow uses it because the verdict comment is already on the pull
- * request. The script refuses if the pull request's current head is not
- * that SHA. On PASS it posts the comment first, then sets success, so a
- * failed comment never turns the commit green. On BLOCK it writes the
- * failure status first, then posts the comment. It does not read or write
- * check runs. A failed BLOCK posts no comment, so an earlier PASS stays
- * green until the BLOCK is retried.
+ * --status-only sets the status and does not post a comment. BLOCK writes
+ * the failure status first, then posts the comment when a comment is
+ * requested. It does not read or write check runs. A failed BLOCK posts
+ * no comment.
+ *
+ * PASS is not posted. approval-gate is the only success status. A PASS
+ * matched by the MotorUnitRoot login is ignored, and --status-only PASS
+ * writes nothing. The independent-review-post workflow has been removed.
+ * This file must not mint or use the shared App key.
  *
  * REVIEW_MODE is "status". The check-run mode has been removed. The
  * installed App has no checks write, and this script never calls the
- * checks API. A PASS from motorunit-aidanos-bots[bot], from any bot, or
- * from a comment made through a GitHub App is ignored. That old status
- * is not approval-gate. The binding check is approval-gate.
- * --parse-request reads an issue_comment event and accepts a PASS only
- * from the MotorUnitRoot login when it was not posted through an app,
- * and only when the SHA is still the pull request head.
+ * checks API. --parse-request reads an issue_comment event and accepts
+ * only a BLOCK whose SHA is still the pull request head.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -137,10 +129,10 @@ export function classifyCommentRequest({ login, body, headSha, viaApp, userType 
 }
 
 function passAuthorAllowed({ login, viaApp, userType }) {
-  if (login !== "MotorUnitRoot") return false;
-  if (viaApp != null) return false;
-  if (userType && userType !== "User") return false;
-  return true;
+  void login;
+  void viaApp;
+  void userType;
+  return false;
 }
 
 export function blockFailureKeptPass({ exitCode, message, comments, statuses }) {
@@ -172,16 +164,16 @@ export async function postReviewVerdict({
   bodySha256,
   log = () => {},
 }) {
+  void commentId;
+  void bodySha256;
+  selectedMode(mode);
+  if (verdict === "PASS") {
+    throw new Error("PASS is not posted. approval-gate is the only success status.");
+  }
   if (!token) throw new Error("GITHUB_TOKEN is required");
   if (!owner || !repo) throw new Error("GITHUB_REPOSITORY is required");
-  if (verdict === "PASS" && process.env.REVIEW_GATE_PASS_ENV !== "1") {
-    throw new Error(
-      "PASS requires REVIEW_GATE_PASS_ENV=1 from the independent-review environment. PASS was not posted.",
-    );
-  }
   const prNumber = Number(number);
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error("pull request number is required");
-  selectedMode(mode);
   const line = verdictLine(verdict, sha);
   const normalized = line.split(" ").pop();
 
@@ -199,46 +191,8 @@ export async function postReviewVerdict({
     throw new Error(`PR #${prNumber} head is ${head || "missing"}, not ${normalized}`);
   }
 
-  if (verdict === "PASS" && commentId != null && commentId !== "") {
-    const id = Number(commentId);
-    if (!Number.isInteger(id) || id <= 0) throw new Error("comment id is required");
-    if (!bodySha256) throw new Error("comment body hash is required");
-    let current;
-    try {
-      current = await call(`/repos/${owner}/${repo}/issues/comments/${id}`);
-    } catch (error) {
-      if (error.status === 404) throw new Error(`Comment ${id} was deleted. PASS was not posted.`);
-      throw error;
-    }
-    if (commentBodySha256(current && current.body) !== bodySha256) {
-      throw new Error(`Comment ${id} changed. PASS was not posted.`);
-    }
-  }
-
-  if (verdict === "PASS") {
-    const combined = await call(`/repos/${owner}/${repo}/commits/${encodeURIComponent(head)}/status`);
-    const latest = ((combined && combined.statuses) || []).find((item) => item && item.context === STATUS_CONTEXT);
-    if (latest && latest.state === "failure") {
-      throw new Error(`independent-review/approved is already failure on ${head}. PASS was not posted.`);
-    }
-    let page = 1;
-    for (;;) {
-      const listed = await call(`/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`);
-      const comments = Array.isArray(listed) ? listed : [];
-      for (const item of comments) {
-        const login = item && item.user && item.user.login;
-        if (!VERDICT_AUTHORS.includes(login)) continue;
-        const parsed = parseVerdictLine(item && item.body);
-        if (!parsed || parsed.verdict !== "BLOCK" || parsed.sha !== normalized) continue;
-        throw new Error(`A BLOCK for ${normalized} from an allowed login exists. PASS was not posted.`);
-      }
-      if (comments.length < 100) break;
-      page += 1;
-      if (page > 20) throw new Error("The comment list was truncated. PASS was not posted.");
-    }
-  }
-
-  const state = verdict === "PASS" ? "success" : "failure";
+  if (verdict !== "BLOCK") throw new Error("verdict must be BLOCK");
+  const state = "failure";
   const writeComment = () => {
     if (!postComment) return null;
     return call(`/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
@@ -279,14 +233,9 @@ export async function postReviewVerdict({
     if (latest && latest.state === "success") await failStatus();
   };
 
-  if (verdict === "BLOCK") {
-    await failStatus();
-    await rewriteFailureIfPassed();
-    await writeComment();
-  } else {
-    await writeComment();
-    await postStatus();
-  }
+  await failStatus();
+  await rewriteFailureIfPassed();
+  await writeComment();
   log(
     postComment
       ? `Posted ${verdict} for PR #${prNumber} at ${head}.`
@@ -306,8 +255,9 @@ export async function parseRequest({ event, request, owner, repo, token, writeOu
     log("No allowlisted verdict on the first line. Nothing to post.");
     return { action: "ignore" };
   }
-  if (parsedLine.verdict === "PASS" && !passAuthorAllowed({ login, viaApp, userType: user && user.type })) {
-    log("PASS from this author is not an approval. Nothing to post.");
+  if (parsedLine.verdict === "PASS") {
+    void passAuthorAllowed({ login, viaApp, userType: user && user.type });
+    log("PASS is not posted. approval-gate is the only success status.");
     return { action: "ignore" };
   }
   const pr = await request(`/repos/${owner}/${repo}/pulls/${number}`, { method: "GET", token });
@@ -462,17 +412,12 @@ export function selfTest() {
 
   return Promise.allSettled([pass, block, stale, leaked]).then(async (results) => {
     const [passResult, blockResult, staleResult, leakedResult] = results;
-    assert(passResult.status === "fulfilled", "pass posts");
-    assert(passResult.value.line === `Independent review: PASS ${sha}`, "pass first line");
-    assert(passResult.value.state === "success", "pass status");
-    assert(passApi.calls.length === 5, "pass reads the status and comments, then comments, then sets success");
-    assert(passApi.calls[3].body.body === `Independent review: PASS ${sha}`, "comment body");
-    assert(passApi.calls[4].body.state === "success", "success state");
-    assert(passApi.calls[4].body.context === "independent-review/approved", "status context");
+    assert(passResult.status === "rejected", "PASS is not posted");
     assert(
-      !passApi.calls.some((call) => call.pathname.includes("/check-runs") || call.pathname.includes("/checks")),
-      "status mode PASS does not call the checks API",
+      String(passResult.reason && passResult.reason.message).includes("PASS is not posted"),
+      "PASS names the approval gate as the only success status",
     );
+    assert(passApi.calls.length === 0, "PASS does not call the API or write a status");
 
     assert(REVIEW_MODE === "status", "the default mode is status");
     assert(blockResult.status === "fulfilled", "block posts");
@@ -486,8 +431,8 @@ export function selfTest() {
       "BLOCK does not call the checks API",
     );
 
-    assert(staleResult.status === "rejected", "stale head is refused");
-    assert(staleApi.calls.length === 1, "stale head posts nothing");
+    assert(staleResult.status === "rejected", "PASS is refused before the head is read");
+    assert(staleApi.calls.length === 0, "PASS posts nothing");
     assert(!String(staleResult.reason && staleResult.reason.message).includes(token), "stale error hides the token");
 
     assert(leakedResult.status === "rejected", "request errors surface");
@@ -514,11 +459,11 @@ export function selfTest() {
       () => null,
       (error) => error,
     );
-    assert(passStopped instanceof Error, "a failed PASS comment stops the script");
     assert(
-      !passCommentFails.calls.some((call) => call.pathname.includes("/statuses/")),
-      "a failed PASS comment does not set success",
+      passStopped instanceof Error && passStopped.message.includes("PASS is not posted"),
+      "PASS does not post",
     );
+    assert(passCommentFails.calls.length === 0, "PASS does not set success");
 
     const blockStatusFails = spawnSync(
       process.execPath,
@@ -604,12 +549,12 @@ export function selfTest() {
       () => null,
       (error) => error,
     );
-    assert(passNoChecksError == null, "status mode PASS does not depend on checks access");
     assert(
-      passNoChecks.posts().some((post) => post.kind === "status" && post.state === "success"),
-      "status mode PASS still writes success when checks are forbidden",
+      passNoChecksError instanceof Error && passNoChecksError.message.includes("PASS is not posted"),
+      "PASS does not write success",
     );
-    assert(passNoChecks.lookups.length === 0, "status mode PASS does not call the checks API");
+    assert(passNoChecks.posts().length === 0, "PASS writes nothing");
+    assert(passNoChecks.lookups.length === 0, "PASS does not call the checks API");
 
     const checkModeRemoved = memoryApi(sha, token);
     const checkModeError = await postReviewVerdict({
@@ -640,8 +585,8 @@ export function selfTest() {
     );
     assert(
       classifyCommentRequest({ login: "MotorUnitRoot", body: `Independent review: PASS ${sha}\nnote`, headSha: sha }).action ===
-        "accept",
-      "Colby can request a PASS",
+        "ignore",
+      "a MotorUnitRoot PASS is not an approval",
     );
     assert(
       classifyCommentRequest({
@@ -678,9 +623,9 @@ export function selfTest() {
       "a BLOCK without the full commit is ignored",
     );
     assert(
-      classifyCommentRequest({ login: "MotorUnitRoot", body: `Independent review: PASS ${sha}`, headSha: `b${"c".repeat(39)}` })
+      classifyCommentRequest({ login: "MotorUnitRoot", body: `Independent review: BLOCK ${sha}`, headSha: `b${"c".repeat(39)}` })
         .action === "refuse",
-      "a verdict for an older commit is refused",
+      "a BLOCK for an older commit is refused",
     );
 
     let lookups = 0;
@@ -738,13 +683,17 @@ export function selfTest() {
       "a moved head refuses the gated post",
     );
 
+    let passLookups = 0;
     let parsedOutput = "";
-    const acceptedRequest = await parseRequest({
+    const ignoredPass = await parseRequest({
       event: {
         comment: { id: 15, user: { login: "MotorUnitRoot", type: "User" }, body: `Independent review: PASS ${sha}\nlater` },
         issue: { number: 40 },
       },
-      request: async () => ({ head: { sha } }),
+      request: async () => {
+        passLookups += 1;
+        return { head: { sha } };
+      },
       owner: "MotorUnitRoot",
       repo: "aidanos",
       token,
@@ -752,14 +701,8 @@ export function selfTest() {
         parsedOutput += text;
       },
     });
-    assert(acceptedRequest.action === "accept" && acceptedRequest.verdict === "PASS", "an allowlisted current verdict is accepted");
-    assert(parsedOutput.includes("verdict=PASS") && parsedOutput.includes(`sha=${sha}`), "parse writes the verdict outputs");
-    assert(parsedOutput.includes("comment_id=15"), "parse passes the comment id");
-    assert(
-      parsedOutput.includes(`body_sha256=${commentBodySha256(`Independent review: PASS ${sha}\nlater`)}`),
-      "parse passes the comment body hash",
-    );
-    assert(parsedOutput.includes(`environment=${PASS_ENVIRONMENT}`), "PASS names the approval environment");
+    assert(ignoredPass.action === "ignore" && passLookups === 0, "a MotorUnitRoot PASS does not read the pull request");
+    assert(!parsedOutput.includes("verdict=PASS"), "parse does not emit a PASS verdict");
 
     let blockOutput = "";
     const blockParsed = await parseRequest({
@@ -803,7 +746,7 @@ export function selfTest() {
     assert(!statusOnlyBlockPosts.some((post) => post.kind === "comment"), "status-only BLOCK does not post a comment");
 
     const statusOnlyPass = memoryApi(sha, token);
-    await postReviewVerdict({
+    const statusOnlyPassError = await postReviewVerdict({
       token,
       owner: "MotorUnitRoot",
       repo: "aidanos",
@@ -813,11 +756,15 @@ export function selfTest() {
       postComment: false,
       request: statusOnlyPass.request,
       log: () => {},
-    });
-    assert(
-      statusOnlyPass.posts().length === 1 && statusOnlyPass.posts()[0].state === "success",
-      "status-only PASS sets success and nothing else",
+    }).then(
+      () => null,
+      (error) => error,
     );
+    assert(
+      statusOnlyPassError instanceof Error && statusOnlyPassError.message.includes("PASS is not posted"),
+      "status-only PASS is refused",
+    );
+    assert(statusOnlyPass.posts().length === 0, "status-only PASS writes nothing");
     assert(statusOnlyPass.comments.length === 0, "status-only PASS does not post a comment");
 
     const rateLimitedStatus = memoryApi(sha, token, {
@@ -899,62 +846,46 @@ export function selfTest() {
       return { error, posts };
     }
 
-    const deleted = await recheck("PASS", { missing: true });
-    assert(deleted.error instanceof Error && deleted.error.message.includes("was deleted"), "a deleted comment refuses the post");
-    assert(deleted.posts.length === 0, "a deleted comment sets no status");
-
-    const changed = await recheck("PASS", { comment: { ...passComment, body: `${passBody}\nedited` } });
-    assert(changed.error instanceof Error && changed.error.message.includes("changed"), "a changed comment refuses the post");
-    assert(changed.posts.length === 0, "a changed comment sets no status");
-
-    const moved = await recheck("PASS", { comment: passComment, head: `b${"c".repeat(39)}` });
-    assert(moved.error instanceof Error && moved.error.message.includes("head is"), "PASS re-checks that the head is still the verdict commit");
-    assert(moved.posts.length === 0, "a moved head sets no status");
-
-    const alreadyBlocked = await recheck("PASS", { comment: passComment, statusState: "failure" });
-    assert(
-      alreadyBlocked.error instanceof Error && alreadyBlocked.error.message.includes("already failure"),
-      "PASS refuses when the commit is already a BLOCK failure",
-    );
-    assert(alreadyBlocked.posts.length === 0, "an existing failure is not overwritten with success");
-
-    const anyBlock = await recheck("PASS", {
-      comment: passComment,
-      comments: [
+    for (const [label, options] of [
+      ["a deleted PASS comment", { missing: true }],
+      ["an edited PASS comment", { comment: { ...passComment, body: `${passBody}\nedited` } }],
+      ["a PASS whose head moved", { comment: passComment, head: `b${"c".repeat(39)}` }],
+      ["a PASS on a commit that is already failure", { comment: passComment, statusState: "failure" }],
+      [
+        "a PASS beside an allowed BLOCK",
         {
-          user: { login: "motorunit-aidanos-bots[bot]" },
-          created_at: "2026-10-20T00:00:00Z",
-          updated_at: "2026-10-21T02:00:00Z",
-          body: `Independent review: BLOCK ${sha}\nedited into a BLOCK`,
+          comment: passComment,
+          comments: [
+            {
+              user: { login: "motorunit-aidanos-bots[bot]" },
+              body: `Independent review: BLOCK ${sha}`,
+            },
+          ],
         },
       ],
-    });
-    assert(
-      anyBlock.error instanceof Error && anyBlock.error.message.includes("from an allowed login exists"),
-      "any allowed BLOCK for the commit refuses PASS, including one posted earlier or edited into a BLOCK",
-    );
-    assert(anyBlock.posts.length === 0, "an existing BLOCK sets no success");
-
-    const strangerBlock = await recheck("PASS", {
-      comment: passComment,
-      comments: [
+      [
+        "a PASS beside a BLOCK from another login",
         {
-          user: { login: "octocat" },
-          created_at: "2026-10-20T00:00:00Z",
-          body: `Independent review: BLOCK ${sha}`,
+          comment: passComment,
+          comments: [{ user: { login: "octocat" }, body: `Independent review: BLOCK ${sha}` }],
         },
       ],
-    });
-    assert(strangerBlock.error == null && strangerBlock.posts[0] === "success", "a BLOCK from outside the login allowlist does not stop PASS");
+    ]) {
+      const outcome = await recheck("PASS", options);
+      assert(
+        outcome.error instanceof Error && outcome.error.message.includes("PASS is not posted") && outcome.posts.length === 0,
+        `${label} writes nothing`,
+      );
+    }
 
     delete process.env.REVIEW_GATE_PASS_ENV;
     const closedGate = await recheck("PASS", { comment: passComment });
     process.env.REVIEW_GATE_PASS_ENV = "1";
     assert(
-      closedGate.error instanceof Error && closedGate.error.message.includes("REVIEW_GATE_PASS_ENV=1"),
-      "PASS refuses without the independent-review gate variable",
+      closedGate.error instanceof Error && closedGate.error.message.includes("PASS is not posted"),
+      "PASS is refused with or without the old gate variable",
     );
-    assert(closedGate.posts.length === 0, "a closed gate sets no success");
+    assert(closedGate.posts.length === 0, "PASS sets no success");
 
     const blockBody = `Independent review: BLOCK ${sha}`;
     const freshBlock = await recheck("BLOCK", {
@@ -995,51 +926,16 @@ export function selfTest() {
     });
     assert(raced.length === 2 && raced.every((state) => state === "failure"), "BLOCK writes failure again when a success landed after it");
 
-    const workflow = fs.readFileSync(new URL("../.github/workflows/independent-review-post.yml", import.meta.url), "utf8");
-    const jobsAt = workflow.indexOf("\njobs:\n");
-    assert(jobsAt > 0, "post workflow has jobs");
-    assert(!/^concurrency:/m.test(workflow.slice(0, jobsAt)), "the workflow itself has no concurrency group");
-    assert(workflow.includes("environment: independent-review\n"), "PASS uses the fixed approval environment");
-    assert(workflow.includes("environment: independent-review-block"), "BLOCK uses the fixed immediate environment");
-    assert(!workflow.includes("needs.parse.outputs.environment"), "the environment name is not taken from an output");
-    assert(
-      workflow.includes("group: independent-review-post-${{ needs.parse.outputs.pr }}-PASS"),
-      "PASS concurrency is its own group",
-    );
-    assert(
-      workflow.includes("group: independent-review-post-${{ needs.parse.outputs.pr }}-BLOCK"),
-      "BLOCK concurrency is its own group",
-    );
-    const passJob = workflow.split("\n  post-pass:")[1].split("\n  post-block:")[0];
-    const blockJob = workflow.split("\n  post-block:")[1];
-    assert(passJob.includes('"$REVIEW_PR" PASS "$REVIEW_SHA"'), "the PASS job hard-codes PASS");
-    assert(passJob.includes("REVIEW_GATE_PASS_ENV: ${{ vars.REVIEW_GATE_PASS_ENV }}"), "PASS reads the gate variable");
-    assert(passJob.includes("permission-statuses: write"), "PASS token can write statuses");
-    assert(passJob.includes("permission-pull-requests: read"), "PASS token can read the pull request");
-    assert(passJob.includes("app-id: ${{ vars.REVIEW_APP_ID }}"), "PASS reads REVIEW_APP_ID from its environment");
-    assert(!passJob.includes("permission-issues:"), "PASS token does not request issues");
-    assert(!passJob.includes("permission-checks:"), "PASS token does not request checks");
-    assert(blockJob.includes('"$REVIEW_PR" BLOCK "$REVIEW_SHA"'), "the BLOCK job hard-codes BLOCK");
-    assert(!blockJob.includes("REVIEW_GATE_PASS_ENV"), "BLOCK does not receive the PASS gate variable");
-    assert(blockJob.includes("permission-statuses: write"), "BLOCK token can write statuses");
-    assert(blockJob.includes("permission-pull-requests: read"), "BLOCK token can read the pull request");
-    assert(blockJob.includes("app-id: ${{ vars.REVIEW_APP_ID }}"), "BLOCK reads REVIEW_APP_ID from its environment");
-    assert(!blockJob.includes("permission-checks:"), "BLOCK token does not request checks");
-    assert(!blockJob.includes("permission-issues:"), "BLOCK token does not request issues");
-    for (const job of [passJob, blockJob]) {
-      const requested = job.match(/permission-[a-z-]+:/g) || [];
-      assert(
-        requested.length === 2 && requested.includes("permission-statuses:") && requested.includes("permission-pull-requests:"),
-        "each post token requests only statuses write and pull requests read",
-      );
+    const workflowDir = new URL("../.github/workflows/", import.meta.url);
+    const workflowNames = fs.readdirSync(workflowDir);
+    assert(!workflowNames.includes("independent-review-post.yml"), "the shared-key status writer workflow is gone");
+    let missingWorkflow = null;
+    try {
+      fs.readFileSync(new URL("../.github/workflows/independent-review-post.yml", import.meta.url), "utf8");
+    } catch (error) {
+      missingWorkflow = error;
     }
-    const summaries = workflow.split("- name: Record the verdict").slice(1);
-    assert(summaries.length === 2, "both post jobs record a summary");
-    for (const summary of summaries) {
-      const script = summary.split("run: |")[1].split("- name:")[0];
-      assert(script && !script.includes("${{"), "summary scripts do not inline action expressions");
-      assert(script.includes("REVIEW_PR") && script.includes("REVIEW_SHA"), "summary scripts read env vars");
-    }
+    assert(missingWorkflow && missingWorkflow.code === "ENOENT", "the post workflow file cannot be read");
     if (previousGate === undefined) delete process.env.REVIEW_GATE_PASS_ENV;
     else process.env.REVIEW_GATE_PASS_ENV = previousGate;
 

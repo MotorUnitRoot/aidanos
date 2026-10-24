@@ -38,12 +38,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: approval-gate-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr || github.event.workflow_run.id }}
+  group: approval-gate-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
   gate:
-    name: approval-gate
+    name: judge
     if: >-
       github.event_name == 'pull_request_target' ||
       github.event_name == 'workflow_dispatch' ||

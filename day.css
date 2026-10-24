@@ -1581,7 +1581,7 @@ body.doc-capture #job-actions {
   background: color-mix(in srgb, var(--text) 8%, transparent);
 }
 .format-btn:focus-visible {
-  outline: 1px solid var(--border);
+  outline: 2px solid var(--text);
   outline-offset: -2px;
 }
 @media (min-width: 641px) {

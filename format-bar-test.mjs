@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -24,12 +25,15 @@ const bundle = [
   grabFn("matchPaperTask", "paperTaskSrc"),
   grabFn("paperTaskSrc", "paintTaskBodyHtml"),
   grabFn("indentDumpLine", "outdentDumpLine"),
-  grabFn("outdentDumpLine", "formatBarBody"),
+  grabFn("outdentDumpLine", "formatBarListMark"),
+  grabFn("formatBarListMark", "formatBarBody"),
   grabFn("formatBarBody", "formatBarTaskLine"),
   grabFn("formatBarTaskLine", "formatBarHeadingLine"),
   grabFn("formatBarHeadingLine", "formatBarListLine"),
-  grabFn("formatBarListLine", "formatBarApply"),
+  grabFn("formatBarListLine", "formatBarCaret"),
+  grabFn("formatBarCaret", "formatBarApply"),
   grabFn("formatBarApply", "emptyListPrefix"),
+  grabFn("emptyListPrefix", "lineBody"),
 ].join("\n");
 
 const sandbox = {};
@@ -40,6 +44,8 @@ const load = new Function(
     " sandbox.formatBarHeadingLine = formatBarHeadingLine;" +
     " sandbox.formatBarListLine = formatBarListLine;" +
     " sandbox.formatBarApply = formatBarApply;" +
+    " sandbox.formatBarCaret = formatBarCaret;" +
+    " sandbox.emptyListPrefix = emptyListPrefix;" +
     " sandbox.indentDumpLine = indentDumpLine;" +
     " sandbox.outdentDumpLine = outdentDumpLine;"
 );
@@ -49,6 +55,8 @@ const {
   formatBarHeadingLine,
   formatBarListLine,
   formatBarApply,
+  formatBarCaret,
+  emptyListPrefix,
   indentDumpLine,
   outdentDumpLine,
 } = sandbox;
@@ -77,6 +85,7 @@ assert(formatBarApply(indented, 1, "indent").split("\n")[1] === "    Buy milk", 
 assert(formatBarTaskLine("- Buy milk") === "- [ ] Buy milk", "a bullet becomes a task");
 assert(formatBarTaskLine("* Buy milk") === "- [ ] Buy milk", "a star bullet becomes a task");
 assert(formatBarTaskLine("1. Buy milk") === "- [ ] Buy milk", "a numbered line becomes a task");
+assert(formatBarTaskLine("2026. Buy milk") === "- [ ] 2026. Buy milk", "a year is not a list marker on a task");
 assert(formatBarTaskLine("  nested") === "  - [ ] nested", "an indented line keeps its indent as a task");
 assert(formatBarTaskLine("- [ ] Buy milk") === "- [x] Buy milk", "a task toggles done");
 assert(formatBarTaskLine("- [x] Buy milk") === "- [ ] Buy milk", "a done task toggles open");
@@ -93,10 +102,15 @@ assert(formatBarHeadingLine("# Buy milk") === "## Buy milk", "a level-1 heading 
 assert(formatBarHeadingLine("### Deep") === "## Deep", "a deeper heading becomes level 2");
 assert(formatBarHeadingLine(formatBarHeadingLine("Buy milk")) === "Buy milk", "heading toggles back to the line");
 assert(formatBarHeadingLine(formatBarHeadingLine("## Section")) === "## Section", "switching a level-2 heading off and on restores it");
-assert(formatBarHeadingLine("- [ ] Buy milk") === "## Buy milk", "a task's body becomes a level-2 heading");
+assert(formatBarHeadingLine("- [ ] Buy milk") === "- [ ] Buy milk", "an unticked task stays a task");
+assert(formatBarHeadingLine("- [x] Buy milk") === "- [x] Buy milk", "a ticked task stays a task");
+assert(formatBarHeadingLine("2026. Buy milk") === "## 2026. Buy milk", "a line starting 2026. keeps the year");
+assert(formatBarHeadingLine("1) Buy milk") === "## 1) Buy milk", "a line starting 1) is not stripped as a list number");
 assert(formatBarHeadingLine("- Buy milk") === "## Buy milk", "a list's body becomes a level-2 heading");
 assert(formatBarHeadingLine("1. Buy milk") === "## Buy milk", "a numbered line becomes a level-2 heading");
 assert(formatBarHeadingLine("  nested") === "## nested", "an indented line becomes a level-2 heading");
+assert(formatBarHeadingLine("  ## Why") === "Why", "an indented level-2 heading switches off");
+assert(formatBarHeadingLine("  # Why") === "## Why", "an indented level-1 heading becomes level 2");
 assert(formatBarHeadingLine("") === "## ", "an empty line becomes an empty level-2 heading");
 
 assert(formatBarListLine("- Buy milk") === "Buy milk", "a bullet toggles off");
@@ -104,6 +118,7 @@ assert(formatBarListLine("* Buy milk") === "Buy milk", "a star bullet toggles of
 assert(formatBarListLine("+ Buy milk") === "Buy milk", "a plus bullet toggles off");
 assert(formatBarListLine("1. Buy milk") === "Buy milk", "a numbered line toggles off");
 assert(formatBarListLine("2) Buy milk") === "Buy milk", "a parenthesis number toggles off");
+assert(formatBarListLine("2026. Buy milk") === "- 2026. Buy milk", "a year is not a list marker on a list");
 assert(formatBarListLine("- [ ] Buy milk") === "- Buy milk", "a task becomes a bullet");
 assert(formatBarListLine("- [x] Buy milk") === "- Buy milk", "a done task becomes a bullet");
 assert(formatBarListLine("# Buy milk") === "- Buy milk", "a heading becomes a bullet");
@@ -117,6 +132,15 @@ assert(indentDumpLine("- [ ] Buy milk") === "  - [ ] Buy milk", "indent shifts t
 assert(outdentDumpLine("    - Buy milk") === "  - Buy milk", "outdent removes two spaces");
 assert(outdentDumpLine("\tBuy milk") === "Buy milk", "outdent removes a tab");
 assert(outdentDumpLine(" Buy milk") === " Buy milk", "a single space is not a level");
+
+assert(formatBarCaret("Buy milk", "## Buy milk", 3) === 6, "heading shifts the cursor by the marks added");
+assert(formatBarCaret("## Buy milk", "Buy milk", 6) === 3, "switching a heading off shifts the cursor back");
+assert(formatBarCaret("Buy milk", "## Buy milk", 8) === 11, "a cursor at the end of the line stays at the end");
+assert(formatBarCaret("- [ ] Buy", "- [x] Buy", 4) === 4, "a same-length toggle keeps the cursor");
+assert(formatBarCaret("Buy milk", "## Buy milk", 0) === 3, "a cursor at the start moves past the marks added");
+
+assert(emptyListPrefix("1. ") === "1. ", "an empty numbered item is still a list");
+assert(emptyListPrefix("2026. ") === "", "a year is not an empty list marker");
 
 const bar = html.slice(html.indexOf('id="format-bar"'), html.indexOf("<script"));
 const labels = [...bar.matchAll(/<button[^>]*aria-label="([^"]+)"/g)].map((m) => m[1]);
@@ -154,6 +178,55 @@ assert(wire.includes('act === "find"') && wire.includes("moveCursorToFindLine()"
 assert(wire.includes('act === "hide"') && wire.includes("hidePhoneKeyboard()"), "hide keyboard button");
 assert(!wire.includes('act === "style"') && !wire.includes('act === "wand"') && !wire.includes('act === "command"'), "old handlers are gone");
 assert(!src.includes("fmtBoldSelectionOrLine"), "text-style handler is gone");
+const applySrc = src.slice(src.indexOf("function fmtActiveLineIndex("), src.indexOf("function fmtToggleTaskLine("));
+assert(!/idx\s*=\s*0/.test(applySrc), "no cursor is not rewritten to the first line");
+assert(/if \(idx < 0\) return;/.test(applySrc), "no cursor returns before a button edits");
+const listen = wire.slice(wire.indexOf('addEventListener("selectionchange"'));
+assert(listen.includes("requestAnimationFrame"), "caret scrolling is framed");
+assert(!listen.slice(0, listen.indexOf("requestAnimationFrame")).includes("revealLineAboveFormatBar"), "a keystroke does not scroll before the frame");
+
+function pressFormat(activeLine, caretLine) {
+  const dump = { value: "First line\nSecond line" };
+  let focused = false;
+  const paper = { focus() { focused = true; } };
+  const document = {
+    getElementById(id) {
+      if (id === "paper") return paper;
+      if (id === "dump") return dump;
+      return null;
+    },
+  };
+  const context = vm.createContext({
+    document,
+    state: { activeLine },
+    lineIndexOfCaret() { return caretLine; },
+    paperLines() { return []; },
+    writeDumpLine() { throw new Error("writeDumpLine"); },
+    caretOffset() { throw new Error("caretOffset"); },
+    lineMarkdown() { throw new Error("lineMarkdown"); },
+    formatBarApply() { throw new Error("formatBarApply"); },
+    pushPaperHistory() { throw new Error("pushPaperHistory"); },
+    scheduleSave() { throw new Error("scheduleSave"); },
+    paintPaperAt() { throw new Error("paintPaperAt"); },
+    revealLineAboveFormatBar() { throw new Error("revealLineAboveFormatBar"); },
+    isSourceTask() { return false; },
+    formatBarCaret() { throw new Error("formatBarCaret"); },
+  });
+  vm.runInContext("const $ = (id) => document.getElementById(id);\n" + applySrc, context);
+  return {
+    dump,
+    focused: () => focused,
+    press() { context.fmtApplyActive("heading", "fmt-heading", "end"); },
+  };
+}
+const noCursor = pressFormat(-1, -1);
+noCursor.press();
+assert(noCursor.dump.value === "First line\nSecond line", "with no cursor in the note a button does nothing");
+assert(!noCursor.focused(), "with no cursor a button does not focus the note");
+const onLine = pressFormat(1, -1);
+let edited = false;
+try { onLine.press(); } catch (e) { edited = e.message === "formatBarApply"; }
+assert(edited, "a cursor still reaches the line edit");
 assert(src.includes('"(max-width: 640px)"') || src.includes("(max-width: 640px)"), "phone width gates the bar");
 assert(!src.includes("pointer: coarse"), "a wide window does not grow the bar");
 
@@ -167,6 +240,9 @@ assert(!rule.includes("#1c1c1e"), "bar has no dark fill");
 assert(/min-height:\s*max\(44px,\s*var\(--tap\)\)/.test(css), "buttons are at least 44px");
 const wide = css.slice(css.indexOf("@media (min-width: 641px)"));
 assert(wide.includes(".format-bar") && /display:\s*none\s*!important/.test(wide), "wide windows hide the bar");
+const barCss = css.slice(css.indexOf("/* Formatting bar above keyboard */"), css.indexOf("/* Conflict"));
+assert(/\.format-btn:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--text\)/.test(barCss), "keyboard focus on a bar button is a clear outline");
+assert(!/outline:\s*1px solid var\(--border\)/.test(barCss), "bar focus is not the hairline border");
 
 const bannedStyle = "NotePlan" + "-style";
 const bannedCapsule = "cap" + "sule";

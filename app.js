@@ -423,6 +423,14 @@ function outdentDumpLine(line) {
   return s;
 }
 
+// "1." and "1)" are ordered markers. A four-digit year like "2026." is not.
+function formatBarListMark(line) {
+  const m = String(line ?? "").match(/^(\s*)(\d+)([.)])(\s+)(.*)$/);
+  if (!m) return null;
+  if (m[2].length === 4 && m[3] === ".") return null;
+  return m;
+}
+
 function formatBarBody(line) {
   const s = String(line ?? "");
   const task = matchPaperTask(s);
@@ -430,7 +438,9 @@ function formatBarBody(line) {
   let m;
   if ((m = s.match(/^(#{1,6})\s+(.*)$/))) return m[2];
   if ((m = s.match(/^(\s*)([-*+])\s+(.*)$/))) return m[3];
-  if ((m = s.match(/^(\s*)(\d+[.)])\s+(.*)$/))) return m[3];
+  const ol = formatBarListMark(s);
+  // Heading keeps a parenthesis number ("1)") in the text. Only "1." is a list.
+  if (ol && ol[3] === ".") return ol[5];
   if ((m = s.match(/^\s{2,}(\S.*)$/))) return m[1];
   return s.replace(/^\s+/, "");
 }
@@ -442,19 +452,22 @@ function formatBarTaskLine(text) {
   if (task) return paperTaskSrc(task[1], task[2], !/x/i.test(task[3]), task[4]);
   const ul = line.match(/^(\s*)([-*+])\s+(.*)$/);
   if (ul) return ul[1] + "- [ ] " + ul[3];
-  const ol = line.match(/^(\s*)(\d+[.)])\s+(.*)$/);
-  if (ol) return ol[1] + "- [ ] " + ol[3];
+  const ol = formatBarListMark(line);
+  if (ol) return ol[1] + "- [ ] " + ol[5];
   const nest = line.match(/^(\s{2,})(\S.*)$/);
   if (nest) return nest[1] + "- [ ] " + nest[2];
   return "- [ ] " + line.replace(/^\s+/, "");
 }
 
-// Heading toggles level 2 ("## "). A level-2 line returns to its body.
-// Any other line, including another heading level, becomes "## " plus that body.
+// Heading toggles level 2 ("## "). A level-2 line, even with leading spaces,
+// returns to its body. Any other line, including another heading level,
+// becomes "## " plus that body. A task line is left unchanged. A year like
+// "2026." is not a list marker, and "1)" stays in the text.
 // List toggles a bullet ("- ").
 function formatBarHeadingLine(text) {
   const line = String(text ?? "");
-  const already = line.match(/^(#{1,6})\s+(.*)$/);
+  if (matchPaperTask(line)) return line;
+  const already = line.match(/^\s*(#{1,6})\s+(.*)$/);
   if (already && already[1] === "##") return already[2];
   const body = already ? already[2] : formatBarBody(line);
   return body ? "## " + body : "## ";
@@ -466,11 +479,23 @@ function formatBarListLine(text) {
   if (task) return task[1] + "- " + String(task[4] ?? "");
   let m;
   if ((m = line.match(/^(\s*)([-*+])\s+(.*)$/))) return m[1] + m[3];
-  if ((m = line.match(/^(\s*)(\d+[.)])\s+(.*)$/))) return m[1] + m[3];
+  const ol = formatBarListMark(line);
+  if (ol) return ol[1] + ol[5];
   if ((m = line.match(/^(#{1,6})\s+(.*)$/))) return m[2] ? "- " + m[2] : "- ";
   if ((m = line.match(/^(\s+)(\S.*)$/))) return m[1] + "- " + m[2].replace(/^#{1,6}\s+/, "");
   const body = line.replace(/^\s+/, "");
   return body ? "- " + body : "- ";
+}
+
+function formatBarCaret(before, after, offset) {
+  const prev = String(before ?? "");
+  const next = String(after ?? "");
+  const off = Number(offset);
+  const start = Number.isFinite(off) ? off : 0;
+  const pos = start + next.length - prev.length;
+  if (pos < 0) return 0;
+  if (pos > next.length) return next.length;
+  return pos;
 }
 
 function formatBarApply(markdown, index, action) {
@@ -495,8 +520,8 @@ function emptyListPrefix(line) {
   if (task) return task[1];
   const ul = s.match(/^(\s*[-*+]\s+)$/);
   if (ul) return ul[1];
-  const ol = s.match(/^(\s*\d+[.)]\s+)$/);
-  if (ol) return ol[1];
+  const ol = s.match(/^(\s*)(\d+)([.)])(\s+)$/);
+  if (ol && !(ol[2].length === 4 && ol[3] === ".")) return ol[0];
   return "";
 }
 
@@ -5685,8 +5710,7 @@ function runPaperUndoAction() {
 }
 
 function fmtActiveLineIndex() {
-  let idx = state.activeLine >= 0 ? state.activeLine : lineIndexOfCaret();
-  if (idx < 0) idx = 0;
+  const idx = state.activeLine >= 0 ? state.activeLine : lineIndexOfCaret();
   return idx;
 }
 
@@ -5694,8 +5718,9 @@ function fmtApplyActive(action, kind, caretMode) {
   const paper = $("paper");
   const dump = $("dump");
   if (!paper || !dump) return;
-  paper.focus();
   const idx = fmtActiveLineIndex();
+  if (idx < 0) return;
+  paper.focus();
   const el = paperLines()[idx];
   const off = el ? (() => { try { return caretOffset(el); } catch (e) { return 0; } })() : 0;
   if (el) writeDumpLine(idx, lineMarkdown(el));
@@ -5706,10 +5731,7 @@ function fmtApplyActive(action, kind, caretMode) {
   if (next === text) return;
   pushPaperHistory(paperHistory, { markdown: dump.value, line: idx, caret: off }, { kind: kind });
   writeDumpLine(idx, next);
-  let caret;
-  if (caretMode === "indent" && isSourceTask(el)) caret = off;
-  else if (caretMode === "indent") caret = Math.max(0, off + (next.length - text.length));
-  else caret = next.length;
+  const caret = (caretMode === "indent" && isSourceTask(el)) ? off : formatBarCaret(text, next, off);
   scheduleSave();
   paintPaperAt(idx, caret);
   revealLineAboveFormatBar();
@@ -5885,9 +5907,17 @@ function hidePhoneKeyboard() {
     }, 0);
   });
 
+  let revealQueued = false;
   document.addEventListener("selectionchange", () => {
-    if (!paperEditorFocused()) return;
-    revealLineAboveFormatBar();
+    const bar = $("format-bar");
+    if (!bar || bar.hasAttribute("hidden") || !paperEditorFocused()) return;
+    if (revealQueued) return;
+    revealQueued = true;
+    requestAnimationFrame(() => {
+      revealQueued = false;
+      if (!paperEditorFocused()) return;
+      revealLineAboveFormatBar();
+    });
   });
 
   const onVV = () => syncFmtBarForKeyboard();

@@ -97,7 +97,7 @@ Run these on a throwaway pull request after the App and the environment exist. R
 3. On the new commit, comment `Independent review: PASS` plus the full commit id. The gate should turn green. Edit that comment. The gate should go back to waiting.
 4. On an ordinary pull request (not a Dependabot security update), have the shared App approve it. The gate should turn red, including when you have also approved it.
 5. Open a pull request that adds its own job named `approval-gate` and make that job pass. The pull request should still be blocked. That job comes from Actions, not from the gate App.
-6. Read the branch rule. Confirm `approval-gate` is pinned to the new App's id and not to "any source". You do not need to forge a status with the shared App's key. The pin is the proof.
+6. Read the branch rule. Confirm `approval-gate` is pinned to the new App's id and not to "any source". You do not need to forge a status with the shared App's key. The pin is the proof. Live test 6 covers the shared App key. Live test 9 uses the built-in `GITHUB_TOKEN` and does not replace this check.
 7. Dependabot path: not active. Do not run this yet. When phase 2 is built, the test is a real Dependabot security update that the App approved (gate green), then a push to that branch by `cursor[bot]` (gate waiting or red). Launch does not include that path.
 8. From the Actions tab, open the workflow named `approval-gate`, choose Run workflow, and select a branch that is not `main`. The `approval-gate` environment must refuse the job before it starts. The run must not mint a token and must not write a status. That refusal is the proof the deployment branch rule is `main` only and that there is no tag rule. Then run the same workflow from `main`, with the throwaway pull request number, and confirm the environment allows that run.
 9. On a commit the gate has already marked green, post a newer `approval-gate` status with state `pending` from the Actions token, then record whether the merge box blocks. This test uses `GITHUB_TOKEN` with `statuses: write`. It does not use an App private key, and it does not use the shared App.
@@ -149,6 +149,8 @@ Run these on a throwaway pull request after the App and the environment exist. R
    From the Actions tab, run `approval-gate-live-test-9` on `main`. The input is that commit id. Open the throwaway pull request and write down whether the merge box blocks, and what it showed. This test records the result. It does not assume it.
 
    Delete `.github/workflows/approval-gate-live-test-9.yml` from `main`. Do that in the next commit. The workflow must not stay.
+
+   Colby confirms the file is deleted afterward. On `main`, he opens `.github/workflows` and checks that it has no `approval-gate-live-test-9.yml`.
 
 ## Manual re-check
 

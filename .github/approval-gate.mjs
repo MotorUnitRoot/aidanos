@@ -76,6 +76,10 @@ export const DEPENDABOT_PATH_ENABLED = false;
 
 export const STATUS_CONTEXT = "approval-gate";
 export const STATUS_DESCRIPTION_LIMIT = 140;
+// GitHub returns at most this many commit statuses per request. The
+// still-green check reads one page, and a page of this length with no
+// gate-bot approval-gate row is judged because the next page is unread.
+export const STATUS_PAGE_SIZE = 100;
 
 export function dependabotSecurityUpdate() {
   return false;
@@ -531,9 +535,9 @@ export function statusPageNeedsJudge(page, gate) {
     return status.state === "success";
   }
   if (sawApprovalGate) return true;
-  // per_page=100. A full page of other contexts can hide the gate bot's
-  // older success on the next page, so that pull request is judged too.
-  return page.length >= 100;
+  // A full page of other contexts can hide the gate bot's older success
+  // on the next page, so that pull request is judged too.
+  return page.length >= STATUS_PAGE_SIZE;
 }
 
 function openMainPulls(pulls) {
@@ -1468,11 +1472,14 @@ export async function selfTest() {
   assert(!statusPageNeedsJudge([listStatus("success", actionsBot, "ok", "tests")], testGate), "a page with no approval-gate row is not re-judged");
   assert(!statusPageNeedsJudge([], testGate), "a missing status page is not re-judged");
   const junkRow = listStatus("success", actionsBot, "ok", "tests");
-  const fullJunk = Array.from({ length: 100 }, () => junkRow);
+  const fullJunk = Array.from({ length: STATUS_PAGE_SIZE }, () => junkRow);
   assert(statusPageNeedsJudge(fullJunk, testGate), "a full page with no gate-bot approval-gate row is judged");
-  assert(!statusPageNeedsJudge(fullJunk.slice(0, 99), testGate), "a short page of other statuses is left alone");
+  assert(!statusPageNeedsJudge(fullJunk.slice(0, STATUS_PAGE_SIZE - 1), testGate), "a short page of other statuses is left alone");
   assert(
-    !statusPageNeedsJudge([listStatus("failure", gateCreator, "Blocked: BLOCK from octocat"), ...fullJunk.slice(0, 99)], testGate),
+    !statusPageNeedsJudge(
+      [listStatus("failure", gateCreator, "Blocked: BLOCK from octocat"), ...fullJunk.slice(0, STATUS_PAGE_SIZE - 1)],
+      testGate,
+    ),
     "a full page still trusts a red status from the gate bot",
   );
   const fullPageSeen = [];
@@ -1905,9 +1912,12 @@ export async function selfTest() {
   assert(!source.includes(execName), "the gate does not exec");
   const sharedKeyName = ["REVIEW_APP", "PRIVATE_KEY"].join("_");
   assert(!source.includes(sharedKeyName), "the gate does not name the shared App key");
-  const statusPageQuery = ["/statuses?per_page=100", "`"].join("");
+  const statusPageQuery = ["statuses?per_page=${", "STATUS_PAGE_SIZE}"].join("");
+  const fullPageCheck = ["page.length >= ", "STATUS_PAGE_SIZE"].join("");
   const combinedStatusQuery = ["/status", "`"].join("");
-  assert(source.includes(statusPageQuery), "the still-green check reads one statuses page");
+  assert(STATUS_PAGE_SIZE === 100, "a statuses page holds 100 rows");
+  assert(source.includes(statusPageQuery), "the statuses request uses STATUS_PAGE_SIZE");
+  assert(source.includes(fullPageCheck), "the full-page check uses STATUS_PAGE_SIZE");
   assert(!source.includes(combinedStatusQuery), "the still-green check does not read combined status");
 
   const workflowDir = fileURLToPath(new URL("./workflows/", import.meta.url));
@@ -2095,7 +2105,8 @@ async function main() {
     triggeringSha,
     listPulls: () =>
       listAll((page) => request(`/repos/${owner}/${repo}/pulls?state=open&base=main&per_page=100&page=${page}`)),
-    readStatusPage: (sha) => request(`/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}/statuses?per_page=100`),
+    readStatusPage: (sha) =>
+      request(`/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}/statuses?per_page=${STATUS_PAGE_SIZE}`),
     writeGateError: (sha) => postStatus(sha, "pending", "gate error"),
     judgeOne: (pullNumber, options = {}) =>
       judgeAndWrite({
@@ -2116,7 +2127,9 @@ async function main() {
         },
         readStatuses: (sha) =>
           listAll((page) =>
-            request(`/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}/statuses?per_page=100&page=${page}`),
+            request(
+              `/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}/statuses?per_page=${STATUS_PAGE_SIZE}&page=${page}`,
+            ),
           ),
         writeStatus: ({ sha, state, description }) => postStatus(sha, state, description),
       }),

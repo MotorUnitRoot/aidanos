@@ -29,7 +29,9 @@
  * Combined status is not used: its rows have no creator. The first
  * approval-gate row from this App's bot decides. Success is judged
  * again. Pending or red is left alone. A page of approval-gate rows
- * with none from this bot is judged anyway. A rate-limit error writes
+ * with none from this bot is judged anyway. A full page of 100 rows
+ * with no approval-gate row from this bot is judged anyway, because
+ * an older green can sit on the next page. A rate-limit error writes
  * pending "gate error" when that head is already known. The write uses
  * the same hourly allowance, so it only helps for a secondary limit.
  *
@@ -523,7 +525,10 @@ export function statusPageNeedsJudge(page, gate) {
     if (!creatorIsGate(status.creator, gate)) continue;
     return status.state === "success";
   }
-  return sawApprovalGate;
+  if (sawApprovalGate) return true;
+  // per_page=100. A full page of other contexts can hide the gate bot's
+  // older success on the next page, so that pull request is judged too.
+  return page.length >= 100;
 }
 
 function openMainPulls(pulls) {
@@ -1444,6 +1449,25 @@ export async function selfTest() {
   assert(!statusPageNeedsJudge([listStatus("pending", gateCreator, "gate error")], testGate), "a pending status from the gate bot is not re-judged");
   assert(!statusPageNeedsJudge([listStatus("success", actionsBot, "ok", "tests")], testGate), "a page with no approval-gate row is not re-judged");
   assert(!statusPageNeedsJudge([], testGate), "a missing status page is not re-judged");
+  const junkRow = listStatus("success", actionsBot, "ok", "tests");
+  const fullJunk = Array.from({ length: 100 }, () => junkRow);
+  assert(statusPageNeedsJudge(fullJunk, testGate), "a full page with no gate-bot approval-gate row is judged");
+  assert(!statusPageNeedsJudge(fullJunk.slice(0, 99), testGate), "a short page of other statuses is left alone");
+  assert(
+    !statusPageNeedsJudge([listStatus("failure", gateCreator, "Blocked: BLOCK from octocat"), ...fullJunk.slice(0, 99)], testGate),
+    "a full page still trusts a red status from the gate bot",
+  );
+  const fullPageSeen = [];
+  const fullPage = await judgeRelevantPulls({
+    gate: testGate,
+    listPulls: async () => [{ number: 21, state: "open", base: { ref: "main" }, head: { sha } }],
+    readStatusPage: async () => fullJunk,
+    judgeOne: async (number) => {
+      fullPageSeen.push(number);
+      return { wrote: false, reason: "skip", result: { state: null, reasons: ["skip"] }, judgedSha: sha };
+    },
+  });
+  assert(fullPage.errors.length === 0 && fullPageSeen.length === 1 && fullPageSeen[0] === 21, "a full status page is judged even with no gate-bot row");
   assert(
     statusPageNeedsJudge([listStatus("success", gateCreator)], { slug: "", botUserId: null }),
     "an empty slug matches no creator, so an approval-gate page is judged",
@@ -1869,6 +1893,12 @@ export async function selfTest() {
   const workflowNames = fs.readdirSync(workflowDir).filter((entry) => entry.endsWith(".yml") || entry.endsWith(".yaml"));
   assert(workflowNames.includes("approval-gate.yml"), "the binding workflow exists");
   assert(workflowNames.includes("approval-gate-trigger.yml"), "the review relay exists");
+  assert(!workflowNames.includes("approval-gate-live-test-9.yml"), "live test 9 is not an active workflow");
+  const gateDoc = fs.readFileSync(fileURLToPath(new URL("../docs/approval-gate.md", import.meta.url)), "utf8");
+  assert(gateDoc.includes("workflow_dispatch:"), "live test 9 is a workflow_dispatch snippet");
+  assert(gateDoc.includes("statuses: write"), "live test 9 uses the Actions status permission");
+  assert(gateDoc.includes("secrets.GITHUB_TOKEN"), "live test 9 uses the Actions token");
+  assert(gateDoc.includes("Delete `.github/workflows/approval-gate-live-test-9.yml` from `main`."), "live test 9 says to remove the workflow");
   const workflowErrors = [];
   for (const entry of workflowNames) {
     const body = fs.readFileSync(`${workflowDir}${entry}`, "utf8");

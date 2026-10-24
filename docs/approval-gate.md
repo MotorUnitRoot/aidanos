@@ -27,7 +27,7 @@ The Dependabot shortcut is not built. It stays off. There is no hardware-key sig
 
 The gate reads the reviews, the comments, and the head again from GitHub just before it writes, and it writes that second result only to the commit it judged. If a new commit landed in between, it writes nothing.
 
-Each judge run checks the pull request that started the run. It also checks other open pull requests into main. For each of those, it reads one page of commit statuses (`GET /repos/{owner}/{repo}/commits/{sha}/statuses?per_page=100`). That list is newest first and each row includes its creator. The combined-status endpoint is not used, because its rows have no creator. The gate takes the first `approval-gate` row on that page whose creator is the gate App's bot. When that row is still success, the pull request is judged again. When that row is pending or red, the pull request is left alone. When the page has `approval-gate` rows and none of them are from the gate bot, the pull request is judged anyway. When the page has no `approval-gate` row, the pull request is left alone. Reviews and comments are read only for the pull requests that are judged. The read-only advisory jobs judge only the pull request that started the run. They do not write a status.
+Each judge run checks the pull request that started the run. It also checks other open pull requests into main. For each of those, it reads one page of commit statuses (`GET /repos/{owner}/{repo}/commits/{sha}/statuses?per_page=100`). That list is newest first and each row includes its creator. The combined-status endpoint is not used, because its rows have no creator. The gate takes the first `approval-gate` row on that page whose creator is the gate App's bot. When that row is still success, the pull request is judged again. When that row is pending or red, the pull request is left alone. When the page has `approval-gate` rows and none of them are from the gate bot, the pull request is judged anyway. When the page has no `approval-gate` row and is not full, the pull request is left alone. A full page of 100 rows with no `approval-gate` row from the gate bot is judged anyway, because an older green can sit on the next page. Reviews and comments are read only for the pull requests that are judged. The read-only advisory jobs judge only the pull request that started the run. They do not write a status.
 
 If the list of pull requests cannot be read, the run judges only the pull request that started it. If that judgment also fails, and the head commit is already known, the gate writes `pending` with the description `gate error` on that commit. A rate-limit response does the same wherever a head is already known: HTTP 403, HTTP 429, or `x-ratelimit-remaining` of 0. The error text is not copied into the status. That pending status replaces an older green. The `gate error` write spends the same hourly allowance as the read. Once that hourly allowance is used up, the write fails too, so this fallback only helps with a secondary limit. The run then continues with the other pull requests it can still reach. If that fallback write also fails, an older green can stay on the commit. If the gate App's slug is missing, the gate writes that same `gate error` instead of judging.
 
@@ -100,11 +100,59 @@ Run these on a throwaway pull request after the App and the environment exist. R
 6. Read the branch rule. Confirm `approval-gate` is pinned to the new App's id and not to "any source". You do not need to forge a status with the shared App's key. The pin is the proof.
 7. Dependabot path: not active. Do not run this yet. When phase 2 is built, the test is a real Dependabot security update that the App approved (gate green), then a push to that branch by `cursor[bot]` (gate waiting or red). Launch does not include that path.
 8. From the Actions tab, open the workflow named `approval-gate`, choose Run workflow, and select a branch that is not `main`. The `approval-gate` environment must refuse the job before it starts. The run must not mint a token and must not write a status. That refusal is the proof the deployment branch rule is `main` only and that there is no tag rule. Then run the same workflow from `main`, with the throwaway pull request number, and confirm the environment allows that run.
-9. On a commit the gate has already marked green, have the shared App post a newer `approval-gate` status with state `pending`. Record whether the merge box blocks. Write down what the merge box showed. This test records the result. It does not assume it.
+9. On a commit the gate has already marked green, post a newer `approval-gate` status with state `pending` from the Actions token, then record whether the merge box blocks. This test uses `GITHUB_TOKEN` with `statuses: write`. It does not use an App private key, and it does not use the shared App.
+
+   The workflow is a snippet in this document, not a file in `.github/workflows/`. A committed workflow would stay runnable on `main`. Add it only for this test, run it once, then delete it.
+
+   On `main`, create `.github/workflows/approval-gate-live-test-9.yml` with this file:
+
+   ```yaml
+   name: approval-gate-live-test-9
+
+   # Temporary. Delete this file after live test 9.
+   # The Actions token writes the status. No App key is read.
+
+   on:
+     workflow_dispatch:
+       inputs:
+         sha:
+           description: Full 40-character commit id the gate already marked green
+           required: true
+           type: string
+
+   permissions:
+     statuses: write
+
+   jobs:
+     post-pending:
+       name: post pending approval-gate
+       runs-on: ubuntu-latest
+       steps:
+         - name: Post a pending approval-gate status
+           env:
+             GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+             SHA: ${{ inputs.sha }}
+           run: |
+             case "$SHA" in
+               *[!0-9a-fA-F]*) echo "sha must be 40 hex characters" >&2; exit 1 ;;
+             esac
+             if [ "${#SHA}" -ne 40 ]; then
+               echo "sha must be 40 hex characters" >&2
+               exit 1
+             fi
+             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+               -f state=pending \
+               -f context=approval-gate \
+               -f description="live test 9"
+   ```
+
+   From the Actions tab, run `approval-gate-live-test-9` on `main`. The input is that commit id. Open the throwaway pull request and write down whether the merge box blocks, and what it showed. This test records the result. It does not assume it.
+
+   Delete `.github/workflows/approval-gate-live-test-9.yml` from `main`. Do that in the next commit. The workflow must not stay.
 
 ## Manual re-check
 
-From the Actions tab, on `main`, run the workflow named `approval-gate`. The input is a pull request number. The run uses the workflow on `main` and the `approval-gate` environment. It judges that pull request, plus any other open pull request into main whose first statuses page still shows a gate-bot success, or shows `approval-gate` rows from anyone else. After a change to the gate App's slug or id, run it so every open pull request is judged again. Live test 8 is the check that a run from any other branch is refused.
+From the Actions tab, on `main`, run the workflow named `approval-gate`. The input is a pull request number. The run uses the workflow on `main` and the `approval-gate` environment. It judges that pull request, plus any other open pull request into main whose first statuses page still shows a gate-bot success, shows `approval-gate` rows from anyone else, or is a full page of 100 rows with no gate-bot `approval-gate` row. After a change to the gate App's slug or id, run it so every open pull request is judged again. Live test 8 is the check that a run from any other branch is refused.
 
 A review (approve, request changes, or dismiss) is picked up by a small relay workflow that has no secrets and does not check out code. The judgment still runs from `main`. If a pull request breaks that relay, the gate is simply not re-checked until the next push, comment, or manual run. Breaking the relay cannot turn the gate green.
 

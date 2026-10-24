@@ -24,10 +24,14 @@
  * user id is optional until Colby sets APPROVAL_GATE_BOT_USER_ID.
  *
  * Each run judges the pull request that started it, plus other open
- * pull requests into main whose latest approval-gate status is still
- * success from this App's bot. Pending, red, and missing statuses
- * already block, so they are not re-judged. A rate-limit error writes
- * pending "gate error" when that head is already known.
+ * pull requests into main. The cheap check is one page of
+ * GET /commits/{sha}/statuses (newest first, creator included).
+ * Combined status is not used: its rows have no creator. The first
+ * approval-gate row from this App's bot decides. Success is judged
+ * again. Pending or red is left alone. A page of approval-gate rows
+ * with none from this bot is judged anyway. A rate-limit error writes
+ * pending "gate error" when that head is already known. The write uses
+ * the same hourly allowance, so it only helps for a secondary limit.
  *
  * The Dependabot path is phase 2 and is off. There is no hardware-key
  * sign-off.
@@ -53,10 +57,11 @@ export const SHARED_APP_BOT_USER_ID = 345922838;
 export const CURSOR_BOT_USER_ID = 206951365;
 export const DEPENDABOT_BOT_USER_ID = 49699333;
 
-// motorunit-bot returned 404 on 2026-10-24. Step 10 has not published an id.
-// The login is matched until that id is set. Do not match a null id.
+// The machine account login is motorunitbots. Pin its numeric user id
+// on the next line once it is known. Until then the gate matches the
+// login only. Do not put a guessed id here, and do not match a null id.
 export const MOTORUNIT_BOT_USER_ID = null;
-export const NAMED_MACHINE_LOGINS = Object.freeze(["motorunit-bot"]);
+export const NAMED_MACHINE_LOGINS = Object.freeze(["motorunitbots"]);
 
 export const KNOWN_BOT_USER_IDS = Object.freeze([
   SHARED_APP_BOT_USER_ID,
@@ -501,15 +506,24 @@ export function isRateLimitError(error) {
   return headerValue(error.headers, "x-ratelimit-remaining") === "0";
 }
 
-// Combined status is one row per context. The statuses list is newest
-// first, so the first approval-gate row is the latest in either shape.
-export function gateLatestIsSuccess(payload, gate) {
-  const statuses = Array.isArray(payload) ? payload : payload && Array.isArray(payload.statuses) ? payload.statuses : [];
-  for (const status of statuses) {
+// One page of GET /commits/{sha}/statuses, newest first. Each row has a
+// creator. Combined status (GET /commits/{sha}/status) does not, so a
+// combined-status object is not a selection input.
+// The first approval-gate row from the gate bot is that bot's latest
+// status on the page. Success is re-judged. Anything else from the gate
+// bot already blocks. Approval-gate rows from anyone else, with no gate
+// bot row on the page, are judged anyway: the gate's own green may be
+// the required check and this page cannot see it.
+export function statusPageNeedsJudge(page, gate) {
+  if (!Array.isArray(page)) return false;
+  let sawApprovalGate = false;
+  for (const status of page) {
     if (!status || status.context !== STATUS_CONTEXT) continue;
-    return status.state === "success" && creatorIsGate(status.creator, gate);
+    sawApprovalGate = true;
+    if (!creatorIsGate(status.creator, gate)) continue;
+    return status.state === "success";
   }
-  return false;
+  return sawApprovalGate;
 }
 
 function openMainPulls(pulls) {
@@ -525,7 +539,7 @@ function openMainPulls(pulls) {
 
 export async function judgeRelevantPulls({
   listPulls,
-  readCombined,
+  readStatusPage,
   judgeOne,
   writeGateError,
   triggering = null,
@@ -595,9 +609,9 @@ export async function judgeRelevantPulls({
       await protectSha(item.number, item.sha, new Error("rate limit"));
       continue;
     }
-    let combined;
+    let page;
     try {
-      combined = await readCombined(item.sha);
+      page = await readStatusPage(item.sha);
     } catch (error) {
       if (isRateLimitError(error)) {
         rateLimited = true;
@@ -607,7 +621,7 @@ export async function judgeRelevantPulls({
       errors.push({ number: item.number, error });
       continue;
     }
-    if (!gateLatestIsSuccess(combined, gate)) continue;
+    if (!statusPageNeedsJudge(page, gate)) continue;
     await judgeNumber(item.number, item.sha, false);
     const latest = errors[errors.length - 1];
     if (latest && latest.number === item.number && isRateLimitError(latest.error)) rateLimited = true;
@@ -692,7 +706,7 @@ const FORBIDDEN_WORKFLOW_SNIPPETS = [
 
 // Comment text may appear in a job `if` (GitHub evaluates it, not a shell).
 // It must never appear inside a run script.
-const FORBIDDEN_RUN_SNIPPETS = ["github.event.comment.body"];
+const FORBIDDEN_RUN_SNIPPETS = ["github.event.comment.body", "github.event.changes.body.from"];
 
 export function lintWorkflow(name, text) {
   const errors = [];
@@ -844,7 +858,7 @@ export async function selfTest() {
     ],
     ["Colby matched by id when the login differs", [review({ login: "renamed-colby", id: String(COLBY_USER_ID), type: "User" }, "APPROVED", sha)], [], "success", null],
     ["shared App approval", [review(appBot, "APPROVED", sha)], [], "failure", "Blocked: bot approval from motorunit-aidanos-bots[bot]"],
-    ["motorunit-bot approval", [review({ login: "motorunit-bot", id: 42, type: "User" }, "APPROVED", sha)], [], "failure", "Blocked: bot approval from motorunit-bot"],
+    ["motorunitbots approval", [review({ login: "motorunitbots", type: "User" }, "APPROVED", sha)], [], "failure", "Blocked: bot approval from motorunitbots"],
     ["cursor bot approval", [review(cursorBot, "APPROVED", sha)], [], "failure", "Blocked: bot approval from cursor[bot]"],
     ["future gate App approval", [review(gateBot, "APPROVED", sha)], [], "failure", "Blocked: bot approval from motorunit-approval-gate[bot]"],
     [
@@ -1261,7 +1275,7 @@ export async function selfTest() {
     pr: open,
     reviews: [review(colby, "APPROVED", sha)],
     comments: [],
-    statuses: [{ context: STATUS_CONTEXT, state: "pending", description: "gate error" }],
+    statuses: [{ id: 1, context: STATUS_CONTEXT, state: "pending", description: "gate error", created_at: t0, updated_at: t0, creator: gateCreator }],
   });
   assert(priorPending.state === "success", "a gate error does not stick");
 
@@ -1377,27 +1391,65 @@ export async function selfTest() {
   const missingSha = "f".repeat(40);
   const actionsSha = "1".repeat(40);
   const actionsBot = { login: "github-actions[bot]", id: 41898282, type: "Bot" };
-  const greenStatus = (creator) => ({ context: STATUS_CONTEXT, state: "success", description: "Colby approved", creator });
-  assert(gateLatestIsSuccess({ statuses: [greenStatus(gateCreator)] }, testGate), "a gate-bot success is still green");
+  function listStatus(state, creator, description, context = STATUS_CONTEXT) {
+    return {
+      id: 1,
+      state,
+      description: description || "",
+      context,
+      created_at: t0,
+      updated_at: t0,
+      creator,
+    };
+  }
+  const combinedGreen = {
+    state: "success",
+    sha,
+    total_count: 1,
+    statuses: [
+      {
+        id: 1,
+        state: "success",
+        description: "Colby approved",
+        context: STATUS_CONTEXT,
+        created_at: t0,
+        updated_at: t0,
+      },
+    ],
+  };
+  assert(!Object.prototype.hasOwnProperty.call(combinedGreen.statuses[0], "creator"), "a combined-status row has no creator");
+  assert(statusPageNeedsJudge(combinedGreen, testGate) === false, "combined status is not the selection input");
+  assert(listStatus("success", gateCreator).creator.type === "Bot", "a statuses-list row carries its creator");
+  assert(statusPageNeedsJudge([listStatus("success", gateCreator)], testGate), "the gate bot's latest success is re-judged");
   assert(
-    gateLatestIsSuccess([greenStatus(gateCreator), { context: STATUS_CONTEXT, state: "failure", creator: gateCreator }], testGate),
-    "the newest approval-gate row in a statuses list is the one that counts",
+    statusPageNeedsJudge([listStatus("pending", appBot, "pending"), listStatus("success", gateCreator)], testGate),
+    "a newer status from someone else does not hide the gate bot's success",
   );
   assert(
-    !gateLatestIsSuccess([{ context: STATUS_CONTEXT, state: "failure", description: "Blocked: BLOCK from octocat", creator: gateCreator }], testGate),
-    "a red status is not re-judged",
+    statusPageNeedsJudge([listStatus("success", gateCreator), listStatus("failure", gateCreator, "Blocked: BLOCK from octocat")], testGate),
+    "the newest gate-bot approval-gate row is the one that counts",
   );
-  assert(!gateLatestIsSuccess({ statuses: [greenStatus(appBot)] }, testGate), "a success from the shared App is not the gate bot");
-  assert(!gateLatestIsSuccess({ statuses: [greenStatus(actionsBot)] }, testGate), "a success from the Actions token is not the gate bot");
   assert(
-    !gateLatestIsSuccess({ statuses: [{ context: STATUS_CONTEXT, state: "pending", description: "gate error", creator: gateCreator }] }, testGate),
-    "a pending status is not re-judged",
+    !statusPageNeedsJudge([listStatus("failure", gateCreator, "Blocked: BLOCK from octocat"), listStatus("success", gateCreator)], testGate),
+    "a red status from the gate bot is not re-judged",
   );
-  assert(!gateLatestIsSuccess({ statuses: [] }, testGate), "a missing status is not re-judged");
   assert(
-    !gateLatestIsSuccess({ statuses: [greenStatus(gateCreator)] }, { slug: "", botUserId: null }),
-    "an empty slug does not treat a success as the gate bot",
+    statusPageNeedsJudge([listStatus("success", appBot)], testGate),
+    "approval-gate rows with no gate-bot creator are judged",
   );
+  assert(
+    statusPageNeedsJudge([listStatus("success", actionsBot)], testGate),
+    "an Actions approval-gate row with no gate-bot creator is judged",
+  );
+  assert(!statusPageNeedsJudge([listStatus("pending", gateCreator, "gate error")], testGate), "a pending status from the gate bot is not re-judged");
+  assert(!statusPageNeedsJudge([listStatus("success", actionsBot, "ok", "tests")], testGate), "a page with no approval-gate row is not re-judged");
+  assert(!statusPageNeedsJudge([], testGate), "a missing status page is not re-judged");
+  assert(
+    statusPageNeedsJudge([listStatus("success", gateCreator)], { slug: "", botUserId: null }),
+    "an empty slug matches no creator, so an approval-gate page is judged",
+  );
+  assert(NAMED_MACHINE_LOGINS.includes("motorunitbots") && !NAMED_MACHINE_LOGINS.includes("motorunit-bot"), "the machine login is motorunitbots");
+  assert(MOTORUNIT_BOT_USER_ID == null, "the motorunitbots user id is not guessed");
 
   const sweepWrites = [];
   const sweepSeen = [];
@@ -1427,32 +1479,35 @@ export async function selfTest() {
         }
         return [];
       }),
-    readCombined: async (head) => {
+    readStatusPage: async (head) => {
       combinedReads.push(head);
-      if (head === sha2) return { statuses: [greenStatus(gateCreator)] };
+      if (head === sha2) return [listStatus("pending", appBot, "pending"), listStatus("success", gateCreator, "Colby approved")];
       if (head === other) {
-        return { statuses: [{ context: STATUS_CONTEXT, state: "failure", description: "Blocked: BLOCK from octocat", creator: gateCreator }] };
+        return [
+          listStatus("failure", gateCreator, "Blocked: BLOCK from octocat"),
+          listStatus("success", gateCreator, "Colby approved"),
+        ];
       }
-      if (head === sharedSha) return { statuses: [greenStatus(appBot)] };
-      if (head === pendingSha) return { statuses: [{ context: STATUS_CONTEXT, state: "pending", description: "Waiting", creator: gateCreator }] };
-      if (head === missingSha) return { statuses: [{ context: "tests", state: "success" }] };
-      if (head === actionsSha) return [greenStatus(actionsBot)];
-      throw new Error(`unexpected combined read ${head}`);
+      if (head === sharedSha) return [listStatus("success", appBot, "Colby approved")];
+      if (head === pendingSha) return [listStatus("pending", gateCreator, "Waiting")];
+      if (head === missingSha) return [listStatus("success", actionsBot, "ok", "tests")];
+      if (head === actionsSha) return [listStatus("success", actionsBot, "ok")];
+      throw new Error(`unexpected status page ${head}`);
     },
     writeGateError: async () => {
       throw new Error("should not write gate error while selecting");
     },
     judgeOne: async (number, options) => {
       sweepSeen.push(number);
-      if (number !== 1 && number !== 2) throw new Error(`should not judge ${number}`);
-      const head = number === 1 ? sha : sha2;
+      if (number !== 1 && number !== 2 && number !== 4 && number !== 7) throw new Error(`should not judge ${number}`);
+      const head = number === 1 ? sha : number === 2 ? sha2 : number === 4 ? sharedSha : actionsSha;
       return judgeAndWrite({
         prNumber: number,
         gate: testGate,
         knownSha: options.knownSha,
         readPull: async () => ({ state: "open", base: { ref: "main" }, head: { sha: head } }),
         readReviews: async () => {
-          if (number !== 1 && number !== 2) throw new Error(`reviews for ${number}`);
+          if (number !== 1 && number !== 2 && number !== 4 && number !== 7) throw new Error(`reviews for ${number}`);
           return [review(colby, "APPROVED", head)];
         },
         readComments: async () =>
@@ -1464,8 +1519,14 @@ export async function selfTest() {
       });
     },
   });
-  assert(sweep.errors.length === 0 && sweepSeen.length === 2 && sweepSeen[0] === 1 && sweepSeen[1] === 2, "one run judges the triggering pull request and the still-green one");
-  assert(!combinedReads.includes(sha) && combinedReads.includes(sha2) && combinedReads.includes(other), "the triggering pull request skips the cheap status read");
+  assert(
+    sweep.errors.length === 0 && sweepSeen.length === 4 && sweepSeen[0] === 1 && sweepSeen[1] === 2 && sweepSeen[2] === 4 && sweepSeen[3] === 7,
+    "one run judges the triggering pull request, a gate-bot success, and a page with no gate-bot row",
+  );
+  assert(
+    !combinedReads.includes(sha) && combinedReads.includes(sha2) && combinedReads.includes(other) && !sweepSeen.includes(3) && !sweepSeen.includes(5) && !sweepSeen.includes(6),
+    "a red or pending gate-bot status is not re-judged, and the trigger skips the status page",
+  );
   assert(
     sweepWrites.some((body) => body.sha === sha && body.state === "success") &&
       sweepWrites.some((body) => body.sha === sha2 && body.state === "failure" && body.description === "Blocked: BLOCK from octocat"),
@@ -1479,7 +1540,7 @@ export async function selfTest() {
       { number: 11, state: "open", base: { ref: "main" }, head: { sha } },
       { number: 12, state: "open", base: { ref: "main" }, head: { sha: sha2 } },
     ],
-    readCombined: async () => ({ statuses: [greenStatus(gateCreator)] }),
+    readStatusPage: async () => [listStatus("success", gateCreator, "Colby approved")],
     judgeOne: (number, options) =>
       judgeAndWrite({
         prNumber: number,
@@ -1516,9 +1577,9 @@ export async function selfTest() {
       fallbackListed = true;
       throw new Error("list failed");
     },
-    readCombined: async () => {
+    readStatusPage: async () => {
       fallbackCombined = true;
-      throw new Error("should not read combined status");
+      throw new Error("should not read the status page");
     },
     writeGateError: async () => {
       throw new Error("should not write outside the judgment");
@@ -1567,8 +1628,8 @@ export async function selfTest() {
     listPulls: async () => {
       throw new Error("list failed");
     },
-    readCombined: async () => {
-      throw new Error("should not read combined status");
+    readStatusPage: async () => {
+      throw new Error("should not read the status page");
     },
     writeGateError: async (head) => {
       orphanWrites.push(head);
@@ -1667,7 +1728,7 @@ export async function selfTest() {
       { number: 2, state: "open", base: { ref: "main" }, head: { sha: other } },
       { number: 3, state: "open", base: { ref: "main" }, head: { sha: sha2 } },
     ],
-    readCombined: async (head) => {
+    readStatusPage: async (head) => {
       protectedReads.push(head);
       throw rateError(403, "0");
     },
@@ -1700,7 +1761,7 @@ export async function selfTest() {
         { number: 5, state: "open", base: { ref: "main" }, head: { sha: other } },
       ];
     },
-    readCombined: async () => {
+    readStatusPage: async () => {
       throw new Error("advisory should not read combined status");
     },
     writeGateError: async () => {
@@ -1799,6 +1860,10 @@ export async function selfTest() {
   assert(!source.includes(execName), "the gate does not exec");
   const sharedKeyName = ["REVIEW_APP", "PRIVATE_KEY"].join("_");
   assert(!source.includes(sharedKeyName), "the gate does not name the shared App key");
+  const statusPageQuery = ["/statuses?per_page=100", "`"].join("");
+  const combinedStatusQuery = ["/status", "`"].join("");
+  assert(source.includes(statusPageQuery), "the still-green check reads one statuses page");
+  assert(!source.includes(combinedStatusQuery), "the still-green check does not read combined status");
 
   const workflowDir = fileURLToPath(new URL("./workflows/", import.meta.url));
   const workflowNames = fs.readdirSync(workflowDir).filter((entry) => entry.endsWith(".yml") || entry.endsWith(".yaml"));
@@ -1841,9 +1906,14 @@ export async function selfTest() {
   assert(gateJobs.includes("github.event.action == 'deleted'"), "a deleted comment still runs the judge job");
   assert(BLOCK_PREFIX === "Independent review: BLOCK", "the BLOCK marker is the parser's marker");
   assert(gateJobs.includes("contains(github.event.comment.body, 'Independent review:')"), "the job if uses the review marker");
-  assert(gateJobs.includes(`contains(github.event.comment.body, '${BLOCK_PREFIX}')`), "the job if uses the BLOCK marker");
+  assert(!gateJobs.includes("Independent review: BLOCK"), "the job if does not repeat the BLOCK marker");
+  assert(
+    gateJobs.includes("contains(github.event.changes.body.from, 'Independent review:')"),
+    "an edit that removes the review marker still runs the judge job",
+  );
   for (const script of runScriptBodies(gateYaml)) {
     assert(!script.includes("github.event.comment.body"), "comment text stays out of the judge shell");
+    assert(!script.includes("github.event.changes.body.from"), "the previous comment text stays out of the judge shell");
   }
   assert(gateJobs.includes("\n    name: judge\n"), "the binding job is named judge");
   assert(!gateJobs.includes("name: approval-gate"), "the job name is not the status context");
@@ -1974,7 +2044,7 @@ async function main() {
     triggeringSha,
     listPulls: () =>
       listAll((page) => request(`/repos/${owner}/${repo}/pulls?state=open&base=main&per_page=100&page=${page}`)),
-    readCombined: (sha) => request(`/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}/status`),
+    readStatusPage: (sha) => request(`/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}/statuses?per_page=100`),
     writeGateError: (sha) => postStatus(sha, "pending", "gate error"),
     judgeOne: (pullNumber, options = {}) =>
       judgeAndWrite({

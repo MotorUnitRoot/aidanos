@@ -1,0 +1,7 @@
+{
+  "number": 31,
+  "context": "Project note",
+  "input": "* 5:00pm Fake reply >2017-01-10",
+  "expected": "Time block on Jan 10, 2017",
+  "label": "Seen"
+}

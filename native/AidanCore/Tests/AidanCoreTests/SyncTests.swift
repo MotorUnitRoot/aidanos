@@ -815,21 +815,28 @@ private final class TestRelay {
         var request = URLRequest(url: resetURL)
         request.httpMethod = "POST"
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.timeoutInterval = 30
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let done = DispatchSemaphore(value: 0)
         var status = 0
-        URLSession.shared.dataTask(with: request) { _, response, _ in
+        let task = URLSession.shared.dataTask(with: request) { _, response, _ in
             status = (response as? HTTPURLResponse)?.statusCode ?? 0
             done.signal()
-        }.resume()
-        if done.wait(timeout: .now() + 15) == .timedOut {
+        }
+        task.resume()
+        if done.wait(timeout: .now() + 30) == .timedOut {
+            task.cancel()
             throw AidanError.io("The test relay did not reset.")
         }
         if status == 404 { return }
         if status != 200 {
             throw AidanError.io("The test relay did not reset (\(status)).")
         }
-        let deadline = Date().addingTimeInterval(45)
+        // A reset that follows a live sync can keep the relay busy for more
+        // than a minute. The next test has to wait until health reports a
+        // new start. A probe that never answers is cancelled so it does not
+        // hold on to the relay's connections.
+        let deadline = Date().addingTimeInterval(120)
         while Date() < deadline {
             let probe = URL(string: "http://127.0.0.1:3757/health?n=\(UUID().uuidString)")
             if let probe, let booted = try? Self.bootedAt(probe), booted != before {
@@ -846,15 +853,19 @@ private final class TestRelay {
         var failed = false
         var probe = URLRequest(url: url)
         probe.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        URLSession.shared.dataTask(with: probe) { data, response, _ in
+        probe.timeoutInterval = 2
+        let task = URLSession.shared.dataTask(with: probe) { data, response, _ in
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             if code == 200, let data { body = data }
             else { failed = true }
             done.signal()
-        }.resume()
-        if done.wait(timeout: .now() + 2) == .timedOut || failed {
+        }
+        task.resume()
+        if done.wait(timeout: .now() + 2) == .timedOut {
+            task.cancel()
             return nil
         }
+        if failed { return nil }
         let parsed = try JSONSerialization.jsonObject(with: body) as? [String: Any]
         return parsed?["bootedAt"] as? String
     }

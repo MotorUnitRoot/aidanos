@@ -3,3 +3,4 @@ logs/
 node_modules/
 native/.cache/
 .build/
+fixtures/sample-notes/screenshots/

@@ -1,0 +1,7 @@
+{
+  "number": 43,
+  "context": "Project note",
+  "input": "* See [[ZZ REA Linked Note | Short]]",
+  "expected": "Shows \"Short\", links to the note",
+  "label": "Seen"
+}

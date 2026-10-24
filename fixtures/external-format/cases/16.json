@@ -1,0 +1,7 @@
+{
+  "number": 16,
+  "context": "Day 2017-01-09",
+  "input": "* Fake task typed with >2017-01-11",
+  "expected": "No reference appears in Jan 11, 2017",
+  "label": "Seen"
+}

@@ -1,0 +1,7 @@
+{
+  "number": 8,
+  "context": "Project note",
+  "input": "+ Pack fake socks",
+  "expected": "Open checklist item; not in overdue counts or Overdue filter",
+  "label": "Seen"
+}

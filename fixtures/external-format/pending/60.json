@@ -1,0 +1,6 @@
+{
+  "number": 60,
+  "title": "* [x] Fake done and * [-] Fake cancelled",
+  "label": "Guessed",
+  "status": "waits for spec v0.3"
+}

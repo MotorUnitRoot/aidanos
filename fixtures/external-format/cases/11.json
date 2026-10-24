@@ -1,0 +1,7 @@
+{
+  "number": 11,
+  "context": "Project note",
+  "input": "* [x] Mail the fake parcel @done(2017-01-09 14:05)",
+  "expected": "Done task completed Jan 9, 2017 at 14:05",
+  "label": "Seen"
+}

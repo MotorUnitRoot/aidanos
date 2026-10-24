@@ -1,0 +1,7 @@
+{
+  "number": 25,
+  "context": "Project note",
+  "input": "* Fake two-day task [[2017-01-10]], [[2017-01-12]]",
+  "expected": "Appears in both days' references",
+  "label": "Seen"
+}

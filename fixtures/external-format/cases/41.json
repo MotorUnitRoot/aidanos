@@ -1,0 +1,7 @@
+{
+  "number": 41,
+  "context": "Project note",
+  "input": "* See [[ZZ REA Linked Note]]",
+  "expected": "Link; clicking creates the note if missing; line shows in that note's references",
+  "label": "Seen"
+}

@@ -65,6 +65,14 @@ extension ExternalFormatReader {
         let parsedNote = read(parts[0], in: context)
         guard parsedNote.lines.count == 1 else { return .unsettled }
         let parsed = parsedNote.lines[0]
+        if parsed.indentTabs > 0 {
+            // AidanOS choice, pending case 54
+            return .unsettled
+        }
+        if case .day(let origin) = context, target <= origin {
+            // AidanOS choice, pending section 7.4
+            return .unsettled
+        }
         switch mode {
         case .scheduleByCopy:
             return scheduleByCopy(parts[0], parsed: parsed, in: context, to: target)
@@ -85,22 +93,13 @@ extension ExternalFormatReader {
     }
 
     /// The first time a day note is created, the caller's template is the whole note.
-    /// A note that already has text is left as it is. Tasks in earlier notes stay there.
+    /// A note that already has text is left as it is. Earlier notes are not copied in.
     public static func openDay(
         existingText: String?,
         template: String?,
-        earlierNotes: [ExternalDayText],
-        today: ExternalDate
+        earlierNotes _: [ExternalDayText],
+        today _: ExternalDate
     ) -> ExternalOpenedDay {
-        // Look at earlier notes so a task there can be reviewed, then leave it where it is.
-        for note in earlierNotes {
-            let reading = read(note.text, in: .day(note.day))
-            for line in reading.lines {
-                if placement(of: line, on: today, in: reading.context) == .overdue {
-                    continue
-                }
-            }
-        }
         if let existingText {
             return ExternalOpenedDay(text: existingText, broughtLines: [])
         }
@@ -140,55 +139,67 @@ extension ExternalFormatReader {
     }
 
     /// How many times the task was put off. Each `[>]` line in the chain counts once.
-    /// `<` marks on one copy do not.
+    /// `<` marks on one copy do not. Nil means the line is a task inside a code block.
     public static func moveCount(
         ofLineAt index: Int,
         on day: ExternalDate,
         in notes: [ExternalDayText]
-    ) -> Int {
+    ) -> Int? {
         guard let note = notes.first(where: { $0.day == day }) else { return 0 }
         let lines = paragraphs(in: note.text)
         guard lines.indices.contains(index) else { return 0 }
-        let parsed = read(lines[index], in: .day(day))
-        guard parsed.lines.count == 1, parsed.lines[0].kind.isTask else { return 0 }
+        let reading = read(note.text, in: .day(day))
+        guard lines.count == reading.lines.count else { return 0 }
+        let alone = read(lines[index], in: .day(day))
+        if reading.lines[index].kind == .unsettled, alone.lines.count == 1, alone.lines[0].kind.isTask {
+            // AidanOS choice, pending case 93
+            return nil
+        }
+        guard reading.lines[index].kind.isTask else { return 0 }
+        // AidanOS choice, pending case 53: the same remaining text is treated as one task.
         let body = matchingBody(lines[index])
         guard !body.isEmpty else { return 0 }
 
-        struct Link: Equatable {
+        struct Link: Hashable {
             var from: ExternalDate
             var to: ExternalDate
         }
-        var links: [Link] = []
+        var seen: Set<Link> = []
+        var byDay: [ExternalDate: [Link]] = [:]
         for source in notes {
             let raw = paragraphs(in: source.text)
-            let reading = read(source.text, in: .day(source.day))
-            guard raw.count == reading.lines.count else { continue }
-            for offset in reading.lines.indices {
-                let line = reading.lines[offset]
-                guard line.kind == .scheduledTask, matchingBody(raw[offset]) == body else { continue }
+            let parsed = read(source.text, in: .day(source.day))
+            guard raw.count == parsed.lines.count else { continue }
+            for offset in parsed.lines.indices {
+                let line = parsed.lines[offset]
+                guard line.kind == .scheduledTask else { continue }
+                // AidanOS choice, pending case 53: the same remaining text is treated as one task.
+                guard matchingBody(raw[offset]) == body else { continue }
                 // AidanOS choice, pending section 7.9: the first typed date is the link.
                 guard let target = line.scheduleDates.first else { continue }
                 let link = Link(from: source.day, to: target)
-                if !links.contains(link) { links.append(link) }
-            }
-        }
-        var days: Set<ExternalDate> = [day]
-        var included: Set<Int> = []
-        var grew = true
-        while grew {
-            grew = false
-            for offset in links.indices {
-                let link = links[offset]
-                if days.contains(link.from) || days.contains(link.to) {
-                    if included.insert(offset).inserted {
-                        days.insert(link.from)
-                        days.insert(link.to)
-                        grew = true
-                    }
+                guard seen.insert(link).inserted else { continue }
+                byDay[source.day, default: []].append(link)
+                if target != source.day {
+                    byDay[target, default: []].append(link)
                 }
             }
         }
-        return included.count
+        var queue: [ExternalDate] = [day]
+        var visitedDays: Set<ExternalDate> = [day]
+        var counted: Set<Link> = []
+        var head = 0
+        while head < queue.count {
+            let current = queue[head]
+            head += 1
+            for link in byDay[current] ?? [] where counted.insert(link).inserted {
+                let next = link.from == current ? link.to : link.from
+                if visitedDays.insert(next).inserted {
+                    queue.append(next)
+                }
+            }
+        }
+        return counted.count
     }
 }
 
@@ -210,7 +221,10 @@ extension ExternalFormatReader {
         // and a project note has no day of its own to write there.
         guard case .day(let origin) = context else { return .unsettled }
         // Case 53 and case 75 are not settled. A today tag on a copied line is not settled either.
-        if !parsed.scheduleDates.isEmpty || !parsed.broughtFromDays.isEmpty || parsed.carriesToday {
+        // A sync id, an @remind, and an @done stamp on a copied line are not settled.
+        // AidanOS choice, pending section 8A.2.
+        if !parsed.scheduleDates.isEmpty || !parsed.broughtFromDays.isEmpty || parsed.carriesToday
+            || hasSyncId(line) || hasMention(parsed, named: "remind") || hasMention(parsed, named: "done") {
             return .unsettled
         }
         guard let rewritten = scheduledAndOpenCopy(line) else { return .unsettled }
@@ -227,7 +241,8 @@ extension ExternalFormatReader {
         to target: ExternalDate
     ) -> ExternalBringForwardResult {
         if parsed.kind.isHeading {
-            return .edited(sourceLine: line, addedLine: line)
+            // AidanOS choice, pending section 7.6: copying a heading is stated for schedule by copy.
+            return .unsettled
         }
         if parsed.kind == .doneTask || parsed.kind == .cancelledTask || parsed.kind == .scheduledTask {
             return .skipped
@@ -252,6 +267,41 @@ extension ExternalFormatReader {
             mark = "[[" + isoDay(target) + "]]"
         }
         return .edited(sourceLine: appendMark(line, mark), addedLine: nil)
+    }
+
+    fileprivate static func hasMention(_ line: ExternalLine, named name: String) -> Bool {
+        line.mentions.contains { $0.name == name }
+    }
+
+    /// A caret followed by letters or digits, as in `^zz1abc`.
+    fileprivate static func hasSyncId(_ line: String) -> Bool {
+        let chars = Array(line)
+        var index = 0
+        while index < chars.count {
+            if chars[index] == "^" {
+                let boundary = index == 0 || chars[index - 1] == " " || chars[index - 1] == "\t"
+                if boundary {
+                    var end = index + 1
+                    while end < chars.count, isSyncChar(chars[end]) {
+                        end += 1
+                    }
+                    let closed = end == chars.count || chars[end] == " " || chars[end] == "\t"
+                    if end > index + 1, closed {
+                        return true
+                    }
+                }
+            }
+            index += 1
+        }
+        return false
+    }
+
+    fileprivate static func isSyncChar(_ char: Character) -> Bool {
+        if char.isLetter { return true }
+        guard let ascii = char.asciiValue, let zero = Character("0").asciiValue, let nine = Character("9").asciiValue else {
+            return false
+        }
+        return ascii >= zero && ascii <= nine
     }
 
     fileprivate static func cutAndPaste(_ line: String, parsed: ExternalLine) -> ExternalBringForwardResult {

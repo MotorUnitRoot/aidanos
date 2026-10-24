@@ -906,6 +906,96 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(results[3], .skipped)
         XCTAssertEqual(results[4], .skipped)
         XCTAssertEqual(results[5], .unsettled)
+        let children = ExternalFormatReader.bringForward(
+            lines: ["* Fake parent", "\t* open child", "\t* [x] done child"],
+            in: .day(date(2017, 1, 9)),
+            to: date(2017, 1, 10),
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(
+            children[0],
+            .edited(sourceLine: "* [>] Fake parent >2017-01-10", addedLine: "* Fake parent <2017-01-09")
+        )
+        XCTAssertEqual(children[1], .unsettled)
+        XCTAssertEqual(children[2], .unsettled)
+    }
+
+    func testSyncIdOrRemindOrDoneStampOnACopyStaysUnsettled() {
+        let origin = ExternalNoteContext.day(date(2017, 1, 9))
+        let target = date(2017, 1, 10)
+        let synced = ExternalFormatReader.bringForward(
+            line: "* Fake synced ^zz1abc",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(synced, .unsettled)
+        let remind = ExternalFormatReader.bringForward(
+            line: "* Call @remind(2pm)",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(remind, .unsettled)
+        let stamped = ExternalFormatReader.bringForward(
+            line: "* Mail the parcel @done(2017-01-09)",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(stamped, .unsettled)
+    }
+
+    func testMoveToTheSameDayOrAnEarlierDayStaysUnsettled() {
+        let line = "* Fake move once"
+        let origin = ExternalNoteContext.day(date(2017, 1, 10))
+        for mode in [ExternalBringForwardMode.scheduleByCopy, .scheduleByLink, .cutAndPaste] {
+            XCTAssertEqual(
+                ExternalFormatReader.bringForward(line: line, in: origin, to: date(2017, 1, 10), mode: mode),
+                .unsettled
+            )
+            XCTAssertEqual(
+                ExternalFormatReader.bringForward(line: line, in: origin, to: date(2017, 1, 9), mode: mode),
+                .unsettled
+            )
+        }
+    }
+
+    func testLinkModeLeavesAHeadingUnsettled() {
+        let result = ExternalFormatReader.bringForward(
+            line: "## Focus",
+            in: .day(date(2017, 1, 9)),
+            to: date(2017, 1, 10),
+            mode: .scheduleByLink
+        )
+        XCTAssertEqual(result, .unsettled)
+    }
+
+    func testMoveCountOfAFencedTaskStaysUnsettled() {
+        let notes = [
+            ExternalDayText(
+                day: date(2017, 1, 9),
+                text: "```\n* [>] Task >2017-01-10\n```\n"
+            ),
+        ]
+        XCTAssertNil(ExternalFormatReader.moveCount(ofLineAt: 1, on: date(2017, 1, 9), in: notes))
+    }
+
+    func testMoveCountOfALongChainStaysWithinTheTimeBound() {
+        let total = 20_000
+        var day = date(2000, 1, 1)
+        var notes: [ExternalDayText] = []
+        notes.reserveCapacity(total + 1)
+        for _ in 0..<total {
+            let next = dayAfter(day)
+            notes.append(ExternalDayText(day: day, text: "* [>] Task >" + isoDay(next)))
+            day = next
+        }
+        notes.append(ExternalDayText(day: day, text: "* Task"))
+        let started = Date()
+        let count = ExternalFormatReader.moveCount(ofLineAt: 0, on: notes[0].day, in: notes)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        XCTAssertEqual(count, total as Int?)
     }
 
     func testMoveCountFollowsScheduledLines() {
@@ -913,14 +1003,14 @@ final class ExternalFormatReaderTests: XCTestCase {
             ExternalDayText(day: date(2017, 1, 9), text: "* [>] Fake move once >2017-01-10"),
             ExternalDayText(day: date(2017, 1, 10), text: "* Fake move once <2017-01-09"),
         ]
-        XCTAssertEqual(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 10), in: once), 1)
-        XCTAssertEqual(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 9), in: once), 1)
+        XCTAssertEqual(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 10), in: once), 1 as Int?)
+        XCTAssertEqual(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 9), in: once), 1 as Int?)
         let twice = [
             ExternalDayText(day: date(2017, 1, 9), text: "* [>] Fake move once >2017-01-10"),
             ExternalDayText(day: date(2017, 1, 10), text: "* [>] Fake move once >2017-01-11"),
             ExternalDayText(day: date(2017, 1, 11), text: "* Fake move once <2017-01-10"),
         ]
-        XCTAssertEqual(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 11), in: twice), 2)
+        XCTAssertEqual(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 11), in: twice), 2 as Int?)
         let twoMarksOnOneCopy = [
             ExternalDayText(day: date(2017, 1, 9), text: "* [>] Task >2017-01-11"),
             ExternalDayText(
@@ -930,12 +1020,12 @@ final class ExternalFormatReaderTests: XCTestCase {
         ]
         XCTAssertEqual(
             ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 11), in: twoMarksOnOneCopy),
-            1
+            1 as Int?
         )
         let marksOnly = [
             ExternalDayText(day: date(2017, 1, 11), text: "* Task <2017-01-09 <2017-01-10"),
         ]
-        XCTAssertEqual(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 11), in: marksOnly), 0)
+        XCTAssertEqual(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 11), in: marksOnly), 0 as Int?)
     }
 
     func testCase53SecondMoveStaysUnsettled() {
@@ -1005,11 +1095,11 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertTrue(ExternalFormatReader.dayCountsAsOverdue(note, on: sessionDay))
     }
 
-    func testProjectScheduledTaskWithAPastDateIsOverdue() {
+    func testMovedAwayTaskInAProjectNoteWithAPastDateStaysUnlisted() {
         let line = ExternalFormatReader.read("* [>] Stay in the note >2017-01-10", in: .project).lines[0]
         XCTAssertEqual(line.kind, .scheduledTask)
         XCTAssertFalse(line.countsAsOpen)
-        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .overdue)
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .unlisted)
     }
 
     func testMovedAwayTaskInAPastDayIsUnlisted() {
@@ -1147,4 +1237,21 @@ private func fixtureContext(_ label: String) -> String {
 
 private func date(_ year: Int, _ month: Int, _ day: Int) -> ExternalDate {
     ExternalDate(year: year, month: month, day: day)
+}
+
+private func dayAfter(_ day: ExternalDate) -> ExternalDate {
+    var length = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][day.month - 1]
+    let leap = day.month == 2 && (day.year % 400 == 0 || (day.year % 100 != 0 && day.year % 4 == 0))
+    if leap { length = 29 }
+    if day.day < length {
+        return ExternalDate(year: day.year, month: day.month, day: day.day + 1)
+    }
+    if day.month < 12 {
+        return ExternalDate(year: day.year, month: day.month + 1, day: 1)
+    }
+    return ExternalDate(year: day.year + 1, month: 1, day: 1)
+}
+
+private func isoDay(_ day: ExternalDate) -> String {
+    String(format: "%04d-%02d-%02d", day.year, day.month, day.day)
 }

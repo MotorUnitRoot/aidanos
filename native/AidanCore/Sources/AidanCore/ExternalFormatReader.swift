@@ -54,8 +54,8 @@ public enum ExternalFormatReader {
     /// typed date is upcoming. An open task with no typed date takes the day note's
     /// date: a past day is overdue, and today or a later day is upcoming.
     /// Checklist items are left out of both. A dateless task in a project note is unlisted.
-    /// A `>today` tag is not a fixed date, so it does not land in either list.
-    /// AidanOS choice, pending case 18.
+    /// An open `>today` line has no typed date. In a day note it follows the note's day:
+    /// overdue when that day is past, and upcoming when that day is today or later.
     public static func placement(
         of line: ExternalLine,
         on sessionDay: ExternalDate,
@@ -74,6 +74,10 @@ public enum ExternalFormatReader {
         }
         let eligible = line.countsAsOpen || line.kind == .scheduledTask
         if eligible, let date = line.scheduleDates.first {
+            if line.kind == .scheduledTask, case .project = context, date < sessionDay {
+                // AidanOS choice, pending section 8B.1
+                return .unlisted
+            }
             if date < sessionDay {
                 return .overdue
             }

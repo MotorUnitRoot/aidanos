@@ -190,7 +190,10 @@ export function checkExternalFormatCases(repoRoot) {
   for (const entry of manifest.pending) {
     assert.deepEqual(Object.keys(entry), PENDING_LIST_KEYS, "pending list " + entry.number);
     assert.equal(entry.path, "pending/" + entry.number + ".json");
-    assert.equal(entry.status, "waits for spec v0.3");
+    const pendingStatus = entry.number === 39
+      ? "Guessed in v0.3; still pending"
+      : "waits for spec v0.3";
+    assert.equal(entry.status, pendingStatus);
     const expectedLabel = GUESSED.includes(entry.number) ? "Guessed" : "Unknown";
     assert.equal(entry.label, expectedLabel);
     assert.equal(typeof entry.title, "string");
@@ -203,7 +206,9 @@ export function checkExternalFormatCases(repoRoot) {
     assert.equal(body.number, entry.number);
     assert.equal(body.title, entry.title);
     assert.equal(body.label, entry.label);
-    assert.equal(body.status, "waits for spec v0.3");
+    assert.equal(body.status, entry.number === 39
+      ? "Guessed in v0.3; still pending"
+      : "waits for spec v0.3");
     assert.equal(Object.hasOwn(body, "expected"), false);
     assert.equal(Object.hasOwn(body, "input"), false);
     assert.equal(Object.hasOwn(body, "context"), false);

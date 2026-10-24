@@ -10,11 +10,7 @@ public enum ExternalFormatReader {
         }
         let prefix = "Day "
         guard label.hasPrefix(prefix) else { return nil }
-        var rest = String(label.dropFirst(prefix.count))
-        let viewed = ", viewed on session day"
-        if rest.hasSuffix(viewed) {
-            rest.removeLast(viewed.count)
-        }
+        let rest = String(label.dropFirst(prefix.count))
         guard let day = ExternalDate.parse(rest) else { return nil }
         return .day(day)
     }
@@ -24,6 +20,7 @@ public enum ExternalFormatReader {
         var inFence = false
         for piece in splitLines(text) {
             if isCodeFence(piece) {
+                // AidanOS choice, pending case 93. An opening fence with no closer stays open for the rest of the note. Lines that are not tasks keep their tags and dates.
                 inFence.toggle()
                 lines.append(readLine(piece, in: context))
                 continue
@@ -39,19 +36,24 @@ public enum ExternalFormatReader {
         return ExternalNoteReading(context: context, lines: lines)
     }
 
-    /// Overdue is a past schedule date, or an open task with no date in a past day note.
-    /// Upcoming is the session day or a later schedule date.
-    /// Checklist items are left out of both. A task with no date is unlisted.
+    /// A typed date before the session day is overdue. The session day or a later
+    /// typed date is upcoming. An open task with no typed date takes the day note's
+    /// date: a past day is overdue, and today or a later day is upcoming.
+    /// Checklist items are left out of both. A dateless task in a project note is unlisted.
     public static func placement(
         of line: ExternalLine,
         on sessionDay: ExternalDate,
-        in context: ExternalNoteContext? = nil
+        in context: ExternalNoteContext
     ) -> ExternalListPlacement {
         if line.leftOutOfOverdue {
             return .unlisted
         }
-        // AidanOS choice, pending case 87
-        if line.kind == .scheduledTask, let day = day(in: context), day < sessionDay {
+        if line.kind == .scheduledTask, case .day(let noteDay) = context, noteDay < sessionDay {
+            if let date = line.scheduleDates.first, date >= sessionDay {
+                // AidanOS choice, pending section 8B.1
+                return .unlisted
+            }
+            // AidanOS choice, pending case 87
             return .unlisted
         }
         let eligible = line.countsAsOpen || line.kind == .scheduledTask
@@ -61,17 +63,14 @@ public enum ExternalFormatReader {
             }
             return .upcoming
         }
-        if line.countsAsOpen, let day = day(in: context), day < sessionDay {
-            return .overdue
+        if line.countsAsOpen, case .day(let noteDay) = context {
+            if noteDay < sessionDay {
+                return .overdue
+            }
+            // AidanOS choice, pending case 82
+            return .upcoming
         }
         return .unlisted
-    }
-
-    fileprivate static func day(in context: ExternalNoteContext?) -> ExternalDate? {
-        if case .day(let day) = context {
-            return day
-        }
-        return nil
     }
 }
 
@@ -234,6 +233,8 @@ public struct ExternalLine: Equatable, Sendable {
     public var referencedDays: [ExternalDate]
     public var timeBlock: ExternalTimeBlock?
     public var tags: [ExternalTag]
+    /// A tag or `@` date that stays out of the lists while the line itself stays.
+    public var flaggedTokens: [String]
     public var mentions: [ExternalMention]
     public var wikiLinks: [ExternalWikiLink]
     public var markdownLinks: [ExternalMarkdownLink]
@@ -249,6 +250,7 @@ public struct ExternalLine: Equatable, Sendable {
         referencedDays: [ExternalDate],
         timeBlock: ExternalTimeBlock?,
         tags: [ExternalTag],
+        flaggedTokens: [String],
         mentions: [ExternalMention],
         wikiLinks: [ExternalWikiLink],
         markdownLinks: [ExternalMarkdownLink],
@@ -263,6 +265,7 @@ public struct ExternalLine: Equatable, Sendable {
         self.referencedDays = referencedDays
         self.timeBlock = timeBlock
         self.tags = tags
+        self.flaggedTokens = flaggedTokens
         self.mentions = mentions
         self.wikiLinks = wikiLinks
         self.markdownLinks = markdownLinks
@@ -300,7 +303,7 @@ private struct InlineMarks {
     var markdownLinks: [ExternalMarkdownLink] = []
     var scheduleDates: [ExternalDate] = []
     var blocked: [Range<Int>] = []
-    var unsettled = false
+    var flaggedTokens: [String] = []
 }
 
 private enum TagIssue {
@@ -313,6 +316,8 @@ private enum BracketRead<Value> {
     case found(Value)
     case noCloser
     case rejected
+    /// A closer was found and the link was not kept. `resume` is the index just past that closer.
+    case rejectedClosed(resume: Int)
 }
 
 private struct FoundClock {
@@ -452,6 +457,7 @@ extension ExternalFormatReader {
             referencedDays: [],
             timeBlock: nil,
             tags: [],
+            flaggedTokens: [],
             mentions: [],
             wikiLinks: [],
             markdownLinks: [],
@@ -466,13 +472,11 @@ extension ExternalFormatReader {
         context: ExternalNoteContext
     ) -> ExternalLine {
         let marks = scan(content)
-        var unsettled = kind == .unsettled || marks.unsettled
-        // AidanOS choice, pending case 97
-        if !unsettled, kind == .doneTask, findClock(blanked(content, blocking: marks.blocked)) != nil {
-            unsettled = true
-        }
+        let unsettled = kind == .unsettled
         let resolved: ExternalLineKind = unsettled ? .unsettled : kind
-        let block = unsettled ? nil : timeBlock(in: content, marks: marks, kind: resolved, context: context)
+        // AidanOS choice, pending case 97
+        let closed = resolved == .doneTask || resolved == .cancelledTask || resolved == .scheduledTask
+        let block = (unsettled || closed) ? nil : timeBlock(in: content, marks: marks, kind: resolved, context: context)
         let completion = unsettled ? nil : marks.mentions.first { $0.name == "done" }?.value.flatMap(readCompletion)
         return ExternalLine(
             kind: resolved,
@@ -484,6 +488,7 @@ extension ExternalFormatReader {
             referencedDays: unsettled ? [] : references(marks: marks, kind: resolved, context: context),
             timeBlock: block,
             tags: unsettled ? [] : marks.tags,
+            flaggedTokens: unsettled ? [] : marks.flaggedTokens,
             mentions: unsettled ? [] : marks.mentions,
             wikiLinks: unsettled ? [] : marks.wikiLinks,
             markdownLinks: unsettled ? [] : marks.markdownLinks,
@@ -502,6 +507,7 @@ extension ExternalFormatReader {
         line.referencedDays = []
         line.timeBlock = nil
         line.tags = []
+        line.flaggedTokens = []
         line.mentions = []
         line.wikiLinks = []
         line.markdownLinks = []
@@ -515,15 +521,18 @@ extension ExternalFormatReader {
         while index < chars.count, chars[index] == " " {
             index += 1
         }
-        let ticks = index
-        while index < chars.count, chars[index] == "`" {
+        guard index < chars.count else { return false }
+        let marker = chars[index]
+        guard marker == "`" || marker == "~" else { return false }
+        let start = index
+        while index < chars.count, chars[index] == marker {
             index += 1
         }
-        guard index - ticks >= 3 else { return false }
+        guard index - start >= 3 else { return false }
         if index == chars.count { return true }
         guard chars[index] == " " else { return false }
         while index < chars.count {
-            if chars[index] == "`" { return false }
+            if chars[index] == marker { return false }
             index += 1
         }
         return true
@@ -603,6 +612,7 @@ extension ExternalFormatReader {
         // so the next opener does not walk to the end again.
         var wikiHasNoCloser = false
         var markdownHasNoCloser = false
+        var mentionParenHasNoCloser = false
         while index < chars.count {
             if chars[index] == "[", index + 1 < chars.count, chars[index + 1] == "[" {
                 if !wikiHasNoCloser {
@@ -614,6 +624,13 @@ extension ExternalFormatReader {
                         continue
                     case .noCloser:
                         wikiHasNoCloser = true
+                    case .rejectedClosed(let resume):
+                        // The closer was found and the link was not kept. Skip the span
+                        // so a later opener does not walk to that same closer.
+                        if resume > index {
+                            index = resume
+                            continue
+                        }
                     case .rejected:
                         break
                     }
@@ -629,7 +646,7 @@ extension ExternalFormatReader {
                         continue
                     case .noCloser:
                         markdownHasNoCloser = true
-                    case .rejected:
+                    case .rejected, .rejectedClosed:
                         break
                     }
                 }
@@ -638,10 +655,10 @@ extension ExternalFormatReader {
                 switch issue {
                 case .hyphen:
                     // AidanOS choice, pending case 95
-                    marks.unsettled = true
+                    marks.flaggedTokens.append(String(chars[range]))
                 case .digitsOnly:
                     // AidanOS choice, pending case 39
-                    marks.unsettled = true
+                    marks.flaggedTokens.append(String(chars[range]))
                 case .none:
                     marks.tags.append(tag)
                 }
@@ -651,12 +668,19 @@ extension ExternalFormatReader {
             if chars[index] == "@", !wordBefore(chars, index),
                let (_, end) = readISODate(chars, at: index + 1) {
                 // AidanOS choice, pending case 22
-                marks.unsettled = true
+                marks.flaggedTokens.append(String(chars[index..<end]))
                 index = end
                 continue
             }
             if chars[index] == "@", !wordBefore(chars, index),
-               let (mention, range, valueRange) = readMention(chars, at: index) {
+               let (mention, range, valueRange, unclosedParen) = readMention(
+                   chars,
+                   at: index,
+                   parenHasNoCloser: mentionParenHasNoCloser
+               ) {
+                if unclosedParen {
+                    mentionParenHasNoCloser = true
+                }
                 marks.mentions.append(mention)
                 if let valueRange {
                     marks.blocked.append(valueRange)
@@ -684,7 +708,7 @@ extension ExternalFormatReader {
         var inner: [Character] = []
         while index + 1 < chars.count {
             if chars[index] == "]", chars[index + 1] == "]" {
-                guard let link = makeWiki(String(inner)) else { return .rejected }
+                guard let link = makeWiki(String(inner)) else { return .rejectedClosed(resume: index + 2) }
                 return .found((link, start..<(index + 2)))
             }
             inner.append(chars[index])
@@ -776,14 +800,16 @@ extension ExternalFormatReader {
 
     fileprivate static func readMention(
         _ chars: [Character],
-        at start: Int
-    ) -> (ExternalMention, Range<Int>, Range<Int>?)? {
+        at start: Int,
+        parenHasNoCloser: Bool
+    ) -> (ExternalMention, Range<Int>, Range<Int>?, Bool)? {
         guard chars[start] == "@" else { return nil }
         var index = start + 1
-        guard let name = readName(chars, from: &index) else { return nil }
-        var value: String?
-        var valueRange: Range<Int>?
+        guard let name = readTagGroup(chars, from: &index) else { return nil }
         if index < chars.count, chars[index] == "(" {
+            if parenHasNoCloser {
+                return (ExternalMention(name: name, value: nil), start..<index, nil, false)
+            }
             let open = index
             index += 1
             let valueStart = index
@@ -791,23 +817,13 @@ extension ExternalFormatReader {
                 index += 1
             }
             if index < chars.count, chars[index] == ")" {
-                value = String(chars[valueStart..<index])
+                let value = String(chars[valueStart..<index])
                 index += 1
-                valueRange = open..<index
-            } else {
-                index = open
+                return (ExternalMention(name: name, value: value), start..<index, open..<index, false)
             }
+            return (ExternalMention(name: name, value: nil), start..<open, nil, true)
         }
-        return (ExternalMention(name: name, value: value), start..<index, valueRange)
-    }
-
-    fileprivate static func readName(_ chars: [Character], from index: inout Int) -> String? {
-        let start = index
-        while index < chars.count, isNameChar(chars[index]) {
-            index += 1
-        }
-        guard index > start else { return nil }
-        return String(chars[start..<index])
+        return (ExternalMention(name: name, value: nil), start..<index, nil, false)
     }
 
     fileprivate static func readCompletion(_ value: String) -> ExternalCompletion? {
@@ -939,11 +955,16 @@ extension ExternalFormatReader {
         char.isLetter || isASCIIDigit(char) || char == "_"
     }
 
-    /// Emoji may sit inside a tag, including at the top of a nested tag.
-    /// ASCII digits and marks are not emoji here.
+    /// Emoji may sit inside a tag or a mention, including at the top of a nested tag.
+    /// ASCII digits and marks are not emoji here. Trademark and copyright signs are not either.
     fileprivate static func isTagChar(_ char: Character) -> Bool {
         if isNameChar(char) { return true }
         guard char.asciiValue == nil else { return false }
+        for scalar in char.unicodeScalars {
+            if scalar.value == 0x00A9 || scalar.value == 0x2122 {
+                return false
+            }
+        }
         return char.unicodeScalars.contains { $0.properties.isEmoji }
     }
 

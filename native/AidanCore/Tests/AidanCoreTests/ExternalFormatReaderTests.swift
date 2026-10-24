@@ -47,8 +47,9 @@ final class ExternalFormatReaderTests: XCTestCase {
             ExternalFormatReader.noteContext(labeled: "Day 2017-01-09"),
             .day(date(2017, 1, 9))
         )
+        XCTAssertNil(ExternalFormatReader.noteContext(labeled: "Day 2017-01-09, viewed on session day"))
         XCTAssertEqual(
-            ExternalFormatReader.noteContext(labeled: "Day 2017-01-09, viewed on session day"),
+            ExternalFormatReader.noteContext(labeled: fixtureContext("Day 2017-01-09, viewed on session day")),
             .day(date(2017, 1, 9))
         )
         XCTAssertNil(ExternalFormatReader.noteContext(labeled: "Weekly note 2017-W02"))
@@ -101,7 +102,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(line.kind, .openChecklist)
         XCTAssertFalse(line.countsAsOpen)
         XCTAssertTrue(line.leftOutOfOverdue)
-        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay), .unlisted)
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .unlisted)
     }
 
     func testCase11DoneStampHasDateAndTime() throws {
@@ -124,7 +125,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertTrue(line.countsAsOpen)
         XCTAssertEqual(line.scheduleDates, [date(2017, 1, 10)])
         XCTAssertEqual(line.referencedDays, [date(2017, 1, 10)])
-        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay), .overdue)
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .overdue)
     }
 
     func testCase16DayScheduleDoesNotMakeAReference() throws {
@@ -284,7 +285,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(fixture.expected, "Listed in Upcoming, not Overdue")
         XCTAssertEqual(line.kind, .openTask)
         XCTAssertEqual(line.scheduleDates, [date(2031, 3, 3)])
-        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay), .upcoming)
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .upcoming)
     }
 
     func testCase65MarkdownLinkShowsItsWords() throws {
@@ -348,7 +349,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(spaces.lines.count, 2)
         XCTAssertEqual(spaces.lines[0].kind, .plain)
         XCTAssertFalse(spaces.lines[0].countsAsOpen)
-        XCTAssertEqual(ExternalFormatReader.placement(of: spaces.lines[0], on: sessionDay), .unlisted)
+        XCTAssertEqual(ExternalFormatReader.placement(of: spaces.lines[0], on: sessionDay, in: .project), .unlisted)
         XCTAssertEqual(spaces.lines[1].kind, .empty)
         XCTAssertEqual(spaces.lines[1].indentTabs, 2)
     }
@@ -379,7 +380,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertTrue(line.scheduleDates.isEmpty)
         XCTAssertTrue(line.referencedDays.isEmpty)
         XCTAssertNil(line.timeBlock)
-        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay), .unlisted)
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .unlisted)
     }
 
     func testCheckedChecklistBoxIsUnsettledAndUnlisted() {
@@ -388,17 +389,18 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertFalse(line.countsAsOpen)
         XCTAssertTrue(line.scheduleDates.isEmpty)
         XCTAssertTrue(line.referencedDays.isEmpty)
-        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay), .unlisted)
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .unlisted)
     }
 
-    func testAtDateIsUnsettledAndUnlisted() {
+    func testAtDateIsFlaggedAndTheLineStays() {
         let line = ExternalFormatReader.read("* Fake meeting prep @2017-01-10", in: .project).lines[0]
-        XCTAssertEqual(line.kind, .unsettled)
-        XCTAssertFalse(line.countsAsOpen)
+        XCTAssertEqual(line.kind, .openTask)
+        XCTAssertTrue(line.countsAsOpen)
         XCTAssertTrue(line.mentions.isEmpty)
         XCTAssertTrue(line.scheduleDates.isEmpty)
         XCTAssertTrue(line.referencedDays.isEmpty)
-        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay), .unlisted)
+        XCTAssertEqual(line.flaggedTokens, ["@2017-01-10"])
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .unlisted)
     }
 
     func testTaskInsideCodeFenceIsUnsettledAndUnlisted() {
@@ -410,27 +412,83 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertTrue(note.lines[1].tags.isEmpty)
         XCTAssertTrue(note.lines[1].scheduleDates.isEmpty)
         XCTAssertTrue(note.lines[1].referencedDays.isEmpty)
-        XCTAssertEqual(ExternalFormatReader.placement(of: note.lines[1], on: sessionDay), .unlisted)
+        XCTAssertEqual(ExternalFormatReader.placement(of: note.lines[1], on: sessionDay, in: .project), .unlisted)
         XCTAssertEqual(note.lines[3].kind, .openTask)
         XCTAssertEqual(note.lines[3].scheduleDates, [date(2017, 1, 10)])
-        XCTAssertEqual(ExternalFormatReader.placement(of: note.lines[3], on: sessionDay), .overdue)
+        XCTAssertEqual(ExternalFormatReader.placement(of: note.lines[3], on: sessionDay, in: .project), .overdue)
     }
 
-    func testDatelessOpenTaskOutsideAPastDayStaysUnlisted() {
+    func testDatelessOpenTaskInTodayOrAFutureDayIsUpcoming() {
         let project = ExternalFormatReader.read("* Open", in: .project).lines[0]
         XCTAssertEqual(ExternalFormatReader.placement(of: project, on: sessionDay, in: .project), .unlisted)
         let today = ExternalFormatReader.read("* Open", in: .day(sessionDay)).lines[0]
+        XCTAssertEqual(today.kind, .openTask)
+        XCTAssertTrue(today.scheduleDates.isEmpty)
         XCTAssertEqual(
             ExternalFormatReader.placement(of: today, on: sessionDay, in: .day(sessionDay)),
-            .unlisted
+            .upcoming
         )
         let futureDay = date(2031, 3, 3)
         let future = ExternalFormatReader.read("* Open", in: .day(futureDay)).lines[0]
-        XCTAssertEqual(ExternalFormatReader.placement(of: future, on: sessionDay, in: .day(futureDay)), .unlisted)
+        XCTAssertEqual(ExternalFormatReader.placement(of: future, on: sessionDay, in: .day(futureDay)), .upcoming)
         let pastDay = date(2017, 1, 9)
         let later = ExternalFormatReader.read("* Later >2031-03-03", in: .day(pastDay)).lines[0]
         XCTAssertEqual(later.scheduleDates, [date(2031, 3, 3)])
         XCTAssertEqual(ExternalFormatReader.placement(of: later, on: sessionDay, in: .day(pastDay)), .upcoming)
+    }
+
+    func testFlaggedTokensStayInTheirLists() throws {
+        let bug = ExternalFormatReader.read("* Fix bug #123 >2017-01-10", in: .project).lines[0]
+        XCTAssertEqual(bug.kind, .openTask)
+        XCTAssertTrue(bug.countsAsOpen)
+        XCTAssertTrue(bug.tags.isEmpty)
+        XCTAssertEqual(bug.flaggedTokens, ["#123"])
+        XCTAssertEqual(bug.scheduleDates, [date(2017, 1, 10)])
+        XCTAssertEqual(ExternalFormatReader.placement(of: bug, on: sessionDay, in: .project), .overdue)
+
+        let see = ExternalFormatReader.read("* Read docs (see #3) >2017-01-10", in: .project).lines[0]
+        XCTAssertEqual(see.kind, .openTask)
+        XCTAssertTrue(see.tags.isEmpty)
+        XCTAssertEqual(see.flaggedTokens, ["#3"])
+        XCTAssertEqual(see.scheduleDates, [date(2017, 1, 10)])
+        XCTAssertEqual(ExternalFormatReader.placement(of: see, on: sessionDay, in: .project), .overdue)
+
+        let follow = ExternalFormatReader.read("* Call Zed #follow-up", in: .project).lines[0]
+        XCTAssertEqual(follow.kind, .openTask)
+        XCTAssertTrue(follow.countsAsOpen)
+        XCTAssertTrue(follow.tags.isEmpty)
+        XCTAssertEqual(follow.flaggedTokens, ["#follow-up"])
+        XCTAssertTrue(follow.scheduleDates.isEmpty)
+        XCTAssertEqual(ExternalFormatReader.placement(of: follow, on: sessionDay, in: .project), .unlisted)
+
+        let link = ExternalFormatReader.read(
+            "* Read https://example.test/#section-two >2017-01-10",
+            in: .project
+        ).lines[0]
+        XCTAssertEqual(link.kind, .openTask)
+        XCTAssertTrue(link.tags.isEmpty)
+        XCTAssertEqual(link.flaggedTokens, ["#section-two"])
+        XCTAssertEqual(link.scheduleDates, [date(2017, 1, 10)])
+        XCTAssertEqual(ExternalFormatReader.placement(of: link, on: sessionDay, in: .project), .overdue)
+
+        let meeting = ExternalFormatReader.read("Meeting @2017-01-10", in: .project).lines[0]
+        XCTAssertEqual(meeting.kind, .plain)
+        XCTAssertTrue(meeting.mentions.isEmpty)
+        XCTAssertTrue(meeting.scheduleDates.isEmpty)
+        XCTAssertEqual(meeting.flaggedTokens, ["@2017-01-10"])
+        XCTAssertEqual(ExternalFormatReader.placement(of: meeting, on: sessionDay, in: .project), .unlisted)
+
+        let heading = ExternalFormatReader.read(
+            "## 09:00 - 11:00 Focus #deep-work",
+            in: .day(date(2017, 1, 9))
+        ).lines[0]
+        XCTAssertEqual(heading.kind, .heading(level: 2))
+        XCTAssertTrue(heading.tags.isEmpty)
+        XCTAssertEqual(heading.flaggedTokens, ["#deep-work"])
+        let block = try XCTUnwrap(heading.timeBlock)
+        XCTAssertEqual(block.start, ExternalClockTime(hour: 9, minute: 0))
+        XCTAssertEqual(block.end, ExternalClockTime(hour: 11, minute: 0))
+        XCTAssertEqual(block.day, date(2017, 1, 9))
     }
 
     func testEmojiCanBePartOfATag() {
@@ -440,46 +498,108 @@ final class ExternalFormatReaderTests: XCTestCase {
         let nested = ExternalFormatReader.read("* Task #📌/zzrea", in: .project).lines[0]
         XCTAssertEqual(nested.kind, .openTask)
         XCTAssertEqual(nested.tags, [ExternalTag(name: "📌/zzrea", parent: "📌")])
+        let mention = ExternalFormatReader.read("* Hey @📌zed", in: .project).lines[0]
+        XCTAssertEqual(mention.mentions, [ExternalMention(name: "📌zed", value: nil)])
+        let brand = ExternalFormatReader.read("* Item #brand™", in: .project).lines[0]
+        XCTAssertEqual(brand.tags, [ExternalTag(name: "brand", parent: nil)])
+        XCTAssertTrue(brand.flaggedTokens.isEmpty)
+        let copy = ExternalFormatReader.read("* Item #brand©", in: .project).lines[0]
+        XCTAssertEqual(copy.tags, [ExternalTag(name: "brand", parent: nil)])
+        XCTAssertTrue(copy.flaggedTokens.isEmpty)
     }
 
-    func testHyphenatedTagIsUnsettledAndUnlisted() {
+    func testHyphenatedTagIsFlaggedAndTheLineStays() {
         let line = ExternalFormatReader.read("* c95 zzrea hyphen tag #zzrea-hy-phen.", in: .project).lines[0]
-        XCTAssertEqual(line.kind, .unsettled)
-        XCTAssertFalse(line.countsAsOpen)
+        XCTAssertEqual(line.kind, .openTask)
+        XCTAssertTrue(line.countsAsOpen)
         XCTAssertTrue(line.tags.isEmpty)
-        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay), .unlisted)
+        XCTAssertEqual(line.flaggedTokens, ["#zzrea-hy-phen"])
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .unlisted)
     }
 
-    func testDigitsOnlyTagIsUnsettledAndUnlisted() {
+    func testDigitsOnlyTagIsFlaggedAndTheLineStays() {
         let count = ExternalFormatReader.read("* Fake count #123", in: .project).lines[0]
-        XCTAssertEqual(count.kind, .unsettled)
-        XCTAssertFalse(count.countsAsOpen)
+        XCTAssertEqual(count.kind, .openTask)
+        XCTAssertTrue(count.countsAsOpen)
         XCTAssertTrue(count.tags.isEmpty)
-        XCTAssertEqual(ExternalFormatReader.placement(of: count, on: sessionDay), .unlisted)
+        XCTAssertEqual(count.flaggedTokens, ["#123"])
+        XCTAssertEqual(ExternalFormatReader.placement(of: count, on: sessionDay, in: .project), .unlisted)
         let year = ExternalFormatReader.read("* c96 zzrea digits tag #2017", in: .project).lines[0]
-        XCTAssertEqual(year.kind, .unsettled)
+        XCTAssertEqual(year.kind, .openTask)
         XCTAssertTrue(year.tags.isEmpty)
+        XCTAssertEqual(year.flaggedTokens, ["#2017"])
         let nestedDigits = ExternalFormatReader.read("* Count #12/34", in: .project).lines[0]
-        XCTAssertEqual(nestedDigits.kind, .unsettled)
+        XCTAssertEqual(nestedDigits.kind, .openTask)
         XCTAssertTrue(nestedDigits.tags.isEmpty)
+        XCTAssertEqual(nestedDigits.flaggedTokens, ["#12/34"])
         let mixed = ExternalFormatReader.read("* Year #zz/2017", in: .project).lines[0]
         XCTAssertEqual(mixed.kind, .openTask)
         XCTAssertEqual(mixed.tags, [ExternalTag(name: "zz/2017", parent: "zz")])
+        XCTAssertTrue(mixed.flaggedTokens.isEmpty)
     }
 
-    func testDoneTaskTimeBlockIsUnsettledAndUnlisted() {
+    func testClosedTaskDropsOnlyTheTimeBlock() {
+        let day = date(2017, 1, 9)
         let line = ExternalFormatReader.read(
-            "* [x] c97 14:30 zzrea done with time",
-            in: .day(date(2017, 1, 9))
+            "* [x] Call at 10:30 @done(2017-01-09)",
+            in: .day(day)
         ).lines[0]
-        XCTAssertEqual(line.kind, .unsettled)
+        XCTAssertEqual(line.kind, .doneTask)
         XCTAssertFalse(line.countsAsOpen)
         XCTAssertNil(line.timeBlock)
-        XCTAssertNil(line.completion)
-        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay), .unlisted)
-        let plainDone = ExternalFormatReader.read("* [x] Pay the fake water bill", in: .project).lines[0]
-        XCTAssertEqual(plainDone.kind, .doneTask)
-        XCTAssertNil(plainDone.timeBlock)
+        XCTAssertEqual(line.completion, ExternalCompletion(day: day, time: nil))
+        XCTAssertEqual(line.mentions, [ExternalMention(name: "done", value: "2017-01-09")])
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .day(day)), .unlisted)
+        let cancelled = ExternalFormatReader.read("* [-] Call at 10:30", in: .day(day)).lines[0]
+        XCTAssertEqual(cancelled.kind, .cancelledTask)
+        XCTAssertNil(cancelled.timeBlock)
+        let moved = ExternalFormatReader.read("* [>] Call at 10:30 >2031-03-03", in: .project).lines[0]
+        XCTAssertEqual(moved.kind, .scheduledTask)
+        XCTAssertEqual(moved.scheduleDates, [date(2031, 3, 3)])
+        XCTAssertNil(moved.timeBlock)
+        XCTAssertEqual(ExternalFormatReader.placement(of: moved, on: sessionDay, in: .project), .upcoming)
+    }
+
+    func testTildeFenceKeepsPlainLinesAndBullets() {
+        let text = "~~~\n* task #zzcode >2017-01-10\n- bullet #zzhome >2017-01-11\nplain #zzhome\n~~~\n* Outside >2017-01-10\n"
+        let note = ExternalFormatReader.read(text, in: .project)
+        XCTAssertEqual(note.lines[1].kind, .unsettled)
+        XCTAssertTrue(note.lines[1].tags.isEmpty)
+        XCTAssertTrue(note.lines[1].scheduleDates.isEmpty)
+        XCTAssertEqual(note.lines[2].kind, .bullet)
+        XCTAssertEqual(note.lines[2].tags, [ExternalTag(name: "zzhome", parent: nil)])
+        XCTAssertEqual(note.lines[2].scheduleDates, [date(2017, 1, 11)])
+        XCTAssertEqual(note.lines[3].kind, .plain)
+        XCTAssertEqual(note.lines[3].tags, [ExternalTag(name: "zzhome", parent: nil)])
+        XCTAssertEqual(note.lines[5].kind, .openTask)
+        XCTAssertEqual(ExternalFormatReader.placement(of: note.lines[5], on: sessionDay, in: .project), .overdue)
+        let open = ExternalFormatReader.read("```\n* inside\n- kept #zzhome\n", in: .project)
+        XCTAssertEqual(open.lines[1].kind, .unsettled)
+        XCTAssertEqual(open.lines[2].kind, .bullet)
+        XCTAssertEqual(open.lines[2].tags, [ExternalTag(name: "zzhome", parent: nil)])
+    }
+
+    func testRejectedWikiDoesNotHideALaterLink() {
+        let line = ExternalFormatReader.read("See [[#nope]] and [[Note]]", in: .project).lines[0]
+        XCTAssertEqual(line.wikiLinks.map(\.target), ["Note"])
+    }
+
+    func testRejectedWikiLineStaysWithinTheTimeBound() {
+        let line = String(repeating: "[[#", count: 350_000) + "]]"
+        let started = Date()
+        let note = ExternalFormatReader.read(line, in: .project)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        XCTAssertEqual(note.lines.count, 1)
+        XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
+    }
+
+    func testUnclosedMentionParenStaysWithinTheTimeBound() {
+        let line = String(repeating: "@a(", count: 350_000)
+        let started = Date()
+        let note = ExternalFormatReader.read(line, in: .project)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        XCTAssertEqual(note.lines.count, 1)
+        XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }
 
     func testMovedAwayTaskInAPastDayIsUnlisted() {
@@ -548,7 +668,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         let fixture = try JSONDecoder().decode(FixtureCase.self, from: Data(contentsOf: url))
         XCTAssertEqual(fixture.number, number)
         XCTAssertEqual(fixture.label, "Seen")
-        guard let context = ExternalFormatReader.noteContext(labeled: fixture.context) else {
+        guard let context = ExternalFormatReader.noteContext(labeled: fixtureContext(fixture.context)) else {
             XCTFail("case \(number) has no readable context \(fixture.context)")
             throw LoadError.context
         }
@@ -597,6 +717,14 @@ private func fixturesRoot() throws -> URL {
         }
     }
     throw LoadError.missingRoot
+}
+
+private func fixtureContext(_ label: String) -> String {
+    let viewed = ", viewed on session day"
+    if label.hasSuffix(viewed) {
+        return String(label.dropLast(viewed.count))
+    }
+    return label
 }
 
 private func date(_ year: Int, _ month: Int, _ day: Int) -> ExternalDate {

@@ -16,7 +16,21 @@ public enum ExternalFormatReader {
     }
 
     public static func read(_ text: String, in context: ExternalNoteContext) -> ExternalNoteReading {
-        var lines = splitLines(text).map { readLine($0, in: context) }
+        var lines: [ExternalLine] = []
+        var inFence = false
+        for piece in splitLines(text) {
+            if isCodeFence(piece) {
+                inFence.toggle()
+                lines.append(readLine(piece, in: context))
+                continue
+            }
+            var line = readLine(piece, in: context)
+            // AidanOS choice, pending case 49
+            if inFence, line.kind.isTask {
+                line = leaveOutOfLists(line)
+            }
+            lines.append(line)
+        }
         attachChildren(&lines)
         return ExternalNoteReading(context: context, lines: lines)
     }
@@ -160,6 +174,8 @@ public enum ExternalLineKind: Equatable, Sendable {
     case cancelledTask
     case scheduledTask
     case openChecklist
+    /// The form is not settled, so this line stays out of the lists.
+    case unsettled
 
     var isTask: Bool {
         switch self {
@@ -261,6 +277,13 @@ private struct InlineMarks {
     var markdownLinks: [ExternalMarkdownLink] = []
     var scheduleDates: [ExternalDate] = []
     var blocked: [Range<Int>] = []
+    var unsettled = false
+}
+
+private enum BracketRead<Value> {
+    case found(Value)
+    case noCloser
+    case rejected
 }
 
 private struct FoundClock {
@@ -269,17 +292,33 @@ private struct FoundClock {
 }
 
 extension ExternalFormatReader {
+    /// `\r\n` is one Swift character, so a split on `"\n"` leaves that pair intact.
+    /// Walk the scalars and break on `\n`, `\r\n`, and a lone `\r`.
     fileprivate static func splitLines(_ text: String) -> [String] {
         if text.isEmpty { return [] }
-        var body = text
-        if body.hasSuffix("\n") { body.removeLast() }
-        if body.hasSuffix("\r") { body.removeLast() }
-        if body.isEmpty { return [""] }
-        return body.split(separator: "\n", omittingEmptySubsequences: false).map { piece in
-            var line = String(piece)
-            if line.hasSuffix("\r") { line.removeLast() }
-            return line
+        let scalars = Array(text.unicodeScalars)
+        var lines: [String] = []
+        var current: [Unicode.Scalar] = []
+        var index = 0
+        while index < scalars.count {
+            let scalar = scalars[index]
+            if scalar == "\n" || scalar == "\r" {
+                lines.append(String(String.UnicodeScalarView(current)))
+                current.removeAll(keepingCapacity: true)
+                if scalar == "\r", index + 1 < scalars.count, scalars[index + 1] == "\n" {
+                    index += 2
+                } else {
+                    index += 1
+                }
+                continue
+            }
+            current.append(scalar)
+            index += 1
         }
+        if !current.isEmpty {
+            lines.append(String(String.UnicodeScalarView(current)))
+        }
+        return lines
     }
 
     fileprivate static func readLine(_ line: String, in context: ExternalNoteContext) -> ExternalLine {
@@ -305,7 +344,12 @@ extension ExternalFormatReader {
             return heading
         }
         if body.hasPrefix("* ") {
-            let (state, rest) = takeBox(String(body.dropFirst(2)))
+            let content = String(body.dropFirst(2))
+            // AidanOS choice, pending case 14
+            if content.hasPrefix("[X]") {
+                return (.unsettled, content)
+            }
+            let (state, rest) = takeBox(content)
             return (taskKind(state), rest)
         }
         if body.hasPrefix("- ") {
@@ -317,7 +361,12 @@ extension ExternalFormatReader {
             return (taskKind(state), rest)
         }
         if body.hasPrefix("+ ") {
-            return (.openChecklist, String(body.dropFirst(2)))
+            let content = String(body.dropFirst(2))
+            // AidanOS choice, pending case 9
+            if content.hasPrefix("[x]") {
+                return (.unsettled, content)
+            }
+            return (.openChecklist, content)
         }
         return (.plain, body)
     }
@@ -388,23 +437,63 @@ extension ExternalFormatReader {
         context: ExternalNoteContext
     ) -> ExternalLine {
         let marks = scan(content)
-        let block = timeBlock(in: content, marks: marks, kind: kind, context: context)
-        let completion = marks.mentions.first { $0.name == "done" }?.value.flatMap(readCompletion)
+        let unsettled = kind == .unsettled || marks.unsettled
+        let resolved: ExternalLineKind = unsettled ? .unsettled : kind
+        let block = unsettled ? nil : timeBlock(in: content, marks: marks, kind: resolved, context: context)
+        let completion = unsettled ? nil : marks.mentions.first { $0.name == "done" }?.value.flatMap(readCompletion)
         return ExternalLine(
-            kind: kind,
+            kind: resolved,
             indentTabs: indent,
-            countsAsOpen: kind == .openTask,
-            leftOutOfOverdue: kind == .openChecklist,
+            countsAsOpen: resolved == .openTask,
+            leftOutOfOverdue: resolved == .openChecklist || resolved == .unsettled,
             completion: completion,
-            scheduleDates: marks.scheduleDates,
-            referencedDays: references(marks: marks, kind: kind, context: context),
+            scheduleDates: unsettled ? [] : marks.scheduleDates,
+            referencedDays: unsettled ? [] : references(marks: marks, kind: resolved, context: context),
             timeBlock: block,
-            tags: marks.tags,
-            mentions: marks.mentions,
-            wikiLinks: marks.wikiLinks,
-            markdownLinks: marks.markdownLinks,
+            tags: unsettled ? [] : marks.tags,
+            mentions: unsettled ? [] : marks.mentions,
+            wikiLinks: unsettled ? [] : marks.wikiLinks,
+            markdownLinks: unsettled ? [] : marks.markdownLinks,
             childIndexes: []
         )
+    }
+
+    /// Drops every field a list could read. The line stays in the note as unsettled.
+    fileprivate static func leaveOutOfLists(_ line: ExternalLine) -> ExternalLine {
+        var line = line
+        line.kind = .unsettled
+        line.countsAsOpen = false
+        line.leftOutOfOverdue = true
+        line.completion = nil
+        line.scheduleDates = []
+        line.referencedDays = []
+        line.timeBlock = nil
+        line.tags = []
+        line.mentions = []
+        line.wikiLinks = []
+        line.markdownLinks = []
+        return line
+    }
+
+    fileprivate static func isCodeFence(_ line: String) -> Bool {
+        let (_, body) = indentAndBody(line)
+        let chars = Array(body)
+        var index = 0
+        while index < chars.count, chars[index] == " " {
+            index += 1
+        }
+        let ticks = index
+        while index < chars.count, chars[index] == "`" {
+            index += 1
+        }
+        guard index - ticks >= 3 else { return false }
+        if index == chars.count { return true }
+        guard chars[index] == " " else { return false }
+        while index < chars.count {
+            if chars[index] == "`" { return false }
+            index += 1
+        }
+        return true
     }
 
     /// A `>YYYY-MM-DD` on a task in a project note is also listed on that day.
@@ -477,24 +566,51 @@ extension ExternalFormatReader {
         let chars = Array(content)
         var marks = InlineMarks()
         var index = 0
+        // An unclosed opener has no closer later in the line. Remember that
+        // so the next opener does not walk to the end again.
+        var wikiHasNoCloser = false
+        var markdownHasNoCloser = false
         while index < chars.count {
             if chars[index] == "[", index + 1 < chars.count, chars[index + 1] == "[" {
-                if let (link, range) = readWiki(chars, at: index) {
-                    marks.wikiLinks.append(link)
-                    marks.blocked.append(range)
-                    index = range.upperBound
-                    continue
+                if !wikiHasNoCloser {
+                    switch readWiki(chars, at: index) {
+                    case .found((let link, let range)):
+                        marks.wikiLinks.append(link)
+                        marks.blocked.append(range)
+                        index = range.upperBound
+                        continue
+                    case .noCloser:
+                        wikiHasNoCloser = true
+                    case .rejected:
+                        break
+                    }
                 }
             }
-            if chars[index] == "[", let (link, range, address) = readMarkdown(chars, at: index) {
-                marks.markdownLinks.append(link)
-                marks.blocked.append(address)
-                index = range.upperBound
-                continue
+            if chars[index] == "[" {
+                if !markdownHasNoCloser {
+                    switch readMarkdown(chars, at: index) {
+                    case .found((let link, let range, let address)):
+                        marks.markdownLinks.append(link)
+                        marks.blocked.append(address)
+                        index = range.upperBound
+                        continue
+                    case .noCloser:
+                        markdownHasNoCloser = true
+                    case .rejected:
+                        break
+                    }
+                }
             }
             if chars[index] == "#", !wordBefore(chars, index), let (tag, range) = readTag(chars, at: index) {
                 marks.tags.append(tag)
                 index = range.upperBound
+                continue
+            }
+            if chars[index] == "@", !wordBefore(chars, index),
+               let (_, end) = readISODate(chars, at: index + 1) {
+                // AidanOS choice, pending case 22
+                marks.unsettled = true
+                index = end
                 continue
             }
             if chars[index] == "@", !wordBefore(chars, index),
@@ -517,19 +633,22 @@ extension ExternalFormatReader {
         return marks
     }
 
-    fileprivate static func readWiki(_ chars: [Character], at start: Int) -> (ExternalWikiLink, Range<Int>)? {
-        guard start + 1 < chars.count, chars[start] == "[", chars[start + 1] == "[" else { return nil }
+    fileprivate static func readWiki(
+        _ chars: [Character],
+        at start: Int
+    ) -> BracketRead<(ExternalWikiLink, Range<Int>)> {
+        guard start + 1 < chars.count, chars[start] == "[", chars[start + 1] == "[" else { return .rejected }
         var index = start + 2
         var inner: [Character] = []
         while index + 1 < chars.count {
             if chars[index] == "]", chars[index + 1] == "]" {
-                guard let link = makeWiki(String(inner)) else { return nil }
-                return (link, start..<(index + 2))
+                guard let link = makeWiki(String(inner)) else { return .rejected }
+                return .found((link, start..<(index + 2)))
             }
             inner.append(chars[index])
             index += 1
         }
-        return nil
+        return .noCloser
     }
 
     fileprivate static func makeWiki(_ inner: String) -> ExternalWikiLink? {
@@ -548,18 +667,18 @@ extension ExternalFormatReader {
     fileprivate static func readMarkdown(
         _ chars: [Character],
         at start: Int
-    ) -> (ExternalMarkdownLink, Range<Int>, Range<Int>)? {
-        guard chars[start] == "[" else { return nil }
-        if start + 1 < chars.count, chars[start + 1] == "[" { return nil }
+    ) -> BracketRead<(ExternalMarkdownLink, Range<Int>, Range<Int>)> {
+        guard chars[start] == "[" else { return .rejected }
+        if start + 1 < chars.count, chars[start + 1] == "[" { return .rejected }
         var index = start + 1
         var shown: [Character] = []
         while index < chars.count, chars[index] != "]" {
             shown.append(chars[index])
             index += 1
         }
-        guard index < chars.count, chars[index] == "]" else { return nil }
+        guard index < chars.count, chars[index] == "]" else { return .noCloser }
         index += 1
-        guard index < chars.count, chars[index] == "(" else { return nil }
+        guard index < chars.count, chars[index] == "(" else { return .rejected }
         let addressStart = index
         index += 1
         var address: [Character] = []
@@ -567,13 +686,13 @@ extension ExternalFormatReader {
             address.append(chars[index])
             index += 1
         }
-        guard index < chars.count, chars[index] == ")" else { return nil }
+        guard index < chars.count, chars[index] == ")" else { return .noCloser }
         index += 1
         let shownText = trim(String(shown))
         let addr = trim(String(address))
-        guard !shownText.isEmpty, !addr.isEmpty else { return nil }
+        guard !shownText.isEmpty, !addr.isEmpty else { return .rejected }
         let link = ExternalMarkdownLink(shownText: shownText, address: addr)
-        return (link, start..<index, addressStart..<index)
+        return .found((link, start..<index, addressStart..<index))
     }
 
     fileprivate static func readTag(_ chars: [Character], at start: Int) -> (ExternalTag, Range<Int>)? {
@@ -762,11 +881,15 @@ extension ExternalFormatReader {
     }
 
     fileprivate static func isASCIIDigit(_ char: Character) -> Bool {
-        char >= "0" && char <= "9"
+        guard let ascii = char.asciiValue, let zero = Character("0").asciiValue, let nine = Character("9").asciiValue else {
+            return false
+        }
+        return ascii >= zero && ascii <= nine
     }
 
     fileprivate static func digitValue(_ char: Character) -> Int {
-        Int(char.asciiValue! - Character("0").asciiValue!)
+        guard let ascii = char.asciiValue, let zero = Character("0").asciiValue else { return 0 }
+        return Int(ascii - zero)
     }
 
     fileprivate static func trim(_ text: String) -> String {

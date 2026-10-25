@@ -163,12 +163,14 @@ function normalizeTime(hhmm) {
 
 function stripWhen(line) {
   return String(line || "")
-    .replace(WHEN_RE, "")
-    .replace(/^[-*+]\s*\[[ xX]\]\s*/, "")
-    .replace(/^#{1,6}\s+/, "")
-    .replace(/^[-*+]\s+/, "")
-    .replace(/^\d+[.)]\s+/, "")
-    .replace(/\s+/g, " ")
+    .replace(/@(\d{4}-\d{2}-\d{2})[ T]\d{1,2}:\d{2}\b/g, "$1")
+    .replace(/@\d{1,2}:\d{2}\b/g, "")
+    .replace(/^\s*[-*+]\s+\[[^\]]*\]\s*/, "")
+    .replace(/^\s*#{1,6}\s+/, "")
+    .replace(/^\s*[-*+]\s+/, "")
+    .replace(/^\s*\d+[.)]\s+/, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([.,])/g, "$1")
     .trim();
 }
 
@@ -190,7 +192,8 @@ function parseBlocks(text, day) {
     const key = time + "|" + label;
     if (seen.has(key)) continue;
     seen.add(key);
-    blocks.push({ time, text: label, raw: line });
+    const done = /^\s*[-*+]\s+\[[xX]\]/.test(line);
+    blocks.push({ time, text: label, raw: line, done });
   }
   const stop = day && day.hard_stop ? normalizeTime(day.hard_stop) : "";
   if (stop && !blocks.some((b) => b.time === stop && /hard stop/i.test(b.text))) {
@@ -218,9 +221,12 @@ function paintWiki(escaped, showMarks) {
 function paintBold(escaped) {
   return String(escaped || "").replace(/\*\*([^*]+)\*\*/g, '<strong class="md-b">$1</strong>');
 }
+function paintDates(escaped) {
+  return String(escaped || "").replace(/(\d{4}-\d{2}-\d{2})/g, '<span class="md-date">$1</span>');
+}
 function paintInline(s) {
-  return paintWiki(paintBold(escapeHtml(s)
-    .replace(/@(\d{1,2}:\d{2})\b/g, '<span class="md-when">@$1</span>')), false);
+  return paintDates(paintWiki(paintBold(escapeHtml(s)
+    .replace(/@(\d{1,2}:\d{2})\b/g, '<span class="md-when">@$1</span>')), false));
 }
 
 function indentPad(spaces) {
@@ -238,8 +244,27 @@ function paperTaskSrc(indent, mark, on, body) {
 
 function paintTaskBodyHtml(body, asSource) {
   const text = String(body ?? "");
-  const html = asSource ? paintWiki(escapeHtml(text), true) : paintInline(text);
+  const html = asSource ? paintDates(paintWiki(escapeHtml(text), true)) : paintInline(text);
   return html || "<br>";
+}
+
+function markLine(line) {
+  const match = String(line ?? "").match(/^(\s*)([-*+])\s+\[([ xX\->]?)\](.*)$/);
+  if (!match) return null;
+  const box = match[3];
+  if (box === "-") return { form: "cancelled", indent: match[1], body: match[4] };
+  if (box === ">") return { form: "scheduled", indent: match[1], body: match[4] };
+  return { form: "task", done: box.toLowerCase() === "x", indent: match[1], body: match[4] };
+}
+
+function tickTypedBox(line) {
+  const text = String(line ?? "");
+  const task = text.match(/^(\s*[-*+]\s+)\[([ xX]?)\](.*)$/);
+  if (!task) return text;
+  const mark = task[2];
+  if (mark !== "" && mark !== " " && mark.toLowerCase() !== "x") return text;
+  const box = mark.toLowerCase() === "x" ? "[ ]" : "[x]";
+  return task[1] + box + task[3];
 }
 
 function familyQuestionText(n) {
@@ -298,9 +323,26 @@ function formatQuestionLine(line, asSource, hidden) {
     '</span><span class="md-body">' + answer + "</span></div>";
 }
 
+function paintMarkedLine(line, asSource, hidden) {
+  const marked = markLine(line);
+  if (!marked || marked.form === "task") return "";
+  const front = hidden ? " md-front" : "";
+  const src = asSource ? " is-source" : "";
+  const nest = marked.indent ? " nest" : "";
+  const body = paintTaskBodyHtml(marked.body, asSource);
+  const cls = "md-line" + src + front + (marked.form === "cancelled" ? " cancelled" : " scheduled") + nest;
+  const arrow = marked.form === "scheduled"
+    ? '<span class="md-go" contenteditable="false" aria-hidden="true"></span>'
+    : "";
+  return '<div draggable="true" class="' + cls + '" data-kind="' + marked.form + '" data-src="' + attr(line) +
+    '" style="' + indentPad(marked.indent) + '">' + arrow + '<span class="md-body">' + body + "</span></div>";
+}
+
 function formatOneLine(line, asSource, hidden) {
   const questionHtml = formatQuestionLine(line, asSource, hidden);
   if (questionHtml) return questionHtml;
+  const markedHtml = paintMarkedLine(line, asSource, hidden);
+  if (markedHtml) return markedHtml;
   if (asSource) {
     let cls = "md-line is-source";
     if (hidden) cls += " md-front";
@@ -317,11 +359,10 @@ function formatOneLine(line, asSource, hidden) {
     } else if ((m = matchPaperTask(line))) {
       const on = /x/i.test(m[3]);
       const nest = m[1] ? " nest" : "";
-      const src = paperTaskSrc(m[1], m[2], on, m[4]);
       cls += " task" + (on ? " done" : "") + nest;
       kind = "task";
       extra = ' data-indent="' + attr(m[1]) + '" data-mark="' + attr(m[2]) + '"';
-      return '<div draggable="true" class="' + cls + '" data-kind="' + kind + '" data-src="' + attr(src) + '"' + extra +
+      return '<div draggable="true" class="' + cls + '" data-kind="' + kind + '" data-src="' + attr(line) + '"' + extra +
         ' style="' + indentPad(m[1]) + '"><span class="md-box" contenteditable="false" role="checkbox" aria-checked="' +
         (on ? "true" : "false") + '"></span><span class="md-body">' +
         paintTaskBodyHtml(m[4], true) + "</span></div>";
@@ -353,9 +394,8 @@ function formatOneLine(line, asSource, hidden) {
   if ((m = matchPaperTask(line))) {
     const on = /x/i.test(m[3]);
     const nest = m[1] ? " nest" : "";
-    const src = paperTaskSrc(m[1], m[2], on, m[4]);
     return '<div draggable="true" class="md-line' + front + ' task' + (on ? " done" : "") + nest +
-      '" data-kind="task" data-src="' + attr(src) + '" data-indent="' + attr(m[1]) + '" data-mark="' + attr(m[2]) +
+      '" data-kind="task" data-src="' + attr(line) + '" data-indent="' + attr(m[1]) + '" data-mark="' + attr(m[2]) +
       '" style="' + indentPad(m[1]) + '"><span class="md-box" contenteditable="false" role="checkbox" aria-checked="' +
       (on ? "true" : "false") + '"></span><span class="md-body">' +
       paintTaskBodyHtml(m[4], false) + "</span></div>";
@@ -701,6 +741,24 @@ function lineIndexOfCaret() {
   return paperLines().indexOf(line);
 }
 
+function keptTaskLine(el, dumpLine) {
+  const original = (el.getAttribute && el.getAttribute("data-src")) || dumpLine || "";
+  const parts = String(original).match(/^(\s*[-*+]\s+\[[^\]]*\]\s*)([\s\S]*)$/);
+  if (!parts) return dumpLine != null ? dumpLine : original;
+  const bodyEl = el.querySelector && el.querySelector(".md-body");
+  const raw = bodyEl
+    ? (bodyEl.innerText != null ? bodyEl.innerText : bodyEl.textContent)
+    : (el.innerText != null ? el.innerText : el.textContent);
+  const body = stripAccidentalBulletSpace(String(raw || "").replace(/\n/g, "").replace(/\u00a0/g, " ").replace(/\u200b/g, ""));
+  let next = body === parts[2] ? original : parts[1] + body;
+  if (el.dataset && el.dataset.kind === "task") {
+    const done = !!(el.classList && el.classList.contains("done"));
+    const was = /\[[xX]\]/.test(parts[1]);
+    if (done !== was) next = tickTypedBox(next);
+  }
+  return next;
+}
+
 function lineMarkdown(el) {
   if (!el) return "";
   const locked = lockedQuestionMarkdown(el);
@@ -717,7 +775,9 @@ function lineMarkdown(el) {
         : String(el.innerText != null ? el.innerText : (el.textContent || "")).replace(/^#+\s*/, "");
       return "#".repeat(level) + " " + stripAccidentalBulletSpace(body.replace(/\n/g, "").replace(/\u00a0/g, " "));
     }
-    if (el.dataset && el.dataset.kind === "task") return sourceTaskMarkdown(el);
+    if (el.dataset && (el.dataset.kind === "task" || el.dataset.kind === "cancelled" || el.dataset.kind === "scheduled")) {
+      return keptTaskLine(el, dumpLine);
+    }
     const raw = (el.innerText != null ? el.innerText : (el.textContent || ""));
     return stripAccidentalBulletSpace(String(raw).replace(/\n/g, "").replace(/\u00a0/g, " "));
   }
@@ -725,8 +785,8 @@ function lineMarkdown(el) {
     if (el.dataset && el.dataset.kind === "task" && matchPaperTask(dumpLine)) {
       const hit = matchPaperTask(dumpLine);
       const on = el.classList.contains("done");
-      const was = /x/i.test(hit[3]);
-      if (on !== was) return paperTaskSrc(hit[1], hit[2], on, hit[4]);
+      const was = String(hit[3] || "").toLowerCase() === "x";
+      if (on !== was) return tickTypedBox(dumpLine);
     }
     return dumpLine;
   }
@@ -975,17 +1035,39 @@ function setStatus(msg, kind = "") {
   }
 }
 
+let openingTimer = null;
+
 function showEditorUnsaved() {
   setStatus("Unsaved");
   editorNotice = "This change is kept on this device.";
   paintEditorNote();
+  const wrap = document.querySelector(".paper-wrap");
+  if (wrap) wrap.scrollTop = 0;
 }
 
 function showEditorState(name) {
   const stateName = String(name || "");
   document.body.dataset.editorState = stateName;
+  clearTimeout(openingTimer);
+  openingTimer = null;
   if (stateName === "error") {
     showEditorUnsaved();
+    return;
+  }
+  if (stateName === "loading") {
+    const paper = $("paper");
+    if (paper) {
+      paper.innerHTML = "";
+      paper.removeAttribute("data-placeholder");
+    }
+    editorNotice = "";
+    paintEditorNote();
+    setStatus("");
+    openingTimer = setTimeout(() => {
+      if (document.body.dataset.editorState !== "loading") return;
+      editorNotice = "Opening\u2026";
+      paintEditorNote();
+    }, 1000);
     return;
   }
   if (stateName === "normal") {
@@ -1161,6 +1243,10 @@ function renderWeek() {
       "<span class=\"dow\">" + DOW_FULL[i] + "</span>" +
       "<span class=\"dom\">" + d.date.slice(8) + "</span>" +
       "<span class=\"moy\">" + escapeHtml(formatCardMonth(d.date)) + "</span>";
+    const month = $("week-month");
+    if (month && i === 0) {
+      month.textContent = parseDate(d.date).toLocaleDateString("en-US", { month: "long", year: "numeric" });
+    }
     btn.addEventListener("click", () => openDay(d.date));
     daysEl.appendChild(btn);
   });
@@ -1440,7 +1526,7 @@ function renderRail() {
     lane.className = "slot-lane";
     for (const b of (byTime[time] || [])) {
       const block = document.createElement("div");
-      block.className = "block" + (b.bound ? " bound" : "");
+      block.className = "block" + (b.bound ? " bound" : "") + (b.done ? " done" : "");
       block.textContent = b.text;
       if (!b.bound) {
         block.draggable = false;
@@ -4021,9 +4107,10 @@ $("paper").addEventListener("click", (e) => {
   const dump = $("dump");
   const lines = dump.value.split("\n");
   if (!lines[idx] || !matchPaperTask(lines[idx])) return;
+  const ticked = tickTypedBox(lines[idx]);
+  if (ticked === lines[idx]) return;
   pushPaperHistory(paperHistory, { markdown: dump.value, line: idx < 0 ? 0 : idx, caret: 0 }, { kind: "box" });
-  const hit = matchPaperTask(lines[idx]);
-  lines[idx] = paperTaskSrc(hit[1], hit[2], !/x/i.test(hit[3]), hit[4]);
+  lines[idx] = ticked;
   dump.value = lines.join("\n");
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
   if (isNoteDoc() && state.doc) state.doc.markdown = dump.value;
@@ -5803,7 +5890,7 @@ function fmtToggleTaskLine() {
   const task = matchPaperTask(text);
   let next;
   if (task) {
-    next = paperTaskSrc(task[1], task[2], !/x/i.test(task[3]), task[4]);
+    next = tickTypedBox(text);
   } else {
     const ul = text.match(/^(\s*)([-*+])\s+(.*)$/);
     const ol = text.match(/^(\s*)(\d+[.)])\s+(.*)$/);
@@ -5901,13 +5988,17 @@ function fmtIndentLine() {
 function setFmtBarVisible(on) {
   const bar = $("fmt-bar");
   if (!bar) return;
+  document.body.classList.toggle("fmt-bar-on", !!on);
   if (on) {
     bar.classList.remove("hidden");
     bar.removeAttribute("hidden");
   } else {
     bar.classList.add("hidden");
     bar.setAttribute("hidden", "");
+    const wrap = document.querySelector(".paper-wrap");
+    if (wrap) wrap.style.paddingBottom = "";
   }
+  syncFmtBarInset();
 }
 
 function fmtKeyboardInset() {
@@ -5930,9 +6021,19 @@ function paperEditorFocused() {
 function syncFmtBarInset() {
   const bar = $("fmt-bar");
   if (!bar) return;
+  const askEl = $("ask-open");
+  const askH = askEl && askEl.getBoundingClientRect ? askEl.getBoundingClientRect().height : 0;
   const inset = fmtKeyboardInset();
-  const ask = inset > 80 ? 0 : 52;
-  bar.style.bottom = (inset + ask) + "px";
+  const lift = inset > 80 ? inset : askH;
+  bar.style.bottom = lift + "px";
+  const wrap = document.querySelector(".paper-wrap");
+  const paper = $("paper");
+  if (!wrap || bar.hidden) {
+    if (paper) paper.style.paddingBottom = "";
+    return;
+  }
+  const cover = Math.max(0, wrap.getBoundingClientRect().bottom - bar.getBoundingClientRect().top);
+  if (paper) paper.style.paddingBottom = (cover + 16) + "px";
 }
 
 let softKeyboardSeen = false;

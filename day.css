@@ -257,9 +257,24 @@ body.view-today.day-page {
 
 .week-row {
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.35rem;
+  margin: 0 0 1rem;
+  min-width: 0;
+}
+.week-main {
+  display: flex;
   align-items: stretch;
   gap: 0.45rem;
-  margin: 0 0 1rem;
+  min-width: 0;
+}
+.week-month {
+  display: none;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
 }
 .view-today .days {
   display: grid;
@@ -382,6 +397,7 @@ body.view-today.day-page {
   width: 42rem;
   max-width: 100%;
   min-width: 0;
+  flex-shrink: 0;
   min-height: 18rem;
   margin-left: auto;
   margin-right: auto;
@@ -481,8 +497,27 @@ body.view-today.day-page {
   text-indent: 0;
 }
 .md-line.nest {
-  color: var(--muted);
   font-size: 0.98em;
+}
+.md-line.cancelled .md-body {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+.md-line.scheduled {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.35em;
+  color: var(--muted);
+}
+.md-line.scheduled .md-go {
+  flex: 0 0 auto;
+  width: 1.1em;
+}
+.md-line.scheduled .md-go::before {
+  content: "\2192";
+}
+.md-date {
+  white-space: nowrap;
 }
 .md-bul,
 .md-num {
@@ -545,7 +580,7 @@ body.view-today.day-page {
   line-height: 1;
 }
 .md-line.task.done .md-body { color: var(--muted); }
-.md-when { color: var(--muted); font-size: 0.88em; }
+.md-when { font-size: 0.88em; }
 .md-b { font-weight: 650; }
 .md-link {
   color: var(--text);
@@ -719,6 +754,7 @@ body.view-today.day-page {
   touch-action: none;
 }
 .block.bound { cursor: default; touch-action: auto; }
+.block.done { color: var(--muted); }
 .block.bound { color: var(--muted); }
 .block.ghost {
   opacity: 0.78;
@@ -974,6 +1010,8 @@ body.view-plan.day-page {
     max-width: 100%;
     letter-spacing: 0.02em;
   }
+  .week-month { display: block; }
+  .view-today .day-card .moy { display: none; }
   .paper-wrap {
     padding: 0.65rem 0.85rem 1.6rem;
   }
@@ -1557,7 +1595,7 @@ body.doc-capture #job-actions {
   position: fixed;
   left: 0;
   right: 0;
-  bottom: 52px;
+  bottom: 0;
   z-index: 60;
   display: flex;
   align-items: stretch;
@@ -1569,10 +1607,10 @@ body.doc-capture #job-actions {
   padding: 0;
   box-sizing: border-box;
   overflow: hidden;
-  background: var(--ink, #f2eee6);
-  color: var(--bg, #161513);
+  background: var(--bg);
+  color: var(--text);
   border: 0;
-  border-top: 1px solid var(--hairline, #2c2a26);
+  border-top: 1px solid var(--border);
   border-radius: 0;
   box-shadow: none;
   transform: none;
@@ -1600,15 +1638,20 @@ body.doc-capture #job-actions {
   -webkit-tap-highlight-color: transparent;
 }
 .fmt-ico {
-  width: 1.15rem;
-  height: 1.15rem;
+  width: 1.35rem;
+  height: 1.35rem;
   display: block;
   pointer-events: none;
 }
 .fmt-bar.hidden { display: none !important; }
 .fmt-btn:active {
   background: transparent;
-  color: var(--bg, #161513);
+  color: var(--text);
+}
+@media (max-width: 640px) {
+  body.fmt-bar-on .paper-wrap {
+    scroll-padding-bottom: 3rem;
+  }
 }
 
 /* Conflict — paper, not Door. Hairline actions. Designer owns look. */

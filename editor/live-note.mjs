@@ -39,6 +39,7 @@ export function tickLine(line) {
   const task = text.match(/^(\s*[-*+]\s+)\[([ xX]?)\](.*)$/);
   if (!task) return text;
   const mark = task[2];
+  if (mark !== "" && mark !== " " && mark.toLowerCase() !== "x") return text;
   const box = mark.toLowerCase() === "x" ? "[ ]" : "[x]";
   return task[1] + box + task[3];
 }
@@ -48,8 +49,10 @@ export function shapeLine(line) {
   if (text === "") return { role: "empty", source: text };
   let match = text.match(/^(#{1,6}) (.*)$/);
   if (match) return { role: "heading", level: match[1].length, source: text };
-  match = text.match(/^(\s*)([-*+])\s+\[([ xX]?)\]\s*(.*)$/);
+  match = text.match(/^(\s*)([-*+])\s+\[([ xX\->]?)\](.*)$/);
   if (match) {
+    if (match[3] === "-") return { role: "cancelled", source: text };
+    if (match[3] === ">") return { role: "scheduled", source: text };
     return {
       role: "task",
       ticked: match[3].toLowerCase() === "x",

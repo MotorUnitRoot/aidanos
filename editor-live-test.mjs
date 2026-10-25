@@ -38,6 +38,16 @@ await check("a tick changes the box and leaves the words", async () => {
   assert(note.undo() === source, "undo did not restore the line");
   assert(tickLine("plain words") === "plain words", "a plain line was rewritten");
   assert(tickLine("- [] Note the glass order") === "- [x] Note the glass order", tickLine("- [] Note the glass order"));
+  assert(tickLine("- [X] Count the spare bulbs") === "- [ ] Count the spare bulbs", tickLine("- [X] Count the spare bulbs"));
+  assert(tickLine("- [x] Sweep the stone steps") === "- [ ] Sweep the stone steps", tickLine("- [x] Sweep the stone steps"));
+  assert(tickLine("- [-] cancelled words") === "- [-] cancelled words", "a cancelled line was rewritten");
+  assert(tickLine("- [>] scheduled words") === "- [>] scheduled words", "a scheduled line was rewritten");
+  const forms = shapeNote("- [ ] open\n- [x] lower\n- [X] upper\n- [-] no\n- [>] later\n");
+  assert(forms[0].role === "task" && forms[0].ticked === false, "open box");
+  assert(forms[1].role === "task" && forms[1].ticked === true, "lower x");
+  assert(forms[2].role === "task" && forms[2].ticked === true, "upper X");
+  assert(forms[3].role === "cancelled" && forms[3].source === "- [-] no", "cancelled");
+  assert(forms[4].role === "scheduled" && forms[4].source === "- [>] later", "scheduled");
 });
 
 await check("headings, lists, and tasks get a shape", async () => {

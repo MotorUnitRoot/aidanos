@@ -58,8 +58,6 @@ public struct LiveNoteEditor: Sendable {
     public mutating func tick(line index: Int) -> String {
         var pieces = NoteLineBreaks.pieces(text)
         guard pieces.indices.contains(index) else { return text }
-        let role = reading.role(ofLine: pieces[index].line, in: context)
-        guard case .task = role else { return text }
         let nextLine = Self.ticking(pieces[index].line)
         guard nextLine != pieces[index].line else { return text }
         pieces[index].line = nextLine
@@ -140,11 +138,11 @@ public struct LiveNoteEditor: Sendable {
         if rest.hasPrefix("[ ]") {
             return prefix + "[x]" + rest.dropFirst(3)
         }
-        if rest.hasPrefix("[x]") {
+        if rest.hasPrefix("[x]") || rest.hasPrefix("[X]") {
             return prefix + "[ ]" + rest.dropFirst(3)
         }
-        if marker == "*", !rest.hasPrefix("[") {
-            return prefix + "[x] " + rest
+        if rest.hasPrefix("[]") {
+            return prefix + "[x]" + rest.dropFirst(2)
         }
         return line
     }

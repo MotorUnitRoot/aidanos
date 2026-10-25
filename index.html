@@ -47,10 +47,13 @@
           <p id="status" class="status" aria-live="polite"></p>
         </header>
         <section class="week-row" aria-label="Week">
+          <p id="week-month" class="week-month"></p>
+          <div class="week-main">
           <div id="days" class="days" role="list"></div>
           <div class="week-arrows">
             <button type="button" id="prev-week" class="icon-btn" aria-label="Previous week">&#8249;</button>
             <button type="button" id="next-week" class="icon-btn" aria-label="Next week">&#8250;</button>
+          </div>
           </div>
         </section>
         <div id="dump-wrap" class="paper-wrap">
@@ -152,28 +155,28 @@
 
   <div id="fmt-bar" class="fmt-bar" hidden role="toolbar" aria-label="Formatting">
     <button type="button" class="fmt-btn" data-fmt="task" aria-label="Task" title="Task">
-      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 12.2l2.4 2.4 5.4-5.6" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M7.5 12.2 10.2 15l6.3-6.5" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
     <button type="button" class="fmt-btn" data-fmt="heading" aria-label="Heading" title="Heading">
-      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h9M5 17h12" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 5v14M18.5 5v14M5.5 12h13" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/></svg>
     </button>
     <button type="button" class="fmt-btn" data-fmt="list" aria-label="List" title="List">
-      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7h10M9 12h10M9 17h10" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5 7h.01M5 12h.01M5 17h.01" fill="none" stroke="currentColor" stroke-width="2.5"/></svg>
+      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h2M9 7h11M4 12h2M9 12h11M4 17h2M9 17h8" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/></svg>
     </button>
     <button type="button" class="fmt-btn" data-fmt="indent" aria-label="Indent" title="Indent">
-      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M11 12h8M5 17h14" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5 12h3M8 10.5L6 12l2 1.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5.25h9M12 12h9M12 18.75h9" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/><path d="M2.2 12h3.6M3.8 7.3 9.6 12 3.8 16.7" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
     <button type="button" class="fmt-btn" data-fmt="outdent" aria-label="Outdent" title="Outdent">
-      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M11 12h8M5 17h14" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 12H5M5 10.5L7 12 5 13.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.25h9M3 12h9M3 18.75h9" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/><path d="M18.2 12h3.6M20.2 7.3 14.4 12 20.2 16.7" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
     <button type="button" class="fmt-btn" data-fmt="undo" aria-label="Undo" title="Undo">
-      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8.5A6 6 0 1 1 7 16" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 5v4H4" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h8.5a3.5 3.5 0 0 1 0 7H9" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/><path d="M11 4.5 7.5 7 11 9.5" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
     <button type="button" class="fmt-btn" data-fmt="find" aria-label="Find" title="Find">
-      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M15 15l4 4" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.2 5.4a4.6 4.6 0 1 0 0 9.2 4.6 4.6 0 0 0 0-9.2z" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M13.8 13.8 19 19" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/></svg>
     </button>
     <button type="button" class="fmt-btn" data-fmt="hide" aria-label="Hide keyboard" title="Hide keyboard">
-      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="10" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M9 19l3 2 3-2" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+      <svg class="fmt-ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="1.75" y="2.15" width="20.5" height="12.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M4.3 5.15h2.15M8.15 5.15h2.15M12 5.15h2.15M15.85 5.15h2.15M4.3 7.85h2.15M8.15 7.85h2.15M12 7.85h2.15M15.85 7.85h2.15M7.1 10.7h9.8" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/><path d="M8.2 17.7 12 21.1 15.8 17.7" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
   </div>
 

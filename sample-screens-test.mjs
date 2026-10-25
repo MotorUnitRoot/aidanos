@@ -504,16 +504,40 @@ try {
     })()`);
     assert(shaped === true, "the note is not formatted");
     const width = await evalJs(`document.documentElement.clientWidth`);
+    const chairs = await evalJs(`(() => {
+      const line = [...document.querySelectorAll("#paper .md-line")].find((el) => (el.innerText || "").includes("extra chairs"));
+      const heading = document.querySelector("#paper .md-line.h1 .md-body");
+      if (!line || line.classList.contains("done") || !heading) return "missing";
+      const body = line.querySelector(".md-body");
+      return getComputedStyle(body).color === getComputedStyle(heading).color;
+    })()`);
+    assert(chairs === true, "the open chairs line is dimmed");
     if (width === 390) {
       await evalJs(`(() => {
         document.getElementById("paper").focus();
-        const bar = document.getElementById("fmt-bar");
-        bar.classList.remove("hidden");
-        bar.removeAttribute("hidden");
-        return [...bar.querySelectorAll("[data-fmt]")].map((button) => button.getAttribute("data-fmt")).join(",");
+        window.dispatchEvent(new Event("resize"));
+        return true;
       })()`);
       const order = await evalJs(`[...document.querySelectorAll("#fmt-bar [data-fmt]")].map((button) => button.getAttribute("data-fmt")).join(",")`);
       assert(order === "task,heading,list,indent,outdent,undo,find,hide", "format bar order " + order);
+      const icons = await evalJs(`[...document.querySelectorAll("#fmt-bar svg")].map((svg) => svg.innerHTML).join(" ")`);
+      assert(icons.includes("M5.5 5v14") && icons.includes("M4 7h2") && icons.includes("9.6 12") && icons.includes("14.4 12") && icons.includes("M4.3 5.15h2.15"), "format icons drifted");
+      const flush = await evalJs(`(() => {
+        const bar = document.getElementById("fmt-bar").getBoundingClientRect();
+        const ask = document.getElementById("ask-open").getBoundingClientRect();
+        return Math.abs(ask.top - bar.bottom);
+      })()`);
+      assert(typeof flush === "number" && flush <= 2, "the bar is not flush on the find line (" + flush + ")");
+      const clear = await evalJs(`(() => {
+        const wrap = document.querySelector(".paper-wrap");
+        wrap.scrollTop = wrap.scrollHeight;
+        const last = [...document.querySelectorAll("#paper .md-line")].pop();
+        const barTop = document.getElementById("fmt-bar").getBoundingClientRect().top;
+        if (!last) return "no line";
+        return last.getBoundingClientRect().bottom <= barTop + 1;
+      })()`);
+      assert(clear === true, "note text sits under the bar");
+      await evalJs(`document.querySelector(".paper-wrap").scrollTop = 0`);
     } else {
       await evalJs(`(() => {
         const bar = document.getElementById("fmt-bar");
@@ -522,6 +546,11 @@ try {
       })()`);
       const hidden = await evalJs(`document.getElementById("fmt-bar").hidden === true`);
       assert(hidden === true, "the Mac shows the formatting bar");
+      const labels = await evalJs(`[...document.querySelectorAll("#timeline .block")].map((block) => block.textContent + (block.classList.contains("done") ? "|done" : "|open")).join(" || ")`);
+      assert(typeof labels === "string" && labels.includes("Set out the extra chairs|open"), "chairs block: " + labels);
+      assert(labels.includes("Sweep the stone steps|done"), "sweep block: " + labels);
+      assert(labels.includes("Meet @Nim at 2026-03-20. The morning check is 2026-06-02.|open"), "meeting block: " + labels);
+      assert(!labels.includes("- [ ]") && !labels.includes("@16:45") && !labels.includes("T08:15"), "timeline marks: " + labels);
     }
     const saved = await evalJs(`document.getElementById("status").textContent`);
     assert(saved === "Saved", "save word is " + saved);
@@ -550,7 +579,7 @@ try {
     await evalJs(`showEditorState("first")`);
     const text = await evalJs(`document.body.innerText || ""`);
     assert(typeof text === "string" && text.includes(LATCH), "first open is not today's note");
-    assert(!/still being read|older notes are|reading your notes/i.test(text), "first open mentions the background read");
+    assert(!/still being read|older notes are|reading your notes|Opening\u2026/i.test(text), "first open mentions the background read");
     const spinner = await evalJs(`!!document.querySelector(".spinner, [aria-busy='true']")`);
     assert(spinner === false, "first open shows a spinner");
     await noSidewaysScroll();
@@ -560,12 +589,25 @@ try {
     await reloadSample();
     await prepareToday();
     await evalJs(`showEditorState("loading")`);
+    const quiet = await evalJs(`document.getElementById("editor-note").hidden === true && !(document.getElementById("paper").innerText || "").trim()`);
+    assert(quiet === true, "loading spoke before a second or kept the note");
+    await sleep(1100);
     const ready = await evalJs(`(() => {
       const paper = document.getElementById("paper");
-      const text = paper ? paper.innerText : "";
-      return text.includes(${JSON.stringify(LATCH)}) && !document.querySelector(".spinner, [aria-busy='true']");
+      const title = document.getElementById("paper-title");
+      const week = document.querySelector(".week-row");
+      const note = document.getElementById("editor-note");
+      const titleBox = title.getBoundingClientRect();
+      const weekBox = week.getBoundingClientRect();
+      return !document.querySelector(".spinner, [aria-busy='true']")
+        && !(paper.innerText || "").trim()
+        && (title.textContent || "").length > 0
+        && week.querySelectorAll(".day-card").length === 7
+        && note.hidden === false
+        && note.textContent === "Opening\u2026"
+        && titleBox.top >= weekBox.bottom - 1;
     })()`);
-    assert(ready === true, "loading hid the note or showed a spinner");
+    assert(ready === true, "loading did not show the week, the title, and Opening");
     await noSidewaysScroll();
   }
 
@@ -586,6 +628,13 @@ try {
       return /rgb\\(\\s*18[0-9]|rgb\\(\\s*2[0-4][0-9]/.test(line + " " + word);
     })()`);
     assert(red === false, "the error is drawn in red");
+    const titleClear = await evalJs(`(() => {
+      const title = document.getElementById("paper-title").getBoundingClientRect();
+      const week = document.querySelector(".week-row").getBoundingClientRect();
+      const note = document.getElementById("editor-note").getBoundingClientRect();
+      return title.height > 8 && title.top >= week.bottom - 1 && note.top >= title.bottom - 1;
+    })()`);
+    assert(titleClear === true, "the failed-save title is under the week strip");
     await noSidewaysScroll();
   }
 
@@ -650,7 +699,36 @@ try {
     }
   }
 
-  const expected = screens.states.length * screens.widths.length;
+  const firstShot = fs.readFileSync(path.join(shotDir, "editor-first-1280.png"));
+  const loadingShot = fs.readFileSync(path.join(shotDir, "editor-loading-1280.png"));
+  assert(!firstShot.equals(loadingShot), "first open and loading are the same picture");
+  await setWidth(390);
+  await prepareEditorNormal();
+  await evalJs(`document.documentElement.setAttribute("data-theme", "light")`);
+  await evalJs(`(() => {
+    document.getElementById("paper").focus();
+    window.dispatchEvent(new Event("resize"));
+    return true;
+  })()`);
+  const paperTone = await evalJs(`(() => {
+    const bar = getComputedStyle(document.getElementById("fmt-bar"));
+    const page = getComputedStyle(document.body);
+    const barRgb = bar.backgroundColor.replace(/\\s/g, "");
+    const pageRgb = page.backgroundColor.replace(/\\s/g, "");
+    const marks = bar.color;
+    return barRgb === pageRgb && /rgb\\(3[0-9],|rgb\\(2[0-9],|rgb\\(1[0-9],/.test(marks);
+  })()`);
+  assert(paperTone === true, "the light bar is not the paper color");
+  await sleep(150);
+  const lightShot = await send("Page.captureScreenshot", { format: "png" }, sessionId);
+  const lightBuf = Buffer.from(lightShot.data, "base64");
+  const lightName = "editor-light-390.png";
+  fs.writeFileSync(path.join(shotDir, lightName), lightBuf);
+  shots.push(lightName);
+  console.log("shot  " + lightName + "  " + lightBuf.length);
+  await evalJs(`document.documentElement.removeAttribute("data-theme")`);
+
+  const expected = screens.states.length * screens.widths.length + 1;
   assert(shots.length === expected, "saved " + shots.length + " pictures, listed " + expected);
   for (const name of shots) {
     const abs = path.join(shotDir, name);

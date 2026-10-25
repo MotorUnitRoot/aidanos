@@ -175,7 +175,7 @@ final class EditorFormatBar: UIView {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        backgroundColor = EditorChrome.cream
+        backgroundColor = EditorChrome.charcoal
         let hair = UIView()
         hair.backgroundColor = EditorChrome.hairline
         hair.translatesAutoresizingMaskIntoConstraints = false
@@ -208,7 +208,7 @@ final class EditorFormatBar: UIView {
         ]
         for (index, item) in items.enumerated() {
             let button = UIButton(type: .system)
-            button.tintColor = EditorChrome.charcoal
+            button.tintColor = EditorChrome.cream
             button.setImage(UIImage(systemName: item.0), for: .normal)
             button.accessibilityLabel = item.2
             button.tag = index
@@ -433,6 +433,13 @@ func applyEditorStyle(_ storage: NSTextStorage, note context: ExternalNoteContex
                 .foregroundColor: EditorChrome.cream,
                 .paragraphStyle: paragraph,
             ], range: range)
+            if line.range(of: #"^\s*[-*+]\s+\[-\]"#, options: .regularExpression) != nil {
+                storage.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+            }
+            if line.range(of: #"^\s*[-*+]\s+\[>\]"#, options: .regularExpression) != nil
+                || line.range(of: #"^\s*[-*+]\s+\[[xX]\]"#, options: .regularExpression) != nil {
+                storage.addAttribute(.foregroundColor, value: EditorChrome.faint, range: range)
+            }
         }
         if case .heading = role, line.hasPrefix("#") {
             var marks = 0

@@ -524,6 +524,56 @@ async function httpPaths() {
   }
 }
 
+async function readOnlySaveStaysUp() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-ro-"));
+  const vault = path.join(tmp, "vault");
+  fs.mkdirSync(vault);
+  const port = 32000 + Math.floor(Math.random() * 2000);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+  });
+  const base = "http://127.0.0.1:" + port;
+  const ro = path.join(vault, "ro");
+  try {
+    await waitHealth(base, child);
+    fs.mkdirSync(ro);
+    fs.chmodSync(ro, 0o555);
+    const loggedBefore = child._log().length;
+    const res = await fetch(base + "/api/file?path=" + encodeURIComponent("ro/x.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "nope\n" }),
+    });
+    const text = await res.text();
+    assert(res.status === 500, "read-only save got " + res.status + " " + text);
+    assert(text === JSON.stringify({ error: "internal error" }), "read-only save leaked " + text);
+    assert(!text.includes(vault) && !text.includes(tmp), "save response included a path");
+    await new Promise((r) => setTimeout(r, 300));
+    assert(child.exitCode == null, "server exited after a failed save");
+    const health = await fetch(base + "/api/health");
+    assert(health.status === 200, "server was not up after the failed save");
+    const logged = child._log().slice(loggedBefore);
+    assert(!logged.includes(vault), "save log included the vault path");
+    assert(!logged.includes(tmp), "save log included the temp path");
+    assert(!fs.existsSync(path.join(ro, "x.md")), "read-only folder was written");
+    const again = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/ok.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "still up\n" }),
+    });
+    assert(again.status === 200, "later save failed after the read-only put");
+  } finally {
+    try { fs.chmodSync(ro, 0o755); } catch {}
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 checkWiring();
 await pathChecks();
 await inodeGitDir();
@@ -532,5 +582,6 @@ await decodedGitPath();
 await literalPathspecs();
 await gitPointerFile();
 await httpPaths();
+await readOnlySaveStaysUp();
 await liveSyncDoesNotFollowOutside();
 console.log("sync-path-test ok");

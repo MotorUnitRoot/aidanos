@@ -261,8 +261,42 @@ async function vaultHasDemo(dir) {
   return (await pathExists(plan)) && (await pathExists(map));
 }
 
-async function copyBundledTree(src, dest) {
-  await fs.mkdir(dest, { recursive: true });
+// A planted link in the destination must not receive the sample files.
+// lstat each part under the seed root. A symlink, including a broken one,
+// stops that branch. COPYFILE_EXCL then refuses to replace a real file.
+async function linkedDestination(root, abs) {
+  const base = path.resolve(root);
+  const target = path.resolve(abs);
+  if (target === base) return false;
+  const rel = path.relative(base, target);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return true;
+  let cursor = base;
+  for (const part of rel.split(path.sep)) {
+    cursor = path.join(cursor, part);
+    let st;
+    try {
+      st = await fs.lstat(cursor);
+    } catch (e) {
+      if (e.code === "ENOENT") return false;
+      throw e;
+    }
+    if (st.isSymbolicLink()) return true;
+  }
+  return false;
+}
+
+async function copyBundledTree(src, dest, root) {
+  const top = root || dest;
+  if (await linkedDestination(top, dest)) return;
+  let destStat = null;
+  try {
+    destStat = await fs.lstat(dest);
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
+  if (destStat && destStat.isSymbolicLink()) return;
+  if (destStat && !destStat.isDirectory()) return;
+  if (!destStat) await fs.mkdir(dest, { recursive: true });
   let entries = [];
   try {
     entries = await fs.readdir(src, { withFileTypes: true });
@@ -273,13 +307,18 @@ async function copyBundledTree(src, dest) {
     if (ent.name === ".git") continue;
     const from = path.join(src, ent.name);
     const to = path.join(dest, ent.name);
+    if (await linkedDestination(top, to)) continue;
     if (ent.isDirectory()) {
-      await copyBundledTree(from, to);
+      await copyBundledTree(from, to, top);
       continue;
     }
     if (!ent.isFile()) continue;
-    if (await pathExists(to)) continue;
-    await fs.copyFile(from, to);
+    try {
+      await fs.copyFile(from, to, fsSync.constants.COPYFILE_EXCL);
+    } catch (e) {
+      if (e.code === "EEXIST") continue;
+      throw e;
+    }
   }
 }
 
@@ -2186,6 +2225,15 @@ function publicPathError(e) {
   return "bad path";
 }
 
+// Bad path and containment stay 400. Anything else, including EACCES,
+// is a 500 whose text is fixed and never the filesystem path.
+function clientRefusal(err) {
+  if (err && err.code === "BAD_PATH") return "bad path";
+  const msg = err && err.message;
+  if (msg === "bad path" || msg === "path escapes vault" || msg === "bad png") return msg;
+  return "";
+}
+
 async function familyRoomPngReal(relPath, abs) {
   const want = familyRoomPngPath(relPath);
   if (!want) throw new Error("bad path");
@@ -2496,7 +2544,7 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         return json(res, 400, { error: publicPathError(e) });
       }
-      return enqueuePathWrite(dayRel, async () => {
+      return await enqueuePathWrite(dayRel, async () => {
         try {
           logPath = await worktreePath(dayRel);
         } catch (e) {
@@ -2665,7 +2713,7 @@ const server = http.createServer(async (req, res) => {
           return json(res, 400, { error: "bad png" });
         }
         const pngKey = "f:" + relPath;
-        return enqueuePathWrite(pngKey, async () => {
+        return await enqueuePathWrite(pngKey, async () => {
           pendingSelfWrites.add(pngKey);
           try {
             await atomicWriteBuffer(real, buf);
@@ -2700,7 +2748,7 @@ const server = http.createServer(async (req, res) => {
         ? Number(body.mtime)
         : NaN;
       const writeKey = "f:" + relPath;
-      return enqueuePathWrite(writeKey, async () => {
+      return await enqueuePathWrite(writeKey, async () => {
         try {
           abs = await worktreePath(rel);
           await readableTarget(abs, VAULT);
@@ -2895,8 +2943,11 @@ const server = http.createServer(async (req, res) => {
       if (!res.headersSent) return json(res, 413, { error: "too large" });
       return;
     }
+    const refusal = clientRefusal(err);
     logSafe(err);
-    if (!res.headersSent) json(res, 500, { error: "internal error" });
+    if (res.headersSent) return;
+    if (refusal) return json(res, 400, { error: refusal });
+    return json(res, 500, { error: "internal error" });
   }
 });
 
@@ -2926,6 +2977,11 @@ function isMainModule() {
 }
 
 if (isMainModule()) {
+  // A rejected request promise must not print the vault path or exit.
+  process.on("unhandledRejection", (reason) => {
+    const err = reason instanceof Error ? reason : new Error(String(reason || "error"));
+    logSafe("unhandled rejection", err);
+  });
   boot().catch((err) => {
     logSafe(err);
     process.exit(1);

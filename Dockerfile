@@ -1,4 +1,4 @@
-FROM node:22.23.4-slim
+FROM node:26.11.1-slim
 WORKDIR /app
 COPY package.json ./
 COPY server.mjs app.js index.html day.css styles.css start.sh ./

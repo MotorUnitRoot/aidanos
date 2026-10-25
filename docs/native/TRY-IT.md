@@ -121,6 +121,41 @@ Both sentences are also in the `log/YYYY-MM-DD.md` file. You are not asked to pi
 
 If the two sides cannot be merged safely, the app shows Keep mine, Take theirs, and Edit. Edit starts with both versions in the note, so you can combine them and press Save edit.
 
+## A key for each device
+
+The shared token above still works, and the home-network steps still use it. When you want the Mac and the iPhone to have different keys, so you can remove one without touching the other, stop the relay first (Control-C). Leave the token file where it is.
+
+```
+export AIDANOS_RELAY_TOKEN_FILE="$HOME/aidanos-relay-token"
+node src/server.mjs --vault "$HOME/aidanos-relay-notes" --issue-device Mac
+```
+
+The command prints the Mac's key once and exits. It does not write the key down. Copy that one line into the Mac app's token field (the field hides what you type), then close the terminal window. Do not redirect the command into a file you keep. Run it again with `iPhone` instead of `Mac`, and paste that key only into the phone. Start the relay again with the same token file as before.
+
+The relay stores a fingerprint of each key. The key itself is not in the notes, the log, or the token file. To remove the Mac and leave the iPhone working:
+
+```
+node src/server.mjs --vault "$HOME/aidanos-relay-notes" --revoke-device Mac
+```
+
+The next connection from the Mac is refused. The iPhone is unchanged. You do not have to restart the relay.
+
+After both devices have connected with their own keys, you can turn the old shared token off. This does not change the token file:
+
+```
+node src/server.mjs --vault "$HOME/aidanos-relay-notes" --retire-shared-key
+```
+
+To turn the shared token back on:
+
+```
+node src/server.mjs --vault "$HOME/aidanos-relay-notes" --restore-shared-key
+```
+
+Keep the token file. The relay still reads it in order to start, and restoring the shared key uses that same file. Deleting `devices.json` inside the relay's data folder also goes back to the shared key alone.
+
+Away from home is not part of this try-out. That needs a server. It is written up in `docs/native/HOSTING.md`. It is not set up here.
+
 ## What this cut does not do
 
-It does not install over TestFlight. It does not sync through git. It does not run a widget or a share extension. Those wait on the paid account, and git stays a backup even then. A separate token for each device comes before the relay is ever reachable from outside the house.
+It does not install over TestFlight. It does not sync through git. It does not run a widget or a share extension. Those wait on the paid account, and git stays a backup even then. It does not put the relay on a server outside the house.

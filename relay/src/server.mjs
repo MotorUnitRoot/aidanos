@@ -10,6 +10,17 @@ import { decode } from "@automerge/automerge-repo/helpers/cbor.js";
 import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import { listenHosts } from "./bind.mjs";
+import {
+  classifyPresented,
+  deviceLines,
+  issueDevice,
+  readDeviceBytes,
+  readDeviceFile,
+  restoreSharedKey,
+  retireSharedKey,
+  revokeDevice,
+  writeDeviceBytes,
+} from "./devices.mjs";
 import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import { createMirror } from "./mirror.mjs";
@@ -36,6 +47,21 @@ export function tokensMatch(expected, got) {
     return false;
   }
   return timingSafeEqual(left, right);
+}
+
+// The shared key is compared in memory. A device key is accepted only when
+// its fingerprint matches a row that has not been removed. A removed key and
+// an unknown key are both refused. The caller does not say which one it was.
+export function connectionAllowed({ sharedToken, record, presented }) {
+  const kind = classifyPresented(record, presented);
+  const sharedOn = !record || record.shared !== "retired";
+  const sharedMatch = tokensMatch(sharedToken, presented);
+  const ok = kind.active || (sharedOn && sharedMatch);
+  let refusal = "";
+  if (!ok && kind.revoked && !sharedMatch) refusal = "removed";
+  else if (!ok && sharedMatch && !sharedOn) refusal = "retired";
+  else if (!ok) refusal = "unknown";
+  return { ok, refusal };
 }
 
 export function bearerToken(header) {
@@ -125,15 +151,39 @@ function health(gitState, bootedAt, syncUp) {
   });
 }
 
+function takeDeviceName(argv, index) {
+  const name = argv[index + 1];
+  if (!name || name.startsWith("--")) {
+    throw new Error("Name the device, for example Mac or iPhone.");
+  }
+  return name;
+}
+
 export function parseArgs(argv) {
-  const out = { lan: false, lanAddress: "", vault: "", data: "", port: null };
+  const out = {
+    lan: false,
+    lanAddress: "",
+    vault: "",
+    data: "",
+    port: null,
+    behindProxy: false,
+    deviceCommand: null,
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--lan") out.lan = true;
+    else if (arg === "--behind-proxy") out.behindProxy = true;
     else if (arg === "--token") {
       throw new Error(
         "The token is not read from the command line. Set AIDANOS_RELAY_TOKEN or AIDANOS_RELAY_TOKEN_FILE.",
       );
+    } else if (arg === "--issue-device" || arg === "--revoke-device") {
+      if (out.deviceCommand) throw new Error("Use one device command at a time.");
+      out.deviceCommand = { action: arg, name: takeDeviceName(argv, i) };
+      i += 1;
+    } else if (arg === "--list-devices" || arg === "--retire-shared-key" || arg === "--restore-shared-key") {
+      if (out.deviceCommand) throw new Error("Use one device command at a time.");
+      out.deviceCommand = { action: arg, name: "" };
     } else if (arg === "--lan-address") out.lanAddress = argv[(i += 1)] || "";
     else if (arg === "--vault") out.vault = argv[(i += 1)] || "";
     else if (arg === "--data") out.data = argv[(i += 1)] || "";
@@ -172,11 +222,30 @@ export function nodeRequirement(version = process.versions.node) {
   return "Node 22 or newer is needed.";
 }
 
-export function startupLines({ lan, port, phone }) {
+export function startupLines({ lan, port, phone, behindProxy }) {
   const lines = ["LISTENING 127.0.0.1 " + port];
+  if (behindProxy) {
+    lines.push(
+      "HOSTED 127.0.0.1 " +
+        port +
+        ". A TLS proxy on this machine may forward here. The relay is not on the public internet.",
+    );
+  }
   if (lan) lines.push(LAN_WARNING);
   if (phone) lines.push("PHONE ws://" + phone + ":" + port);
   return lines;
+}
+
+function resolveHome(options, env) {
+  const vaultArg = options.vault || env.AIDANOS_RELAY_VAULT || "";
+  if (!String(vaultArg).trim()) {
+    throw new Error(
+      "Set --vault or AIDANOS_RELAY_VAULT. The relay will not use AIDANOS_VAULT or another app's folder.",
+    );
+  }
+  const vault = path.resolve(String(vaultArg));
+  const dataDir = path.resolve(options.data || env.AIDANOS_RELAY_DATA || path.join(vault, ".aidanos", "relay"));
+  return { vault, dataDir };
 }
 
 function isInsideDirectory(parent, child) {
@@ -424,25 +493,23 @@ export async function startRelay(options = {}) {
   if (token.length < MIN_TOKEN_LENGTH) {
     throw new Error("The relay token must be at least 32 characters.");
   }
-  const vaultArg = options.vault || env.AIDANOS_RELAY_VAULT || "";
-  if (!String(vaultArg).trim()) {
-    throw new Error(
-      "Set --vault or AIDANOS_RELAY_VAULT. The relay will not use AIDANOS_VAULT or another app's folder.",
-    );
+  const behindProxy = Boolean(options.behindProxy) || String(env.AIDANOS_RELAY_BEHIND_PROXY || "") === "1";
+  if (behindProxy && (options.lan || options.lanAddress)) {
+    throw new Error("A hosted relay listens on 127.0.0.1 only. Do not use --lan with --behind-proxy.");
   }
-  const vault = path.resolve(String(vaultArg));
-  const dataDir = path.resolve(options.data || env.AIDANOS_RELAY_DATA || path.join(vault, ".aidanos", "relay"));
+  const { vault, dataDir } = resolveHome(options, env);
   const port = options.port == null ? portFromEnv(env) : Number(options.port);
   const { hosts, phone } = listenHosts({
-    lan: Boolean(options.lan) || Boolean(options.lanAddress),
+    lan: behindProxy ? false : Boolean(options.lan) || Boolean(options.lanAddress),
     interfaces: options.interfaces,
-    choose: options.lanAddress || "",
+    choose: behindProxy ? "" : options.lanAddress || "",
   });
   const gitUrl = String(options.gitUrl ?? env.AIDANOS_RELAY_GIT_URL ?? "").trim();
   const gitToken = String(options.gitToken ?? env.AIDANOS_RELAY_GIT_TOKEN ?? "").trim();
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
   await assertNotClientVault(vault);
   await claimRelayFolders(vault, dataDir);
+  await readDeviceFile(dataDir);
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
   const failures = new Map();
@@ -480,6 +547,25 @@ export async function startRelay(options = {}) {
     row.at = now;
     if (row.count >= guessLimit) row.until = now + guessBlockMs;
     failures.set(ip, row);
+  }
+
+  // Read the device file on every attempt so removing a key takes effect on
+  // the next connection. The shared key is still the one in memory.
+  async function allowPresented(presented, ip) {
+    if (blocked(ip)) return false;
+    let record;
+    try {
+      record = await readDeviceFile(dataDir);
+    } catch {
+      return false;
+    }
+    const decision = connectionAllowed({ sharedToken: token, record, presented });
+    if (!decision.ok) {
+      noteFailure(ip);
+      return false;
+    }
+    failures.delete(ip);
+    return true;
   }
 
   function noteGit(result) {
@@ -558,6 +644,11 @@ export async function startRelay(options = {}) {
       logSafe(secrets, "reset refused: the folder has no current relay marker");
       return;
     }
+    // Device fingerprints survive a notes reset. Read them before anything is
+    // deleted. A crash after the delete and before they are written back can
+    // drop the file; the shared key then works again, which is why that file
+    // is kept.
+    const savedDevices = await readDeviceBytes(dataDir);
     await disposeSession(live);
     live = null;
     let lastError;
@@ -573,6 +664,7 @@ export async function startRelay(options = {}) {
         await fs.mkdir(dataDir, { recursive: true });
         await writeMarkerFile(path.join(vault, ".aidanos", "relay-folder"), marker);
         await writeMarkerFile(path.join(dataDir, "relay-folder"), marker);
+        if (savedDevices) await writeDeviceBytes(dataDir, savedDevices);
         if (typeof options.beforeReopen === "function") await options.beforeReopen();
         live = await openSession();
         bootedAt = new Date().toISOString();
@@ -615,15 +707,19 @@ export async function startRelay(options = {}) {
           return;
         }
         const ip = clientAddress(req);
-        if (blocked(ip) || !tokensMatch(token, bearerToken(req.headers.authorization))) {
-          if (!blocked(ip)) noteFailure(ip);
-          res.writeHead(401, { "content-length": 0 });
-          res.end();
-          return;
-        }
-        ownedMarkerId(vault, dataDir)
+        const presented = bearerToken(req.headers.authorization);
+        allowPresented(presented, ip)
+          .then((allowed) => {
+            if (res.writableEnded) return undefined;
+            if (!allowed) {
+              res.writeHead(401, { "content-length": 0 });
+              res.end();
+              return undefined;
+            }
+            return ownedMarkerId(vault, dataDir);
+          })
           .then((markerId) => {
-            if (res.writableEnded) return;
+            if (markerId === undefined || res.writableEnded) return;
             if (!markerId) {
               const refused = "reset refused";
               res.writeHead(409, {
@@ -669,52 +765,63 @@ export async function startRelay(options = {}) {
         return;
       }
       const ip = clientAddress(req);
-      if (blocked(ip) || !tokensMatch(token, bearerToken(req.headers.authorization))) {
-        if (!blocked(ip)) noteFailure(ip);
-        logSafe(secrets, "rejected a sync connection");
-        rejectUpgrade(socket);
-        return;
-      }
-      failures.delete(ip);
-      entry.wss.handleUpgrade(req, socket, head, (ws) => {
-        const addListener = ws.addListener.bind(ws);
-        let rejectedFrame = false;
-        function listen(event, handler) {
-          if (event !== "message" || typeof handler !== "function") return addListener(event, handler);
-          return addListener(event, function guarded(data, ...rest) {
-            let allowed = false;
-            try {
-              allowed = syncFrameAllowed(data);
-            } catch {
-              allowed = false;
+      const presented = bearerToken(req.headers.authorization);
+      allowPresented(presented, ip)
+        .then((allowed) => {
+          if (!allowed) {
+            const listed = String(presented || "").length >= MIN_TOKEN_LENGTH ? secrets.concat(presented) : secrets;
+            logSafe(listed, "rejected a sync connection");
+            rejectUpgrade(socket);
+            return;
+          }
+          entry.wss.handleUpgrade(req, socket, head, (ws) => {
+            const addListener = ws.addListener.bind(ws);
+            let rejectedFrame = false;
+            function listen(event, handler) {
+              if (event !== "message" || typeof handler !== "function") return addListener(event, handler);
+              return addListener(event, function guarded(data, ...rest) {
+                let allowedFrame = false;
+                try {
+                  allowedFrame = syncFrameAllowed(data);
+                } catch {
+                  allowedFrame = false;
+                }
+                if (!allowedFrame) {
+                  if (!rejectedFrame) {
+                    rejectedFrame = true;
+                    logSafe(secrets, "closed a sync connection");
+                    ws.terminate();
+                  }
+                  return;
+                }
+                return handler.call(this, data, ...rest);
+              });
             }
-            if (!allowed) {
-              if (!rejectedFrame) {
-                rejectedFrame = true;
-                logSafe(secrets, "closed a sync connection");
-                ws.terminate();
-              }
-              return;
-            }
-            return handler.call(this, data, ...rest);
+            ws.on = listen;
+            ws.addListener = listen;
+            ws.on("error", (error) => {
+              logSafe(secrets, "sync connection closed:", error instanceof Error ? error.message : error);
+            });
+            ws.on("message", (data) => {
+              logSyncFrame("in", data, secrets);
+            });
+            const send = ws.send;
+            ws.send = function sendLogged(...args) {
+              logSyncFrame("out", args[0], secrets);
+              return send.apply(ws, args);
+            };
+            logSafe(secrets, "accepted a sync connection");
+            entry.wss.emit("connection", ws, req);
           });
-        }
-        ws.on = listen;
-        ws.addListener = listen;
-        ws.on("error", (error) => {
-          logSafe(secrets, "sync connection closed:", error instanceof Error ? error.message : error);
+        })
+        .catch(() => {
+          logSafe(secrets, "rejected a sync connection");
+          try {
+            rejectUpgrade(socket);
+          } catch {
+            socket.destroy();
+          }
         });
-        ws.on("message", (data) => {
-          logSyncFrame("in", data, secrets);
-        });
-        const send = ws.send;
-        ws.send = function sendLogged(...args) {
-          logSyncFrame("out", args[0], secrets);
-          return send.apply(ws, args);
-        };
-        logSafe(secrets, "accepted a sync connection");
-        entry.wss.emit("connection", ws, req);
-      });
     });
     servers.push(entry);
   }
@@ -753,6 +860,7 @@ export async function startRelay(options = {}) {
     url: "ws://" + "127.0.0.1:" + boundPort,
     phone: phone ? "ws://" + phone + ":" + boundPort : null,
     hosts,
+    behindProxy,
     vault,
     repo: live.repo,
     token,
@@ -819,6 +927,46 @@ function gitInterval(override, env = process.env) {
   return Number(raw);
 }
 
+function redactList(token, key) {
+  const list = [];
+  if (token) list.push(token);
+  if (key && String(key).length >= MIN_TOKEN_LENGTH) list.push(key);
+  return list;
+}
+
+export async function runDeviceCommand(args, env = process.env) {
+  const token = await loadToken(env);
+  const { vault, dataDir } = resolveHome(args, env);
+  await assertNotClientVault(vault);
+  await claimRelayFolders(vault, dataDir);
+  const command = args.deviceCommand;
+  if (!command) throw new Error("Name the device command.");
+  if (command.action === "--list-devices") {
+    const record = await readDeviceFile(dataDir);
+    return { lines: deviceLines(record) };
+  }
+  if (command.action === "--issue-device") {
+    const issued = await issueDevice(dataDir, command.name);
+    return { announcement: issued.announcement, key: issued.key, name: issued.name, token };
+  }
+  if (command.action === "--revoke-device") {
+    const name = await revokeDevice(dataDir, command.name);
+    return { message: "removed a device key for " + name, token };
+  }
+  if (command.action === "--retire-shared-key") {
+    await retireSharedKey(dataDir);
+    return {
+      message: "The shared key will no longer open a connection. The key file was not changed.",
+      token,
+    };
+  }
+  if (command.action === "--restore-shared-key") {
+    await restoreSharedKey(dataDir);
+    return { message: "The shared key can open a connection again.", token };
+  }
+  throw new Error("Name the device command.");
+}
+
 async function main() {
   const needed = nodeRequirement();
   if (needed) {
@@ -826,11 +974,34 @@ async function main() {
     process.exit(1);
   }
   const args = parseArgs(process.argv.slice(2));
+  if (args.deviceCommand) {
+    let revealed = "";
+    try {
+      const result = await runDeviceCommand(args);
+      revealed = result.key || "";
+      if (result.announcement) {
+        writeSync(1, result.announcement);
+        logSafe(redactList(result.token, result.key), "issued a device key for " + result.name);
+      } else if (result.lines) {
+        for (const line of result.lines) writeSync(1, line + "\n");
+      } else if (result.message) {
+        logSafe(redactList(result.token, ""), result.message);
+      }
+    } catch (error) {
+      logSafe(
+        redactList(process.env.AIDANOS_RELAY_TOKEN, revealed),
+        error instanceof Error ? error.message : error,
+      );
+      process.exit(1);
+    }
+    return;
+  }
   let relay;
   try {
     relay = await startRelay({
       lan: args.lan,
       lanAddress: args.lanAddress,
+      behindProxy: args.behindProxy,
       vault: args.vault || undefined,
       data: args.data || undefined,
       port: args.port == null || Number.isNaN(args.port) ? undefined : args.port,
@@ -843,7 +1014,12 @@ async function main() {
     );
     process.exit(1);
   }
-  for (const line of startupLines({ lan: args.lan || Boolean(args.lanAddress), port: relay.port, phone: relay.phone })) {
+  for (const line of startupLines({
+    lan: !relay.behindProxy && (args.lan || Boolean(args.lanAddress)),
+    port: relay.port,
+    phone: relay.behindProxy ? null : relay.phone,
+    behindProxy: relay.behindProxy,
+  })) {
     writeSync(line.startsWith("WARNING") ? 2 : 1, stampLine(line) + "\n");
   }
   const shutdown = () => {

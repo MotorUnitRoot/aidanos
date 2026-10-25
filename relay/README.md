@@ -2,6 +2,12 @@
 
 The relay is the small sync server the iPhone and Mac apps talk to. How to run it is in `docs/native/TRY-IT.md`. The design notes are in `docs/native/DESIGN.md`.
 
+## Device keys
+
+Each device can have its own key. The key is shown once, when that device is added. The disk stores a fingerprint, not the key. Removing one device does not change the other. The shared token still works until you retire it, and retiring it does not edit the token file. `--restore-shared-key` turns it back on.
+
+Local runs bind to `127.0.0.1` only. `--behind-proxy` is the hosted shape: the same bind, with a TLS proxy on that machine in front. It refuses `--lan`. It is not a deploy. What a later hosted machine needs is in `docs/native/HOSTING.md`.
+
 ## Tracked, not done yet
 
 These are for the later cloud relay ticket. They are not fixed here.

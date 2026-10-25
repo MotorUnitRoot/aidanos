@@ -17,6 +17,8 @@ COPY --chown=node:node Acknowledgements.txt ./
 ENV AIDANOS_RELAY_PORT=3750
 EXPOSE 3750
 
-# Listens on 127.0.0.1 inside the container. Pass --vault, and --lan only when you mean to.
+# Listens on 127.0.0.1 inside the container. A hosted machine keeps that bind
+# and puts a TLS proxy in front (--behind-proxy). See docs/native/HOSTING.md.
+# Pass --vault, and --lan only when you mean to.
 USER node
 CMD ["node", "src/server.mjs"]

@@ -609,7 +609,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing bracket-bound \(elapsed)")
-        XCTAssertLessThan(elapsed, 5)
+        XCTAssertLessThan(elapsed, readerTimeLimit())
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
@@ -1043,7 +1043,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing wiki-bound \(elapsed)")
-        XCTAssertLessThan(elapsed, 5)
+        XCTAssertLessThan(elapsed, readerTimeLimit())
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
     }
@@ -1054,7 +1054,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing mention-bound \(elapsed)")
-        XCTAssertLessThan(elapsed, 5)
+        XCTAssertLessThan(elapsed, readerTimeLimit())
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }
@@ -1274,7 +1274,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         notes.append(ExternalDayText(day: day, text: "* Task"))
         let started = Date()
         let count = ExternalFormatReader.moveCount(ofLineAt: 0, on: notes[0].day, in: notes)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        XCTAssertLessThan(Date().timeIntervalSince(started), readerTimeLimit())
         XCTAssertEqual(count, total as Int?)
     }
 
@@ -1423,7 +1423,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing mention-closed-bound \(elapsed)")
-        XCTAssertLessThan(elapsed, 5)
+        XCTAssertLessThan(elapsed, readerTimeLimit())
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }
@@ -1446,7 +1446,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing bracket-closed-bound \(elapsed)")
-        XCTAssertLessThan(elapsed, 5)
+        XCTAssertLessThan(elapsed, readerTimeLimit())
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
@@ -1462,6 +1462,17 @@ final class ExternalFormatReaderTests: XCTestCase {
         }
         print("reader-timing bracket-closed-growth \(once) \(twice) \(twice / once)")
         XCTAssertLessThanOrEqual(twice, once * 3)
+    }
+
+    /// On the paired diagnostic runs the thread's CPU time stayed under 0.65 s
+    /// while wall time stalled up to 11.7 s, and the base stalled too
+    /// (base 40149606278, PR 40149604751). Mac and Linux stay at 5 s.
+    private func readerTimeLimit() -> TimeInterval {
+        #if targetEnvironment(simulator)
+        return 30
+        #else
+        return 5
+        #endif
     }
 
     /// simulator wall-clock time varied about 6x on identical input in run 40128432168
@@ -1507,7 +1518,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing non-english-bound \(elapsed)")
-        XCTAssertLessThan(elapsed, 5)
+        XCTAssertLessThan(elapsed, readerTimeLimit())
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }

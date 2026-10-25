@@ -1027,6 +1027,23 @@ test("a failed reset makes health report sync down", async () => {
   }
 });
 
+test("a repeated or low-variety token is refused", async () => {
+  await assert.rejects(loadToken({ AIDANOS_RELAY_TOKEN: "a".repeat(32) }), /low-variety/);
+  await assert.rejects(loadToken({ AIDANOS_RELAY_TOKEN: "abcd".repeat(8) }), /low-variety/);
+  const varied = "abcdefgh".repeat(4);
+  assert.equal((await loadToken({ AIDANOS_RELAY_TOKEN: varied })) === varied, true);
+  assert.equal((await loadToken({ AIDANOS_RELAY_TOKEN: TOKEN })) === TOKEN, true);
+  const dir = await tempDir();
+  const file = path.join(dir, "token");
+  await fs.writeFile(file, "b".repeat(32) + "\n", { mode: 0o600 });
+  await assert.rejects(loadToken({ AIDANOS_RELAY_TOKEN_FILE: file }), /low-variety/);
+  await assert.rejects(
+    startRelay({ token: "c".repeat(40), vault: path.join(dir, "vault"), port: 0, gitUrl: "" }),
+    /low-variety/,
+  );
+  await assert.rejects(fs.stat(path.join(dir, "vault")));
+});
+
 test("a token with spaces is refused before the relay listens", async () => {
   const spaced = "several words you can remember today";
   assert.ok(spaced.length >= 32);

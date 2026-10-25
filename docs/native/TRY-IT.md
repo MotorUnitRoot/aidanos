@@ -54,7 +54,7 @@ The relay is the small program both apps talk to. It keeps its own folder of not
    chmod 600 "$HOME/aidanos-relay-token"
    ```
 
-   `openssl rand -base64 32` writes a token with no spaces. The file is only readable by your user (mode 0600). A single newline at the end of that file is fine.
+   `openssl rand -base64 32` writes a token with no spaces. The file is only readable by your user (mode 0600). A single newline at the end of that file is fine. A repeated character, or a token with very little variety, is refused.
 
 4. Start the relay with its own empty folder. Do not point it at the Mac app's notes. The relay marks the folder the first time, and it writes an id file next to that folder. Leave the id file where it is. The next start has to use that same folder. A folder an older relay marked is not accepted.
 
@@ -121,6 +121,41 @@ Both sentences are also in the `log/YYYY-MM-DD.md` file. You are not asked to pi
 
 If the two sides cannot be merged safely, the app shows Keep mine, Take theirs, and Edit. Edit starts with both versions in the note, so you can combine them and press Save edit.
 
+## A key for each device
+
+The shared token above still works, and the home-network steps still use it. When you want the Mac and the iPhone to have different keys, so you can remove one without touching the other, stop the relay first (Control-C). Leave the token file where it is.
+
+```
+export AIDANOS_RELAY_TOKEN_FILE="$HOME/aidanos-relay-token"
+node src/server.mjs --vault "$HOME/aidanos-relay-notes" --issue-device Mac
+```
+
+The command prints the Mac's key once and exits. It does not write the key down. Run it from a Terminal window you are watching. If stdout is not a terminal, the command refuses to print the key unless you add `--print-key-anyway`. Do not run it under a service or inside a container: those keep the printed line in their logs. Copy that one line into the Mac app's token field (the field hides what you type), then close the terminal window. Do not redirect the command into a file you keep. Run it again with `iPhone` instead of `Mac`, and paste that key only into the phone. Start the relay again with the same token file as before.
+
+The relay stores a fingerprint of each key. The key itself is not in the notes, the log, or the token file. To remove the Mac and leave the iPhone working:
+
+```
+node src/server.mjs --vault "$HOME/aidanos-relay-notes" --revoke-device Mac
+```
+
+The next connection from the Mac is refused. A connection that is already open with the removed key is closed within a few seconds. The iPhone is unchanged. You do not have to restart the relay.
+
+After both devices have connected with their own keys, you can turn the old shared token off. This does not change the token file:
+
+```
+node src/server.mjs --vault "$HOME/aidanos-relay-notes" --retire-shared-key
+```
+
+To turn the shared token back on:
+
+```
+node src/server.mjs --vault "$HOME/aidanos-relay-notes" --restore-shared-key
+```
+
+Keep the token file. The relay still reads it in order to start, and restoring the shared key uses that same file. Deleting `devices.json` does not turn the shared key back on. Deleting `devices.json` and `device-policy` while the relay is running does not turn it back on either. If those files are missing after a device key was issued, a restart refuses to start until `--init-devices`. `--list-devices` and `--issue-device` refuse in that same case unless `--init-devices` is passed. `--restore-shared-key` will not change that while the device file is missing. A relay already running with `--behind-proxy` keeps the shared key off after `--restore-shared-key` unless it was started with `--allow-shared-key-behind-proxy`. A device backup older than the last device change is refused. `--reenable-shared-key` is the command that turns the shared key back on when the device file is unreadable: it moves that file aside and turns every device key off. The default data folder is inside the notes, at `<vault>/.aidanos/relay`. Pass `--data` with a folder outside the notes when you want the device fingerprints kept apart from them.
+
+Away from home is not part of this try-out. That needs a server. It is written up in `docs/native/HOSTING.md`. It is not set up here.
+
 ## What this cut does not do
 
-It does not install over TestFlight. It does not sync through git. It does not run a widget or a share extension. Those wait on the paid account, and git stays a backup even then. A separate token for each device comes before the relay is ever reachable from outside the house.
+It does not install over TestFlight. It does not sync through git. It does not run a widget or a share extension. Those wait on the paid account, and git stays a backup even then. It does not put the relay on a server outside the house.

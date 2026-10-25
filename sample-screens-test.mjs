@@ -319,6 +319,29 @@ try {
       })()`);
       return ok === true ? true : ok;
     }, 4000, "timeline");
+    await evalJs(`(() => {
+      const paper = document.getElementById("paper");
+      if (paper && paper.contains(document.activeElement) && paper.blur) paper.blur();
+      const active = document.activeElement;
+      if (active && active !== document.body && active !== document.documentElement && active.blur) active.blur();
+      window.dispatchEvent(new Event("resize"));
+      return true;
+    })()`);
+    await waitFor(async () => {
+      const ok = await evalJs(`(() => {
+        const bar = document.getElementById("fmt-bar");
+        const rail = document.querySelector(".today-rail");
+        if (!bar || !rail) return "missing";
+        const hidden = bar.hidden || getComputedStyle(bar).display === "none";
+        const barBox = bar.getBoundingClientRect();
+        const railBox = rail.getBoundingClientRect();
+        const overlaps = !hidden && barBox.height > 0 && barBox.bottom > railBox.top + 1 && barBox.top < railBox.bottom - 1 && barBox.right > railBox.left + 1 && barBox.left < railBox.right - 1;
+        if (!hidden) return "bar visible";
+        if (overlaps) return "bar covers the timeline";
+        return true;
+      })()`);
+      return ok === true ? true : ok;
+    }, 2000, "timeline format bar");
   }
 
   async function prepareMonth() {
@@ -757,7 +780,46 @@ try {
   console.log("shot  " + lightName + "  " + lightBuf.length);
   await evalJs(`document.documentElement.removeAttribute("data-theme")`);
 
-  const expected = screens.states.length * screens.widths.length + 1;
+  await setWidth(1280);
+  await expandRail();
+  await evalJs(`(() => {
+    document.getElementById("paper").focus();
+    window.dispatchEvent(new Event("resize"));
+    return true;
+  })()`);
+  const wideBar = await evalJs(`document.getElementById("fmt-bar").hidden === true || getComputedStyle(document.getElementById("fmt-bar")).display === "none"`);
+  assert(wideBar === true, "the wide layout shows the formatting bar");
+
+  await setWidth(390);
+  await expandRail();
+  await evalJs(`(() => {
+    document.getElementById("paper").focus();
+    window.dispatchEvent(new Event("resize"));
+    return true;
+  })()`);
+  const editing = await evalJs(`(() => {
+    const bar = document.getElementById("fmt-bar");
+    const rail = document.querySelector(".today-rail");
+    const ask = document.getElementById("ask-open");
+    const barBox = bar.getBoundingClientRect();
+    const railBox = rail.getBoundingClientRect();
+    const askBox = ask.getBoundingClientRect();
+    const hidden = bar.hidden || getComputedStyle(bar).display === "none";
+    const overlaps = barBox.height > 0 && barBox.bottom > railBox.top + 1 && barBox.top < railBox.bottom - 1;
+    return { hidden, overlaps, flush: Math.abs(barBox.bottom - askBox.top), above: barBox.bottom <= railBox.top + 1 };
+  })()`);
+  assert(editing && editing.hidden === false, "the focused editor hides the formatting bar");
+  assert(editing.overlaps === false && editing.above === true, "the focused bar covers the timeline");
+  assert(editing.flush <= 2, "the bar is not on the find line (" + (editing && editing.flush) + ")");
+  await sleep(150);
+  const editingShot = await send("Page.captureScreenshot", { format: "png" }, sessionId);
+  const editingBuf = Buffer.from(editingShot.data, "base64");
+  const editingName = "timeline-editing-390.png";
+  fs.writeFileSync(path.join(shotDir, editingName), editingBuf);
+  shots.push(editingName);
+  console.log("shot  " + editingName + "  " + editingBuf.length);
+
+  const expected = screens.states.length * screens.widths.length + 2;
   assert(shots.length === expected, "saved " + shots.length + " pictures, listed " + expected);
   for (const name of shots) {
     const abs = path.join(shotDir, name);

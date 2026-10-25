@@ -5877,6 +5877,7 @@ document.addEventListener("visibilitychange", () => {
   btn.addEventListener("click", () => {
     handCollapsed = !room.classList.contains("rail-collapsed");
     sync(handCollapsed);
+    syncFmtBarForKeyboard();
   });
 })();
 
@@ -6040,13 +6041,30 @@ function paperEditorFocused() {
   return !!(paper && a && (a === paper || (paper.contains && paper.contains(a))));
 }
 
+function timelineRailBox() {
+  const room = document.querySelector(".today-room");
+  const rail = document.querySelector(".today-rail");
+  if (!room || !rail || room.classList.contains("rail-collapsed")) return null;
+  if (getComputedStyle(rail).display === "none") return null;
+  const box = rail.getBoundingClientRect();
+  if (box.height < 8 || box.width < 8) return null;
+  return box;
+}
+
 function syncFmtBarInset() {
   const bar = $("fmt-bar");
   if (!bar) return;
   const askEl = $("ask-open");
-  const askH = askEl && askEl.getBoundingClientRect ? askEl.getBoundingClientRect().height : 0;
   const inset = fmtKeyboardInset();
-  const lift = inset > 80 ? inset : askH;
+  let lift = 0;
+  if (inset > 80) {
+    lift = inset;
+  } else if (askEl && askEl.getBoundingClientRect) {
+    const ask = askEl.getBoundingClientRect();
+    if (ask.height > 0) lift = Math.max(0, window.innerHeight - ask.top);
+  }
+  const rail = timelineRailBox();
+  if (rail) lift = Math.max(lift, Math.max(0, window.innerHeight - rail.top));
   bar.style.bottom = lift + "px";
   const wrap = document.querySelector(".paper-wrap");
   const paper = $("paper");
@@ -6058,16 +6076,9 @@ function syncFmtBarInset() {
   if (paper) paper.style.paddingBottom = (cover + 16) + "px";
 }
 
-let softKeyboardSeen = false;
-
 function syncFmtBarForKeyboard() {
-  if (!fmtPhoneLike() || !paperEditorFocused()) {
-    setFmtBarVisible(false);
-    return;
-  }
-  const inset = fmtKeyboardInset();
-  if (inset > 80) softKeyboardSeen = true;
-  if (softKeyboardSeen && inset <= 80) {
+  const editing = paperEditorFocused() || fmtKeyboardInset() > 80;
+  if (!fmtPhoneLike() || !editing) {
     setFmtBarVisible(false);
     return;
   }
@@ -6117,7 +6128,6 @@ function syncFmtBarForKeyboard() {
         return;
       }
       if (bar.contains(document.activeElement)) return;
-      softKeyboardSeen = false;
       setFmtBarVisible(false);
     }, 0);
   });

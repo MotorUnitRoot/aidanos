@@ -634,7 +634,7 @@ async function readRel(rel) {
   return text == null ? "" : text;
 }
 
-async function writeVaultText(rel, text) {
+export async function writeVaultText(rel, text) {
   if (!isSafeRel(rel)) throw new Error("bad path");
   await atomicWriteFile(safeJoin(VAULT, rel), text);
 }

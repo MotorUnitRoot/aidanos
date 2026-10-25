@@ -10,9 +10,11 @@
 // choose swap-in there. Elsewhere, swap-in stays the default unless the
 // setting turns it off.
 //
-// An in-place save never follows a link. The swap-in path still writes a
-// temp file and renames it, and beforeRename runs after that temp file is
-// ready and before the rename.
+// An in-place save never follows a link, a hard link, or any file that is
+// not a regular file. It opens a new note with O_CREAT|O_EXCL, writes the
+// new bytes, and only then truncates to that length. The swap-in path still
+// writes a temp file and renames it, and beforeRename runs after that temp
+// file is ready and before the rename.
 
 import { constants as fsConstants, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -68,6 +70,15 @@ function badPath() {
   return error;
 }
 
+function isRegularFile(stats) {
+  return !!stats && (stats.mode & fsConstants.S_IFMT) === fsConstants.S_IFREG;
+}
+
+function environment(options) {
+  if (!options.env) return process.env;
+  return { ...process.env, ...options.env };
+}
+
 async function lstatOrMissing(filePath) {
   try {
     return await fs.lstat(filePath);
@@ -81,24 +92,34 @@ async function writeInPlace(filePath, body, options) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const before = await lstatOrMissing(filePath);
   if (before && before.isSymbolicLink()) throw badPath();
+  if (before && !isRegularFile(before)) throw badPath();
   if (typeof options.beforeOpen === "function") await options.beforeOpen(filePath);
-  const flags = fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW | (before ? 0 : fsConstants.O_CREAT);
+  const flags = fsConstants.O_WRONLY
+    | fsConstants.O_NOFOLLOW
+    | fsConstants.O_NONBLOCK
+    | (before ? 0 : (fsConstants.O_CREAT | fsConstants.O_EXCL));
   let handle;
   try {
-    handle = await fs.open(filePath, flags, 0o666);
+    handle = await fs.open(filePath, flags, 0o644);
   } catch (e) {
-    if (e.code === "ELOOP" || e.code === "EEXIST") throw badPath();
+    if (e.code === "ELOOP" || e.code === "EEXIST" || e.code === "ENXIO") throw badPath();
     throw e;
   }
   try {
     const opened = await handle.stat();
     if (before) {
       if (opened.dev !== before.dev || opened.ino !== before.ino) throw badPath();
-    } else if (!opened.isFile()) {
-      throw badPath();
     }
-    await handle.truncate(0);
-    await handle.write(body, 0, "utf8");
+    if (!isRegularFile(opened) || opened.nlink > 1) throw badPath();
+    if (typeof options.failWrite === "function") await options.failWrite();
+    const payload = Buffer.from(body, "utf8");
+    let written = 0;
+    while (written < payload.length) {
+      const result = await handle.write(payload, written, payload.length - written, written);
+      if (!result.bytesWritten) throw new Error("write failed");
+      written += result.bytesWritten;
+    }
+    await handle.truncate(payload.length);
     await handle.sync();
   } finally {
     await handle.close();
@@ -123,7 +144,7 @@ async function writeSwapIn(filePath, body, options) {
 }
 
 export async function writeNoteText(filePath, text, options = {}) {
-  const env = options.env || process.env;
+  const env = environment(options);
   const requested = options.swapInRequested != null ? options.swapInRequested : swapInSetting(env);
   const style = noteSaveStyle(filePath, requested, env);
   const body = String(text ?? "");

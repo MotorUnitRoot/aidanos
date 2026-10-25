@@ -176,6 +176,48 @@ final class LiveNoteEditorTests: XCTestCase {
         XCTAssertTrue(NoteFolderSave.isSymbolicLink(swapped.path))
     }
 
+    func testInPlaceRefusesAHardLink() throws {
+        let folder = try makeFolder(named: "notes")
+        let outside = folder.deletingLastPathComponent().appendingPathComponent("outside.txt")
+        try Data("keep\n".utf8).write(to: outside)
+        let note = folder.appendingPathComponent("day.md")
+        try FileManager.default.linkItem(at: outside, to: note)
+        setenv("AIDANOS_SAVE_SWAP_IN", "0", 1)
+        defer { unsetenv("AIDANOS_SAVE_SWAP_IN") }
+        XCTAssertThrowsError(try NoteFolderSave.write(Data("pwned\n".utf8), to: note))
+        XCTAssertEqual(try String(contentsOf: outside, encoding: .utf8), "keep\n")
+        XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), "keep\n")
+    }
+
+    func testInPlaceRefusesAFifo() throws {
+        let folder = try makeFolder(named: "notes")
+        let note = folder.appendingPathComponent("day.md")
+        let made = note.path.withCString { mkfifo($0, S_IRUSR | S_IWUSR) }
+        XCTAssertEqual(made, 0)
+        setenv("AIDANOS_SAVE_SWAP_IN", "0", 1)
+        defer { unsetenv("AIDANOS_SAVE_SWAP_IN") }
+        XCTAssertThrowsError(try NoteFolderSave.write(Data("pwned\n".utf8), to: note))
+    }
+
+    func testCreateRefusesAFileThatAppearsFirst() throws {
+        let folder = try makeFolder(named: "notes")
+        let note = folder.appendingPathComponent("fresh.md")
+        XCTAssertThrowsError(try NoteFolderSave.writeInPlace(Data("pwned\n".utf8), to: note, beforeOpen: {
+            FileManager.default.createFile(atPath: note.path, contents: Data("kept\n".utf8))
+        }))
+        XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), "kept\n")
+    }
+
+    func testAFailedWriteLeavesTheExistingNote() throws {
+        let folder = try makeFolder(named: "notes")
+        let note = folder.appendingPathComponent("day.md")
+        try NoteFolderSave.writeInPlace(Data("original-text\n".utf8), to: note)
+        XCTAssertThrowsError(try NoteFolderSave.writeInPlace(Data("new\n".utf8), to: note, beforeWrite: {
+            throw AidanError.io("disk full")
+        }))
+        XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), "original-text\n")
+    }
+
     func testTypedWeekMatchesTheFiles() throws {
         let root = try sampleVault()
         let week = [

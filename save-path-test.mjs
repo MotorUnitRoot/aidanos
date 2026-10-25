@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // The note writer refuses a link. Nothing is written through it.
 // These checks call the writer directly, in both save modes.
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -210,6 +211,123 @@ await check("beforeRename can stop a swap-in", async () => {
   assert(fs.readFileSync(note, "utf8") === "one\n", "the note changed");
   assert(fs.statSync(note).ino === inode, "the file was replaced");
   assert(!fs.readdirSync(dir).some((entry) => entry.includes(".tmp")), "a temp file was left behind");
+});
+
+await check("a hard link to an outside file is refused", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-hard-"));
+  const outside = path.join(dir, "outside.txt");
+  fs.writeFileSync(outside, "keep\n");
+  const note = path.join(dir, "notes", "day.md");
+  fs.mkdirSync(path.dirname(note));
+  fs.linkSync(outside, note);
+  const error = await rejects(() => writeNoteText(note, "pwned\n", { swapInRequested: false, style: "swap-in" }));
+  assert(error.code === "BAD_PATH", error.message);
+  assert(fs.readFileSync(outside, "utf8") === "keep\n", "the outside file was written");
+  assert(fs.readFileSync(note, "utf8") === "keep\n", "the note was written");
+  assert(fs.statSync(note).nlink > 1, "the hard link was replaced");
+});
+
+await check("a file that appears before create is left alone", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-excl-"));
+  const note = path.join(dir, "day.md");
+  const error = await rejects(() => writeNoteText(note, "pwned\n", {
+    swapInRequested: false,
+    beforeOpen() {
+      fs.writeFileSync(note, "kept\n");
+    },
+  }));
+  assert(error.code === "BAD_PATH", error.message);
+  assert(fs.readFileSync(note, "utf8") === "kept\n", "the new file was overwritten");
+});
+
+await check("a fifo named as a note is refused", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-fifo-"));
+  const note = path.join(dir, "day.md");
+  execFileSync("mkfifo", [note]);
+  const error = await rejects(() => writeNoteText(note, "pwned\n", { swapInRequested: false }));
+  assert(error.code === "BAD_PATH", error.message);
+  assert(fs.lstatSync(note).isFIFO(), "the fifo was replaced");
+
+  const raced = path.join(dir, "raced.md");
+  await writeNoteText(raced, "original\n", { swapInRequested: false });
+  const racedError = await rejects(() => writeNoteText(raced, "pwned\n", {
+    swapInRequested: false,
+    beforeOpen() {
+      fs.unlinkSync(raced);
+      execFileSync("mkfifo", [raced]);
+    },
+  }));
+  assert(racedError.code === "BAD_PATH", racedError.message);
+  assert(fs.lstatSync(raced).isFIFO(), "the swapped fifo was replaced");
+});
+
+await check("a failed write leaves the existing note", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-fail-"));
+  const note = path.join(dir, "day.md");
+  await writeNoteText(note, "original-text\n", { swapInRequested: false });
+  const inode = fs.statSync(note).ino;
+  const error = await rejects(() => writeNoteText(note, "new\n", {
+    swapInRequested: false,
+    failWrite() {
+      throw new Error("disk full");
+    },
+  }));
+  assert(error.message === "disk full", error.message);
+  assert(fs.readFileSync(note, "utf8") === "original-text\n", "the note was emptied");
+  assert(fs.statSync(note).ino === inode, "the note was replaced");
+});
+
+await check("an empty env overlay keeps the vault kind", async () => {
+  const previous = process.env.AIDANOS_VAULT_KIND;
+  process.env.AIDANOS_VAULT_KIND = "noteplan";
+  try {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-env-"));
+    const file = path.join(dir, "plain", "day.md");
+    const style = await writeNoteText(file, "one\n", {
+      env: {},
+      style: "swap-in",
+      swapInRequested: true,
+    });
+    assert(style === "in-place", style);
+    const inode = fs.statSync(file).ino;
+    const again = await writeNoteText(file, "two\n", { env: {}, swapInRequested: true });
+    assert(again === "in-place", again);
+    assert(fs.statSync(file).ino === inode, "the overlay replaced the file");
+    assert(fs.readFileSync(file, "utf8") === "two\n", "the new text was dropped");
+  } finally {
+    if (previous === undefined) delete process.env.AIDANOS_VAULT_KIND;
+    else process.env.AIDANOS_VAULT_KIND = previous;
+  }
+});
+
+await check("writeVaultText in NotePlan mode keeps the note and its new text", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-vault-text-"));
+  const vault = path.join(dir, "vault");
+  fs.mkdirSync(vault);
+  const previous = {
+    vault: process.env.AIDANOS_VAULT,
+    kind: process.env.AIDANOS_VAULT_KIND,
+    git: process.env.AIDANOS_VAULT_GIT_URL,
+  };
+  process.env.AIDANOS_VAULT = vault;
+  process.env.AIDANOS_VAULT_KIND = "noteplan";
+  process.env.AIDANOS_VAULT_GIT_URL = "";
+  try {
+    const { writeVaultText } = await import("./server.mjs");
+    await writeVaultText("notes/day.md", "old\n");
+    const file = path.join(vault, "notes", "day.md");
+    const inode = fs.statSync(file).ino;
+    await writeVaultText("notes/day.md", "new text\n");
+    assert(fs.statSync(file).ino === inode, "the note was replaced");
+    assert(fs.readFileSync(file, "utf8") === "new text\n", "the new text was not saved");
+  } finally {
+    if (previous.vault === undefined) delete process.env.AIDANOS_VAULT;
+    else process.env.AIDANOS_VAULT = previous.vault;
+    if (previous.kind === undefined) delete process.env.AIDANOS_VAULT_KIND;
+    else process.env.AIDANOS_VAULT_KIND = previous.kind;
+    if (previous.git === undefined) delete process.env.AIDANOS_VAULT_GIT_URL;
+    else process.env.AIDANOS_VAULT_GIT_URL = previous.git;
+  }
 });
 
 await check("the server passes beforeRename into the save", async () => {

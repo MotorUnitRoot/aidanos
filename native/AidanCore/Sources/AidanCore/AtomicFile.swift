@@ -6,11 +6,6 @@ import Darwin
 import Glibc
 #endif
 
-/// C `open` is variadic. The Swift overlay on Linux only exposes the two-argument
-/// form, so the mode goes through the C function directly.
-@_silgen_name("open")
-private func systemOpen(_ path: UnsafePointer<CChar>, _ flags: Int32, _ mode: mode_t) -> Int32
-
 enum AtomicFile {
     /// Swap-in: a reader never sees a half-written file. Do not use this for a
     /// note that lives inside a NotePlan folder. See `NoteFolderSave`.
@@ -94,17 +89,21 @@ public enum NoteFolderSave {
         }
     }
 
-    static func writeInPlace(_ data: Data, to url: URL, beforeOpen: (() -> Void)? = nil) throws {
+    static func writeInPlace(
+        _ data: Data,
+        to url: URL,
+        beforeOpen: (() -> Void)? = nil,
+        beforeWrite: (() throws -> Void)? = nil
+    ) throws {
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let before = try identity(url.path)
-        if let before, before.isLink {
+        if let before, before.isLink || !before.isRegular {
             throw AidanError.io("Could not save \(url.lastPathComponent).")
         }
         beforeOpen?()
-        let flags: Int32 = O_WRONLY | O_NOFOLLOW | (before == nil ? O_CREAT : 0)
-        let mode = mode_t(0o644)
-        let fd = url.path.withCString { systemOpen($0, flags, mode) }
+        let flags: Int32 = O_WRONLY | O_NOFOLLOW | O_NONBLOCK | (before == nil ? (O_CREAT | O_EXCL) : 0)
+        let fd = url.path.withCString { open($0, flags, mode_t(0o644)) }
         if fd < 0 {
             throw AidanError.io("Could not save \(url.lastPathComponent).")
         }
@@ -117,13 +116,15 @@ public enum NoteFolderSave {
             if opened.st_dev != before.dev || opened.st_ino != before.ino {
                 throw AidanError.io("Could not save \(url.lastPathComponent).")
             }
-        } else if (opened.st_mode & S_IFMT) != S_IFREG {
+        }
+        if (opened.st_mode & S_IFMT) != S_IFREG || opened.st_nlink > 1 {
             throw AidanError.io("Could not save \(url.lastPathComponent).")
         }
-        if ftruncate(fd, 0) != 0 {
-            throw AidanError.io("Could not save \(url.lastPathComponent).")
-        }
+        try beforeWrite?()
         try writeAll(fd, data, url.lastPathComponent)
+        if ftruncate(fd, off_t(data.count)) != 0 {
+            throw AidanError.io("Could not save \(url.lastPathComponent).")
+        }
         if fsync(fd) != 0 {
             throw AidanError.io("Could not save \(url.lastPathComponent).")
         }
@@ -137,6 +138,7 @@ public enum NoteFolderSave {
         let dev: dev_t
         let ino: ino_t
         let isLink: Bool
+        let isRegular: Bool
     }
 
     private static func identity(_ path: String) throws -> FileIdentity? {
@@ -148,7 +150,8 @@ public enum NoteFolderSave {
         return FileIdentity(
             dev: info.st_dev,
             ino: info.st_ino,
-            isLink: (info.st_mode & S_IFMT) == S_IFLNK
+            isLink: (info.st_mode & S_IFMT) == S_IFLNK,
+            isRegular: (info.st_mode & S_IFMT) == S_IFREG
         )
     }
 

@@ -2590,6 +2590,7 @@ const server = http.createServer(async (req, res) => {
       let abs;
       try {
         abs = await worktreePath(rel);
+        await readableTarget(abs, VAULT);
       } catch (e) {
         return json(res, 400, { error: publicPathError(e) });
       }
@@ -2625,6 +2626,7 @@ const server = http.createServer(async (req, res) => {
       let abs;
       try {
         abs = await worktreePath(rel);
+        await readableTarget(abs, VAULT);
       } catch (e) {
         return json(res, 400, { error: publicPathError(e) });
       }
@@ -2688,6 +2690,7 @@ const server = http.createServer(async (req, res) => {
       return enqueuePathWrite(writeKey, async () => {
         try {
           abs = await worktreePath(rel);
+          await readableTarget(abs, VAULT);
         } catch (e) {
           return json(res, 400, { error: publicPathError(e) });
         }

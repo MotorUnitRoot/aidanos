@@ -26,6 +26,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { writeNoteText } from "./editor/note-save.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GIT_URL = String(process.env.AIDANOS_VAULT_GIT_URL || "").trim();
@@ -75,6 +76,7 @@ const PUBLIC_FILES = new Set([
   "icon-180.png",
   "icon-192.png",
   "apple-touch-icon.png",
+  "editor/live-note.mjs",
 ]);
 const lastSelfWrites = new Map();
 const pendingSelfWrites = new Set();
@@ -1860,15 +1862,7 @@ function sameTextAlreadyStored(exists, raw, markdown, conflict, resolve) {
 }
 
 async function atomicWriteFile(filePath, markdown) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-  try {
-    await fs.writeFile(tmpPath, markdown, { encoding: "utf8", flag: "wx" });
-    await fs.rename(tmpPath, filePath);
-  } catch (e) {
-    try { await fs.unlink(tmpPath); } catch {}
-    throw e;
-  }
+  await writeNoteText(filePath, markdown);
 }
 
 function atomicWriteDay(logPath, markdown) {

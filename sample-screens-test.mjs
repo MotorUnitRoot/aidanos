@@ -467,6 +467,128 @@ try {
     await evalJs(`document.getElementById("conflict-sheet").scrollIntoView({ block: "center" })`);
   }
 
+  function restoreShowcase() {
+    fs.copyFileSync(
+      path.join(fixture, "vault", "log", SHOWCASE + ".md"),
+      path.join(vault, "log", SHOWCASE + ".md"),
+    );
+  }
+
+  async function reloadSample() {
+    restoreShowcase();
+    const stamp = Date.now();
+    await evalJs(`window.__aidanReload = ${stamp}`);
+    await send("Page.navigate", { url: "http://127.0.0.1:" + port + "/?fresh=" + stamp }, sessionId);
+    await waitFor(async () => {
+      const ok = await evalJs(`document.readyState === "complete" && !!document.getElementById("door-input") && window.__aidanReload !== ${stamp} && document.body.classList.contains("view-door") && !document.body.classList.contains("has-conflict")`);
+      return ok === true ? true : ok;
+    }, 12000, "reload");
+    await evalJs(`localStorage.clear(); sessionStorage.clear();`);
+  }
+
+  async function noSidewaysScroll() {
+    const ok = await evalJs(`document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1`);
+    assert(ok === true, "the page scrolls sideways");
+  }
+
+  async function prepareEditorNormal() {
+    await reloadSample();
+    await prepareToday();
+    await evalJs(`showEditorState("normal")`);
+    const shaped = await evalJs(`(() => {
+      const paper = document.getElementById("paper");
+      const headings = paper.querySelectorAll(".md-line.h1, .md-line.h2, .md-line.h3").length;
+      const boxes = paper.querySelectorAll(".md-box").length;
+      const hanging = paper.querySelectorAll(".md-line.nest").length;
+      return headings > 0 && boxes > 0 && hanging > 0;
+    })()`);
+    assert(shaped === true, "the note is not formatted");
+    const width = await evalJs(`document.documentElement.clientWidth`);
+    if (width === 390) {
+      await evalJs(`(() => {
+        document.getElementById("paper").focus();
+        const bar = document.getElementById("fmt-bar");
+        bar.classList.remove("hidden");
+        bar.removeAttribute("hidden");
+        return [...bar.querySelectorAll("[data-fmt]")].map((button) => button.getAttribute("data-fmt")).join(",");
+      })()`);
+      const order = await evalJs(`[...document.querySelectorAll("#fmt-bar [data-fmt]")].map((button) => button.getAttribute("data-fmt")).join(",")`);
+      assert(order === "task,heading,list,indent,outdent,undo,find,hide", "format bar order " + order);
+    } else {
+      await evalJs(`(() => {
+        const bar = document.getElementById("fmt-bar");
+        bar.setAttribute("hidden", "");
+        return bar.hidden;
+      })()`);
+      const hidden = await evalJs(`document.getElementById("fmt-bar").hidden === true`);
+      assert(hidden === true, "the Mac shows the formatting bar");
+    }
+    const saved = await evalJs(`document.getElementById("status").textContent`);
+    assert(saved === "Saved", "save word is " + saved);
+    await noSidewaysScroll();
+  }
+
+  async function prepareEditorEmpty() {
+    await reloadSample();
+    await showToday();
+    await evalJs(`openDay("2026-03-13")`);
+    await waitFor(async () => {
+      const ok = await evalJs(`document.getElementById("paper").classList.contains("is-empty") && (document.getElementById("paper-title").textContent || "").length > 0`);
+      return ok === true ? true : await evalJs(`document.getElementById("paper").className + " " + document.getElementById("paper-title").textContent`);
+    }, 8000, "empty day");
+    await evalJs(`showEditorState("empty")`);
+    const placeholder = await evalJs(`document.getElementById("paper").getAttribute("data-placeholder")`);
+    assert(placeholder === "Write.", "empty day does not say Write.");
+    const spinner = await evalJs(`document.querySelector(".spinner, [aria-busy='true']")`);
+    assert(!spinner, "empty day shows a spinner");
+    await noSidewaysScroll();
+  }
+
+  async function prepareEditorFirst() {
+    await reloadSample();
+    await prepareToday();
+    await evalJs(`showEditorState("first")`);
+    const text = await evalJs(`document.body.innerText || ""`);
+    assert(typeof text === "string" && text.includes(LATCH), "first open is not today's note");
+    assert(!/still being read|older notes are|reading your notes/i.test(text), "first open mentions the background read");
+    const spinner = await evalJs(`!!document.querySelector(".spinner, [aria-busy='true']")`);
+    assert(spinner === false, "first open shows a spinner");
+    await noSidewaysScroll();
+  }
+
+  async function prepareEditorLoading() {
+    await reloadSample();
+    await prepareToday();
+    await evalJs(`showEditorState("loading")`);
+    const ready = await evalJs(`(() => {
+      const paper = document.getElementById("paper");
+      const text = paper ? paper.innerText : "";
+      return text.includes(${JSON.stringify(LATCH)}) && !document.querySelector(".spinner, [aria-busy='true']");
+    })()`);
+    assert(ready === true, "loading hid the note or showed a spinner");
+    await noSidewaysScroll();
+  }
+
+  async function prepareEditorError() {
+    await reloadSample();
+    await prepareToday();
+    await evalJs(`showEditorState("error")`);
+    const status = await evalJs(`document.getElementById("status").textContent`);
+    const note = await evalJs(`(() => {
+      const line = document.getElementById("editor-note");
+      return line && !line.hidden ? line.textContent : "";
+    })()`);
+    assert(status === "Unsaved", "save word is " + status);
+    assert(note === "This change is kept on this device.", "quiet line is " + note);
+    const red = await evalJs(`(() => {
+      const line = getComputedStyle(document.getElementById("editor-note")).color;
+      const word = getComputedStyle(document.getElementById("status")).color;
+      return /rgb\\(\\s*18[0-9]|rgb\\(\\s*2[0-4][0-9]/.test(line + " " + word);
+    })()`);
+    assert(red === false, "the error is drawn in red");
+    await noSidewaysScroll();
+  }
+
   async function prepareConflictEdit() {
     const ready = await evalJs(`document.body.classList.contains("conflict-edit") && document.getElementById("conflict-sheet").classList.contains("is-edit")`);
     if (ready === true) {
@@ -496,6 +618,11 @@ try {
     stage: prepareStage,
     conflict: prepareConflict,
     "conflict-edit": prepareConflictEdit,
+    "editor-normal": prepareEditorNormal,
+    "editor-empty": prepareEditorEmpty,
+    "editor-first": prepareEditorFirst,
+    "editor-loading": prepareEditorLoading,
+    "editor-error": prepareEditorError,
   };
 
   for (const state of screens.states) {

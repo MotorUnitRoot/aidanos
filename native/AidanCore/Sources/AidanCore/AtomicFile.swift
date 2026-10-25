@@ -7,6 +7,8 @@ import Glibc
 #endif
 
 enum AtomicFile {
+    /// Swap-in: a reader never sees a half-written file. Do not use this for a
+    /// note that lives inside a NotePlan folder. See `NoteFolderSave`.
     static func write(_ data: Data, to url: URL) throws {
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -24,6 +26,66 @@ enum AtomicFile {
         }
         if renamed != 0 {
             throw AidanError.io("Could not finish saving \(url.lastPathComponent).")
+        }
+    }
+}
+
+public enum NoteSaveStyle: Equatable, Sendable {
+    case inPlace
+    case swapIn
+}
+
+/// Notes inside a NotePlan folder are saved in place. Swap-in (a temp file
+/// renamed over the note) stays off there, including when a setting asks for
+/// it. Other folders may swap in.
+public enum NoteFolderSave {
+    public static func isNotePlanFolder(_ url: URL) -> Bool {
+        let parts = url.standardizedFileURL.path.split(separator: "/").map(String.init)
+        guard parts.count >= 2 else { return false }
+        return parts.dropLast().contains { $0.caseInsensitiveCompare("NotePlan") == .orderedSame }
+    }
+
+    public static func style(for url: URL, swapInRequested: Bool) -> NoteSaveStyle {
+        if isNotePlanFolder(url) { return .inPlace }
+        return swapInRequested ? .swapIn : .inPlace
+    }
+
+    public static func swapInRequested() -> Bool {
+        let raw = ProcessInfo.processInfo.environment["AIDANOS_SAVE_SWAP_IN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        if raw == "0" || raw == "false" || raw == "no" { return false }
+        if raw == "1" || raw == "true" || raw == "yes" { return true }
+        return true
+    }
+
+    public static func write(_ data: Data, to url: URL, style explicit: NoteSaveStyle? = nil) throws {
+        let chosen = explicit ?? style(for: url, swapInRequested: swapInRequested())
+        switch chosen {
+        case .inPlace:
+            try writeInPlace(data, to: url)
+        case .swapIn:
+            try AtomicFile.write(data, to: url)
+        }
+    }
+
+    static func writeInPlace(_ data: Data, to url: URL) throws {
+        let directory = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+                throw AidanError.io("Could not save \(url.lastPathComponent).")
+            }
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        do {
+            try handle.truncate(atOffset: 0)
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw AidanError.io("Could not save \(url.lastPathComponent).")
         }
     }
 }

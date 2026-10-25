@@ -844,7 +844,7 @@ public final class AidanSession: SyncHost {
 
     private func writeFileLocked(_ path: String, _ text: String) throws {
         let url = try VaultPaths.fileURL(vault: vault, path: path)
-        try AtomicFile.write(Data(text.utf8), to: url)
+        try NoteFolderSave.write(Data(text.utf8), to: url)
         lastWritten[path] = text
         writtenHash[path] = Self.sha(text)
         persistWritten()

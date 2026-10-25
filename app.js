@@ -434,6 +434,12 @@ function cleanPaperMarkdown(md) {
   return joinBrokenHyphens(String(md ?? "").split("\n").map((line) => normalizeCheckboxStub(stripAccidentalBulletSpace(line))).join("\n"));
 }
 
+function textAsTyped(markdown) {
+  const editor = globalThis.AidanLiveNote;
+  if (editor && typeof editor.keepTyped === "function") return editor.keepTyped(markdown);
+  return cleanPaperMarkdown(markdown);
+}
+
 function normalizeSeasonPlanMarkdown(md) {
   let s = String(md ?? "").replace(/\r\n/g, "\n");
   // Un-task headings accidentally saved as "- [ ] ## Why"
@@ -768,7 +774,7 @@ function syncDumpFromPaper() {
     const was = /x/i.test(hit[3]);
     if (on !== was) lines[idx] = paperTaskSrc(hit[1], hit[2], on, hit[4]);
   }
-  dump.value = cleanPaperMarkdown(lines.join("\n"));
+  dump.value = textAsTyped(lines.join("\n"));
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
   return dump;
 }
@@ -944,12 +950,53 @@ function paperFocused() {
   return a && (a.id === "paper" || a.id === "dump" || (a.closest && a.closest("#paper")));
 }
 
+let editorNotice = "";
+
+function paintEditorNote() {
+  const note = $("editor-note");
+  if (!note) return;
+  if (!editorNotice) {
+    note.hidden = true;
+    note.textContent = "";
+    return;
+  }
+  note.hidden = false;
+  note.textContent = editorNotice;
+}
+
 function setStatus(msg, kind = "") {
   const el = $("status");
   if (!el) return;
   el.textContent = msg || "\u00a0";
   el.className = "status" + (kind ? " " + kind : "");
+  if (msg !== "Unsaved") {
+    editorNotice = "";
+    paintEditorNote();
+  }
 }
+
+function showEditorUnsaved() {
+  setStatus("Unsaved");
+  editorNotice = "This change is kept on this device.";
+  paintEditorNote();
+}
+
+function showEditorState(name) {
+  const stateName = String(name || "");
+  document.body.dataset.editorState = stateName;
+  if (stateName === "error") {
+    showEditorUnsaved();
+    return;
+  }
+  if (stateName === "normal") {
+    setStatus("Saved", "saved");
+    return;
+  }
+  setStatus("");
+}
+
+globalThis.showEditorState = showEditorState;
+globalThis.openDay = openDay;
 
 async function api(path, opts = {}) {
   const rest = { ...opts };
@@ -1278,7 +1325,7 @@ async function openDay(date, { silent = false, force = false } = {}) {
     clearTimeout(state.saveTimer);
     state.saveTimer = null;
     if (state.day) {
-      const kept = cleanPaperMarkdown(oldMd);
+      const kept = textAsTyped(oldMd);
       state.day.markdown = kept;
       state.day.paper = kept;
       if (dump) dump.value = kept;
@@ -1359,7 +1406,7 @@ function renderDay() {
   $("paper-title").textContent = formatPaperTitle(d.date);
   $("rail-date").textContent = formatRailDate(d.date);
   const dump = $("dump");
-  dump.value = cleanPaperMarkdown(dayMarkdown(d));
+  dump.value = textAsTyped(dayMarkdown(d));
   paintPaper();
   syncJobChrome();
   paintJobSeason();
@@ -1799,9 +1846,9 @@ function ensureDumpMatchesPaper() {
   const nodes = paperLines();
   let rebuilt = "";
   if (nodes.length) {
-    rebuilt = cleanPaperMarkdown(nodes.map(lineMarkdown).join("\n"));
+    rebuilt = textAsTyped(nodes.map(lineMarkdown).join("\n"));
   } else {
-    rebuilt = cleanPaperMarkdown(String(paper.innerText || "").replace(/\u00a0/g, " "));
+    rebuilt = textAsTyped(String(paper.innerText || "").replace(/\u00a0/g, " "));
   }
   const dumpTrim = String(dump.value || "").trim();
   const paperTrim = String(rebuilt || "").trim();
@@ -1849,7 +1896,7 @@ function applyRemoteDay(day) {
   if (state.selectedDate && date && date !== state.selectedDate) return;
   const markdown = typeof day.markdown === "string" ? day.markdown : dayMarkdown(day);
   const dump = $("dump");
-  const cleaned = cleanPaperMarkdown(markdown || "");
+  const cleaned = textAsTyped(markdown || "");
   if (dump) dump.value = cleaned;
   if (state.day && (!date || state.day.date === date)) {
     state.day.markdown = cleaned;
@@ -1996,7 +2043,7 @@ function applyRemoteNote(body) {
   const path = body && body.path ? String(body.path).replace(/\\/g, "/") : state.doc.path;
   if (path && state.doc.path && path !== state.doc.path) return;
   const markdown = typeof (body && body.markdown) === "string" ? body.markdown : "";
-  const cleaned = cleanPaperMarkdown(markdown || "");
+  const cleaned = textAsTyped(markdown || "");
   const dump = $("dump");
   if (dump) dump.value = cleaned;
   state.doc.markdown = cleaned;
@@ -2013,7 +2060,7 @@ function paperSaveSnapshot() {
   ensureDumpMatchesPaper();
   const dump = $("dump");
   if (isNoteDoc()) {
-    let markdown = cleanPaperMarkdown(dump ? dump.value : String(state.doc.markdown || ""));
+    let markdown = textAsTyped(dump ? dump.value : String(state.doc.markdown || ""));
     if (String(state.doc.path || "").replace(/\\/g, "/") === "aidanos/active-horse.md") {
       markdown = normalizeSeasonPlanMarkdown(markdown);
     }
@@ -2033,7 +2080,7 @@ function paperSaveSnapshot() {
     };
   }
   if (state.day) {
-    const markdown = cleanPaperMarkdown(dump ? dump.value : dayMarkdown(state.day));
+    const markdown = textAsTyped(dump ? dump.value : dayMarkdown(state.day));
     if (dump) dump.value = markdown;
     state.day.markdown = markdown;
     const stamp = captureUnsentStamp();
@@ -2131,7 +2178,7 @@ function conflictMineNow() {
   if (document.body.classList.contains("conflict-edit")) {
     ensureDumpMatchesPaper();
     const dump = $("dump");
-    if (dump) return cleanPaperMarkdown(dump.value);
+    if (dump) return textAsTyped(dump.value);
   }
   return paperConflict.mine;
 }
@@ -2321,7 +2368,7 @@ function openGitConflict(item) {
   if (state.dirty) {
     ensureDumpMatchesPaper();
     const dump = $("dump");
-    if (dump) mine = cleanPaperMarkdown(dump.value);
+    if (dump) mine = textAsTyped(dump.value);
   }
   if (mine === theirs) return;
   const mtime = Number(item && item.mtime) || 0;
@@ -2592,7 +2639,7 @@ async function saveDay({ keepalive = false, bound = null } = {}) {
         return { ok: true };
       } catch (e) {
         rememberUnsent(snap);
-        if (!keepalive) setStatus(String(e.message), "error");
+        if (!keepalive) showEditorUnsaved();
         return { ok: false, error: String(e.message || e) };
       }
     }
@@ -2640,7 +2687,7 @@ async function saveDay({ keepalive = false, bound = null } = {}) {
       return { ok: true };
     } catch (e) {
       rememberUnsent(snap);
-      if (!keepalive) setStatus(String(e.message), "error");
+      if (!keepalive) showEditorUnsaved();
       return { ok: false, error: String(e.message || e) };
     }
   };
@@ -2839,7 +2886,7 @@ function renderNote() {
   if ($("paper-title")) $("paper-title").textContent = jobDay ? formatPaperTitle(day) : title;
   if ($("rail-date")) $("rail-date").textContent = jobDay ? formatRailDate(day) : title;
   const dump = $("dump");
-  const md = cleanPaperMarkdown(doc.markdown || "");
+  const md = textAsTyped(doc.markdown || "");
   if (dump) dump.value = md;
   paintJobSeason();
   if (isWorkMapPath(path)) {
@@ -4081,6 +4128,10 @@ $("paper").addEventListener("mouseup", () => {
 });
 $("paper").addEventListener("pointerdown", (e) => {
   if (e.target.closest && e.target.closest(".md-box")) {
+    slotDrag.armed = false;
+    return;
+  }
+  if (e.target.closest && e.target.closest(".md-body")) {
     slotDrag.armed = false;
     return;
   }
@@ -5768,67 +5819,62 @@ function fmtToggleTaskLine() {
   paintPaperAt(idx, next.length);
 }
 
-function fmtBoldSelectionOrLine() {
+function fmtTransformLine(transform) {
   const paper = $("paper");
   const dump = $("dump");
-  if (!paper || !dump) return;
+  if (!paper || !dump || typeof transform !== "function") return;
   paper.focus();
   const idx = fmtActiveLineIndex();
   const el = paperLines()[idx];
-  if (!el) return;
+  const off = el ? (() => { try { return caretOffset(el); } catch (e) { return 0; } })() : 0;
+  if (idx < 0 || !el) return;
   writeDumpLine(idx, lineMarkdown(el));
   const lines = dump.value.split("\n");
-  while (lines.length <= idx) lines.push("");
-  let text = lines[idx] != null ? lines[idx] : "";
-  const sel = window.getSelection();
-  let start = -1;
-  let end = -1;
-  if (sel && sel.rangeCount && paper.contains(sel.anchorNode) && !sel.isCollapsed) {
-    try {
-      void caretOffset(el);
-      const selected = String(sel.toString() || "");
-      if (selected && text.includes(selected)) {
-        start = text.indexOf(selected);
-        end = start + selected.length;
-      } else {
-        // best-effort: wrap around caret using last selection length
-        const piece = state.lastPaperSelection || selected;
-        if (piece && text.includes(piece)) {
-          start = text.indexOf(piece);
-          end = start + piece.length;
-        }
-      }
-    } catch (err) {}
-  }
-  pushPaperHistory(paperHistory, {
-    markdown: dump.value,
-    line: idx,
-    caret: el ? (() => { try { return caretOffset(el); } catch (e) { return 0; } })() : 0,
-  }, { kind: "fmt-bold" });
-  let caret = text.length;
-  if (start >= 0 && end > start) {
-    const wrapped = text.slice(0, start) + "**" + text.slice(start, end) + "**" + text.slice(end);
-    text = wrapped;
-    caret = end + 4;
-  } else {
-    // wrap whole body after list/task prefix, or wrap empty as ****
-    const m = text.match(/^(\s*(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+|#{1,6}\s+)?)([\s\S]*)$/);
-    const prefix = m ? m[1] : "";
-    const body = m ? m[2] : text;
-    if (!body) {
-      text = prefix + "****";
-      caret = prefix.length + 2;
-    } else if (/^\*\*([\s\S]*)\*\*$/.test(body)) {
-      text = prefix + body.replace(/^\*\*([\s\S]*)\*\*$/, "$1");
-      caret = text.length;
-    } else {
-      text = prefix + "**" + body + "**";
-      caret = text.length;
-    }
-  }
-  writeDumpLine(idx, text);
+  const text = lines[idx] != null ? lines[idx] : "";
+  const next = transform(text);
+  if (next === text) return;
+  pushPaperHistory(paperHistory, { markdown: dump.value, line: idx, caret: off }, { kind: "fmt" });
+  writeDumpLine(idx, next);
   scheduleSave();
-  paintPaperAt(idx, caret);
+  paintPaperAt(idx, next.length);
+}
+
+function fmtHeadingLine() {
+  const api = globalThis.AidanLiveNote;
+  const transform = api && api.makeHeading ? api.makeHeading : function (line) {
+    const text = String(line ?? "");
+    if (/^\s*#{1,6}\s/.test(text)) return text;
+    return text.replace(/^(\s*)/, "$1# ");
+  };
+  fmtTransformLine(transform);
+}
+
+function fmtListLine() {
+  const api = globalThis.AidanLiveNote;
+  const transform = api && api.makeList ? api.makeList : function (line) {
+    const text = String(line ?? "");
+    if (/^\s*[-*+]\s+\[/.test(text)) return text;
+    if (/^\s*([-*+]|\d+[.)])\s/.test(text)) return text;
+    return text.replace(/^(\s*)/, "$1- ");
+  };
+  fmtTransformLine(transform);
+}
+
+function fmtOutdentLine() {
+  const api = globalThis.AidanLiveNote;
+  const transform = api && api.outdentLine ? api.outdentLine : function (line) {
+    const text = String(line ?? "");
+    if (text.charAt(0) === "\t") return text.slice(1);
+    if (text.startsWith("  ")) return text.slice(2);
+    return text;
+  };
+  fmtTransformLine(transform);
+}
+
+function fmtHideKeyboard() {
+  const paper = $("paper");
+  if (paper && paper.blur) paper.blur();
+  setFmtBarVisible(false);
 }
 
 function fmtIndentLine() {
@@ -5884,32 +5930,22 @@ function paperEditorFocused() {
 function syncFmtBarInset() {
   const bar = $("fmt-bar");
   if (!bar) return;
-  const vv = window.visualViewport;
-  if (!vv) {
-    bar.style.bottom = "calc(12px + env(safe-area-inset-bottom, 0px))";
-    return;
-  }
-  bar.style.bottom = (fmtKeyboardInset() + 12) + "px";
+  const inset = fmtKeyboardInset();
+  const ask = inset > 80 ? 0 : 52;
+  bar.style.bottom = (inset + ask) + "px";
 }
 
 let softKeyboardSeen = false;
 
 function syncFmtBarForKeyboard() {
-  if (!paperEditorFocused()) {
+  if (!fmtPhoneLike() || !paperEditorFocused()) {
     setFmtBarVisible(false);
     return;
   }
-  const phone = fmtPhoneLike();
   const inset = fmtKeyboardInset();
-  if (phone) {
-    if (inset > 80) softKeyboardSeen = true;
-    if (softKeyboardSeen && inset <= 80) {
-      setFmtBarVisible(false);
-      return;
-    }
-    // Phone: show while focused even before the keyboard lifts
-    setFmtBarVisible(true);
-    syncFmtBarInset();
+  if (inset > 80) softKeyboardSeen = true;
+  if (softKeyboardSeen && inset <= 80) {
+    setFmtBarVisible(false);
     return;
   }
   setFmtBarVisible(true);
@@ -5937,10 +5973,13 @@ function syncFmtBarForKeyboard() {
     e.preventDefault();
     const act = btn.getAttribute("data-fmt");
     if (act === "task") fmtToggleTaskLine();
-    else if (act === "style") fmtBoldSelectionOrLine();
-    else if (act === "undo") runPaperUndoAction();
+    else if (act === "heading") fmtHeadingLine();
+    else if (act === "list") fmtListLine();
     else if (act === "indent") fmtIndentLine();
-    else if (act === "find" || act === "wand" || act === "command") openAsk();
+    else if (act === "outdent") fmtOutdentLine();
+    else if (act === "undo") runPaperUndoAction();
+    else if (act === "find") openAsk();
+    else if (act === "hide") fmtHideKeyboard();
     syncFmtBarInset();
   });
 

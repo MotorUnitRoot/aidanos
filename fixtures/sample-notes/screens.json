@@ -13,6 +13,11 @@
     "map",
     "stage",
     "conflict",
-    "conflict-edit"
+    "conflict-edit",
+    "editor-normal",
+    "editor-empty",
+    "editor-first",
+    "editor-loading",
+    "editor-error"
   ]
 }

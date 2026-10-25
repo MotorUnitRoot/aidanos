@@ -626,15 +626,62 @@ function resolvedChoices() {
   return out;
 }
 
+// A directory symlink is followed by a later read, write, or unlink.
+// O_NOFOLLOW applies only to the last path part, so a link named like a
+// folder can still aim a note at another directory. Refuse one that leaves
+// the vault or lands in .git. A link that stays on a normal folder inside
+// the vault is left alone.
+export async function worktreePath(rel, root = VAULT) {
+  if (!isSafeRel(rel)) throw new Error("bad path");
+  const abs = safeJoin(root, rel);
+  const logicalRoot = path.resolve(root);
+  let rootReal = logicalRoot;
+  try {
+    rootReal = await fs.realpath(logicalRoot);
+  } catch (e) {
+    if (e.code !== "ENOENT") throw new Error("bad path");
+  }
+  const logical = path.resolve(abs);
+  const relPath = path.relative(logicalRoot, logical);
+  if (!relPath || relPath.startsWith("..") || path.isAbsolute(relPath)) {
+    throw new Error("bad path");
+  }
+  const parts = relPath.split(path.sep);
+  let cursor = logicalRoot;
+  for (let i = 0; i < parts.length - 1; i++) {
+    cursor = path.join(cursor, parts[i]);
+    let st;
+    try {
+      st = await fs.lstat(cursor);
+    } catch (e) {
+      if (e.code === "ENOENT") return abs;
+      throw new Error("bad path");
+    }
+    if (st.isSymbolicLink()) {
+      let real;
+      try {
+        real = await fs.realpath(cursor);
+      } catch {
+        throw new Error("bad path");
+      }
+      if (!contained(real, rootReal)) throw new Error("bad path");
+      const gitDir = path.join(rootReal, ".git");
+      if (real === gitDir || real.startsWith(gitDir + path.sep)) throw new Error("bad path");
+      continue;
+    }
+    if (!st.isDirectory()) throw new Error("bad path");
+  }
+  return abs;
+}
+
 async function readRel(rel) {
   if (!isSafeRel(rel)) return "";
-  const text = await readFileSafe(safeJoin(VAULT, rel));
+  const text = await readFileSafe(await worktreePath(rel));
   return text == null ? "" : text;
 }
 
 async function writeVaultText(rel, text) {
-  if (!isSafeRel(rel)) throw new Error("bad path");
-  await atomicWriteFile(safeJoin(VAULT, rel), text);
+  await atomicWriteFile(await worktreePath(rel), text);
 }
 
 async function gitShow(rev, rel) {
@@ -778,6 +825,7 @@ async function compareToRemote() {
 
 async function detachFile(rel) {
   if (!isSafeRel(rel)) return;
+  const abs = await worktreePath(rel);
   let tracked = true;
   try {
     await runGit(["-C", VAULT, "ls-files", "--error-unmatch", "--", rel], { timeoutMs: 4000 });
@@ -788,7 +836,7 @@ async function detachFile(rel) {
     await runGit(["-C", VAULT, "checkout", "HEAD", "--", rel], { timeoutMs: 8000 });
     return;
   }
-  await fs.unlink(safeJoin(VAULT, rel)).catch(() => {});
+  await fs.unlink(abs).catch(() => {});
 }
 
 async function fastForward(rev, parkList) {
@@ -817,8 +865,10 @@ async function announcePaths(rels) {
   for (const rel of rels) {
     if (!isSafeRel(rel) || seen.has(rel)) continue;
     seen.add(rel);
+    let abs;
+    try { abs = await worktreePath(rel); } catch { continue; }
     let mtime = 0;
-    try { mtime = await fileMtimeMs(safeJoin(VAULT, rel)); } catch { mtime = 0; }
+    try { mtime = await fileMtimeMs(abs); } catch { mtime = 0; }
     const date = dayFromRel(rel);
     if (date) sendDayWatch(date, mtime);
     else if (rel.endsWith(".md")) sendWatch({ path: rel, mtime });
@@ -989,7 +1039,8 @@ async function stageAndCommit(paths) {
   if (!safe.length) return false;
   let stagedAny = false;
   for (const rel of safe) {
-    if (await pathExists(safeJoin(VAULT, rel))) {
+    const abs = await worktreePath(rel);
+    if (await pathExists(abs)) {
       await runGit(["-C", VAULT, "add", "--", rel], { timeoutMs: 8000 });
       stagedAny = true;
     } else {

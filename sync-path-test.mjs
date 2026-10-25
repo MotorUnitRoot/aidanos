@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 // A folder symlink under the vault is followed by read, write, and unlink.
-// The last path part is a separate case (open security draft). This checks
-// the parent link: it must not leave the vault or land in .git.
+// Refuse a parent or a leaf that leaves the vault or lands in .git.
+// A link that stays on a normal file or folder inside the vault still works.
+// Writes replace a leaf link; they do not follow it.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { worktreePath } from "./server.mjs";
+import { gitEnv, readWorktree, vaultRel, worktreePath } from "./server.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const serverSrc = fs.readFileSync(path.join(root, "server.mjs"), "utf8");
@@ -41,16 +42,46 @@ async function rejects(fn) {
 }
 
 function checkWiring() {
-  const read = sliceFn("async function readRel(", "async function writeVaultText(");
+  const envFn = sliceFn("function gitEnv(", "function runGit(");
+  const run = sliceFn("function runGit(", "async function ensureGitIdentity(");
+  const read = sliceFn("export async function readWorktree(", "async function readRel(");
+  const rel = sliceFn("async function readRel(", "async function writeVaultText(");
   const write = sliceFn("async function writeVaultText(", "async function gitShow(");
   const detach = sliceFn("async function detachFile(", "async function fastForward(");
   const announce = sliceFn("async function announcePaths(", "async function recordConflicts(");
+  const conflicts = sliceFn("async function recordConflicts(", "function explicitResolve(");
+  const choices = sliceFn("async function noteChoices(", "async function dropStaleChoices(");
+  const drop = sliceFn("async function dropStaleChoices(", "async function noteDivergence(");
   const stage = sliceFn("async function stageAndCommit(", "async function commitAppPaths(");
-  assert(read.includes("worktreePath"), "read checks the parent path");
-  assert(write.includes("worktreePath"), "write checks the parent path");
-  assert(detach.includes("worktreePath") && detach.indexOf("worktreePath") < detach.indexOf("unlink"), "unlink checks the parent path first");
+  const atomic = sliceFn("async function atomicWriteFile(", "function atomicWriteDay(");
+  const reader = sliceFn("async function readFileSafe(", "function parseFrontmatter(");
+  assert(envFn.includes('GIT_LITERAL_PATHSPECS: "1"'), "git pathspecs are literal");
+  assert(run.includes("gitEnv()"), "git commands use that environment");
+  assert(read.includes("worktreePath") && read.includes("readableTarget"), "read checks parents and the leaf");
+  assert(rel.includes("readWorktree"), "sync read uses the leaf check");
+  assert(write.indexOf("worktreePath") !== write.lastIndexOf("worktreePath"), "write rechecks the folder");
+  assert(atomic.includes("beforeRename") && atomic.indexOf("beforeRename") < atomic.indexOf("fs.rename"), "recheck sits before rename");
+  assert(detach.includes("vaultRel") && detach.indexOf("worktreePath") < detach.indexOf("unlink"), "unlink checks the path and git gets the checked name");
+  assert(!detach.includes('"--", rel'), "detach does not pass the raw name");
   assert(announce.includes("worktreePath"), "watch stat checks the parent path");
-  assert(stage.includes("worktreePath") && stage.indexOf("worktreePath") < stage.indexOf("pathExists"), "stage checks the parent path first");
+  assert(conflicts.includes("worktreePath") && !conflicts.includes("safeJoin(VAULT"), "conflict mtime uses the checked path");
+  assert(choices.includes("worktreePath") && !choices.includes("safeJoin(VAULT"), "choice mtime uses the checked path");
+  assert(drop.includes("worktreePath") && !drop.includes("safeJoin(VAULT"), "stale choice mtime uses the checked path");
+  assert(stage.includes("vaultRel") && stage.indexOf("worktreePath") < stage.indexOf("pathExists"), "stage checks the path first");
+  assert(!stage.includes('"--", rel'), "stage does not pass the raw name");
+  assert(reader.includes("readableTarget"), "note reads use the leaf check");
+  assert(serverSrc.includes('process.platform === "darwin" || process.platform === "win32"'), "lowercase .git name is only a second check on darwin and win32");
+}
+
+async function refusesRead(rel, root, sentinel) {
+  try {
+    const text = await readWorktree(rel, root);
+    if (text && text.includes(sentinel)) throw new Error("read returned the target");
+    throw new Error("expected a refusal");
+  } catch (e) {
+    if (e.message === "read returned the target" || e.message === "expected a refusal") throw e;
+    assert(!String(e.message).includes(sentinel), "refusal leaked the target");
+  }
 }
 
 async function pathChecks() {
@@ -81,6 +112,10 @@ async function pathChecks() {
 
     fs.symlinkSync(path.join(vault, "gitlink"), path.join(vault, "loop"));
     await rejects(() => worktreePath("loop/config", vault));
+
+    fs.mkdirSync(path.join(vault, "sub", ".git", "hooks"), { recursive: true });
+    fs.symlinkSync(path.join(vault, "sub", ".git", "hooks"), path.join(vault, "nested"));
+    await rejects(() => worktreePath("nested/sample", vault));
   } finally {
     fs.rmSync(vault, { recursive: true, force: true });
     fs.rmSync(outside, { recursive: true, force: true });
@@ -202,7 +237,124 @@ async function liveSyncDoesNotFollowOutside() {
   }
 }
 
+async function inodeGitDir() {
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-ino-"));
+  try {
+    // Linux cannot have both spellings of one directory. Point .git at
+    // store so the resolved path has no ".git" text and the inode still matches.
+    fs.mkdirSync(path.join(vault, "store", "hooks"), { recursive: true });
+    fs.writeFileSync(path.join(vault, "store", "config"), "git-config-sentinel\n");
+    fs.symlinkSync(path.join(vault, "store"), path.join(vault, ".git"));
+    fs.symlinkSync(path.join(vault, "store", "hooks"), path.join(vault, "planted"));
+    const spelled = fs.realpathSync(path.join(vault, "planted"));
+    assert(!spelled.split(path.sep).includes(".git"), "inode case uses a path with no .git part");
+    await rejects(() => worktreePath("planted/post-update", vault));
+
+    fs.mkdirSync(path.join(vault, "notes"));
+    fs.symlinkSync(path.join(vault, "store", "config"), path.join(vault, "notes", "gitcfg.md"));
+    await refusesRead("notes/gitcfg.md", vault, "git-config-sentinel");
+
+    if (process.platform !== "darwin" && process.platform !== "win32") {
+      fs.mkdirSync(path.join(vault, ".GIT", "hooks"), { recursive: true });
+      fs.symlinkSync(path.join(vault, ".GIT"), path.join(vault, "caps"));
+      const allowed = await worktreePath("caps/hooks/x", vault);
+      assert(allowed === path.join(vault, "caps", "hooks", "x"), "a different-inode .GIT folder is not the vault git dir");
+    }
+  } finally {
+    fs.rmSync(vault, { recursive: true, force: true });
+  }
+}
+
+async function leafChecks() {
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-leaf-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-leaf-out-"));
+  try {
+    fs.mkdirSync(path.join(vault, "notes"));
+    fs.writeFileSync(path.join(vault, "notes", "real.md"), "inside\n");
+    fs.symlinkSync(path.join(vault, "notes", "real.md"), path.join(vault, "notes", "alias.md"));
+    assert(await readWorktree("notes/alias.md", vault) === "inside\n", "in-vault leaf link still reads");
+    assert(await readWorktree("notes/missing.md", vault) == null, "missing note");
+
+    fs.writeFileSync(path.join(outside, "secret.md"), "OUTSIDE_LEAF\n");
+    fs.symlinkSync(path.join(outside, "secret.md"), path.join(vault, "notes", "leak.md"));
+    await refusesRead("notes/leak.md", vault, "OUTSIDE_LEAF");
+    assert(fs.readFileSync(path.join(outside, "secret.md"), "utf8") === "OUTSIDE_LEAF\n", "outside file unchanged");
+
+    fs.mkdirSync(path.join(vault, ".git"));
+    fs.writeFileSync(path.join(vault, ".git", "config"), "git-config-sentinel\n");
+    fs.symlinkSync(path.join(vault, ".git", "config"), path.join(vault, "notes", "gitcfg.md"));
+    await refusesRead("notes/gitcfg.md", vault, "git-config-sentinel");
+  } finally {
+    fs.rmSync(vault, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+}
+
+async function decodedGitPath() {
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-rel-"));
+  try {
+    const abs = await worktreePath("notes%2Fa.md", vault);
+    assert(abs === path.join(vault, "notes", "a.md"), "percent-encoded slash is a real separator");
+    assert(vaultRel(abs, vault) === "notes/a.md", "git receives the checked path");
+  } finally {
+    fs.rmSync(vault, { recursive: true, force: true });
+  }
+}
+
+function gitWithEnv(args, cwd, allowFail) {
+  try {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      env: gitEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (e) {
+    if (allowFail) return "";
+    throw e;
+  }
+}
+
+async function literalPathspecs() {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-literal-"));
+  try {
+    git(["init", "-b", "main"], repo);
+    git(["config", "user.email", "t@local"], repo);
+    git(["config", "user.name", "T"], repo);
+    fs.writeFileSync(path.join(repo, "QA.md"), "qa\n");
+    fs.writeFileSync(path.join(repo, "Q?.md"), "qq\n");
+    fs.writeFileSync(path.join(repo, "a.md"), "committed\n");
+    git(["add", "-A"], repo);
+    git(["commit", "-m", "seed"], repo);
+
+    fs.writeFileSync(path.join(repo, "QA.md"), "changed-qa\n");
+    fs.writeFileSync(path.join(repo, "Q?.md"), "changed-qq\n");
+    gitWithEnv(["add", "--", "Q?.md"], repo);
+    const staged = git(["diff", "--cached", "--name-only"], repo).split("\n").map((s) => s.trim()).filter(Boolean);
+    assert(staged.includes("Q?.md"), "stages the literal note");
+    assert(!staged.includes("QA.md"), "does not stage QA.md");
+
+    git(["reset", "--hard"], repo);
+    fs.rmSync(path.join(repo, "Q?.md"));
+    gitWithEnv(["rm", "--", "Q?.md"], repo);
+    assert(fs.readFileSync(path.join(repo, "QA.md"), "utf8") === "qa\n", "QA.md stays");
+    const tracked = git(["ls-files"], repo).split("\n").map((s) => s.trim());
+    assert(tracked.includes("QA.md"), "QA.md still tracked");
+    assert(!tracked.includes("Q?.md"), "literal Q?.md is deleted");
+
+    fs.writeFileSync(path.join(repo, "a.md"), "dirty\n");
+    gitWithEnv(["checkout", "HEAD", "--", "?.md"], repo, true);
+    assert(fs.readFileSync(path.join(repo, "a.md"), "utf8") === "dirty\n", "checkout of ?.md leaves a.md");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+}
+
 checkWiring();
 await pathChecks();
+await inodeGitDir();
+await leafChecks();
+await decodedGitPath();
+await literalPathspecs();
 await liveSyncDoesNotFollowOutside();
 console.log("sync-path-test ok");

@@ -177,12 +177,14 @@ function gitHint() {
   return hint;
 }
 
-function gitEnv() {
+export function gitEnv() {
   const env = {
     ...process.env,
     GIT_TERMINAL_PROMPT: "0",
     GIT_EDITOR: "true",
     GIT_MERGE_AUTOEDIT: "no",
+    // Pathspecs stay literal after "--". Otherwise `Q?.md` also matches QA.md.
+    GIT_LITERAL_PATHSPECS: "1",
   };
   delete env.GIT_ASKPASS;
   return env;
@@ -626,11 +628,63 @@ function resolvedChoices() {
   return out;
 }
 
+// APFS and Windows fold `.GIT` onto `.git`. Linux does not, so the name
+// check stays exact there and the inode check does the real work.
+const FOLD_GIT_NAME = process.platform === "darwin" || process.platform === "win32";
+
+function vaultGitId(rootReal) {
+  try {
+    const st = fsSync.statSync(path.join(rootReal, ".git"));
+    return { dev: st.dev, ino: st.ino };
+  } catch {
+    return null;
+  }
+}
+
+// `real` is a resolved path. Refuse it when it is the vault .git directory,
+// sits inside that directory, or has a .git part at any depth (a nested
+// repo). Match the directory by device and inode, not by the spelling of
+// the path: a link can resolve to a folder `.git` merely points at.
+function realPathInGit(real, rootReal) {
+  const resolved = path.resolve(real);
+  const root = path.resolve(rootReal);
+  const rel = path.relative(root, resolved);
+  const outside = !rel || rel.startsWith("..") || path.isAbsolute(rel);
+  const parts = (outside ? resolved : rel).split(path.sep);
+  for (const part of parts) {
+    if (part === ".git") return true;
+    if (FOLD_GIT_NAME && part.toLowerCase() === ".git") return true;
+  }
+  const id = vaultGitId(root);
+  if (!id) return false;
+  let cursor = resolved;
+  for (;;) {
+    let st;
+    try {
+      st = fsSync.statSync(cursor);
+    } catch {
+      return true;
+    }
+    if (st.dev === id.dev && st.ino === id.ino) return true;
+    if (cursor === root) break;
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  return false;
+}
+
+export function vaultRel(abs, root = VAULT) {
+  const rel = path.relative(path.resolve(root), path.resolve(abs));
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) throw new Error("bad path");
+  return rel.split(path.sep).join("/");
+}
+
 // A directory symlink is followed by a later read, write, or unlink.
 // O_NOFOLLOW applies only to the last path part, so a link named like a
 // folder can still aim a note at another directory. Refuse one that leaves
 // the vault or lands in .git. A link that stays on a normal folder inside
-// the vault is left alone.
+// the vault is left alone. The leaf is checked on read, in readableTarget.
 export async function worktreePath(rel, root = VAULT) {
   if (!isSafeRel(rel)) throw new Error("bad path");
   const abs = safeJoin(root, rel);
@@ -665,8 +719,7 @@ export async function worktreePath(rel, root = VAULT) {
         throw new Error("bad path");
       }
       if (!contained(real, rootReal)) throw new Error("bad path");
-      const gitDir = path.join(rootReal, ".git");
-      if (real === gitDir || real.startsWith(gitDir + path.sep)) throw new Error("bad path");
+      if (realPathInGit(real, rootReal)) throw new Error("bad path");
       continue;
     }
     if (!st.isDirectory()) throw new Error("bad path");
@@ -674,14 +727,66 @@ export async function worktreePath(rel, root = VAULT) {
   return abs;
 }
 
+// Last path part on read. resolveInside allows a target that stays in the
+// vault, including .git/config, so the git check is separate. Returns the
+// path to read: the real file for a link, the logical path otherwise.
+async function readableTarget(abs, root) {
+  let st;
+  try {
+    st = await fs.lstat(abs);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw new Error("bad path");
+  }
+  if (!st.isSymbolicLink()) return abs;
+  try {
+    await resolveInside(root, abs);
+  } catch (e) {
+    if (e.message === "path escapes vault" || e.message === "bad path") throw new Error("bad path");
+    if (e.code === "ENOENT" || e.code === "ELOOP" || e.code === "ENOTDIR") throw new Error("bad path");
+    throw e;
+  }
+  let rootReal = path.resolve(root);
+  try {
+    rootReal = await fs.realpath(root);
+  } catch (e) {
+    if (e.code !== "ENOENT") throw new Error("bad path");
+  }
+  let real;
+  try {
+    real = await fs.realpath(abs);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw new Error("bad path");
+  }
+  if (!contained(real, rootReal) || realPathInGit(real, rootReal)) throw new Error("bad path");
+  return real;
+}
+
+export async function readWorktree(rel, root = VAULT) {
+  if (!isSafeRel(rel)) throw new Error("bad path");
+  const abs = await worktreePath(rel, root);
+  const target = await readableTarget(abs, root);
+  if (target == null) return null;
+  try {
+    return await fs.readFile(target, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw e;
+  }
+}
+
 async function readRel(rel) {
   if (!isSafeRel(rel)) return "";
-  const text = await readFileSafe(await worktreePath(rel));
+  const text = await readWorktree(rel);
   return text == null ? "" : text;
 }
 
 async function writeVaultText(rel, text) {
-  await atomicWriteFile(await worktreePath(rel), text);
+  const abs = await worktreePath(rel);
+  await atomicWriteFile(abs, text, async () => {
+    await worktreePath(rel);
+  });
 }
 
 async function gitShow(rev, rel) {
@@ -826,14 +931,15 @@ async function compareToRemote() {
 async function detachFile(rel) {
   if (!isSafeRel(rel)) return;
   const abs = await worktreePath(rel);
+  const gitPath = vaultRel(abs);
   let tracked = true;
   try {
-    await runGit(["-C", VAULT, "ls-files", "--error-unmatch", "--", rel], { timeoutMs: 4000 });
+    await runGit(["-C", VAULT, "ls-files", "--error-unmatch", "--", gitPath], { timeoutMs: 4000 });
   } catch {
     tracked = false;
   }
   if (tracked) {
-    await runGit(["-C", VAULT, "checkout", "HEAD", "--", rel], { timeoutMs: 8000 });
+    await runGit(["-C", VAULT, "checkout", "HEAD", "--", gitPath], { timeoutMs: 8000 });
     return;
   }
   await fs.unlink(abs).catch(() => {});
@@ -897,7 +1003,7 @@ async function recordConflicts(rels, rev) {
       forgot = true;
     }
     let mtime = 0;
-    try { mtime = await fileMtimeMs(safeJoin(VAULT, rel)); } catch { mtime = 0; }
+    try { mtime = await fileMtimeMs(await worktreePath(rel)); } catch { mtime = 0; }
     vaultGit.conflicts.set(rel, {
       path: rel,
       mine,
@@ -955,7 +1061,7 @@ async function noteChoices(paths) {
     const text = await readRel(rel);
     item.choice = text;
     item.mine = text;
-    try { item.mtime = await fileMtimeMs(safeJoin(VAULT, rel)); } catch { item.mtime = 0; }
+    try { item.mtime = await fileMtimeMs(await worktreePath(rel)); } catch { item.mtime = 0; }
     item.against = bound || item.theirsBlob || "";
     if (item.against) vaultGit.choiceAgainst.set(rel, item.against);
     item.theirsBlob = item.theirsBlob || item.against;
@@ -987,7 +1093,7 @@ async function dropStaleChoices(rev) {
       continue;
     }
     let mtime = 0;
-    try { mtime = await fileMtimeMs(safeJoin(VAULT, item.path)); } catch { mtime = 0; }
+    try { mtime = await fileMtimeMs(await worktreePath(item.path)); } catch { mtime = 0; }
     vaultGit.conflicts.set(item.path, {
       path: item.path,
       mine,
@@ -1037,15 +1143,18 @@ async function stageAndCommit(paths) {
     safe.push(rel);
   }
   if (!safe.length) return false;
+  const gitPaths = [];
   let stagedAny = false;
   for (const rel of safe) {
     const abs = await worktreePath(rel);
+    const gitPath = vaultRel(abs);
+    if (!gitPaths.includes(gitPath)) gitPaths.push(gitPath);
     if (await pathExists(abs)) {
-      await runGit(["-C", VAULT, "add", "--", rel], { timeoutMs: 8000 });
+      await runGit(["-C", VAULT, "add", "--", gitPath], { timeoutMs: 8000 });
       stagedAny = true;
     } else {
       try {
-        await runGit(["-C", VAULT, "rm", "--", rel], { timeoutMs: 8000 });
+        await runGit(["-C", VAULT, "rm", "--", gitPath], { timeoutMs: 8000 });
         stagedAny = true;
       } catch {
         // This one path was never tracked.
@@ -1054,12 +1163,12 @@ async function stageAndCommit(paths) {
   }
   if (!stagedAny) return false;
   const staged = await runGit(
-    ["-C", VAULT, "diff", "--cached", "--name-only", "--", ...safe],
+    ["-C", VAULT, "diff", "--cached", "--name-only", "--", ...gitPaths],
     { timeoutMs: 8000 },
   );
   if (!String(staged.out || "").trim()) return false;
   await runGit(
-    ["-C", VAULT, "commit", "-m", "vault: " + safe.join(", "), "--", ...safe],
+    ["-C", VAULT, "commit", "-m", "vault: " + gitPaths.join(", "), "--", ...gitPaths],
     { timeoutMs: 8000 },
   );
   return true;
@@ -1601,8 +1710,16 @@ function addDays(iso, n) {
 }
 
 async function readFileSafe(p) {
+  let target;
   try {
-    return await fs.readFile(p, "utf8");
+    target = await readableTarget(p, VAULT);
+  } catch (e) {
+    if (e.message === "bad path" || e.message === "path escapes vault") return null;
+    throw e;
+  }
+  if (target == null) return null;
+  try {
+    return await fs.readFile(target, "utf8");
   } catch (e) {
     if (e.code === "ENOENT") return null;
     throw e;
@@ -1910,11 +2027,12 @@ function sameTextAlreadyStored(exists, raw, markdown, conflict, resolve) {
   return true;
 }
 
-async function atomicWriteFile(filePath, markdown) {
+async function atomicWriteFile(filePath, markdown, beforeRename) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
   try {
     await fs.writeFile(tmpPath, markdown, { encoding: "utf8", flag: "wx" });
+    if (beforeRename) await beforeRename();
     await fs.rename(tmpPath, filePath);
   } catch (e) {
     try { await fs.unlink(tmpPath); } catch {}
@@ -2269,9 +2387,12 @@ const server = http.createServer(async (req, res) => {
         let diskMtime = 0;
         let exists = false;
         try {
-          const st = await fs.stat(logPath);
-          exists = st.isFile();
-          diskMtime = Math.trunc(st.mtimeMs);
+          const st = await fs.lstat(logPath);
+          // A leaf symlink is replaced by the write below. Do not follow it.
+          if (!st.isSymbolicLink() && st.isFile()) {
+            exists = true;
+            diskMtime = Math.trunc(st.mtimeMs);
+          }
         } catch (e) {
           if (e.code !== "ENOENT") throw e;
         }
@@ -2479,10 +2600,16 @@ const server = http.createServer(async (req, res) => {
         let diskMtime = 0;
         let exists = false;
         try {
-          const st = await fs.stat(abs);
-          if (st.isDirectory()) return json(res, 400, { error: "not a file" });
-          exists = st.isFile();
-          diskMtime = Math.trunc(st.mtimeMs);
+          const st = await fs.lstat(abs);
+          // A leaf symlink is replaced by the write below. Do not follow it.
+          if (st.isSymbolicLink()) {
+            exists = false;
+          } else if (st.isDirectory()) {
+            return json(res, 400, { error: "not a file" });
+          } else {
+            exists = st.isFile();
+            diskMtime = Math.trunc(st.mtimeMs);
+          }
         } catch (e) {
           if (e.code !== "ENOENT") throw e;
         }

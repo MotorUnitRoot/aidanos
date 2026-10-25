@@ -24,7 +24,7 @@ function fail(message) {
 }
 
 const destRoot = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-week-"));
-const notePlan = path.join(destRoot, "NotePlan", "Notes");
+const notePlan = path.join(destRoot, "Library", "Containers", "co.noteplan.NotePlan3", "Data", "Documents");
 
 for (const relative of week) {
   const original = fs.readFileSync(path.join(source, relative), "utf8");

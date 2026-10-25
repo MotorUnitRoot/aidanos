@@ -53,18 +53,55 @@ final class LiveNoteEditorTests: XCTestCase {
     }
 
     func testANotePlanFolderSavesInPlace() throws {
-        let folder = try makeFolder(named: "NotePlan")
+        let folder = try makeFolder(named: "iCloud~co~noteplan~NotePlan3")
+            .appendingPathComponent("Documents", isDirectory: true)
         let file = folder.appendingPathComponent("log").appendingPathComponent("day.md")
         XCTAssertTrue(NoteFolderSave.isNotePlanFolder(file))
+        XCTAssertFalse(NoteFolderSave.isNotePlanFolder(try makeFolder(named: "NotePlan").appendingPathComponent("day.md")))
         XCTAssertEqual(NoteFolderSave.style(for: file, swapInRequested: true), .inPlace)
+        setenv("AIDANOS_SAVE_SWAP_IN", "1", 1)
+        defer { unsetenv("AIDANOS_SAVE_SWAP_IN") }
         try NoteFolderSave.write(Data("one\n".utf8), to: file)
         let inode = try fileInode(file)
-        try NoteFolderSave.write(Data("one\ntwo\n".utf8), to: file, style: .inPlace)
+        try NoteFolderSave.write(Data("one\ntwo\n".utf8), to: file)
         XCTAssertEqual(try fileInode(file), inode)
         let names = try FileManager.default.contentsOfDirectory(atPath: file.deletingLastPathComponent().path)
         XCTAssertFalse(names.contains { $0.contains(".tmp") })
         let saved = try String(contentsOf: file, encoding: .utf8)
         XCTAssertEqual(saved, "one\ntwo\n")
+    }
+
+    func testRealNotePlanPathShapes() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("aidanos-shapes-\(UUID().uuidString)", isDirectory: true)
+        let shapes = [
+            ["iCloud~co~noteplan~NotePlan3", "Documents", "log", "day.md"],
+            ["Library", "Containers", "co.noteplan.NotePlan3", "Data", "Documents", "log", "day.md"],
+            ["iCloud~co~noteplan~NotePlan-setapp", "Documents", "log", "day.md"],
+            ["Library", "Containers", "co.noteplan.NotePlan-setapp", "Data", "Documents", "log", "day.md"],
+        ]
+        for parts in shapes {
+            let file = parts.reduce(root) { $0.appendingPathComponent($1) }
+            XCTAssertTrue(NoteFolderSave.isNotePlanFolder(file), parts.joined(separator: "/"))
+            XCTAssertEqual(NoteFolderSave.style(for: file, swapInRequested: true), .inPlace)
+        }
+        let upper = root
+            .appendingPathComponent("Library")
+            .appendingPathComponent("Containers")
+            .appendingPathComponent("CO.NotePlan.NotePlan3")
+            .appendingPathComponent("day.md")
+        XCTAssertTrue(NoteFolderSave.isNotePlanFolder(upper))
+        XCTAssertFalse(NoteFolderSave.isNotePlanFolder(root.appendingPathComponent("NotePlan").appendingPathComponent("day.md")))
+        let real = root.appendingPathComponent("iCloud~co~noteplan~NotePlan3").appendingPathComponent("Documents")
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        let link = root.appendingPathComponent("linked-vault")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+        XCTAssertTrue(NoteFolderSave.isNotePlanFolder(link.appendingPathComponent("log").appendingPathComponent("day.md")))
+        let plain = root.appendingPathComponent("plain").appendingPathComponent("day.md")
+        XCTAssertFalse(NoteFolderSave.isNotePlanFolder(plain))
+        setenv("AIDANOS_VAULT_KIND", "noteplan", 1)
+        defer { unsetenv("AIDANOS_VAULT_KIND") }
+        XCTAssertEqual(NoteFolderSave.style(for: plain, swapInRequested: true), .inPlace)
     }
 
     func testSwapInStaysOutsideANotePlanFolder() throws {
@@ -73,11 +110,70 @@ final class LiveNoteEditorTests: XCTestCase {
         XCTAssertFalse(NoteFolderSave.isNotePlanFolder(file))
         XCTAssertEqual(NoteFolderSave.style(for: file, swapInRequested: true), .swapIn)
         XCTAssertEqual(NoteFolderSave.style(for: file, swapInRequested: false), .inPlace)
-        try NoteFolderSave.write(Data("one\n".utf8), to: file, style: .swapIn)
+        setenv("AIDANOS_SAVE_SWAP_IN", "1", 1)
+        defer { unsetenv("AIDANOS_SAVE_SWAP_IN") }
+        try NoteFolderSave.write(Data("one\n".utf8), to: file)
         let inode = try fileInode(file)
-        try NoteFolderSave.write(Data("two\n".utf8), to: file, style: .swapIn)
+        try NoteFolderSave.write(Data("two\n".utf8), to: file)
         XCTAssertNotEqual(try fileInode(file), inode)
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "two\n")
+    }
+
+    func testInPlaceRefusesALink() throws {
+        defer { unsetenv("AIDANOS_SAVE_SWAP_IN") }
+        for mode in ["0", "1"] {
+            setenv("AIDANOS_SAVE_SWAP_IN", mode, 1)
+            let folder = try makeFolder(named: "vault")
+            let git = folder.appendingPathComponent(".git")
+            let hooks = git.appendingPathComponent("hooks")
+            try FileManager.default.createDirectory(at: hooks, withIntermediateDirectories: true)
+            let config = git.appendingPathComponent("config")
+            try Data("original\n".utf8).write(to: config)
+            let linked = folder.appendingPathComponent("note.md")
+            try FileManager.default.createSymbolicLink(at: linked, withDestinationURL: config)
+            XCTAssertThrowsError(try NoteFolderSave.write(Data("pwned\n".utf8), to: linked))
+            XCTAssertEqual(try String(contentsOf: config, encoding: .utf8), "original\n")
+            let hook = hooks.appendingPathComponent("post-commit")
+            let danglingHook = folder.appendingPathComponent("hook.md")
+            try FileManager.default.createSymbolicLink(at: danglingHook, withDestinationURL: hook)
+            XCTAssertThrowsError(try NoteFolderSave.write(Data("pwned\n".utf8), to: danglingHook))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: hook.path))
+            let outside = folder.deletingLastPathComponent().appendingPathComponent("missing-\(mode).md")
+            let danglingOut = folder.appendingPathComponent("out.md")
+            try FileManager.default.createSymbolicLink(at: danglingOut, withDestinationURL: outside)
+            XCTAssertThrowsError(try NoteFolderSave.write(Data("pwned\n".utf8), to: danglingOut))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: outside.path))
+            let log = folder.appendingPathComponent("log").appendingPathComponent("2026-10-25.md")
+            try FileManager.default.createDirectory(at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let outsideLog = folder.deletingLastPathComponent().appendingPathComponent("kept-\(mode).md")
+            try Data("keep\n".utf8).write(to: outsideLog)
+            try FileManager.default.createSymbolicLink(at: log, withDestinationURL: outsideLog)
+            XCTAssertThrowsError(try NoteFolderSave.write(Data("pwned\n".utf8), to: log))
+            XCTAssertEqual(try String(contentsOf: outsideLog, encoding: .utf8), "keep\n")
+        }
+    }
+
+    func testASwappedLinkIsRefused() throws {
+        let folder = try makeFolder(named: "vault")
+        let secret = folder.appendingPathComponent("secret.txt")
+        try Data("SECRET\n".utf8).write(to: secret)
+        let note = folder.appendingPathComponent("note.md")
+        setenv("AIDANOS_SAVE_SWAP_IN", "0", 1)
+        defer { unsetenv("AIDANOS_SAVE_SWAP_IN") }
+        try NoteFolderSave.write(Data("one\n".utf8), to: note)
+        XCTAssertThrowsError(try NoteFolderSave.writeInPlace(Data("pwned\n".utf8), to: note, beforeOpen: {
+            try? FileManager.default.removeItem(at: note)
+            try? FileManager.default.createSymbolicLink(at: note, withDestinationURL: secret)
+        }))
+        XCTAssertEqual(try String(contentsOf: secret, encoding: .utf8), "SECRET\n")
+        let swapped = folder.appendingPathComponent("swap.md")
+        try Data("one\n".utf8).write(to: swapped)
+        XCTAssertThrowsError(try AtomicFile.write(Data("pwned\n".utf8), to: swapped, beforeRename: {
+            try FileManager.default.removeItem(at: swapped)
+            try FileManager.default.createSymbolicLink(at: swapped, withDestinationURL: secret)
+        }))
+        XCTAssertEqual(try String(contentsOf: secret, encoding: .utf8), "SECRET\n")
+        XCTAssertTrue(NoteFolderSave.isSymbolicLink(swapped.path))
     }
 
     func testTypedWeekMatchesTheFiles() throws {
@@ -89,7 +185,7 @@ final class LiveNoteEditorTests: XCTestCase {
             "log/2026-03-16.md",
             "aidanos/weeks/2026-03-09.md",
         ]
-        let vault = try makeFolder(named: "NotePlan").appendingPathComponent("Notes", isDirectory: true)
+        let vault = try makeFolder(named: "co.noteplan.NotePlan3").appendingPathComponent("Documents", isDirectory: true)
         let session = try AidanSession(vault: vault)
         for relative in week {
             let original = try String(contentsOf: root.appendingPathComponent(relative), encoding: .utf8)

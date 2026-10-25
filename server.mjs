@@ -1861,8 +1861,8 @@ function sameTextAlreadyStored(exists, raw, markdown, conflict, resolve) {
   return true;
 }
 
-async function atomicWriteFile(filePath, markdown) {
-  await writeNoteText(filePath, markdown);
+async function atomicWriteFile(filePath, markdown, beforeRename) {
+  await writeNoteText(filePath, markdown, { beforeRename });
 }
 
 function atomicWriteDay(logPath, markdown) {

@@ -63,12 +63,13 @@ await check("headings, lists, and tasks get a shape", async () => {
 
 await check("a NotePlan folder saves in place", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-save-"));
-  const file = path.join(dir, "NotePlan", "log", "day.md");
+  const file = path.join(dir, "iCloud~co~noteplan~NotePlan3", "Documents", "log", "day.md");
   assert(isNotePlanFolder(file), "folder was not recognized");
+  assert(!isNotePlanFolder(path.join(dir, "NotePlan", "log", "day.md")), "a folder named NotePlan counted");
   assert(noteSaveStyle(file, true) === "in-place", "swap-in was allowed inside the folder");
   await writeNoteText(file, "one\n");
   const inode = fs.statSync(file).ino;
-  const style = await writeNoteText(file, "one\ntwo\n", { swapInRequested: true });
+  const style = await writeNoteText(file, "one\ntwo\n", { style: "swap-in", swapInRequested: true });
   assert(style === "in-place", style);
   assert(fs.statSync(file).ino === inode, "the file was replaced");
   assert(fs.readFileSync(file, "utf8") === "one\ntwo\n", "text");
@@ -82,9 +83,9 @@ await check("swap-in still works outside a NotePlan folder", async () => {
   assert(!isNotePlanFolder(file), "an ordinary folder was treated as NotePlan");
   assert(noteSaveStyle(file, true) === "swap-in", "outside save was in place");
   assert(noteSaveStyle(file, false) === "in-place", "the setting could not choose in place");
-  await writeNoteText(file, "one\n", { style: "swap-in" });
+  await writeNoteText(file, "one\n", { style: "in-place", swapInRequested: true });
   const inode = fs.statSync(file).ino;
-  await writeNoteText(file, "two\n", { style: "swap-in" });
+  await writeNoteText(file, "two\n", { style: "in-place", swapInRequested: true });
   assert(fs.statSync(file).ino !== inode, "swap-in kept the same file");
   assert(fs.readFileSync(file, "utf8") === "two\n", "swap text");
 });

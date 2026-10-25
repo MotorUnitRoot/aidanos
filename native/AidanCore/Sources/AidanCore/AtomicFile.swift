@@ -6,26 +6,45 @@ import Darwin
 import Glibc
 #endif
 
+/// C `open` is variadic. The Swift overlay on Linux only exposes the two-argument
+/// form, so the mode goes through the C function directly.
+@_silgen_name("open")
+private func systemOpen(_ path: UnsafePointer<CChar>, _ flags: Int32, _ mode: mode_t) -> Int32
+
 enum AtomicFile {
     /// Swap-in: a reader never sees a half-written file. Do not use this for a
     /// note that lives inside a NotePlan folder. See `NoteFolderSave`.
-    static func write(_ data: Data, to url: URL) throws {
+    /// `beforeRename` runs after the temp file is ready and before the rename.
+    /// A throw leaves the destination untouched and removes the temp file.
+    static func write(_ data: Data, to url: URL, beforeRename: (() throws -> Void)? = nil) throws {
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if NoteFolderSave.isSymbolicLink(url.path) {
+            throw AidanError.io("Could not save \(url.lastPathComponent).")
+        }
         let temporary = directory.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
-        try data.write(to: temporary)
-        let descriptor = temporary.path.withCString { open($0, O_RDONLY) }
-        if descriptor >= 0 {
-            _ = fsync(descriptor)
-            _ = close(descriptor)
-        }
-        let renamed = temporary.path.withCString { source in
-            url.path.withCString { destination in
-                rename(source, destination)
+        do {
+            try data.write(to: temporary)
+            let descriptor = temporary.path.withCString { open($0, O_RDONLY) }
+            if descriptor >= 0 {
+                _ = fsync(descriptor)
+                _ = close(descriptor)
             }
-        }
-        if renamed != 0 {
-            throw AidanError.io("Could not finish saving \(url.lastPathComponent).")
+            try beforeRename?()
+            if NoteFolderSave.isSymbolicLink(url.path) {
+                throw AidanError.io("Could not save \(url.lastPathComponent).")
+            }
+            let renamed = temporary.path.withCString { source in
+                url.path.withCString { destination in
+                    rename(source, destination)
+                }
+            }
+            if renamed != 0 {
+                throw AidanError.io("Could not finish saving \(url.lastPathComponent).")
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
         }
     }
 }
@@ -35,57 +54,154 @@ public enum NoteSaveStyle: Equatable, Sendable {
     case swapIn
 }
 
-/// Notes inside a NotePlan folder are saved in place. Swap-in (a temp file
-/// renamed over the note) stays off there, including when a setting asks for
-/// it. Other folders may swap in.
+/// Notes inside a NotePlan vault are saved in place. The vault is recognized
+/// from the real path: a path part starting with "iCloud~co~noteplan~" or
+/// "co.noteplan.", in any letter case. A folder merely named NotePlan is not
+/// one. AIDANOS_VAULT_KIND=noteplan forces the same in-place save. A caller
+/// cannot choose swap-in there. Other folders may swap in.
 public enum NoteFolderSave {
+    private static let prefixes = ["icloud~co~noteplan~", "co.noteplan."]
+
     public static func isNotePlanFolder(_ url: URL) -> Bool {
-        let parts = url.standardizedFileURL.path.split(separator: "/").map(String.init)
-        guard parts.count >= 2 else { return false }
-        return parts.dropLast().contains { $0.caseInsensitiveCompare("NotePlan") == .orderedSame }
+        resolvedPath(url).split(separator: "/").contains { part in
+            let name = part.lowercased()
+            return prefixes.contains { name.hasPrefix($0) }
+        }
     }
 
     public static func style(for url: URL, swapInRequested: Bool) -> NoteSaveStyle {
-        if isNotePlanFolder(url) { return .inPlace }
+        if isNotePlanFolder(url) || vaultKindForcesInPlace() { return .inPlace }
         return swapInRequested ? .swapIn : .inPlace
     }
 
     public static func swapInRequested() -> Bool {
-        let raw = ProcessInfo.processInfo.environment["AIDANOS_SAVE_SWAP_IN"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() ?? ""
+        let raw = env("AIDANOS_SAVE_SWAP_IN")
         if raw == "0" || raw == "false" || raw == "no" { return false }
         if raw == "1" || raw == "true" || raw == "yes" { return true }
         return true
     }
 
-    public static func write(_ data: Data, to url: URL, style explicit: NoteSaveStyle? = nil) throws {
-        let chosen = explicit ?? style(for: url, swapInRequested: swapInRequested())
-        switch chosen {
+    public static func vaultKindForcesInPlace() -> Bool {
+        env("AIDANOS_VAULT_KIND") == "noteplan"
+    }
+
+    public static func write(_ data: Data, to url: URL, beforeRename: (() throws -> Void)? = nil) throws {
+        switch style(for: url, swapInRequested: swapInRequested()) {
         case .inPlace:
             try writeInPlace(data, to: url)
         case .swapIn:
-            try AtomicFile.write(data, to: url)
+            try AtomicFile.write(data, to: url, beforeRename: beforeRename)
         }
     }
 
-    static func writeInPlace(_ data: Data, to url: URL) throws {
+    static func writeInPlace(_ data: Data, to url: URL, beforeOpen: (() -> Void)? = nil) throws {
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: url.path) {
-            guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+        let before = try identity(url.path)
+        if let before, before.isLink {
+            throw AidanError.io("Could not save \(url.lastPathComponent).")
+        }
+        beforeOpen?()
+        let flags: Int32 = O_WRONLY | O_NOFOLLOW | (before == nil ? O_CREAT : 0)
+        let mode = mode_t(0o644)
+        let fd = url.path.withCString { systemOpen($0, flags, mode) }
+        if fd < 0 {
+            throw AidanError.io("Could not save \(url.lastPathComponent).")
+        }
+        defer { _ = close(fd) }
+        var opened = stat()
+        if fstat(fd, &opened) != 0 {
+            throw AidanError.io("Could not save \(url.lastPathComponent).")
+        }
+        if let before {
+            if opened.st_dev != before.dev || opened.st_ino != before.ino {
                 throw AidanError.io("Could not save \(url.lastPathComponent).")
             }
-        }
-        let handle = try FileHandle(forWritingTo: url)
-        do {
-            try handle.truncate(atOffset: 0)
-            try handle.write(contentsOf: data)
-            try handle.synchronize()
-            try handle.close()
-        } catch {
-            try? handle.close()
+        } else if (opened.st_mode & S_IFMT) != S_IFREG {
             throw AidanError.io("Could not save \(url.lastPathComponent).")
+        }
+        if ftruncate(fd, 0) != 0 {
+            throw AidanError.io("Could not save \(url.lastPathComponent).")
+        }
+        try writeAll(fd, data, url.lastPathComponent)
+        if fsync(fd) != 0 {
+            throw AidanError.io("Could not save \(url.lastPathComponent).")
+        }
+    }
+
+    static func isSymbolicLink(_ path: String) -> Bool {
+        (try? identity(path))?.isLink == true
+    }
+
+    private struct FileIdentity {
+        let dev: dev_t
+        let ino: ino_t
+        let isLink: Bool
+    }
+
+    private static func identity(_ path: String) throws -> FileIdentity? {
+        var info = stat()
+        if lstat(path, &info) != 0 {
+            if errno == ENOENT { return nil }
+            throw AidanError.io("Could not save \(URL(fileURLWithPath: path).lastPathComponent).")
+        }
+        return FileIdentity(
+            dev: info.st_dev,
+            ino: info.st_ino,
+            isLink: (info.st_mode & S_IFMT) == S_IFLNK
+        )
+    }
+
+    private static func writeAll(_ fd: Int32, _ data: Data, _ name: String) throws {
+        var offset = 0
+        let total = data.count
+        try data.withUnsafeBytes { raw in
+            if total == 0 { return }
+            guard let base = raw.baseAddress else {
+                throw AidanError.io("Could not save \(name).")
+            }
+            while offset < total {
+                let wrote = pwrite(fd, base.advanced(by: offset), total - offset, off_t(offset))
+                if wrote < 0 {
+                    if errno == EINTR { continue }
+                    throw AidanError.io("Could not save \(name).")
+                }
+                if wrote == 0 {
+                    throw AidanError.io("Could not save \(name).")
+                }
+                offset += Int(wrote)
+            }
+        }
+    }
+
+    private static func env(_ name: String) -> String {
+        guard let raw = getenv(name) else { return "" }
+        return String(cString: raw)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    private static func resolvedPath(_ url: URL) -> String {
+        var cursor = url.standardizedFileURL.path
+        var pending: [String] = []
+        while true {
+            if let real = realPath(cursor) {
+                return pending.reversed().reduce(real) { $0 + "/" + $1 }
+            }
+            let parent = (cursor as NSString).deletingLastPathComponent
+            if parent == cursor || parent.isEmpty {
+                return url.standardizedFileURL.path
+            }
+            pending.append((cursor as NSString).lastPathComponent)
+            cursor = parent
+        }
+    }
+
+    private static func realPath(_ path: String) -> String? {
+        path.withCString { cString in
+            guard let resolved = realpath(cString, nil) else { return nil }
+            defer { free(resolved) }
+            return String(cString: resolved)
         }
     }
 }

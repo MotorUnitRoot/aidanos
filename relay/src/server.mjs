@@ -176,12 +176,18 @@ export function parseArgs(argv) {
     data: "",
     port: null,
     behindProxy: false,
+    allowSharedKeyBehindProxy: false,
+    initDevices: false,
+    printKeyAnyway: false,
     deviceCommand: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--lan") out.lan = true;
     else if (arg === "--behind-proxy") out.behindProxy = true;
+    else if (arg === "--allow-shared-key-behind-proxy") out.allowSharedKeyBehindProxy = true;
+    else if (arg === "--init-devices") out.initDevices = true;
+    else if (arg === "--print-key-anyway") out.printKeyAnyway = true;
     else if (arg === "--token") {
       throw new Error(
         "The token is not read from the command line. Set AIDANOS_RELAY_TOKEN or AIDANOS_RELAY_TOKEN_FILE.",
@@ -378,6 +384,47 @@ async function writeMarkerFile(file, text) {
   }
 }
 
+async function replaceRegularFile(file, text) {
+  const info = await fs.lstat(file);
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new Error("The relay marker is a symlink and will not be followed.");
+  }
+  const tmp = path.join(path.dirname(file), ".relay-id-" + randomUUID() + ".tmp");
+  let handle;
+  try {
+    handle = await fs.open(tmp, MARKER_CREATE_FLAGS, 0o600);
+  } catch {
+    throw new Error("The relay marker could not be saved.");
+  }
+  try {
+    await handle.writeFile(text);
+    await handle.sync();
+  } catch {
+    await handle.close().catch(() => {});
+    await fs.rm(tmp, { force: true });
+    throw new Error("The relay marker could not be saved.");
+  }
+  await handle.close();
+  try {
+    await fs.rename(tmp, file);
+  } catch {
+    await fs.rm(tmp, { force: true });
+    throw new Error("The relay marker could not be saved.");
+  }
+  await fs.chmod(file, 0o600);
+}
+
+async function writeKeysIssuedRecord(vault, issued) {
+  const file = relayIdFile(vault);
+  const current = await readMarker(file);
+  const id = relayMarkerId(current || "");
+  if (!id) return;
+  const line = issued ? "keys-issued yes" : "keys-issued no";
+  if (current && current.split("\n")[2] === line) return;
+  const next = MARKER_HEADER + "\n" + id + "\n" + line + "\n";
+  await replaceRegularFile(file, next);
+}
+
 async function directoryHasGitRemote(dir) {
   try {
     const text = await fs.readFile(path.join(dir, ".git", "config"), "utf8");
@@ -444,9 +491,17 @@ export function relayMarkerText(id) {
 export function relayMarkerId(text) {
   if (typeof text !== "string") return "";
   const lines = text.split("\n");
-  if (lines.length !== 3 || lines[2] !== "") return "";
+  if (lines[lines.length - 1] !== "") return "";
   if (lines[0] !== MARKER_HEADER || !MARKER_ID.test(lines[1])) return "";
-  return lines[1];
+  if (lines.length === 3) return lines[1];
+  if (lines.length === 4 && (lines[2] === "keys-issued yes" || lines[2] === "keys-issued no")) return lines[1];
+  return "";
+}
+
+export function relayMarkerKeysIssued(text) {
+  if (typeof text !== "string") return false;
+  const lines = text.split("\n");
+  return lines.length === 4 && lines[2] === "keys-issued yes" && lines[3] === "";
 }
 
 export function relayIdFile(vault) {
@@ -563,9 +618,41 @@ export async function startRelay(options = {}) {
   await assertNotClientVault(vault);
   await claimRelayFolders(vault, dataDir);
   const opened = await reconcileDeviceState(dataDir);
+  const idText = await readMarker(relayIdFile(vault));
+  const filesMissing = !opened.record && opened.policy && !opened.policy.exists;
+  const recordedKeys = relayMarkerKeysIssued(idText || "");
+  if (recordedKeys && filesMissing && !options.initDevices) {
+    throw new Error(
+      "Device keys were issued, but the device files are missing. The relay will not start. Pass --init-devices to start again on purpose.",
+    );
+  }
   const sharedStillOn = !(opened.policy.sharedRetired || (opened.record && opened.record.shared === "retired"));
+  if (behindProxy && sharedStillOn && !options.allowSharedKeyBehindProxy) {
+    throw new Error(
+      "A hosted relay will not start while the shared key can open a connection. Retire the shared key, or pass --allow-shared-key-behind-proxy.",
+    );
+  }
+  if (recordedKeys && filesMissing && options.initDevices) {
+    await writeKeysIssuedRecord(vault, false);
+    logSafe(secrets, "cleared the keys-issued record because --init-devices was passed and the device files are missing");
+  }
   if (sharedStillOn) logSafe(secrets, "WARNING: the shared key can still open a connection");
   else logSafe(secrets, "the shared key is off");
+  let stickyKeysIssued = Boolean(
+    opened.policy.devicesIssued || (opened.record && opened.record.devices.length > 0),
+  );
+  let stickySharedRetired = Boolean(
+    opened.policy.sharedRetired || (opened.record && opened.record.shared === "retired"),
+  );
+  if (stickyKeysIssued) {
+    try {
+      await writeKeysIssuedRecord(vault, true);
+    } catch (error) {
+      logSafe(secrets, "could not record that device keys were issued:", error instanceof Error ? error.message : "error");
+    }
+  }
+  let loggedDisappeared = false;
+  let loggedSharedBack = false;
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
   const failures = new Map();
@@ -605,6 +692,71 @@ export async function startRelay(options = {}) {
     failures.set(ip, row);
   }
 
+  // Once this process has seen device keys, or a retired shared key, forgetting
+  // the files must not turn the shared key back on. An explicit policy that
+  // says the shared key is on is the only way it returns before a restart.
+  async function gateState(state) {
+    if (!state.unreadable) {
+      const issued = Boolean(
+        (state.policy && state.policy.devicesIssued) || (state.record && state.record.devices.length > 0),
+      );
+      const retired = Boolean(
+        (state.policy && state.policy.sharedRetired) || (state.record && state.record.shared === "retired"),
+      );
+      if (issued) {
+        if (!stickyKeysIssued) {
+          stickyKeysIssued = true;
+          try {
+            await writeKeysIssuedRecord(vault, true);
+          } catch (error) {
+            logSafe(
+              secrets,
+              "could not record that device keys were issued:",
+              error instanceof Error ? error.message : "error",
+            );
+          }
+        }
+      }
+      if (retired) stickySharedRetired = true;
+      const explicitOn =
+        state.policy &&
+        state.policy.exists &&
+        !state.policy.sharedRetired &&
+        !(state.record && state.record.shared === "retired") &&
+        !(state.policy.devicesIssued && !state.record);
+      if (explicitOn && stickySharedRetired) {
+        stickySharedRetired = false;
+        if (!loggedSharedBack) {
+          loggedSharedBack = true;
+          logSafe(secrets, "the shared key can open a connection again");
+        }
+      }
+    }
+    const bothGone = !state.unreadable && state.policy && !state.policy.exists && !state.record;
+    if ((stickyKeysIssued || stickySharedRetired) && bothGone) {
+      if (!loggedDisappeared) {
+        loggedDisappeared = true;
+        logSafe(secrets, "refusing the shared key because the device files disappeared");
+      }
+      return {
+        policy: { exists: false, devicesIssued: true, sharedRetired: true },
+        record: null,
+        unreadable: true,
+      };
+    }
+    if (stickySharedRetired && state.policy) {
+      return {
+        ...state,
+        policy: {
+          ...state.policy,
+          sharedRetired: true,
+          devicesIssued: state.policy.devicesIssued || stickyKeysIssued,
+        },
+      };
+    }
+    return state;
+  }
+
   // Read the device file on every attempt. Behind a proxy every client is
   // 127.0.0.1, so the per-address lockout is off and the proxy does that job.
   // X-Forwarded-For is not read.
@@ -616,6 +768,7 @@ export async function startRelay(options = {}) {
     } catch {
       return { ok: false, refusal: "device-file", deviceId: "" };
     }
+    state = await gateState(state);
     const decision = connectionAllowed({
       sharedToken: token,
       record: state.record,
@@ -943,6 +1096,7 @@ export async function startRelay(options = {}) {
       closeForDeviceFile();
       return;
     }
+    state = await gateState(state);
     if (state.unreadable || (state.policy.devicesIssued && !state.record)) {
       closeForDeviceFile();
       return;
@@ -1074,7 +1228,17 @@ export async function runDeviceCommand(args, env = process.env) {
     return { lines };
   }
   if (command.action === "--issue-device") {
+    if (!args.stdoutIsTTY && !args.printKeyAnyway) {
+      throw new Error(
+        "Refusing to print a device key because stdout is not a terminal. Pass --print-key-anyway to print it.",
+      );
+    }
     const issued = await issueDevice(dataDir, command.name);
+    try {
+      await writeKeysIssuedRecord(vault, true);
+    } catch (error) {
+      logSafe(redactList(token, issued.key), "could not record that device keys were issued:", error instanceof Error ? error.message : "error");
+    }
     return { announcement: issued.announcement, key: issued.key, id: issued.id, token };
   }
   if (command.action === "--revoke-device") {
@@ -1093,8 +1257,8 @@ export async function runDeviceCommand(args, env = process.env) {
     return { message: "The shared key can open a connection again.", token };
   }
   if (command.action === "--reenable-shared-key") {
-    await reenableSharedKey(dataDir);
-    return { message: "The shared key can open a connection again.", token };
+    const message = await reenableSharedKey(dataDir);
+    return { message, token };
   }
   if (command.action === "--restore-device-file") {
     await restoreDeviceFile(dataDir);
@@ -1110,6 +1274,7 @@ async function main() {
     process.exit(1);
   }
   const args = parseArgs(process.argv.slice(2));
+  args.stdoutIsTTY = process.stdout.isTTY === true;
   if (args.deviceCommand) {
     let revealed = "";
     try {
@@ -1138,6 +1303,8 @@ async function main() {
       lan: args.lan,
       lanAddress: args.lanAddress,
       behindProxy: args.behindProxy,
+      allowSharedKeyBehindProxy: args.allowSharedKeyBehindProxy,
+      initDevices: args.initDevices,
       vault: args.vault || undefined,
       data: args.data || undefined,
       port: args.port == null || Number.isNaN(args.port) ? undefined : args.port,

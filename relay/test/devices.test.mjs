@@ -21,7 +21,7 @@ import {
   revokeDevice,
   withDeviceLock,
 } from "../src/devices.mjs";
-import { connectionAllowed, parseArgs, startRelay, startupLines } from "../src/server.mjs";
+import { connectionAllowed, parseArgs, relayIdFile, startRelay, startupLines } from "../src/server.mjs";
 
 // Assertions below never interpolate a key into a message. A failure prints
 // true/false, not the key.
@@ -394,7 +394,11 @@ test("a hosted relay stays on 127.0.0.1 and will not add the home network", asyn
   assert.equal(lines.some((line) => line.includes("PHONE")), false);
   const dirs = await relayDirs();
   await assert.rejects(boot(dirs, { lan: true, behindProxy: true }), /127\.0\.0\.1/);
-  const relay = await boot(dirs, { behindProxy: true, env: { AIDANOS_RELAY_BEHIND_PROXY: "1" } });
+  const relay = await boot(dirs, {
+    behindProxy: true,
+    allowSharedKeyBehindProxy: true,
+    env: { AIDANOS_RELAY_BEHIND_PROXY: "1" },
+  });
   try {
     assert.deepEqual(relay.hosts, ["127.0.0.1"]);
     assert.equal(relay.behindProxy, true);
@@ -415,6 +419,10 @@ test("device commands parse without reading a key from the command line", () => 
   assert.equal(parsed.deviceCommand.name, "iPhone");
   assert.equal(parsed.behindProxy, true);
   assert.equal(parsed.vault, "notes");
+  const flags = parseArgs(["--init-devices", "--print-key-anyway", "--allow-shared-key-behind-proxy"]);
+  assert.equal(flags.initDevices, true);
+  assert.equal(flags.printKeyAnyway, true);
+  assert.equal(flags.allowSharedKeyBehindProxy, true);
 });
 
 test("the issue command shows a key once and does not change the shared-key file", async () => {
@@ -423,7 +431,7 @@ test("the issue command shows a key once and does not change the shared-key file
   await fs.writeFile(tokenFile, TOKEN + "\n", { mode: 0o600 });
   const before = await fs.readFile(tokenFile);
   const env = { AIDANOS_RELAY_TOKEN_FILE: tokenFile };
-  const args = ["--vault", dirs.vault, "--data", dirs.data, "--issue-device", "Mac"];
+  const args = ["--vault", dirs.vault, "--data", dirs.data, "--print-key-anyway", "--issue-device", "Mac"];
   assert.equal(args.some((part) => part.includes(TOKEN)), false);
   const issued = await runNode(args, env);
   if (issued.failed) {
@@ -476,6 +484,11 @@ test("the hosting note says what Colby has to do and does not open a public bind
   assert.equal(hosting.includes("rate") || hosting.includes("Rate limiting"), true);
   assert.equal(hosting.includes("X-Forwarded-For"), true);
   assert.equal(hosting.includes("--data"), true);
+  assert.equal(hosting.includes("limit_req_zone $binary_remote_addr zone=relay:10m rate=10r/m;"), true);
+  assert.equal(hosting.includes("limit_req zone=relay burst=5 nodelay;"), true);
+  assert.equal(hosting.includes("limit_conn"), true);
+  assert.equal(hosting.includes("429"), true);
+  assert.equal(hosting.includes("openssl rand -base64 32"), true);
 });
 
 test("removing a device closes an open connection", async () => {
@@ -519,7 +532,12 @@ test("removing a device closes an open connection", async () => {
 
 test("a hosted relay does not lock every device out from one address", async () => {
   const dirs = await relayDirs();
-  const relay = await boot(dirs, { behindProxy: true, guessLimit: 1, guessBlockMs: 60_000 });
+  const relay = await boot(dirs, {
+    behindProxy: true,
+    allowSharedKeyBehindProxy: true,
+    guessLimit: 1,
+    guessBlockMs: 60_000,
+  });
   const mac = await issueDevice(dirs.data, "Mac");
   try {
     for (let i = 0; i < 6; i += 1) {
@@ -652,5 +670,200 @@ test("startup names whether the shared key is still on", async () => {
   } finally {
     console.error = write;
     await again.close();
+  }
+});
+
+test("deleting both device files while the relay is running does not turn the shared key back on", async () => {
+  const dirs = await relayDirs();
+  const seen = [];
+  const write = console.error;
+  console.error = (line) => seen.push(String(line));
+  const relay = await boot(dirs, { devicePollMs: 40 });
+  const mac = await issueDevice(dirs.data, "Mac");
+  try {
+    const opened = await connect(relay.url, mac.key);
+    assert.equal(opened.opened, true);
+    opened.socket.close();
+    await retireSharedKey(dirs.data);
+    const retired = await connect(relay.url, TOKEN);
+    assert.equal(retired.opened, false);
+    assert.equal(retired.status, 401);
+    await fs.rm(deviceFilePath(dirs.data));
+    await fs.rm(devicePolicyPath(dirs.data));
+    const deadline = Date.now() + 2000;
+    let logged = false;
+    while (Date.now() < deadline) {
+      if (seen.join("\n").includes("refusing the shared key because the device files disappeared")) {
+        logged = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    assert.equal(logged, true);
+    const shared = await connect(relay.url, TOKEN);
+    assert.equal(shared.opened, false);
+    assert.equal(shared.status, 401);
+    const logs = seen.join("\n");
+    assert.equal(logs.includes(mac.key), false);
+    assert.equal(logs.includes(TOKEN), false);
+    assert.equal(logs.includes("Mac"), false);
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+});
+
+test("a restart refuses when the id file and the device files disagree", async () => {
+  const dirs = await relayDirs();
+  const relay = await boot(dirs, { devicePollMs: 40 });
+  const mac = await issueDevice(dirs.data, "Mac");
+  try {
+    const opened = await connect(relay.url, mac.key);
+    assert.equal(opened.opened, true);
+    opened.socket.close();
+    const deadline = Date.now() + 2000;
+    let recorded = false;
+    while (Date.now() < deadline) {
+      const text = await fs.readFile(relayIdFile(dirs.vault), "utf8");
+      if (text.includes("keys-issued yes")) {
+        recorded = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    assert.equal(recorded, true);
+  } finally {
+    await relay.close();
+  }
+  await fs.rm(deviceFilePath(dirs.data));
+  await fs.rm(devicePolicyPath(dirs.data));
+  await assert.rejects(boot(dirs), /init-devices/);
+  const fresh = await boot(dirs, { initDevices: true });
+  try {
+    const shared = await connect(fresh.url, TOKEN);
+    assert.equal(shared.opened, true);
+    shared.socket.close();
+    const old = await connect(fresh.url, mac.key);
+    assert.equal(old.opened, false);
+    assert.equal(old.status, 401);
+  } finally {
+    await fresh.close();
+  }
+  const again = await boot(dirs);
+  await again.close();
+});
+
+test("a key is not printed when stdout is not a terminal", async () => {
+  const dirs = await relayDirs();
+  const tokenFile = path.join(dirs.dir, "token");
+  await fs.writeFile(tokenFile, TOKEN + "\n", { mode: 0o600 });
+  const env = { AIDANOS_RELAY_TOKEN_FILE: tokenFile };
+  const refused = await runNode(["--vault", dirs.vault, "--data", dirs.data, "--issue-device", "Mac"], env);
+  assert.equal(refused.failed, true);
+  assert.equal(refused.stdout.includes("shown once"), false);
+  assert.equal(refused.stdout.length, 0);
+  assert.equal(refused.stderr.includes("print-key-anyway"), true);
+  assert.equal(refused.stderr.includes(TOKEN), false);
+  await assert.rejects(fs.stat(deviceFilePath(dirs.data)));
+});
+
+test("a readable device file is not replaced from the backup", async () => {
+  const dirs = await relayDirs();
+  const mac = await issueDevice(dirs.data, "Mac");
+  await revokeDevice(dirs.data, "Mac");
+  await assert.rejects(restoreDeviceFile(dirs.data), /already readable/);
+  const record = await readDeviceFile(dirs.data);
+  assert.equal(record.devices[0].revokedAt == null, false);
+  assert.equal(record.devices[0].id, mac.id);
+});
+
+test("a failed device backup is logged without the key", async () => {
+  const dirs = await relayDirs();
+  const seen = [];
+  const write = console.error;
+  console.error = (line) => seen.push(String(line));
+  try {
+    const mac = await issueDevice(dirs.data, "Mac");
+    await fs.rm(deviceBackupPath(dirs.data));
+    await fs.mkdir(deviceBackupPath(dirs.data));
+    const phone = await issueDevice(dirs.data, "iPhone");
+    const logs = seen.join("\n");
+    assert.equal(logs.includes("device backup was not saved"), true);
+    assert.equal(logs.includes(mac.key), false);
+    assert.equal(logs.includes(phone.key), false);
+    assert.equal(logs.includes(TOKEN), false);
+  } finally {
+    console.error = write;
+  }
+});
+
+test("reenable says it moved the device file aside and turned device keys off", async () => {
+  const dirs = await relayDirs();
+  const tokenFile = path.join(dirs.dir, "token");
+  await fs.writeFile(tokenFile, TOKEN + "\n", { mode: 0o600 });
+  const env = { AIDANOS_RELAY_TOKEN_FILE: tokenFile };
+  const issued = await runNode(
+    ["--vault", dirs.vault, "--data", dirs.data, "--print-key-anyway", "--issue-device", "Mac"],
+    env,
+  );
+  assert.equal(issued.failed, false);
+  const key = keyFromAnnouncement(issued.stdout);
+  await fs.writeFile(deviceFilePath(dirs.data), "{", { mode: 0o600 });
+  await fs.chmod(deviceFilePath(dirs.data), 0o600);
+  const again = await runNode(["--vault", dirs.vault, "--data", dirs.data, "--reenable-shared-key"], env);
+  assert.equal(again.failed, false);
+  assert.equal(again.stderr.includes("Moved the device file aside and turned every device key off"), true);
+  assert.equal(again.stderr.includes(key), false);
+  assert.equal(again.stderr.includes(TOKEN), false);
+  assert.equal(again.stdout.includes(key), false);
+});
+
+test("the running relay logs when the shared key turns back on", async () => {
+  const dirs = await relayDirs();
+  const seen = [];
+  const write = console.error;
+  console.error = (line) => seen.push(String(line));
+  const relay = await boot(dirs, { devicePollMs: 40 });
+  const mac = await issueDevice(dirs.data, "Mac");
+  try {
+    await retireSharedKey(dirs.data);
+    const off = await connect(relay.url, TOKEN);
+    assert.equal(off.status, 401);
+    await restoreSharedKey(dirs.data);
+    const deadline = Date.now() + 2000;
+    let logged = false;
+    while (Date.now() < deadline) {
+      if (seen.join("\n").includes("the shared key can open a connection again")) {
+        logged = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    assert.equal(logged, true);
+    const on = await connect(relay.url, TOKEN);
+    assert.equal(on.opened, true);
+    on.socket.close();
+    const logs = seen.join("\n");
+    assert.equal(logs.includes(mac.key), false);
+    assert.equal(logs.includes(TOKEN), false);
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+});
+
+test("a hosted relay refuses to start while the shared key is on", async () => {
+  const dirs = await relayDirs();
+  await assert.rejects(boot(dirs, { behindProxy: true }), /allow-shared-key-behind-proxy/);
+  await issueDevice(dirs.data, "Mac");
+  await retireSharedKey(dirs.data);
+  const relay = await boot(dirs, { behindProxy: true });
+  try {
+    assert.deepEqual(relay.hosts, ["127.0.0.1"]);
+    assert.equal(relay.behindProxy, true);
+    const health = await fetch(relay.healthURL);
+    assert.equal(health.status, 200);
+  } finally {
+    await relay.close();
   }
 });

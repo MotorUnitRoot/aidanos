@@ -17,6 +17,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { logSafe } from "./redact.mjs";
 
 export const DEVICE_FILE_NAME = "devices.json";
 export const DEVICE_BACKUP_NAME = "devices.json.bak";
@@ -241,8 +242,9 @@ export async function writeDeviceBytes(dataDir, bytes) {
   await writeDurableFile(dataDir, DEVICE_FILE_NAME, bytes);
   try {
     await writeDurableFile(dataDir, DEVICE_BACKUP_NAME, bytes);
-  } catch {
+  } catch (error) {
     // The live file is already in place. The backup is not used on its own.
+    logSafe([], "device backup was not saved:", error instanceof Error ? error.message : "error");
   }
 }
 
@@ -555,22 +557,35 @@ export async function reenableSharedKey(dataDir) {
       broken = true;
     }
     if (broken) {
-      await moveDeviceFileAside(dataDir);
+      const moved = await moveDeviceFileAside(dataDir);
       await writeDevicePolicy(dataDir, { devicesIssued: false, sharedRetired: false });
-      return;
+      if (moved) {
+        return "Moved the device file aside and turned every device key off. The shared key can open a connection again.";
+      }
+      return "The device file is missing. The shared key can open a connection again. Device keys stay off.";
     }
     if (!current) {
       await writeDevicePolicy(dataDir, { devicesIssued: false, sharedRetired: false });
-      return;
+      return "The device file is missing. The shared key can open a connection again. Device keys stay off.";
     }
     current.shared = "active";
     await writeRecord(dataDir, current);
     await writeDevicePolicy(dataDir, { devicesIssued: current.devices.length > 0, sharedRetired: false });
+    return "The shared key can open a connection again. Existing device keys were kept.";
   });
 }
 
 export async function restoreDeviceFile(dataDir) {
   return withDeviceLock(dataDir, async () => {
+    let live;
+    try {
+      live = await readDeviceFile(dataDir);
+    } catch {
+      live = undefined;
+    }
+    if (live) {
+      throw new Error("The device file is already readable. The relay will not replace it.");
+    }
     const backup = await readBackupBytes(dataDir);
     if (!backup) throw new Error("There is no saved device file to restore.");
     let record;
@@ -620,10 +635,10 @@ async function moveDeviceFileAside(dataDir) {
   try {
     info = await fs.lstat(file);
   } catch (error) {
-    if (error && error.code === "ENOENT") return;
+    if (error && error.code === "ENOENT") return "";
     throw new Error("The device file could not be moved aside.");
   }
-  if (!info) return;
+  if (!info) return "";
   const aside = path.join(dataDir, "devices.json.aside");
   let dest = aside;
   try {
@@ -637,4 +652,5 @@ async function moveDeviceFileAside(dataDir) {
   } catch {
     throw new Error("The device file could not be moved aside.");
   }
+  return dest;
 }

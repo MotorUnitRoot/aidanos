@@ -106,7 +106,9 @@ The earlier single shared key is still how the relay starts. It is read from `AI
 
 Whether any device key has been issued, and whether the shared key is retired, also lives in `device-policy` in the relay data folder. A notes reset does not delete that file or `devices.json`. If device keys were issued and `devices.json` is missing or unreadable, the relay refuses to start. Deleting `devices.json` does not turn the shared key back on, and `--restore-shared-key` will not either while the file is missing. `--reenable-shared-key` is the command that turns the shared key back on in that case. `devices.json.bak` is a copy of the fingerprints for `--restore-device-file`. The relay does not read that copy on its own, and restoring it does not turn a retired shared key back on.
 
-Removing a device closes a connection that is already open with that key. The relay notices within a few seconds. While the shared key can still open a connection, the relay says so when it starts. Issue a key from a terminal you are watching. A service or a container would keep that one printed line in its logs.
+Removing a device closes a connection that is already open with that key. The relay notices within a few seconds. While the shared key can still open a connection, the relay says so when it starts. Issue a key from a terminal you are watching. If stdout is not a terminal, the relay refuses to print the key unless `--print-key-anyway` is passed. A service or a container would keep that one printed line in its logs.
+
+The id file beside the notes folder gains a line, `keys-issued yes`, once a device key exists. If that line says yes and both `devices.json` and `device-policy` are missing, the relay refuses to start until `--init-devices`. Deleting those two files while the relay is running does not turn the shared key back on. The process remembers that keys were issued, or that the shared key was retired, until it exits.
 
 Commands that add, remove, retire, or restore a key need that same shared key to be configured, so the relay will not run them with no key at all. They still do not print it. The steps are in `docs/native/TRY-IT.md`.
 

@@ -1,6 +1,24 @@
 @testable import AidanCore
 import Foundation
 import XCTest
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
+
+/// Diagnostic only. Thread CPU time in seconds, or -1 when the clock cannot be read.
+private func threadCPUTime() -> TimeInterval {
+    var time = timespec()
+    guard clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) == 0 else { return -1 }
+    return TimeInterval(time.tv_sec) + TimeInterval(time.tv_nsec) / 1_000_000_000
+}
+
+/// Diagnostic only. Nothing here is asserted.
+private func printCPU(_ label: String, wall: TimeInterval, cpu: TimeInterval) {
+    print("reader-cpu \(label) wall=\(wall) cpu=\(cpu)")
+    fflush(stdout)
+}
 
 /// Cases 1–8, 11, 15–17, 25, 26–31, 34, 35, 41–43, 47, 55, 62, and 65.
 /// Each one is loaded from fixtures/external-format and read by ExternalFormatReader.
@@ -378,9 +396,11 @@ final class ExternalFormatReaderTests: XCTestCase {
     func testUnclosedBracketLineStaysWithinTheTimeBound() {
         let line = String(repeating: "[", count: 1_000_000)
         let started = Date()
+        let cpuStarted = threadCPUTime()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing bracket-bound \(elapsed)")
+        printCPU("bracket-bound", wall: elapsed, cpu: threadCPUTime() - cpuStarted)
         XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
@@ -758,9 +778,11 @@ final class ExternalFormatReaderTests: XCTestCase {
     func testRejectedWikiLineStaysWithinTheTimeBound() {
         let line = String(repeating: "[[#", count: 350_000) + "]]"
         let started = Date()
+        let cpuStarted = threadCPUTime()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing wiki-bound \(elapsed)")
+        printCPU("wiki-bound", wall: elapsed, cpu: threadCPUTime() - cpuStarted)
         XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
@@ -769,9 +791,11 @@ final class ExternalFormatReaderTests: XCTestCase {
     func testUnclosedMentionParenStaysWithinTheTimeBound() {
         let line = String(repeating: "@a(", count: 350_000)
         let started = Date()
+        let cpuStarted = threadCPUTime()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing mention-bound \(elapsed)")
+        printCPU("mention-bound", wall: elapsed, cpu: threadCPUTime() - cpuStarted)
         XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
@@ -793,9 +817,11 @@ final class ExternalFormatReaderTests: XCTestCase {
     func testClosedMentionParenStaysWithinTheTimeBound() {
         let line = String(repeating: "@a(", count: 350_000) + ")"
         let started = Date()
+        let cpuStarted = threadCPUTime()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing mention-closed-bound \(elapsed)")
+        printCPU("mention-closed-bound", wall: elapsed, cpu: threadCPUTime() - cpuStarted)
         XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
@@ -816,9 +842,11 @@ final class ExternalFormatReaderTests: XCTestCase {
     func testClosedBracketLineStaysWithinTheTimeBound() {
         let line = String(repeating: "[a", count: 350_000) + "]"
         let started = Date()
+        let cpuStarted = threadCPUTime()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing bracket-closed-bound \(elapsed)")
+        printCPU("bracket-closed-bound", wall: elapsed, cpu: threadCPUTime() - cpuStarted)
         XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
@@ -857,9 +885,13 @@ final class ExternalFormatReaderTests: XCTestCase {
         ]
         var measured: [(String, Int, Int)] = []
         for (name, make) in samples {
+            let started = Date()
+            let cpuStarted = threadCPUTime()
             let once = scanWork(make(count))
             let twice = scanWork(make(count * 2))
+            let elapsed = Date().timeIntervalSince(started)
             print("reader-work \(name) \(once) \(twice) \(Double(twice) / Double(once))")
+            printCPU("scan-\(name)", wall: elapsed, cpu: threadCPUTime() - cpuStarted)
             measured.append((name, once, twice))
         }
         for (name, once, twice) in measured {
@@ -877,9 +909,11 @@ final class ExternalFormatReaderTests: XCTestCase {
     func testNonEnglishLineStaysWithinTheTimeBound() {
         let line = "é" + String(repeating: "@a(", count: 350_000)
         let started = Date()
+        let cpuStarted = threadCPUTime()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing non-english-bound \(elapsed)")
+        printCPU("non-english-bound", wall: elapsed, cpu: threadCPUTime() - cpuStarted)
         XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)

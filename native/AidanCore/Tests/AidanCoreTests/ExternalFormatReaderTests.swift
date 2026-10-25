@@ -2,13 +2,13 @@
 import Foundation
 import XCTest
 
-/// Cases 1–8, 11, 15–17, 25, 26–31, 34, 35, 41–43, 47, 55, 62, and 65.
+/// Cases 1–8, 11, 15–18, 25, 26–31, 34, 35, 41–43, 47, 52, 55, 58, 59, 61, 62, and 65.
 /// Each one is loaded from fixtures/external-format and read by ExternalFormatReader.
-/// Other active cases stay as fixture files. Guessed and Unknown cases stay out of this list.
+/// Case 64 stays a fixture file. Guessed and Unknown cases stay out of this list.
 final class ExternalFormatReaderTests: XCTestCase {
     private let checkedCaseNumbers = [
-        1, 2, 3, 4, 5, 6, 7, 8, 11, 15, 16, 17, 25, 26, 27, 28, 29, 30, 31, 34, 35,
-        41, 42, 43, 47, 55, 62, 65,
+        1, 2, 3, 4, 5, 6, 7, 8, 11, 15, 16, 17, 18, 25, 26, 27, 28, 29, 30, 31, 34, 35,
+        41, 42, 43, 47, 52, 55, 58, 59, 61, 62, 65,
     ]
 
     /// Any day after 2017-01-10 and on or before 2031-03-03 gives the same list
@@ -17,7 +17,7 @@ final class ExternalFormatReaderTests: XCTestCase {
 
     func testCheckedCasesAreTheActiveFixtureFiles() throws {
         XCTAssertEqual(Set(checkedCaseNumbers).count, checkedCaseNumbers.count)
-        XCTAssertEqual(checkedCaseNumbers.count, 28)
+        XCTAssertEqual(checkedCaseNumbers.count, 33)
         let root: URL
         do {
             root = try fixturesRoot()
@@ -38,7 +38,7 @@ final class ExternalFormatReaderTests: XCTestCase {
             XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "missing case \(number)")
         }
         let fixtureOnly = active.subtracting(checkedCaseNumbers)
-        XCTAssertEqual(fixtureOnly, [18, 52, 58, 59, 61, 64])
+        XCTAssertEqual(fixtureOnly, [64])
     }
 
     func testProjectAndDayLabels() {
@@ -126,6 +126,21 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(line.scheduleDates, [date(2017, 1, 10)])
         XCTAssertEqual(line.referencedDays, [date(2017, 1, 10)])
         XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .overdue)
+        XCTAssertTrue(ExternalFormatReader.references(line, on: date(2017, 1, 10)))
+        let listed = ExternalFormatReader.viewListing(of: line, on: sessionDay, in: .project)
+        XCTAssertEqual(listed.calendar, .open)
+        XCTAssertEqual(listed.notes, .scheduled)
+        XCTAssertTrue(listed.staysInOverdue)
+        XCTAssertEqual(listed.date, date(2017, 1, 10))
+        XCTAssertFalse(line.carriesToday)
+        let opened = ExternalFormatReader.openDay(
+            existingText: nil,
+            template: nil,
+            earlierNotes: [],
+            today: sessionDay
+        )
+        XCTAssertEqual(opened.text, "")
+        XCTAssertTrue(opened.broughtLines.isEmpty)
     }
 
     func testCase16DayScheduleDoesNotMakeAReference() throws {
@@ -278,6 +293,16 @@ final class ExternalFormatReaderTests: XCTestCase {
             ExternalFormatReader.placement(of: line, on: sessionDay, in: note.context),
             .overdue
         )
+        XCTAssertTrue(ExternalFormatReader.dayCountsAsOverdue(note, on: sessionDay))
+        let opened = ExternalFormatReader.openDay(
+            existingText: nil,
+            template: nil,
+            earlierNotes: [ExternalDayText(day: date(2017, 1, 9), text: fixture.input)],
+            today: sessionDay
+        )
+        XCTAssertEqual(opened.text, "")
+        XCTAssertTrue(opened.broughtLines.isEmpty)
+        XCTAssertFalse(opened.text.contains("left behind"))
     }
 
     func testCase62FutureDateIsUpcoming() throws {
@@ -286,6 +311,209 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(line.kind, .openTask)
         XCTAssertEqual(line.scheduleDates, [date(2031, 3, 3)])
         XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .upcoming)
+    }
+
+    func testCase18TodayTagFollowsTheRealCurrentDay() throws {
+        let (fixture, line) = try oneLine(18)
+        XCTAssertEqual(fixture.expected, "Shows in the session day's references, and on each later day until done")
+        XCTAssertEqual(line.kind, .openTask)
+        XCTAssertTrue(line.countsAsOpen)
+        XCTAssertTrue(line.carriesToday)
+        XCTAssertTrue(line.scheduleDates.isEmpty)
+        XCTAssertTrue(line.referencedDays.isEmpty)
+        let clock = FixedDayClock(today: sessionDay)
+        XCTAssertEqual(
+            ExternalFormatReader.placement(of: line, on: sessionDay, in: .project, clock: clock),
+            .upcoming
+        )
+        let listed = ExternalFormatReader.viewListing(of: line, on: sessionDay, in: .project, clock: clock)
+        XCTAssertEqual(listed.calendar, .open)
+        XCTAssertEqual(listed.notes, .open)
+        XCTAssertFalse(listed.staysInOverdue)
+        XCTAssertEqual(
+            ExternalFormatReader.viewListing(of: line, on: date(2031, 3, 3), in: .project, clock: clock).calendar,
+            .unlisted
+        )
+        XCTAssertTrue(ExternalFormatReader.references(line, on: sessionDay, clock: clock))
+        XCTAssertFalse(ExternalFormatReader.references(line, on: date(2031, 3, 3), clock: clock))
+        let nextDay = FixedDayClock(today: date(2026, 10, 25))
+        XCTAssertTrue(ExternalFormatReader.references(line, on: date(2026, 10, 25), clock: nextDay))
+        XCTAssertFalse(ExternalFormatReader.references(line, on: sessionDay, clock: nextDay))
+        let pastNote = ExternalFormatReader.read("* x >today", in: .day(date(2017, 1, 9))).lines[0]
+        XCTAssertTrue(pastNote.carriesToday)
+        XCTAssertEqual(
+            ExternalFormatReader.placement(of: pastNote, on: sessionDay, in: .day(date(2017, 1, 9)), clock: clock),
+            .upcoming
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.placement(of: pastNote, on: date(2017, 1, 9), in: .day(date(2017, 1, 9)), clock: clock),
+            .unlisted
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.viewListing(of: pastNote, on: sessionDay, in: .day(date(2017, 1, 9)), clock: clock).calendar,
+            .open
+        )
+        XCTAssertFalse(ExternalFormatReader.references(pastNote, on: date(2017, 1, 9), clock: clock))
+        XCTAssertTrue(ExternalFormatReader.references(pastNote, on: sessionDay, clock: clock))
+        let done = ExternalFormatReader.read("* [x] Water fake plants >today", in: .project).lines[0]
+        XCTAssertEqual(done.kind, .doneTask)
+        XCTAssertFalse(done.carriesToday)
+        XCTAssertFalse(ExternalFormatReader.references(done, on: sessionDay, clock: clock))
+        let bullet = ExternalFormatReader.read("- Water fake plants >today", in: .project).lines[0]
+        XCTAssertEqual(bullet.kind, .bullet)
+        XCTAssertTrue(bullet.carriesToday)
+        XCTAssertTrue(ExternalFormatReader.references(bullet, on: sessionDay, clock: clock))
+        let instant = Date()
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = .current
+        var buddhist = Calendar(identifier: .buddhist)
+        buddhist.timeZone = .current
+        buddhist.locale = Locale(identifier: "th_TH")
+        var japanese = Calendar(identifier: .japanese)
+        japanese.timeZone = .current
+        japanese.locale = Locale(identifier: "ja_JP")
+        let before = gregorian.dateComponents([.year, .month, .day], from: instant)
+        let real = ExternalSystemDayClock().today
+        let after = gregorian.dateComponents([.year, .month, .day], from: Date())
+        let matchesBefore = real.year == before.year && real.month == before.month && real.day == before.day
+        let matchesAfter = real.year == after.year && real.month == after.month && real.day == after.day
+        XCTAssertTrue(matchesBefore || matchesAfter)
+        XCTAssertGreaterThan(real.year, 2000)
+        XCTAssertEqual(String(real.year).count, 4)
+        XCTAssertNotEqual(real.year, buddhist.component(.year, from: instant))
+        XCTAssertNotEqual(real.year, japanese.component(.year, from: instant))
+    }
+
+    func testGregorianDayIgnoresABuddhistOrJapaneseCalendar() {
+        let instant = Date()
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = .current
+        var buddhist = Calendar(identifier: .buddhist)
+        buddhist.timeZone = .current
+        buddhist.locale = Locale(identifier: "th_TH")
+        var japanese = Calendar(identifier: .japanese)
+        japanese.timeZone = .current
+        japanese.locale = Locale(identifier: "ja_JP")
+        let expected = gregorian.dateComponents([.year, .month, .day], from: instant)
+        for foreign in [buddhist, japanese] {
+            let day = ExternalSystemDayClock.gregorianDay(of: instant, in: .current, ignoring: foreign)
+            XCTAssertEqual(day.year, expected.year)
+            XCTAssertEqual(day.month, expected.month)
+            XCTAssertEqual(day.day, expected.day)
+            XCTAssertNotEqual(day.year, foreign.component(.year, from: instant))
+        }
+    }
+
+    func testCase52ScheduleByCopyWritesBothLines() throws {
+        let fixture = try loadFixture(52)
+        XCTAssertEqual(fixture.expected, "Jan 9: [>] with >2017-01-10; Jan 10: open copy with <2017-01-09")
+        let result = ExternalFormatReader.bringForward(
+            line: "* Fake move once",
+            in: .day(date(2017, 1, 9)),
+            to: date(2017, 1, 10),
+            mode: .scheduleByCopy
+        )
+        guard case .edited(sourceLine: let source, addedLine: let added) = result else {
+            return XCTFail("case 52 did not edit the line")
+        }
+        let sourceLine = try XCTUnwrap(source)
+        let addedLine = try XCTUnwrap(added)
+        XCTAssertEqual(sourceLine, "* [>] Fake move once >2017-01-10")
+        XCTAssertEqual(addedLine, "* Fake move once <2017-01-09")
+        let original = ExternalFormatReader.read(sourceLine, in: .day(date(2017, 1, 9))).lines[0]
+        XCTAssertEqual(original.kind, .scheduledTask)
+        XCTAssertFalse(original.countsAsOpen)
+        XCTAssertEqual(original.scheduleDates, [date(2017, 1, 10)])
+        XCTAssertTrue(original.broughtFromDays.isEmpty)
+        let copy = ExternalFormatReader.read(addedLine, in: .day(date(2017, 1, 10))).lines[0]
+        XCTAssertEqual(copy.kind, .openTask)
+        XCTAssertTrue(copy.countsAsOpen)
+        XCTAssertEqual(copy.broughtFromDays, [date(2017, 1, 9)])
+        XCTAssertTrue(copy.scheduleDates.isEmpty)
+    }
+
+    func testCase58OpeningAnEmptyDayCopiesNothing() throws {
+        let fixture = try loadFixture(58)
+        XCTAssertEqual(
+            fixture.expected,
+            "If an auto-insert daily template exists, it is inserted; otherwise empty; no tasks from earlier days appear by themselves"
+        )
+        let earlier = [
+            ExternalDayText(day: date(2017, 1, 9), text: "* Fake left behind"),
+            ExternalDayText(day: date(2017, 1, 10), text: "* [ ] Another open task"),
+        ]
+        let opened = ExternalFormatReader.openDay(
+            existingText: nil,
+            template: nil,
+            earlierNotes: earlier,
+            today: date(2017, 1, 13)
+        )
+        XCTAssertEqual(opened.text, "")
+        XCTAssertTrue(opened.broughtLines.isEmpty)
+        let template = "* From the caller template"
+        let inserted = ExternalFormatReader.openDay(
+            existingText: nil,
+            template: template,
+            earlierNotes: earlier,
+            today: date(2017, 1, 13)
+        )
+        XCTAssertEqual(inserted.text, template)
+        XCTAssertTrue(inserted.broughtLines.isEmpty)
+        XCTAssertFalse(inserted.text.contains("Fake left behind"))
+        let existing = ExternalFormatReader.openDay(
+            existingText: "* Already written",
+            template: template,
+            earlierNotes: earlier,
+            today: date(2017, 1, 13)
+        )
+        XCTAssertEqual(existing.text, "* Already written")
+        XCTAssertTrue(existing.broughtLines.isEmpty)
+    }
+
+    func testCase59WeeklyTaskReferencesThePassedDays() throws {
+        let fixture = try loadFixture(59)
+        XCTAssertEqual(fixture.expected, "Shows in references of each day Jan 9 to 15, 2017")
+        let days = (9...15).map { date(2017, 1, $0) }
+        let week = ExternalFormatReader.readWeekly(fixture.input, containing: date(2017, 1, 11))
+        XCTAssertEqual(week.days, days)
+        XCTAssertEqual(week.lines.count, 1)
+        XCTAssertEqual(week.lines[0].kind, .openTask)
+        XCTAssertEqual(week.lines[0].referencedDays, days)
+        for day in days {
+            XCTAssertTrue(ExternalFormatReader.references(week.lines[0], on: day))
+        }
+        XCTAssertFalse(ExternalFormatReader.references(week.lines[0], on: date(2017, 1, 8)))
+        XCTAssertFalse(ExternalFormatReader.references(week.lines[0], on: date(2017, 1, 16)))
+    }
+
+    func testWeeklyNoteWithASundayStartListsEveryItem() {
+        let text = "* Open item\n* [x] Done item\n- Bullet item\n"
+        let week = ExternalFormatReader.readWeekly(
+            text,
+            containing: date(2017, 1, 9),
+            weekStart: ExternalWeekStart(firstDay: .sunday)
+        )
+        let days = (8...14).map { date(2017, 1, $0) }
+        XCTAssertEqual(week.days, days)
+        XCTAssertEqual(week.lines.count, 3)
+        XCTAssertEqual(week.lines[0].kind, .openTask)
+        XCTAssertEqual(week.lines[1].kind, .doneTask)
+        XCTAssertEqual(week.lines[2].kind, .bullet)
+        for line in week.lines {
+            XCTAssertEqual(line.referencedDays, days)
+        }
+        XCTAssertFalse(week.lines[0].referencedDays.contains(date(2017, 1, 15)))
+    }
+
+    func testCase61OpenChecklistDoesNotMakeTheDayOverdue() throws {
+        let (fixture, line, note) = try oneLineNote(61)
+        XCTAssertEqual(fixture.expected, "Not in Overdue; does not make the day count as overdue on iPhone")
+        XCTAssertEqual(note.context, .day(date(2017, 1, 9)))
+        XCTAssertEqual(line.kind, .openChecklist)
+        XCTAssertFalse(line.countsAsOpen)
+        XCTAssertTrue(line.leftOutOfOverdue)
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: note.context), .unlisted)
+        XCTAssertFalse(ExternalFormatReader.dayCountsAsOverdue(note, on: sessionDay))
     }
 
     func testCase65MarkdownLinkShowsItsWords() throws {
@@ -381,7 +609,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing bracket-bound \(elapsed)")
-        XCTAssertLessThan(elapsed, 5)
+        XCTAssertLessThan(elapsed, readerTimeLimit())
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
@@ -575,7 +803,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(moved.kind, .scheduledTask)
         XCTAssertEqual(moved.scheduleDates, [date(2031, 3, 3)])
         XCTAssertNil(moved.timeBlock)
-        XCTAssertEqual(ExternalFormatReader.placement(of: moved, on: sessionDay, in: .project), .upcoming)
+        XCTAssertEqual(ExternalFormatReader.placement(of: moved, on: sessionDay, in: .project), .unlisted)
     }
 
     func testFenceUnsettlesPlainLinesAndBullets() {
@@ -733,6 +961,60 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(nested.wikiLinks.map(\.target), ["Note"])
     }
 
+    /// `[[#heading]]` and an empty target stay rejected. `[[Market List#Dairy]]` stays a link.
+    func testEmptyOrHashedWikiTargetKeepsTheSameReading() {
+        let hashed = ExternalFormatReader.read("[[#heading]]", in: .project).lines[0]
+        XCTAssertEqual(hashed.kind, .plain)
+        XCTAssertTrue(hashed.wikiLinks.isEmpty)
+        XCTAssertTrue(hashed.markdownLinks.isEmpty)
+        XCTAssertEqual(hashed.tags, [ExternalTag(name: "heading", parent: nil)])
+
+        let empty = ExternalFormatReader.read("[[]]", in: .project).lines[0]
+        XCTAssertEqual(empty.kind, .plain)
+        XCTAssertTrue(empty.wikiLinks.isEmpty)
+        XCTAssertTrue(empty.tags.isEmpty)
+        XCTAssertTrue(empty.markdownLinks.isEmpty)
+        XCTAssertTrue(empty.flaggedTokens.isEmpty)
+
+        let alias = ExternalFormatReader.read("[[|alias]]", in: .project).lines[0]
+        XCTAssertEqual(alias.kind, .plain)
+        XCTAssertTrue(alias.wikiLinks.isEmpty)
+        XCTAssertTrue(alias.tags.isEmpty)
+        XCTAssertTrue(alias.markdownLinks.isEmpty)
+        XCTAssertTrue(alias.flaggedTokens.isEmpty)
+
+        let titled = ExternalFormatReader.read("[[Market List#Dairy]]", in: .project).lines[0]
+        XCTAssertEqual(
+            titled.wikiLinks,
+            [ExternalWikiLink(target: "Market List", heading: "Dairy", shownText: nil, day: nil)]
+        )
+        XCTAssertTrue(titled.tags.isEmpty)
+        XCTAssertTrue(titled.markdownLinks.isEmpty)
+
+        let keycap = ExternalFormatReader.read("[[#️⃣ Notes]]", in: .project).lines[0]
+        XCTAssertEqual(
+            keycap.wikiLinks,
+            [ExternalWikiLink(target: "#️⃣ Notes", heading: nil, shownText: nil, day: nil)]
+        )
+        XCTAssertTrue(keycap.tags.isEmpty)
+        XCTAssertTrue(keycap.markdownLinks.isEmpty)
+
+        let combining = ExternalFormatReader.read("[[#\u{301}x]]", in: .project).lines[0]
+        XCTAssertEqual(
+            combining.wikiLinks,
+            [ExternalWikiLink(target: "#\u{301}x", heading: nil, shownText: nil, day: nil)]
+        )
+        XCTAssertTrue(combining.tags.isEmpty)
+        XCTAssertTrue(combining.markdownLinks.isEmpty)
+
+        for text in ["[[#heading]]", "[[]]", "[[|alias]]", "[[Market List#Dairy]]", "[[#️⃣ Notes]]", "[[#\u{301}x]]"] {
+            var work: ExternalFormatScanWork?
+            let characters = ExternalFormatReader.read(text, in: .project, work: &work, route: .characters).lines[0]
+            let bytes = ExternalFormatReader.read(text, in: .project).lines[0]
+            XCTAssertEqual(characters, bytes, text)
+        }
+    }
+
     func testLooseHashInsideAMentionKeepsTheValue() {
         let text = "See @a(item # 3)"
         let line = ExternalFormatReader.read(text, in: .project).lines[0]
@@ -761,7 +1043,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing wiki-bound \(elapsed)")
-        XCTAssertLessThan(elapsed, 5)
+        XCTAssertLessThan(elapsed, readerTimeLimit())
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
     }
@@ -772,9 +1054,354 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing mention-bound \(elapsed)")
-        XCTAssertLessThan(elapsed, 5)
+        XCTAssertLessThan(elapsed, readerTimeLimit())
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
+    }
+
+    func testCase73CopyKeepsTheTagsAndTheMention() {
+        let result = ExternalFormatReader.bringForward(
+            line: "* c66 Fake move with extras #zzmove @Zed_Tester",
+            in: .day(date(2017, 1, 9)),
+            to: date(2017, 1, 10),
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(
+            result,
+            .edited(
+                sourceLine: "* [>] c66 Fake move with extras #zzmove @Zed_Tester >2017-01-10",
+                addedLine: "* c66 Fake move with extras #zzmove @Zed_Tester <2017-01-09"
+            )
+        )
+        let added = "* c66 Fake move with extras #zzmove @Zed_Tester <2017-01-09"
+        let copy = ExternalFormatReader.read(added, in: .day(date(2017, 1, 10))).lines[0]
+        XCTAssertEqual(copy.kind, .openTask)
+        XCTAssertEqual(copy.tags, [ExternalTag(name: "zzmove", parent: nil)])
+        XCTAssertEqual(copy.mentions, [ExternalMention(name: "Zed_Tester", value: nil)])
+        XCTAssertEqual(copy.broughtFromDays, [date(2017, 1, 9)])
+    }
+
+    func testBringForwardModesAreDistinct() {
+        let line = "* Fake move once"
+        let origin = ExternalNoteContext.day(date(2017, 1, 9))
+        let target = date(2017, 1, 10)
+        let copy = ExternalFormatReader.bringForward(line: line, in: origin, to: target, mode: .scheduleByCopy)
+        let link = ExternalFormatReader.bringForward(line: line, in: origin, to: target, mode: .scheduleByLink)
+        let cut = ExternalFormatReader.bringForward(line: line, in: origin, to: target, mode: .cutAndPaste)
+        XCTAssertEqual(
+            copy,
+            .edited(sourceLine: "* [>] Fake move once >2017-01-10", addedLine: "* Fake move once <2017-01-09")
+        )
+        XCTAssertEqual(link, .edited(sourceLine: "* Fake move once [[2017-01-10]]", addedLine: nil))
+        XCTAssertEqual(cut, .edited(sourceLine: nil, addedLine: line))
+        let linked = ExternalFormatReader.read("* Fake move once [[2017-01-10]]", in: origin).lines[0]
+        XCTAssertEqual(linked.kind, .openTask)
+        XCTAssertEqual(linked.referencedDays, [target])
+        XCTAssertTrue(linked.scheduleDates.isEmpty)
+        let project = ExternalFormatReader.bringForward(
+            line: "* Send fake invoice",
+            in: .project,
+            to: date(2017, 1, 10),
+            mode: .scheduleByLink
+        )
+        XCTAssertEqual(project, .edited(sourceLine: "* Send fake invoice >2017-01-10", addedLine: nil))
+        let fromProject = ExternalFormatReader.bringForward(
+            line: "* Send fake invoice",
+            in: .project,
+            to: date(2017, 1, 10),
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(fromProject, .unsettled)
+        let boxed = ExternalFormatReader.bringForward(
+            line: "* [ ] Boxed",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(
+            boxed,
+            .edited(sourceLine: "* [>] Boxed >2017-01-10", addedLine: "* [ ] Boxed <2017-01-09")
+        )
+    }
+
+    func testScheduledSelectionCopiesAHeadingAndSkipsClosedTasks() {
+        let lines = [
+            "## Focus",
+            "* Open task",
+            "* [x] Done task",
+            "* [-] Cancelled task",
+            "* [>] Already moved >2017-01-12",
+            "+ Checklist item",
+        ]
+        let results = ExternalFormatReader.bringForward(
+            lines: lines,
+            in: .day(date(2017, 1, 9)),
+            to: date(2017, 1, 10),
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(results[0], .edited(sourceLine: "## Focus", addedLine: "## Focus"))
+        XCTAssertEqual(
+            results[1],
+            .edited(sourceLine: "* [>] Open task >2017-01-10", addedLine: "* Open task <2017-01-09")
+        )
+        XCTAssertEqual(results[2], .skipped)
+        XCTAssertEqual(results[3], .skipped)
+        XCTAssertEqual(results[4], .skipped)
+        XCTAssertEqual(results[5], .unsettled)
+        let children = ExternalFormatReader.bringForward(
+            lines: ["* Fake parent", "\t* open child", "\t* [x] done child", "\t- bullet child"],
+            in: .day(date(2017, 1, 9)),
+            to: date(2017, 1, 10),
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(children[0], .unsettled)
+        XCTAssertEqual(children[1], .unsettled)
+        XCTAssertEqual(children[2], .unsettled)
+        XCTAssertEqual(children[3], .unsettled)
+    }
+
+    func testSyncIdOrRemindOrDoneStampOnACopyStaysUnsettled() {
+        let origin = ExternalNoteContext.day(date(2017, 1, 9))
+        let target = date(2017, 1, 10)
+        let synced = ExternalFormatReader.bringForward(
+            line: "* Fake synced ^zz1abc",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(synced, .unsettled)
+        let remind = ExternalFormatReader.bringForward(
+            line: "* Call @remind(2pm)",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(remind, .unsettled)
+        let stamped = ExternalFormatReader.bringForward(
+            line: "* Mail the parcel @done(2017-01-09)",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(stamped, .unsettled)
+        let shortId = ExternalFormatReader.bringForward(
+            line: "* Fake synced ^AB12",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(shortId, .unsettled)
+        let glued = ExternalFormatReader.bringForward(
+            line: "* task^ab",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(glued, .unsettled)
+        let accented = ExternalFormatReader.bringForward(
+            line: "* Fake synced ^zz1abé",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(
+            accented,
+            .edited(
+                sourceLine: "* [>] Fake synced ^zz1abé >2017-01-10",
+                addedLine: "* Fake synced ^zz1abé <2017-01-09"
+            )
+        )
+        let notAtEnd = ExternalFormatReader.bringForward(
+            line: "* Fake ^zz1abc still open",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(
+            notAtEnd,
+            .edited(
+                sourceLine: "* [>] Fake ^zz1abc still open >2017-01-10",
+                addedLine: "* Fake ^zz1abc still open <2017-01-09"
+            )
+        )
+    }
+
+    func testMoveToTheSameDayOrAnEarlierDayStaysUnsettled() {
+        let line = "* Fake move once"
+        let origin = ExternalNoteContext.day(date(2017, 1, 10))
+        for mode in [ExternalBringForwardMode.scheduleByCopy, .scheduleByLink, .cutAndPaste] {
+            XCTAssertEqual(
+                ExternalFormatReader.bringForward(line: line, in: origin, to: date(2017, 1, 10), mode: mode),
+                .unsettled
+            )
+            XCTAssertEqual(
+                ExternalFormatReader.bringForward(line: line, in: origin, to: date(2017, 1, 9), mode: mode),
+                .unsettled
+            )
+        }
+    }
+
+    func testLinkModeLeavesAHeadingUnsettled() {
+        let result = ExternalFormatReader.bringForward(
+            line: "## Focus",
+            in: .day(date(2017, 1, 9)),
+            to: date(2017, 1, 10),
+            mode: .scheduleByLink
+        )
+        XCTAssertEqual(result, .unsettled)
+    }
+
+    func testMoveCountOfAFencedTaskStaysUnsettled() {
+        let notes = [
+            ExternalDayText(
+                day: date(2017, 1, 9),
+                text: "```\n* [>] Task >2017-01-10\n```\n"
+            ),
+        ]
+        XCTAssertNil(ExternalFormatReader.moveCount(ofLineAt: 1, on: date(2017, 1, 9), in: notes))
+    }
+
+    func testMoveCountOfALongChainStaysWithinTheTimeBound() {
+        let total = 20_000
+        var day = date(2000, 1, 1)
+        var notes: [ExternalDayText] = []
+        notes.reserveCapacity(total + 1)
+        for _ in 0..<total {
+            let next = dayAfter(day)
+            notes.append(ExternalDayText(day: day, text: "* [>] Task >" + isoDay(next)))
+            day = next
+        }
+        notes.append(ExternalDayText(day: day, text: "* Task"))
+        let started = Date()
+        let count = ExternalFormatReader.moveCount(ofLineAt: 0, on: notes[0].day, in: notes)
+        XCTAssertLessThan(Date().timeIntervalSince(started), readerTimeLimit())
+        XCTAssertEqual(count, total as Int?)
+    }
+
+    func testMoveCountFollowsScheduledLines() {
+        let once = [
+            ExternalDayText(day: date(2017, 1, 9), text: "* [>] Fake move once >2017-01-10"),
+            ExternalDayText(day: date(2017, 1, 10), text: "* Fake move once <2017-01-09"),
+        ]
+        XCTAssertEqual(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 10), in: once), 1 as Int?)
+        XCTAssertEqual(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 9), in: once), 1 as Int?)
+        let twice = [
+            ExternalDayText(day: date(2017, 1, 9), text: "* [>] Fake move once >2017-01-10"),
+            ExternalDayText(day: date(2017, 1, 10), text: "* [>] Fake move once >2017-01-11"),
+            ExternalDayText(day: date(2017, 1, 11), text: "* Fake move once <2017-01-10"),
+        ]
+        XCTAssertEqual(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 11), in: twice), 2 as Int?)
+        let twoMarksOnOneCopy = [
+            ExternalDayText(day: date(2017, 1, 9), text: "* [>] Task >2017-01-11"),
+            ExternalDayText(
+                day: date(2017, 1, 11),
+                text: "* Task <2017-01-09 <2017-01-10"
+            ),
+        ]
+        XCTAssertEqual(
+            ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 11), in: twoMarksOnOneCopy),
+            1 as Int?
+        )
+        let marksOnly = [
+            ExternalDayText(day: date(2017, 1, 11), text: "* Task <2017-01-09 <2017-01-10"),
+        ]
+        XCTAssertEqual(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 11), in: marksOnly), 0 as Int?)
+        let twoDates = [
+            ExternalDayText(day: date(2017, 1, 9), text: "* [>] Task >2017-01-10 >2017-01-11"),
+        ]
+        XCTAssertNil(ExternalFormatReader.moveCount(ofLineAt: 0, on: date(2017, 1, 9), in: twoDates))
+    }
+
+    func testCase53SecondMoveStaysUnsettled() {
+        let result = ExternalFormatReader.bringForward(
+            line: "* Fake move once <2017-01-09",
+            in: .day(date(2017, 1, 10)),
+            to: date(2017, 1, 11),
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(result, .unsettled)
+    }
+
+    func testSchedulingALineThatAlreadyHasADateStaysUnsettled() {
+        let copy = ExternalFormatReader.bringForward(
+            line: "* c67 Fake dated >2017-01-12",
+            in: .day(date(2017, 1, 9)),
+            to: date(2017, 1, 11),
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(copy, .unsettled)
+        let link = ExternalFormatReader.bringForward(
+            line: "* c67 Fake dated >2017-01-12",
+            in: .day(date(2017, 1, 9)),
+            to: date(2017, 1, 11),
+            mode: .scheduleByLink
+        )
+        XCTAssertEqual(link, .unsettled)
+    }
+
+    func testCase80DueOnThePassedDayIsUpcoming() {
+        let line = ExternalFormatReader.read("* c69 Fake due today >2026-10-24", in: .project).lines[0]
+        XCTAssertEqual(line.scheduleDates, [sessionDay])
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .upcoming)
+    }
+
+    func testCase81DueBeforeThePassedDayIsOverdue() {
+        let line = ExternalFormatReader.read("* c70 Fake due yesterday >2026-10-23", in: .project).lines[0]
+        XCTAssertEqual(line.scheduleDates, [date(2026, 10, 23)])
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .overdue)
+    }
+
+    func testCase86OpenTaskWithNoDateInAPastDayIsOverdue() {
+        let day = date(2017, 1, 16)
+        let note = ExternalFormatReader.read("* c86 zzrea left open, no date", in: .day(day))
+        XCTAssertEqual(note.lines[0].kind, .openTask)
+        XCTAssertTrue(note.lines[0].scheduleDates.isEmpty)
+        XCTAssertEqual(ExternalFormatReader.placement(of: note.lines[0], on: sessionDay, in: note.context), .overdue)
+        XCTAssertTrue(ExternalFormatReader.dayCountsAsOverdue(note, on: sessionDay))
+        let opened = ExternalFormatReader.openDay(
+            existingText: nil,
+            template: nil,
+            earlierNotes: [ExternalDayText(day: day, text: "* c86 zzrea left open, no date")],
+            today: sessionDay
+        )
+        XCTAssertEqual(opened.text, "")
+        XCTAssertTrue(opened.broughtLines.isEmpty)
+    }
+
+    func testCase90OpenCopyInAPastDayIsOverdue() {
+        let day = date(2017, 1, 17)
+        let note = ExternalFormatReader.read("* c87 zzrea move away <2017-01-16", in: .day(day))
+        XCTAssertEqual(note.lines[0].kind, .openTask)
+        XCTAssertTrue(note.lines[0].countsAsOpen)
+        XCTAssertEqual(note.lines[0].broughtFromDays, [date(2017, 1, 16)])
+        XCTAssertTrue(note.lines[0].scheduleDates.isEmpty)
+        XCTAssertEqual(ExternalFormatReader.placement(of: note.lines[0], on: sessionDay, in: note.context), .overdue)
+        XCTAssertTrue(ExternalFormatReader.dayCountsAsOverdue(note, on: sessionDay))
+    }
+
+    func testMovedAwayTaskInAProjectNoteWithAPastDateStaysUnlisted() {
+        let line = ExternalFormatReader.read("* [>] Stay in the note >2017-01-10", in: .project).lines[0]
+        XCTAssertEqual(line.kind, .scheduledTask)
+        XCTAssertFalse(line.countsAsOpen)
+        XCTAssertEqual(line.scheduleDates, [date(2017, 1, 10)])
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .unlisted)
+        let listed = ExternalFormatReader.viewListing(of: line, on: sessionDay, in: .project)
+        XCTAssertEqual(listed.calendar, .unlisted)
+        XCTAssertEqual(listed.notes, .unlisted)
+        XCTAssertFalse(listed.staysInOverdue)
+    }
+
+    func testCase123OpenPastProjectTaskIsOpenInTheCalendarAndScheduledInNotes() {
+        let line = ExternalFormatReader.read("* c123 zzrea past project >2017-01-24", in: .project).lines[0]
+        XCTAssertEqual(line.kind, .openTask)
+        XCTAssertTrue(line.countsAsOpen)
+        XCTAssertEqual(line.scheduleDates, [date(2017, 1, 24)])
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .overdue)
+        let listed = ExternalFormatReader.viewListing(of: line, on: sessionDay, in: .project)
+        XCTAssertEqual(listed.calendar, .open)
+        XCTAssertEqual(listed.notes, .scheduled)
+        XCTAssertTrue(listed.staysInOverdue)
+        XCTAssertEqual(listed.date, date(2017, 1, 24))
     }
 
     /// The same unclosed `@a(` input at N and 2N. A quadratic closer scan grows by about 4x.
@@ -796,7 +1423,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing mention-closed-bound \(elapsed)")
-        XCTAssertLessThan(elapsed, 5)
+        XCTAssertLessThan(elapsed, readerTimeLimit())
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }
@@ -819,7 +1446,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing bracket-closed-bound \(elapsed)")
-        XCTAssertLessThan(elapsed, 5)
+        XCTAssertLessThan(elapsed, readerTimeLimit())
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
@@ -835,6 +1462,17 @@ final class ExternalFormatReaderTests: XCTestCase {
         }
         print("reader-timing bracket-closed-growth \(once) \(twice) \(twice / once)")
         XCTAssertLessThanOrEqual(twice, once * 3)
+    }
+
+    /// On the paired diagnostic runs the thread's CPU time stayed under 0.65 s
+    /// while wall time stalled up to 11.7 s, and the base stalled too
+    /// (base 40149606278, PR 40149604751). Mac and Linux stay at 5 s.
+    private func readerTimeLimit() -> TimeInterval {
+        #if targetEnvironment(simulator)
+        return 30
+        #else
+        return 5
+        #endif
     }
 
     /// simulator wall-clock time varied about 6x on identical input in run 40128432168
@@ -880,7 +1518,7 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing non-english-bound \(elapsed)")
-        XCTAssertLessThan(elapsed, 5)
+        XCTAssertLessThan(elapsed, readerTimeLimit())
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }
@@ -975,7 +1613,166 @@ final class ExternalFormatReaderTests: XCTestCase {
         let project = ExternalFormatReader.read("* [>] Pay the fake water bill >2031-03-03", in: .project).lines[0]
         XCTAssertEqual(project.kind, .scheduledTask)
         XCTAssertEqual(project.scheduleDates, [date(2031, 3, 3)])
-        XCTAssertEqual(ExternalFormatReader.placement(of: project, on: sessionDay, in: .project), .upcoming)
+        XCTAssertEqual(ExternalFormatReader.placement(of: project, on: sessionDay, in: .project), .unlisted)
+        let futureListed = ExternalFormatReader.viewListing(of: project, on: sessionDay, in: .project)
+        XCTAssertEqual(futureListed.calendar, .unlisted)
+        XCTAssertEqual(futureListed.notes, .unlisted)
+    }
+
+    func testTwoScheduleDatesAddNoReferenceDays() {
+        let line = ExternalFormatReader.read(
+            "* c122 zzrea two dates >2017-01-24 >2031-03-05",
+            in: .project
+        ).lines[0]
+        XCTAssertEqual(line.scheduleDates, [date(2017, 1, 24), date(2031, 3, 5)])
+        XCTAssertTrue(line.referencedDays.isEmpty)
+        XCTAssertEqual(ExternalFormatReader.placement(of: line, on: sessionDay, in: .project), .unlisted)
+    }
+
+    func testScheduleByCopyRewritesALeadingLink() {
+        let origin = ExternalNoteContext.day(date(2017, 1, 9))
+        let target = date(2017, 1, 10)
+        let wiki = ExternalFormatReader.bringForward(
+            line: "* [[Project]] call",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(
+            wiki,
+            .edited(
+                sourceLine: "* [>] [[Project]] call >2017-01-10",
+                addedLine: "* [[Project]] call <2017-01-09"
+            )
+        )
+        let spec = ExternalFormatReader.bringForward(
+            line: "* [Spec](notes/spec) review",
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(
+            spec,
+            .edited(
+                sourceLine: "* [>] [Spec](notes/spec) review >2017-01-10",
+                addedLine: "* [Spec](notes/spec) review <2017-01-09"
+            )
+        )
+    }
+
+    func testUnsettledBringForwardPaths() {
+        let origin = ExternalNoteContext.day(date(2017, 1, 9))
+        let target = date(2017, 1, 10)
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "* One\n* Two", in: origin, to: target, mode: .scheduleByCopy),
+            .unsettled
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "* Call >today", in: origin, to: target, mode: .scheduleByCopy),
+            .unsettled
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "- Top bullet", in: origin, to: target, mode: .scheduleByCopy),
+            .unsettled
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(
+                line: "* c104 14:00 zzrea timed",
+                in: origin,
+                to: target,
+                mode: .scheduleByCopy
+            ),
+            .unsettled
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "## Focus", in: .project, to: target, mode: .scheduleByCopy),
+            .unsettled
+        )
+        let fenced = ExternalFormatReader.bringForward(
+            lines: ["```", "* Fenced task", "```"],
+            in: origin,
+            to: target,
+            mode: .scheduleByCopy
+        )
+        XCTAssertEqual(fenced, [.unsettled, .unsettled, .unsettled])
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "* Fake synced ^zz1abc", in: origin, to: target, mode: .scheduleByLink),
+            .unsettled
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(
+                line: "* Mail the parcel @done(2017-01-09)",
+                in: origin,
+                to: target,
+                mode: .scheduleByLink
+            ),
+            .unsettled
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "- Top bullet", in: origin, to: target, mode: .scheduleByLink),
+            .unsettled
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "+ Checklist item", in: origin, to: target, mode: .scheduleByLink),
+            .unsettled
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "* Task <2017-01-08", in: origin, to: target, mode: .scheduleByLink),
+            .unsettled
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "* Call >today", in: origin, to: target, mode: .scheduleByLink),
+            .unsettled
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "* [x] Done task", in: origin, to: target, mode: .scheduleByLink),
+            .skipped
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "* [-] Cancelled task", in: origin, to: target, mode: .scheduleByLink),
+            .skipped
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(
+                line: "* [>] Already moved >2017-01-12",
+                in: origin,
+                to: target,
+                mode: .scheduleByLink
+            ),
+            .skipped
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "- Top bullet", in: origin, to: target, mode: .cutAndPaste),
+            .unsettled
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "## Focus", in: origin, to: target, mode: .cutAndPaste),
+            .unsettled
+        )
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: "+ Checklist item", in: origin, to: target, mode: .cutAndPaste),
+            .unsettled
+        )
+        let done = "* [x] Done task"
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: done, in: origin, to: target, mode: .cutAndPaste),
+            .edited(sourceLine: nil, addedLine: done)
+        )
+        let cancelled = "* [-] Cancelled task"
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: cancelled, in: origin, to: target, mode: .cutAndPaste),
+            .edited(sourceLine: nil, addedLine: cancelled)
+        )
+        let scheduled = "* [>] Already moved >2017-01-12"
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: scheduled, in: origin, to: target, mode: .cutAndPaste),
+            .edited(sourceLine: nil, addedLine: scheduled)
+        )
+        let stamped = "* Mail the parcel @done(2017-01-09)"
+        XCTAssertEqual(
+            ExternalFormatReader.bringForward(line: stamped, in: origin, to: target, mode: .cutAndPaste),
+            .edited(sourceLine: nil, addedLine: stamped)
+        )
     }
 
     private func assertOpenTask(_ number: Int) throws {
@@ -1005,23 +1802,17 @@ final class ExternalFormatReaderTests: XCTestCase {
         return (fixture, note.lines[0], note)
     }
 
-    private func loadCase(_ number: Int) throws -> (FixtureCase, ExternalNoteReading) {
-        let root: URL
-        do {
-            root = try fixturesRoot()
-        } catch {
-            // The simulator cannot see the checkout. Linux and Mac package tests can.
-            #if os(iOS)
-            throw XCTSkip("The checkout fixtures are not visible from the simulator.")
-            #else
-            XCTFail("fixtures/external-format was not found from \(#filePath)")
-            throw error
-            #endif
-        }
+    private func loadFixture(_ number: Int) throws -> FixtureCase {
+        let root = try fixtureRootOrSkip()
         let url = root.appendingPathComponent("cases/\(number).json")
         let fixture = try JSONDecoder().decode(FixtureCase.self, from: Data(contentsOf: url))
         XCTAssertEqual(fixture.number, number)
         XCTAssertEqual(fixture.label, "Seen")
+        return fixture
+    }
+
+    private func loadCase(_ number: Int) throws -> (FixtureCase, ExternalNoteReading) {
+        let fixture = try loadFixture(number)
         guard let context = ExternalFormatReader.noteContext(labeled: fixtureContext(fixture.context)) else {
             XCTFail("case \(number) has no readable context \(fixture.context)")
             throw LoadError.context
@@ -1053,6 +1844,20 @@ private enum LoadError: Error {
     case context
 }
 
+private func fixtureRootOrSkip() throws -> URL {
+    do {
+        return try fixturesRoot()
+    } catch {
+        // The simulator cannot see the checkout. Linux and Mac package tests can.
+        #if os(iOS)
+        throw XCTSkip("The checkout fixtures are not visible from the simulator.")
+        #else
+        XCTFail("fixtures/external-format was not found from \(#filePath)")
+        throw error
+        #endif
+    }
+}
+
 private func fixturesRoot() throws -> URL {
     let starts = [
         URL(fileURLWithPath: #filePath),
@@ -1081,6 +1886,27 @@ private func fixtureContext(_ label: String) -> String {
     return label
 }
 
+private struct FixedDayClock: ExternalDayClock {
+    var today: ExternalDate
+}
+
 private func date(_ year: Int, _ month: Int, _ day: Int) -> ExternalDate {
     ExternalDate(year: year, month: month, day: day)
+}
+
+private func dayAfter(_ day: ExternalDate) -> ExternalDate {
+    var length = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][day.month - 1]
+    let leap = day.month == 2 && (day.year % 400 == 0 || (day.year % 100 != 0 && day.year % 4 == 0))
+    if leap { length = 29 }
+    if day.day < length {
+        return ExternalDate(year: day.year, month: day.month, day: day.day + 1)
+    }
+    if day.month < 12 {
+        return ExternalDate(year: day.year, month: day.month + 1, day: 1)
+    }
+    return ExternalDate(year: day.year + 1, month: 1, day: 1)
+}
+
+private func isoDay(_ day: ExternalDate) -> String {
+    String(format: "%04d-%02d-%02d", day.year, day.month, day.day)
 }

@@ -71,12 +71,29 @@ public enum ExternalFormatReader {
     /// typed date is upcoming. An open task with no typed date takes the day note's
     /// date: a past day is overdue, and today or a later day is upcoming.
     /// Checklist items are left out of both. A dateless task in a project note is unlisted.
+    /// An open `>today` line has no typed date. It is listed on the clock's today,
+    /// and it is not placed from the note's day.
     public static func placement(
         of line: ExternalLine,
         on sessionDay: ExternalDate,
-        in context: ExternalNoteContext
+        in context: ExternalNoteContext,
+        clock: any ExternalDayClock = ExternalSystemDayClock()
     ) -> ExternalListPlacement {
         if line.leftOutOfOverdue {
+            return .unlisted
+        }
+        if line.scheduleDates.count > 1 {
+            // AidanOS choice, pending case 122
+            return .unlisted
+        }
+        if line.carriesToday, line.scheduleDates.isEmpty {
+            if line.countsAsOpen, sessionDay == clock.today {
+                return .upcoming
+            }
+            return .unlisted
+        }
+        if line.kind == .scheduledTask, case .project = context {
+            // AidanOS choice, pending section 8B.1
             return .unlisted
         }
         if line.kind == .scheduledTask, case .day(let noteDay) = context, noteDay < sessionDay {
@@ -94,7 +111,7 @@ public enum ExternalFormatReader {
             }
             return .upcoming
         }
-        if line.countsAsOpen, case .day(let noteDay) = context {
+        if line.countsAsOpen, !line.carriesToday, case .day(let noteDay) = context {
             if noteDay < sessionDay {
                 return .overdue
             }
@@ -103,6 +120,45 @@ public enum ExternalFormatReader {
         }
         return .unlisted
     }
+
+    /// How an open dated task in a project note is listed. The calendar keeps it open and dated.
+    /// The notes list shows it only as scheduled. A past date stays overdue.
+    public static func viewListing(
+        of line: ExternalLine,
+        on sessionDay: ExternalDate,
+        in context: ExternalNoteContext,
+        clock: any ExternalDayClock = ExternalSystemDayClock()
+    ) -> ExternalViewListing {
+        if line.scheduleDates.count > 1 {
+            // AidanOS choice, pending case 122
+            return ExternalViewListing(calendar: .unlisted, notes: .unlisted, staysInOverdue: false, date: nil)
+        }
+        if case .project = context, line.countsAsOpen, let date = line.scheduleDates.first {
+            return ExternalViewListing(
+                calendar: .open,
+                notes: .scheduled,
+                staysInOverdue: date < sessionDay,
+                date: date
+            )
+        }
+        let place = placement(of: line, on: sessionDay, in: context, clock: clock)
+        let role: ExternalListRole
+        if place == .unlisted {
+            role = .unlisted
+        } else if line.kind == .scheduledTask {
+            role = .scheduled
+        } else if line.countsAsOpen {
+            role = .open
+        } else {
+            role = .unlisted
+        }
+        return ExternalViewListing(
+            calendar: role,
+            notes: role,
+            staysInOverdue: place == .overdue,
+            date: line.scheduleDates.first
+        )
+    }
 }
 
 public enum ExternalNoteContext: Equatable, Sendable {
@@ -110,7 +166,7 @@ public enum ExternalNoteContext: Equatable, Sendable {
     case day(ExternalDate)
 }
 
-public struct ExternalDate: Equatable, Comparable, Sendable {
+public struct ExternalDate: Equatable, Hashable, Comparable, Sendable {
     public var year: Int
     public var month: Int
     public var day: Int
@@ -261,6 +317,10 @@ public struct ExternalLine: Equatable, Sendable {
     public var leftOutOfOverdue: Bool
     public var completion: ExternalCompletion?
     public var scheduleDates: [ExternalDate]
+    /// Days named by `<YYYY-MM-DD`. They mark where a copy came from. They are not a schedule.
+    public var broughtFromDays: [ExternalDate]
+    /// `>today` is on the line and the line is not done, so the reference is the real current day.
+    public var carriesToday: Bool
     public var referencedDays: [ExternalDate]
     public var timeBlock: ExternalTimeBlock?
     public var tags: [ExternalTag]
@@ -278,6 +338,8 @@ public struct ExternalLine: Equatable, Sendable {
         leftOutOfOverdue: Bool,
         completion: ExternalCompletion?,
         scheduleDates: [ExternalDate],
+        broughtFromDays: [ExternalDate] = [],
+        carriesToday: Bool = false,
         referencedDays: [ExternalDate],
         timeBlock: ExternalTimeBlock?,
         tags: [ExternalTag],
@@ -293,6 +355,8 @@ public struct ExternalLine: Equatable, Sendable {
         self.leftOutOfOverdue = leftOutOfOverdue
         self.completion = completion
         self.scheduleDates = scheduleDates
+        self.broughtFromDays = broughtFromDays
+        self.carriesToday = carriesToday
         self.referencedDays = referencedDays
         self.timeBlock = timeBlock
         self.tags = tags
@@ -320,11 +384,42 @@ public enum ExternalListPlacement: Equatable, Sendable {
     case unlisted
 }
 
+public enum ExternalListRole: Equatable, Sendable {
+    case open
+    case scheduled
+    case unlisted
+}
+
+public struct ExternalViewListing: Equatable, Sendable {
+    public var calendar: ExternalListRole
+    public var notes: ExternalListRole
+    public var staysInOverdue: Bool
+    public var date: ExternalDate?
+
+    public init(
+        calendar: ExternalListRole,
+        notes: ExternalListRole,
+        staysInOverdue: Bool,
+        date: ExternalDate?
+    ) {
+        self.calendar = calendar
+        self.notes = notes
+        self.staysInOverdue = staysInOverdue
+        self.date = date
+    }
+}
+
 private enum BoxState {
     case open
     case done
     case cancelled
     case scheduled
+}
+
+enum ExternalLeadingBox: Equatable {
+    case open
+    case closed
+    case none
 }
 
 private struct InlineMarks {
@@ -333,6 +428,8 @@ private struct InlineMarks {
     var wikiLinks: [ExternalWikiLink] = []
     var markdownLinks: [ExternalMarkdownLink] = []
     var scheduleDates: [ExternalDate] = []
+    var broughtFrom: [ExternalDate] = []
+    var carriesToday = false
     var blocked: [Range<Int>] = []
     var flaggedTokens: [String] = []
 }
@@ -374,6 +471,10 @@ private struct FoundClock {
 }
 
 extension ExternalFormatReader {
+    static func paragraphs(in text: String) -> [String] {
+        splitLines(text)
+    }
+
     /// `\r\n` is one Swift character, so a split on `"\n"` leaves that pair intact.
     /// Walk the scalars and break on `\n`, `\r\n`, and a lone `\r`.
     fileprivate static func splitLines(_ text: String) -> [String] {
@@ -502,6 +603,17 @@ extension ExternalFormatReader {
         return (nil, content)
     }
 
+    static func leadingBox(_ content: String) -> ExternalLeadingBox {
+        switch takeBox(content).0 {
+        case .open:
+            return .open
+        case .done, .cancelled, .scheduled:
+            return .closed
+        case nil:
+            return .none
+        }
+    }
+
     fileprivate static func taskKind(_ state: BoxState?) -> ExternalLineKind {
         switch state {
         case .done:
@@ -523,6 +635,8 @@ extension ExternalFormatReader {
             leftOutOfOverdue: false,
             completion: nil,
             scheduleDates: [],
+            broughtFromDays: [],
+            carriesToday: false,
             referencedDays: [],
             timeBlock: nil,
             tags: [],
@@ -549,6 +663,12 @@ extension ExternalFormatReader {
         let closed = resolved == .doneTask || resolved == .cancelledTask || resolved == .scheduledTask
         let block = (unsettled || closed) ? nil : timeBlock(in: content, marks: marks, kind: resolved, context: context)
         let completion = unsettled ? nil : marks.mentions.first { $0.name == "done" }?.value.flatMap(readCompletion)
+        // AidanOS choice, pending section 3.4: the words name a task or a bullet, and they stop at done.
+        // A cancelled line is not done, so the tag still follows the real current day. A checklist is neither.
+        let carriesToday = !unsettled
+            && marks.carriesToday
+            && resolved != .doneTask
+            && (resolved.isTask || resolved == .bullet)
         return ExternalLine(
             kind: resolved,
             indentTabs: indent,
@@ -556,6 +676,8 @@ extension ExternalFormatReader {
             leftOutOfOverdue: resolved == .openChecklist || resolved == .unsettled,
             completion: completion,
             scheduleDates: unsettled ? [] : marks.scheduleDates,
+            broughtFromDays: unsettled ? [] : marks.broughtFrom,
+            carriesToday: carriesToday,
             referencedDays: unsettled ? [] : references(marks: marks, kind: resolved, context: context),
             timeBlock: block,
             tags: unsettled ? [] : marks.tags,
@@ -575,6 +697,8 @@ extension ExternalFormatReader {
         line.leftOutOfOverdue = true
         line.completion = nil
         line.scheduleDates = []
+        line.broughtFromDays = []
+        line.carriesToday = false
         line.referencedDays = []
         line.timeBlock = nil
         line.tags = []
@@ -629,7 +753,8 @@ extension ExternalFormatReader {
             }
         }
         if kind.isTask, case .project = context {
-            for date in marks.scheduleDates where !days.contains(date) {
+            // AidanOS choice, pending case 122: two or more schedule dates add no reference days.
+            if marks.scheduleDates.count == 1, let date = marks.scheduleDates.first, !days.contains(date) {
                 days.append(date)
             }
         }
@@ -650,7 +775,12 @@ extension ExternalFormatReader {
         case .day(let contextDay):
             day = contextDay
         case .project:
-            day = marks.scheduleDates.first
+            if marks.scheduleDates.count == 1 {
+                day = marks.scheduleDates.first
+            } else {
+                // AidanOS choice, pending case 122
+                day = nil
+            }
         }
         guard let day else { return nil }
         return ExternalTimeBlock(
@@ -772,6 +902,17 @@ extension ExternalFormatReader {
                     continue
                 }
             }
+            if chars[index] == ">", boundaryBefore(chars, index), isTodayWord(chars, at: index + 1) {
+                marks.carriesToday = true
+                index += 1 + "today".count
+                continue
+            }
+            if chars[index] == "<", boundaryBefore(chars, index),
+               let (date, end) = readISODate(chars, at: index + 1) {
+                marks.broughtFrom.append(date)
+                index = end
+                continue
+            }
             if chars[index] == ">", boundaryBefore(chars, index),
                let (date, end) = readISODate(chars, at: index + 1) {
                 marks.scheduleDates.append(date)
@@ -856,6 +997,17 @@ extension ExternalFormatReader {
                     index = range.upperBound
                     continue
                 }
+            }
+            if bytes[index] == 62, boundaryBeforeASCII(bytes, index), isTodayWordASCII(bytes, at: index + 1) {
+                marks.carriesToday = true
+                index += 1 + 5
+                continue
+            }
+            if bytes[index] == 60, boundaryBeforeASCII(bytes, index),
+               let (date, end) = readISODateASCII(bytes, at: index + 1) {
+                marks.broughtFrom.append(date)
+                index = end
+                continue
             }
             if bytes[index] == 62, boundaryBeforeASCII(bytes, index),
                let (date, end) = readISODateASCII(bytes, at: index + 1) {
@@ -1188,6 +1340,17 @@ extension ExternalFormatReader {
         index == 0 || bytes[index - 1] == 32 || bytes[index - 1] == 9
     }
 
+    fileprivate static func isTodayWordASCII(_ bytes: [UInt8], at start: Int) -> Bool {
+        let word = Array("today".utf8)
+        guard start + word.count <= bytes.count else { return false }
+        for offset in word.indices where bytes[start + offset] != word[offset] {
+            return false
+        }
+        let end = start + word.count
+        if end < bytes.count, isWordByte(bytes[end]) { return false }
+        return true
+    }
+
     fileprivate static func readWiki(
         _ chars: [Character],
         at start: Int,
@@ -1254,6 +1417,9 @@ extension ExternalFormatReader {
     }
 
     fileprivate static func makeWiki(_ inner: String) -> ExternalWikiLink? {
+        // An empty target, or one that starts with `#`, is not a link. Decide that
+        // before trim and the split copies.
+        if wikiTargetIsEmpty(inner) { return nil }
         let trimmed = trim(inner)
         guard !trimmed.isEmpty else { return nil }
         let pipe = trimmed.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
@@ -1264,6 +1430,13 @@ extension ExternalFormatReader {
         guard !target.isEmpty else { return nil }
         let heading = hash.count == 2 ? emptyToNil(trim(hash[1])) : nil
         return ExternalWikiLink(target: target, heading: heading, shownText: shown, day: ExternalDate.parse(target))
+    }
+
+    /// The target is empty, or it starts with `#`. Leading spaces and tabs do not count.
+    /// A leading `|` leaves the target empty, as in `[[|alias]]`.
+    fileprivate static func wikiTargetIsEmpty(_ text: String) -> Bool {
+        for ch in text where ch != " " && ch != "\t" { return ch == "#" || ch == "|" }
+        return true
     }
 
     fileprivate static func readMarkdown(
@@ -1572,6 +1745,17 @@ extension ExternalFormatReader {
 
     fileprivate static func boundaryBefore(_ chars: [Character], _ index: Int) -> Bool {
         index == 0 || chars[index - 1] == " " || chars[index - 1] == "\t"
+    }
+
+    fileprivate static func isTodayWord(_ chars: [Character], at start: Int) -> Bool {
+        let word = Array("today")
+        guard start + word.count <= chars.count else { return false }
+        for offset in word.indices where chars[start + offset] != word[offset] {
+            return false
+        }
+        let end = start + word.count
+        if end < chars.count, isWordChar(chars[end]) { return false }
+        return true
     }
 
     fileprivate static func isWordChar(_ char: Character) -> Bool {

@@ -795,6 +795,29 @@ async function worktreeDir(rel, root = VAULT) {
   return safeJoin(root, cleaned);
 }
 
+async function readVaultRel(rel) {
+  try {
+    return await readFileSafe(await worktreePath(rel));
+  } catch {
+    return null;
+  }
+}
+
+async function readLogNames() {
+  let logDir;
+  try {
+    logDir = await worktreeDir("log");
+  } catch {
+    return null;
+  }
+  try {
+    return await fs.readdir(logDir);
+  } catch (e) {
+    if (e.code === "ENOENT") return [];
+    throw e;
+  }
+}
+
 // Last path part on read. resolveInside allows a target that stays in the
 // vault, including .git/config, so the git check is separate. Returns the
 // path to read: the real file for a link, the logical path otherwise.
@@ -2250,33 +2273,36 @@ function sendDayWatch(date, mtime) {
 }
 
 function startLogWatch() {
-  const logDir = path.join(VAULT, "log");
-  try {
-    fsSync.mkdirSync(logDir, { recursive: true });
-  } catch {}
-  try {
-    const watcher = fsSync.watch(logDir, { persistent: true, recursive: false }, (_eventType, filename) => {
-      if (!filename) return;
-      const name = path.basename(String(filename));
-      if (name.endsWith(".tmp")) return;
-      if (!DAY_FILE_RE.test(name)) return;
-      const date = name.slice(0, 10);
-      const logPath = path.join(logDir, name);
-      fsSync.stat(logPath, (err, st) => {
-        if (vaultGit.suppressWatch) return;
-        if (err || !st) return;
-        const mtime = Math.trunc(st.mtimeMs);
-        // Own writes are already announced by the save. Ignore the echo.
-        if (isSelfWrite(date, mtime)) return;
-        sendDayWatch(date, mtime);
+  worktreeDir("log").then((logDir) => {
+    try {
+      fsSync.mkdirSync(logDir, { recursive: true });
+    } catch {}
+    try {
+      const watcher = fsSync.watch(logDir, { persistent: true, recursive: false }, (_eventType, filename) => {
+        if (!filename) return;
+        const name = path.basename(String(filename));
+        if (name.endsWith(".tmp")) return;
+        if (!DAY_FILE_RE.test(name)) return;
+        const date = name.slice(0, 10);
+        const logPath = path.join(logDir, name);
+        fsSync.lstat(logPath, (err, st) => {
+          if (vaultGit.suppressWatch) return;
+          if (err || !st || !st.isFile()) return;
+          const mtime = Math.trunc(st.mtimeMs);
+          // Own writes are already announced by the save. Ignore the echo.
+          if (isSelfWrite(date, mtime)) return;
+          sendDayWatch(date, mtime);
+        });
       });
-    });
-    watcher.on("error", (err) => {
+      watcher.on("error", (err) => {
+        logSafe("log watch", err);
+      });
+    } catch (err) {
       logSafe("log watch", err);
-    });
-  } catch (err) {
+    }
+  }).catch((err) => {
     logSafe("log watch", err);
-  }
+  });
 }
 
 function sendFile(res, filePath, contentType) {
@@ -2358,8 +2384,7 @@ const server = http.createServer(async (req, res) => {
       else if (!isIsoDate(start)) {
         return json(res, 400, { error: "start must be YYYY-MM-DD" });
       }
-      const weekPath = path.join(VAULT, "aidanos", "weeks", `${start}.md`);
-      let raw = await readFileSafe(weekPath);
+      const raw = await readVaultRel(`aidanos/weeks/${start}.md`);
       if (!raw) {
         const days = [];
         for (let i = 0; i < 7; i++) {
@@ -2376,7 +2401,7 @@ const server = http.createServer(async (req, res) => {
       }
       const days = parseWeekMarkdown(raw, start);
       for (const d of days) {
-        const logRaw = await readFileSafe(path.join(VAULT, "log", `${d.date}.md`));
+        const logRaw = await readVaultRel(`log/${d.date}.md`);
         if (logRaw) {
           const items = parseCheckboxes(logRaw);
           d.rx_total = items.length;
@@ -2432,21 +2457,15 @@ const server = http.createServer(async (req, res) => {
         }
       }
       const prefix = `${year}-${String(month).padStart(2, "0")}-`;
-      const logDir = path.join(VAULT, "log");
-      let names = [];
-      try {
-        names = await fs.readdir(logDir);
-      } catch (e) {
-        if (e.code === "ENOENT") return json(res, 200, { year, month, days: [] });
-        throw e;
-      }
+      const names = await readLogNames();
+      if (names == null) return json(res, 200, { year, month, days: [] });
       const days = [];
       for (const name of names) {
         if (name.endsWith(".tmp")) continue;
         if (!DAY_FILE_RE.test(name)) continue;
         if (!name.startsWith(prefix)) continue;
         const date = name.slice(0, 10);
-        const raw = await readFileSafe(path.join(logDir, name));
+        const raw = await readVaultRel(`log/${name}`);
         if (raw == null) continue;
         if (!String(raw).trim()) continue;
         days.push(date);
@@ -2540,26 +2559,20 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/plan" && req.method === "GET") {
-      const raw = await readFileSafe(path.join(VAULT, "aidanos", "active-horse.md"));
+      const raw = await readVaultRel("aidanos/active-horse.md");
       return json(res, 200, { plan: parsePlan(raw), exists: Boolean(raw) });
     }
 
     if (pathname === "/api/open-tasks" && req.method === "GET") {
-      const logDir = path.join(VAULT, "log");
-      let names = [];
-      try {
-        names = await fs.readdir(logDir);
-      } catch (e) {
-        if (e.code === "ENOENT") return json(res, 200, { items: [] });
-        throw e;
-      }
+      const names = await readLogNames();
+      if (names == null) return json(res, 200, { items: [] });
       const items = [];
       names.sort((a, b) => a.localeCompare(b));
       for (const name of names) {
         if (name.endsWith(".tmp")) continue;
         if (!DAY_FILE_RE.test(name)) continue;
         const date = name.slice(0, 10);
-        const raw = await readFileSafe(path.join(logDir, name));
+        const raw = await readVaultRel(`log/${name}`);
         if (raw == null) continue;
         const lines = raw.split("\n");
         for (let i = 0; i < lines.length; i++) {
@@ -2842,8 +2855,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/skin.css" && req.method === "GET") {
-      const skinPath = path.join(VAULT, "aidanos", "skin.css");
-      const raw = await readFileSafe(skinPath);
+      const raw = await readVaultRel("aidanos/skin.css");
       res.writeHead(200, {
         "Content-Type": "text/css; charset=utf-8",
         "Cache-Control": "no-store",

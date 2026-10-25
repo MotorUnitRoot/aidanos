@@ -79,13 +79,27 @@ function checkWiring() {
   const filePut = sliceFn('pathname === "/api/file" && req.method === "PUT"', 'pathname === "/api/tree"');
   const tree = sliceFn('pathname === "/api/tree"', 'pathname === "/api/search"');
   const search = sliceFn('pathname === "/api/search"', 'pathname === "/api/day-watch"');
-  const dirFn = sliceFn("async function worktreeDir(", "async function readableTarget(");
+  const dirFn = sliceFn("async function worktreeDir(", "async function readVaultRel(");
+  const vaultRead = sliceFn("async function readVaultRel(", "async function readLogNames(");
+  const week = sliceFn('pathname === "/api/week"', 'pathname === "/api/day" && req.method === "GET"');
+  const month = sliceFn('pathname === "/api/month"', 'pathname === "/api/day" && req.method === "PUT"');
+  const tasks = sliceFn('pathname === "/api/open-tasks"', 'pathname === "/api/folders"');
+  const plan = sliceFn('pathname === "/api/plan"', 'pathname === "/api/open-tasks"');
+  const skin = sliceFn('pathname === "/api/skin.css"', "let file = pathname");
+  const watch = sliceFn("function startLogWatch(", "function sendFile(");
   assert(dayGet.includes("worktreePath"), "day read uses worktreePath");
   assert(dayPut.includes("worktreePath") && !dayPut.includes('path.join(VAULT, "log"'), "day write uses worktreePath");
   assert(fileGet.includes("worktreePath") && !fileGet.includes("resolveInside"), "file read uses worktreePath");
   assert(filePut.includes("worktreePath") && !filePut.includes("resolveInside"), "file write uses worktreePath");
   assert(tree.includes("worktreeDir") && dirFn.includes("worktreePath"), "tree checks the folder through worktreePath");
   assert(search.includes("worktreePath"), "search reads through worktreePath");
+  assert(vaultRead.includes("worktreePath"), "vault reads use worktreePath");
+  assert(week.includes("readVaultRel") && !week.includes("path.join"), "week reads use the checked path");
+  assert(month.includes("readLogNames") && month.includes("readVaultRel"), "month reads use the checked path");
+  assert(tasks.includes("readLogNames") && tasks.includes("readVaultRel"), "open tasks use the checked path");
+  assert(plan.includes("readVaultRel"), "plan reads use the checked path");
+  assert(skin.includes("readVaultRel"), "skin reads use the checked path");
+  assert(watch.includes("worktreeDir") && watch.includes("lstat"), "log watch skips a linked folder");
   assert(serverSrc.includes("worktreePath(rel, root = VAULT)"), "worktreePath keeps a two-argument signature");
 }
 
@@ -401,6 +415,7 @@ async function httpPaths() {
   fs.mkdirSync(outside);
   const outsideDay = "OUTSIDE_DAY\n";
   fs.writeFileSync(path.join(outside, "2026-01-05.md"), outsideDay);
+  fs.writeFileSync(path.join(outside, "2026-01-06.md"), "- [ ] OUTSIDE_TASK_SENTINEL\n");
   const port = 30000 + Math.floor(Math.random() * 2000);
   const child = spawnServer({
     PORT: String(port),
@@ -434,6 +449,9 @@ async function httpPaths() {
     const readDay = await fetch(base + "/api/day?date=2026-01-05");
     const dayBody = await readDay.json();
     assert(readDay.status === 200 && dayBody.markdown === "ordinary day\n", "ordinary day read failed");
+    const monthOk = await fetch(base + "/api/month?date=2026-01-05");
+    const monthOkBody = await monthOk.json();
+    assert(monthOk.status === 200 && monthOkBody.days.includes("2026-01-05"), "ordinary month failed");
     const listed = await fetch(base + "/api/tree?dir=" + encodeURIComponent("notes"));
     const listedBody = await listed.json();
     assert(listed.status === 200 && listedBody.files.includes("notes/plain.md"), "ordinary tree failed");
@@ -450,13 +468,31 @@ async function httpPaths() {
     });
     await expectRefused(dayWrite, "OUTSIDE_DAY");
     assert(fs.readFileSync(path.join(outside, "2026-01-05.md"), "utf8") === outsideDay, "outside day was written");
-    assert(fs.readdirSync(outside).join(",") === "2026-01-05.md", "outside log gained a file");
+    assert(fs.readdirSync(outside).sort().join(",") === "2026-01-05.md,2026-01-06.md", "outside log gained a file");
     await expectRefused(await fetch(base + "/api/day?date=2026-01-05"), "OUTSIDE_DAY");
     await expectRefused(
       await fetch(base + "/api/file?path=" + encodeURIComponent("log/2026-01-05.md")),
       "OUTSIDE_DAY",
     );
     await expectRefused(await fetch(base + "/api/tree?dir=" + encodeURIComponent("log")), "OUTSIDE_DAY");
+    fs.mkdirSync(path.join(vault, "aidanos", "weeks"), { recursive: true });
+    fs.writeFileSync(path.join(vault, "aidanos", "weeks", "2026-01-05.md"), "week\n");
+    const weekRes = await fetch(base + "/api/week?start=2026-01-05");
+    const weekText = await weekRes.text();
+    assert(weekRes.status === 200, "week failed");
+    assert(!weekText.includes("OUTSIDE_DAY") && !weekText.includes("OUTSIDE_TASK_SENTINEL"), "week included an outside day");
+    const weekBody = JSON.parse(weekText);
+    const tuesday = (weekBody.days || []).find((d) => d.date === "2026-01-06");
+    assert(tuesday && !tuesday.task_open && !tuesday.rx_total, "week counted an outside task");
+    const monthRes = await fetch(base + "/api/month?date=2026-01-05");
+    const monthText = await monthRes.text();
+    assert(monthRes.status === 200, "month failed");
+    assert(!monthText.includes("2026-01-05") && !monthText.includes("2026-01-06"), "month listed an outside day");
+    assert(!monthText.includes("OUTSIDE_DAY") && !monthText.includes("OUTSIDE_TASK_SENTINEL"), "month included outside text");
+    const taskRes = await fetch(base + "/api/open-tasks");
+    const taskText = await taskRes.text();
+    assert(taskRes.status === 200, "open tasks failed");
+    assert(!taskText.includes("OUTSIDE_DAY") && !taskText.includes("OUTSIDE_TASK_SENTINEL"), "open tasks included an outside task");
 
     fs.mkdirSync(path.join(vault, ".git", "info"), { recursive: true });
     fs.writeFileSync(path.join(vault, ".git", "info", "secret.md"), "GIT_SECRET\n");

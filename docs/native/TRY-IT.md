@@ -54,7 +54,7 @@ The relay is the small program both apps talk to. It keeps its own folder of not
    chmod 600 "$HOME/aidanos-relay-token"
    ```
 
-   `openssl rand -base64 32` writes a token with no spaces. The file is only readable by your user (mode 0600). A single newline at the end of that file is fine.
+   `openssl rand -base64 32` writes a token with no spaces. The file is only readable by your user (mode 0600). A single newline at the end of that file is fine. A repeated character, or a token with very little variety, is refused.
 
 4. Start the relay with its own empty folder. Do not point it at the Mac app's notes. The relay marks the folder the first time, and it writes an id file next to that folder. Leave the id file where it is. The next start has to use that same folder. A folder an older relay marked is not accepted.
 
@@ -152,7 +152,7 @@ To turn the shared token back on:
 node src/server.mjs --vault "$HOME/aidanos-relay-notes" --restore-shared-key
 ```
 
-Keep the token file. The relay still reads it in order to start, and restoring the shared key uses that same file. Deleting `devices.json` does not turn the shared key back on. Deleting `devices.json` and `device-policy` while the relay is running does not turn it back on either. If those files are missing after a device key was issued, a restart refuses to start until `--init-devices`. `--restore-shared-key` will not change that while the device file is missing. `--reenable-shared-key` is the command that turns the shared key back on when the device file is unreadable: it moves that file aside and turns every device key off. The default data folder is inside the notes, at `<vault>/.aidanos/relay`. Pass `--data` with a folder outside the notes when you want the device fingerprints kept apart from them.
+Keep the token file. The relay still reads it in order to start, and restoring the shared key uses that same file. Deleting `devices.json` does not turn the shared key back on. Deleting `devices.json` and `device-policy` while the relay is running does not turn it back on either. If those files are missing after a device key was issued, a restart refuses to start until `--init-devices`. `--list-devices` and `--issue-device` refuse in that same case unless `--init-devices` is passed. `--restore-shared-key` will not change that while the device file is missing. A relay already running with `--behind-proxy` keeps the shared key off after `--restore-shared-key` unless it was started with `--allow-shared-key-behind-proxy`. A device backup older than the last device change is refused. `--reenable-shared-key` is the command that turns the shared key back on when the device file is unreadable: it moves that file aside and turns every device key off. The default data folder is inside the notes, at `<vault>/.aidanos/relay`. Pass `--data` with a folder outside the notes when you want the device fingerprints kept apart from them.
 
 Away from home is not part of this try-out. That needs a server. It is written up in `docs/native/HOSTING.md`. It is not set up here.
 

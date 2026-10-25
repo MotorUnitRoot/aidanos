@@ -12,6 +12,8 @@
 // --reenable-shared-key (the explicit command when it is not).
 // devices.json.bak is the last good copy of the fingerprints. Nothing reads
 // it unless --restore-device-file is run. It never turns the shared key on.
+// A backup older than the revision in device-policy is refused, so a removed
+// device does not come back from a stale copy.
 
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
@@ -125,11 +127,24 @@ export function parseDeviceRecord(text) {
   }
   if (parsed.shared !== "active" && parsed.shared !== "retired") failUnreadable();
   if (!Array.isArray(parsed.devices) || parsed.devices.length > MAX_DEVICES) failUnreadable();
+  let revision = 0;
+  if (parsed.revision != null) {
+    if (!Number.isSafeInteger(parsed.revision) || parsed.revision < 0) failUnreadable();
+    revision = parsed.revision;
+  }
   return {
     version: 1,
+    revision,
     shared: parsed.shared,
     devices: parsed.devices.map(normalizeDevice),
   };
+}
+
+function bumpRevision(record) {
+  const current = record.revision == null ? 0 : record.revision;
+  if (!Number.isSafeInteger(current) || current < 0) failUnreadable();
+  record.revision = current + 1;
+  return record.revision;
 }
 
 async function statDeviceFile(dataDir) {
@@ -288,7 +303,9 @@ export async function readDevicePolicy(dataDir) {
   try {
     info = await fs.lstat(file);
   } catch (error) {
-    if (error && error.code === "ENOENT") return { exists: false, devicesIssued: false, sharedRetired: false };
+    if (error && error.code === "ENOENT") {
+    return { exists: false, devicesIssued: false, sharedRetired: false, revision: 0 };
+  }
     throw new Error("The device policy is unreadable. The relay will not start.");
   }
   if (info.isSymbolicLink() || !info.isFile()) {
@@ -311,9 +328,6 @@ export async function readDevicePolicy(dataDir) {
     await handle.close();
   }
   const lines = text.split("\n");
-  if (lines.length !== 4 || lines[3] !== "") {
-    throw new Error("The device policy is unreadable. The relay will not start.");
-  }
   if (lines[0] !== POLICY_HEADER) throw new Error("The device policy is unreadable. The relay will not start.");
   if (lines[1] !== "devices-issued yes" && lines[1] !== "devices-issued no") {
     throw new Error("The device policy is unreadable. The relay will not start.");
@@ -321,17 +335,38 @@ export async function readDevicePolicy(dataDir) {
   if (lines[2] !== "shared retired" && lines[2] !== "shared active") {
     throw new Error("The device policy is unreadable. The relay will not start.");
   }
+  let revision = 0;
+  if (lines.length === 4 && lines[3] === "") {
+    revision = 0;
+  } else if (lines.length === 5 && lines[4] === "" && /^revision (0|[1-9][0-9]*)$/.test(lines[3])) {
+    revision = Number(lines[3].slice("revision ".length));
+    if (!Number.isSafeInteger(revision)) throw new Error("The device policy is unreadable. The relay will not start.");
+  } else {
+    throw new Error("The device policy is unreadable. The relay will not start.");
+  }
   return {
     exists: true,
     devicesIssued: lines[1] === "devices-issued yes",
     sharedRetired: lines[2] === "shared retired",
+    revision,
   };
 }
 
 export async function writeDevicePolicy(dataDir, policy) {
+  const existing = await readDevicePolicy(dataDir);
+  let revision = policy && Number.isSafeInteger(policy.revision) && policy.revision >= 0 ? policy.revision : 0;
+  if (existing.revision > revision) revision = existing.revision;
   const issued = policy && policy.devicesIssued ? "yes" : "no";
   const shared = policy && policy.sharedRetired ? "retired" : "active";
-  const text = POLICY_HEADER + "\ndevices-issued " + issued + "\nshared " + shared + "\n";
+  const text =
+    POLICY_HEADER +
+    "\ndevices-issued " +
+    issued +
+    "\nshared " +
+    shared +
+    "\nrevision " +
+    String(revision) +
+    "\n";
   await writeDurableFile(dataDir, DEVICE_POLICY_NAME, Buffer.from(text, "utf8"));
 }
 
@@ -362,18 +397,32 @@ export async function reconcileDeviceState(dataDir) {
       throw new Error(MISSING_DEVICE_FILE);
     }
     if (!policy.exists && record && record.devices.length > 0) {
-      const adopted = { devicesIssued: true, sharedRetired: record.shared === "retired" };
+      const adopted = {
+        devicesIssued: true,
+        sharedRetired: record.shared === "retired",
+        revision: record.revision || 0,
+      };
       await writeDevicePolicy(dataDir, adopted);
       return { policy: { ...adopted, exists: true }, record };
     }
     if (record && record.shared === "retired" && !policy.sharedRetired) {
-      const next = { devicesIssued: true, sharedRetired: true };
+      const next = {
+        devicesIssued: true,
+        sharedRetired: true,
+        revision: Math.max(policy.revision || 0, record.revision || 0),
+      };
       await writeDevicePolicy(dataDir, next);
       return { policy: { ...next, exists: true }, record };
     }
     if (policy.sharedRetired && record && record.shared !== "retired") {
       record.shared = "retired";
+      bumpRevision(record);
       await writeRecord(dataDir, record);
+      await writeDevicePolicy(dataDir, {
+        devicesIssued: policy.devicesIssued || record.devices.length > 0,
+        sharedRetired: true,
+        revision: record.revision,
+      });
     }
     return { policy, record };
   });
@@ -451,8 +500,13 @@ export async function issueDevice(dataDir, name) {
       revokedAt: null,
     };
     current.devices.push(entry);
+    bumpRevision(current);
     await writeRecord(dataDir, current);
-    await writeDevicePolicy(dataDir, { devicesIssued: true, sharedRetired: current.shared === "retired" });
+    await writeDevicePolicy(dataDir, {
+      devicesIssued: true,
+      sharedRetired: current.shared === "retired",
+      revision: current.revision,
+    });
     const saved = await readDeviceBytes(dataDir);
     let backup = null;
     try {
@@ -500,8 +554,9 @@ export async function revokeDevice(dataDir, name) {
       if (device.name === deviceName && !device.revokedAt) device.revokedAt = now;
     }
     if (retired) current.shared = "retired";
+    bumpRevision(current);
     await writeRecord(dataDir, current);
-    await writeDevicePolicy(dataDir, { devicesIssued: true, sharedRetired: retired });
+    await writeDevicePolicy(dataDir, { devicesIssued: true, sharedRetired: retired, revision: current.revision });
     return active.map((device) => device.id);
   });
 }
@@ -519,9 +574,12 @@ export async function retireSharedKey(dataDir) {
       throw new Error("The shared key stays on until at least one device has its own key.");
     }
     // The policy is written first. A crash before the device file is updated
-    // still leaves the shared key off.
-    await writeDevicePolicy(dataDir, { devicesIssued: true, sharedRetired: true });
+    // still leaves the shared key off. The revision moves with it, so an older
+    // backup cannot be restored over this change.
+    const revision = (current.revision || 0) + 1;
+    await writeDevicePolicy(dataDir, { devicesIssued: true, sharedRetired: true, revision });
     current.shared = "retired";
+    current.revision = revision;
     await writeRecord(dataDir, current);
   });
 }
@@ -542,13 +600,19 @@ export async function restoreSharedKey(dataDir) {
       );
     }
     current.shared = "active";
+    bumpRevision(current);
     await writeRecord(dataDir, current);
-    await writeDevicePolicy(dataDir, { devicesIssued: current.devices.length > 0, sharedRetired: false });
+    await writeDevicePolicy(dataDir, {
+      devicesIssued: current.devices.length > 0,
+      sharedRetired: false,
+      revision: current.revision,
+    });
   });
 }
 
 export async function reenableSharedKey(dataDir) {
   return withDeviceLock(dataDir, async () => {
+    const policy = await readDevicePolicy(dataDir);
     let current = null;
     let broken = false;
     try {
@@ -556,21 +620,28 @@ export async function reenableSharedKey(dataDir) {
     } catch {
       broken = true;
     }
+    const currentRevision = current && Number.isSafeInteger(current.revision) ? current.revision : 0;
+    const revision = Math.max(policy.revision || 0, currentRevision) + 1;
     if (broken) {
       const moved = await moveDeviceFileAside(dataDir);
-      await writeDevicePolicy(dataDir, { devicesIssued: false, sharedRetired: false });
+      await writeDevicePolicy(dataDir, { devicesIssued: false, sharedRetired: false, revision });
       if (moved) {
         return "Moved the device file aside and turned every device key off. The shared key can open a connection again.";
       }
       return "The device file is missing. The shared key can open a connection again. Device keys stay off.";
     }
     if (!current) {
-      await writeDevicePolicy(dataDir, { devicesIssued: false, sharedRetired: false });
+      await writeDevicePolicy(dataDir, { devicesIssued: false, sharedRetired: false, revision });
       return "The device file is missing. The shared key can open a connection again. Device keys stay off.";
     }
     current.shared = "active";
+    current.revision = revision;
     await writeRecord(dataDir, current);
-    await writeDevicePolicy(dataDir, { devicesIssued: current.devices.length > 0, sharedRetired: false });
+    await writeDevicePolicy(dataDir, {
+      devicesIssued: current.devices.length > 0,
+      sharedRetired: false,
+      revision,
+    });
     return "The shared key can open a connection again. Existing device keys were kept.";
   });
 }
@@ -595,11 +666,16 @@ export async function restoreDeviceFile(dataDir) {
       throw new Error("The saved device file is unreadable. The relay will not restore it.");
     }
     const policy = await readDevicePolicy(dataDir);
+    if ((record.revision || 0) < (policy.revision || 0)) {
+      throw new Error("The saved device file is older than the last device change. The relay will not restore it.");
+    }
     if (policy.sharedRetired || record.shared === "retired") record.shared = "retired";
+    record.revision = Math.max(record.revision || 0, policy.revision || 0);
     await writeRecord(dataDir, record);
     await writeDevicePolicy(dataDir, {
       devicesIssued: true,
       sharedRetired: policy.sharedRetired || record.shared === "retired",
+      revision: record.revision,
     });
   });
 }

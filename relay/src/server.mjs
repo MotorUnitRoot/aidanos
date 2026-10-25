@@ -96,6 +96,20 @@ export function tokenWithoutTrailingNewline(raw) {
   return token;
 }
 
+// A single repeated character, or a handful of characters copied over and
+// over, is not a key. Eight different characters is the floor. The check
+// does not print the key.
+export function requireRandomToken(token) {
+  const seen = new Set();
+  for (const char of String(token)) {
+    seen.add(char);
+    if (seen.size >= 8) return;
+  }
+  throw new Error(
+    "The relay token must be at least 32 random characters. A repeated or low-variety token is refused.",
+  );
+}
+
 export function payloadLimit(value) {
   if (value == null || value === "") return MAX_PAYLOAD;
   const n = Number(value);
@@ -234,6 +248,7 @@ export async function loadToken(env = process.env) {
   if (token.length < MIN_TOKEN_LENGTH) {
     throw new Error("The relay token must be at least 32 characters.");
   }
+  requireRandomToken(token);
   return token;
 }
 
@@ -414,15 +429,44 @@ async function replaceRegularFile(file, text) {
   await fs.chmod(file, 0o600);
 }
 
-async function writeKeysIssuedRecord(vault, issued) {
-  const file = relayIdFile(vault);
-  const current = await readMarker(file);
-  const id = relayMarkerId(current || "");
+function markerFiles(vault, dataDir) {
+  return [relayIdFile(vault), path.join(vault, ".aidanos", "relay-folder"), path.join(dataDir, "relay-folder")];
+}
+
+async function readMarkerSet(vault, dataDir) {
+  const texts = [];
+  for (const file of markerFiles(vault, dataDir)) texts.push(await readMarker(file));
+  return texts;
+}
+
+async function writeKeysIssuedRecord(vault, dataDir, issued) {
+  const files = markerFiles(vault, dataDir);
+  const current = [];
+  let id = "";
+  for (const file of files) {
+    const text = await readMarker(file);
+    current.push(text);
+    if (!id) id = relayMarkerId(text || "");
+  }
   if (!id) return;
   const line = issued ? "keys-issued yes" : "keys-issued no";
-  if (current && current.split("\n")[2] === line) return;
   const next = MARKER_HEADER + "\n" + id + "\n" + line + "\n";
-  await replaceRegularFile(file, next);
+  for (let i = 0; i < files.length; i += 1) {
+    if (current[i] === next) continue;
+    await replaceRegularFile(files[i], next);
+  }
+}
+
+function markerTextForReset(id, texts) {
+  const anyYes = texts.some((text) => relayMarkerKeysIssued(text || ""));
+  if (anyYes) return MARKER_HEADER + "\n" + id + "\nkeys-issued yes\n";
+  const anyNo = texts.some((text) => {
+    if (typeof text !== "string") return false;
+    const lines = text.split("\n");
+    return lines.length === 4 && lines[2] === "keys-issued no" && lines[3] === "";
+  });
+  if (anyNo) return MARKER_HEADER + "\n" + id + "\nkeys-issued no\n";
+  return relayMarkerText(id);
 }
 
 async function directoryHasGitRemote(dir) {
@@ -502,6 +546,20 @@ export function relayMarkerKeysIssued(text) {
   if (typeof text !== "string") return false;
   const lines = text.split("\n");
   return lines.length === 4 && lines[2] === "keys-issued yes" && lines[3] === "";
+}
+
+// Once any marker says keys were issued, a sibling that has gone back to the
+// old three-line form is not accepted. A fresh install, where every marker is
+// still three lines, is left alone.
+export function relayMarkerMissingIssuedLine(texts) {
+  const list = Array.isArray(texts) ? texts : [];
+  const anyYes = list.some((text) => relayMarkerKeysIssued(text || ""));
+  if (!anyYes) return false;
+  return list.some((text) => {
+    const body = typeof text === "string" ? text : "";
+    if (!relayMarkerId(body)) return true;
+    return body.split("\n").length === 3;
+  });
 }
 
 export function relayIdFile(vault) {
@@ -601,6 +659,7 @@ export async function startRelay(options = {}) {
   if (token.length < MIN_TOKEN_LENGTH) {
     throw new Error("The relay token must be at least 32 characters.");
   }
+  requireRandomToken(token);
   const behindProxy = Boolean(options.behindProxy) || String(env.AIDANOS_RELAY_BEHIND_PROXY || "") === "1";
   if (behindProxy && (options.lan || options.lanAddress)) {
     throw new Error("A hosted relay listens on 127.0.0.1 only. Do not use --lan with --behind-proxy.");
@@ -618,9 +677,12 @@ export async function startRelay(options = {}) {
   await assertNotClientVault(vault);
   await claimRelayFolders(vault, dataDir);
   const opened = await reconcileDeviceState(dataDir);
-  const idText = await readMarker(relayIdFile(vault));
+  const markerTexts = await readMarkerSet(vault, dataDir);
+  if (relayMarkerMissingIssuedLine(markerTexts)) {
+    throw new Error("The relay id file is missing the keys-issued line. The relay will not start.");
+  }
   const filesMissing = !opened.record && opened.policy && !opened.policy.exists;
-  const recordedKeys = relayMarkerKeysIssued(idText || "");
+  const recordedKeys = markerTexts.some((text) => relayMarkerKeysIssued(text || ""));
   if (recordedKeys && filesMissing && !options.initDevices) {
     throw new Error(
       "Device keys were issued, but the device files are missing. The relay will not start. Pass --init-devices to start again on purpose.",
@@ -633,7 +695,7 @@ export async function startRelay(options = {}) {
     );
   }
   if (recordedKeys && filesMissing && options.initDevices) {
-    await writeKeysIssuedRecord(vault, false);
+    await writeKeysIssuedRecord(vault, dataDir, false);
     logSafe(secrets, "cleared the keys-issued record because --init-devices was passed and the device files are missing");
   }
   if (sharedStillOn) logSafe(secrets, "WARNING: the shared key can still open a connection");
@@ -646,13 +708,14 @@ export async function startRelay(options = {}) {
   );
   if (stickyKeysIssued) {
     try {
-      await writeKeysIssuedRecord(vault, true);
+      await writeKeysIssuedRecord(vault, dataDir, true);
     } catch (error) {
       logSafe(secrets, "could not record that device keys were issued:", error instanceof Error ? error.message : "error");
     }
   }
   let loggedDisappeared = false;
   let loggedSharedBack = false;
+  let loggedSharedBlocked = false;
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
   const failures = new Map();
@@ -707,7 +770,7 @@ export async function startRelay(options = {}) {
         if (!stickyKeysIssued) {
           stickyKeysIssued = true;
           try {
-            await writeKeysIssuedRecord(vault, true);
+            await writeKeysIssuedRecord(vault, dataDir, true);
           } catch (error) {
             logSafe(
               secrets,
@@ -725,10 +788,17 @@ export async function startRelay(options = {}) {
         !(state.record && state.record.shared === "retired") &&
         !(state.policy.devicesIssued && !state.record);
       if (explicitOn && stickySharedRetired) {
-        stickySharedRetired = false;
-        if (!loggedSharedBack) {
-          loggedSharedBack = true;
-          logSafe(secrets, "the shared key can open a connection again");
+        if (behindProxy && !options.allowSharedKeyBehindProxy) {
+          if (!loggedSharedBlocked) {
+            loggedSharedBlocked = true;
+            logSafe(secrets, "refusing to turn the shared key back on because this relay is behind a proxy");
+          }
+        } else {
+          stickySharedRetired = false;
+          if (!loggedSharedBack) {
+            loggedSharedBack = true;
+            logSafe(secrets, "the shared key can open a connection again");
+          }
         }
       }
     }
@@ -863,10 +933,11 @@ export async function startRelay(options = {}) {
     // Device fingerprints and the policy marker stay on disk. The reset does
     // not delete them and does not write them back, so a crash cannot drop
     // them and a removal during the reset is not undone.
+    const markerTexts = await readMarkerSet(vault, dataDir);
     await disposeSession(live);
     live = null;
     let lastError;
-    const marker = relayMarkerText(markerId);
+    const marker = markerTextForReset(markerId, markerTexts);
     const dataInsideVault = isInsideDirectory(vault, dataDir);
     const keep = preservedDevicePaths(dataDir);
     for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -1216,8 +1287,29 @@ export async function runDeviceCommand(args, env = process.env) {
   const { vault, dataDir } = resolveHome(args, env);
   await assertNotClientVault(vault);
   await claimRelayFolders(vault, dataDir);
+  const markerTexts = await readMarkerSet(vault, dataDir);
+  if (relayMarkerMissingIssuedLine(markerTexts)) {
+    throw new Error("The relay id file is missing the keys-issued line. The relay will not start.");
+  }
   const command = args.deviceCommand;
   if (!command) throw new Error("Name the device command.");
+  if (command.action === "--list-devices" || command.action === "--issue-device") {
+    const state = await readDeviceState(dataDir);
+    const filesMissing = !state.unreadable && !state.record && state.policy && !state.policy.exists;
+    const recordedKeys = markerTexts.some((text) => relayMarkerKeysIssued(text || ""));
+    if (recordedKeys && filesMissing && !args.initDevices) {
+      throw new Error(
+        "Device keys were issued, but the device files are missing. The relay will not start. Pass --init-devices to start again on purpose.",
+      );
+    }
+    if (recordedKeys && filesMissing && args.initDevices) {
+      await writeKeysIssuedRecord(vault, dataDir, false);
+      logSafe(
+        redactList(token, ""),
+        "cleared the keys-issued record because --init-devices was passed and the device files are missing",
+      );
+    }
+  }
   if (command.action === "--list-devices") {
     const state = await readDeviceState(dataDir);
     if (state.unreadable || (state.policy.devicesIssued && !state.record)) {
@@ -1235,7 +1327,7 @@ export async function runDeviceCommand(args, env = process.env) {
     }
     const issued = await issueDevice(dataDir, command.name);
     try {
-      await writeKeysIssuedRecord(vault, true);
+      await writeKeysIssuedRecord(vault, dataDir, true);
     } catch (error) {
       logSafe(redactList(token, issued.key), "could not record that device keys were issued:", error instanceof Error ? error.message : "error");
     }

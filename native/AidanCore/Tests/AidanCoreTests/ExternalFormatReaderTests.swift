@@ -1864,8 +1864,12 @@ private func printMemory(_ label: String, seconds: TimeInterval) {
         }
     }
     let footprint = result == KERN_SUCCESS ? info.phys_footprint : 0
+    #if os(iOS)
     let available = os_proc_available_memory()
     print("reader-memory \(label) \(seconds) footprint=\(footprint) available=\(available)")
+    #else
+    print("reader-memory \(label) \(seconds) footprint=\(footprint) available=unavailable")
+    #endif
     #else
     print("reader-memory \(label) \(seconds) footprint=unavailable available=unavailable")
     #endif

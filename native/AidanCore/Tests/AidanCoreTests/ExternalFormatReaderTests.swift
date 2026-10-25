@@ -1,6 +1,12 @@
 @testable import AidanCore
 import Foundation
 import XCTest
+#if canImport(Darwin)
+import Darwin
+import os
+#else
+import Glibc
+#endif
 
 /// Cases 1–8, 11, 15–18, 25, 26–31, 34, 35, 41–43, 47, 52, 55, 58, 59, 61, 62, and 65.
 /// Each one is loaded from fixtures/external-format and read by ExternalFormatReader.
@@ -604,11 +610,13 @@ final class ExternalFormatReaderTests: XCTestCase {
     }
 
     func testUnclosedBracketLineStaysWithinTheTimeBound() {
+        printMemory("bracket-bound-start", seconds: 0)
         let line = String(repeating: "[", count: 1_000_000)
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing bracket-bound \(elapsed)")
+        printMemory("bracket-bound-end", seconds: elapsed)
         XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
@@ -1038,22 +1046,26 @@ final class ExternalFormatReaderTests: XCTestCase {
     }
 
     func testRejectedWikiLineStaysWithinTheTimeBound() {
+        printMemory("wiki-bound-start", seconds: 0)
         let line = String(repeating: "[[#", count: 350_000) + "]]"
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing wiki-bound \(elapsed)")
+        printMemory("wiki-bound-end", seconds: elapsed)
         XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
     }
 
     func testUnclosedMentionParenStaysWithinTheTimeBound() {
+        printMemory("mention-bound-start", seconds: 0)
         let line = String(repeating: "@a(", count: 350_000)
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing mention-bound \(elapsed)")
+        printMemory("mention-bound-end", seconds: elapsed)
         XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
@@ -1272,9 +1284,12 @@ final class ExternalFormatReaderTests: XCTestCase {
             day = next
         }
         notes.append(ExternalDayText(day: day, text: "* Task"))
+        printMemory("move-count-setup", seconds: 0)
         let started = Date()
         let count = ExternalFormatReader.moveCount(ofLineAt: 0, on: notes[0].day, in: notes)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        let elapsed = Date().timeIntervalSince(started)
+        printMemory("move-count", seconds: elapsed)
+        XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(count, total as Int?)
     }
 
@@ -1418,11 +1433,13 @@ final class ExternalFormatReaderTests: XCTestCase {
     }
 
     func testClosedMentionParenStaysWithinTheTimeBound() {
+        printMemory("mention-closed-bound-start", seconds: 0)
         let line = String(repeating: "@a(", count: 350_000) + ")"
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing mention-closed-bound \(elapsed)")
+        printMemory("mention-closed-bound-end", seconds: elapsed)
         XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
@@ -1441,11 +1458,13 @@ final class ExternalFormatReaderTests: XCTestCase {
     }
 
     func testClosedBracketLineStaysWithinTheTimeBound() {
+        printMemory("bracket-closed-bound-start", seconds: 0)
         let line = String(repeating: "[a", count: 350_000) + "]"
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing bracket-closed-bound \(elapsed)")
+        printMemory("bracket-closed-bound-end", seconds: elapsed)
         XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
@@ -1484,9 +1503,12 @@ final class ExternalFormatReaderTests: XCTestCase {
         ]
         var measured: [(String, Int, Int)] = []
         for (name, make) in samples {
+            let started = Date()
             let once = scanWork(make(count))
             let twice = scanWork(make(count * 2))
+            let elapsed = Date().timeIntervalSince(started)
             print("reader-work \(name) \(once) \(twice) \(Double(twice) / Double(once))")
+            printMemory("scan-\(name)", seconds: elapsed)
             measured.append((name, once, twice))
         }
         for (name, once, twice) in measured {
@@ -1502,11 +1524,13 @@ final class ExternalFormatReaderTests: XCTestCase {
     }
 
     func testNonEnglishLineStaysWithinTheTimeBound() {
+        printMemory("non-english-bound-start", seconds: 0)
         let line = "é" + String(repeating: "@a(", count: 350_000)
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing non-english-bound \(elapsed)")
+        printMemory("non-english-bound-end", seconds: elapsed)
         XCTAssertLessThan(elapsed, 5)
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
@@ -1826,6 +1850,26 @@ private struct ManifestFile: Decodable {
     }
 
     var active: [Entry]
+}
+
+/// Diagnostic only. Prints the slice time beside the process footprint and the
+/// memory still available to it. Nothing here is asserted.
+private func printMemory(_ label: String, seconds: TimeInterval) {
+    #if canImport(Darwin)
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let result = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    let footprint = result == KERN_SUCCESS ? info.phys_footprint : 0
+    let available = os_proc_available_memory()
+    print("reader-memory \(label) \(seconds) footprint=\(footprint) available=\(available)")
+    #else
+    print("reader-memory \(label) \(seconds) footprint=unavailable available=unavailable")
+    #endif
+    fflush(stdout)
 }
 
 private enum LoadError: Error {

@@ -24,7 +24,7 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -632,13 +632,68 @@ function resolvedChoices() {
 // check stays exact there and the inode check does the real work.
 const FOLD_GIT_NAME = process.platform === "darwin" || process.platform === "win32";
 
-function vaultGitId(rootReal) {
+const gitDirCache = new Map();
+
+function resolveGitDirPointer(rootReal) {
+  const child = spawnSync("git", ["-C", rootReal, "rev-parse", "--git-dir"], {
+    encoding: "utf8",
+    timeout: 4000,
+    env: gitEnv(),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (!child || child.status !== 0) return null;
+  const text = String(child.stdout || "").trim();
+  if (!text || text.includes("\0") || text.includes("\n")) return null;
+  return path.resolve(rootReal, text);
+}
+
+// `.git` may be a directory, or a pointer file in a linked worktree.
+// The pointer's own inode is not the real git dir, so resolve that with
+// git and check it too. A normal directory does not spawn git.
+function gitDirIds(rootReal) {
+  const gitPath = path.join(rootReal, ".git");
+  let listed;
   try {
-    const st = fsSync.statSync(path.join(rootReal, ".git"));
-    return { dev: st.dev, ino: st.ino };
+    listed = fsSync.lstatSync(gitPath);
   } catch {
-    return null;
+    return [];
   }
+  let followed;
+  try {
+    followed = fsSync.statSync(gitPath);
+  } catch {
+    return [];
+  }
+  const ids = [{ dev: followed.dev, ino: followed.ino }];
+  if (!listed.isFile() && !followed.isFile()) return ids;
+  const cached = gitDirCache.get(rootReal);
+  if (cached && cached.fileDev === listed.dev && cached.fileIno === listed.ino) {
+    try {
+      const gst = fsSync.statSync(cached.resolved);
+      if (gst.dev === cached.dirDev && gst.ino === cached.dirIno) return cached.ids;
+    } catch {
+      // The resolved directory moved. Look it up again.
+    }
+  }
+  const resolved = resolveGitDirPointer(rootReal);
+  if (!resolved) return ids;
+  try {
+    const gst = fsSync.statSync(resolved);
+    if (gst.dev !== followed.dev || gst.ino !== followed.ino) {
+      ids.push({ dev: gst.dev, ino: gst.ino });
+    }
+    gitDirCache.set(rootReal, {
+      fileDev: listed.dev,
+      fileIno: listed.ino,
+      resolved,
+      dirDev: gst.dev,
+      dirIno: gst.ino,
+      ids,
+    });
+  } catch {
+    return ids;
+  }
+  return ids;
 }
 
 // `real` is a resolved path. Refuse it when it is the vault .git directory,
@@ -655,8 +710,8 @@ function realPathInGit(real, rootReal) {
     if (part === ".git") return true;
     if (FOLD_GIT_NAME && part.toLowerCase() === ".git") return true;
   }
-  const id = vaultGitId(root);
-  if (!id) return false;
+  const ids = gitDirIds(root);
+  if (!ids.length) return false;
   let cursor = resolved;
   for (;;) {
     let st;
@@ -665,7 +720,7 @@ function realPathInGit(real, rootReal) {
     } catch {
       return true;
     }
-    if (st.dev === id.dev && st.ino === id.ino) return true;
+    if (ids.some((id) => st.dev === id.dev && st.ino === id.ino)) return true;
     if (cursor === root) break;
     const parent = path.dirname(cursor);
     if (parent === cursor) break;
@@ -680,11 +735,15 @@ export function vaultRel(abs, root = VAULT) {
   return rel.split(path.sep).join("/");
 }
 
+// Stable signature: worktreePath(rel, root = VAULT) -> absolute path.
+// rel is vault-relative. Throws Error("bad path") when a parent symlink
+// leaves the vault or lands in .git. A parent link that stays inside the
+// vault is allowed. The last path part is not checked here: reads use
+// readableTarget, and writes replace a leaf link. Callers (including the
+// live-editor branch) pass one or two arguments and no more.
 // A directory symlink is followed by a later read, write, or unlink.
 // O_NOFOLLOW applies only to the last path part, so a link named like a
-// folder can still aim a note at another directory. Refuse one that leaves
-// the vault or lands in .git. A link that stays on a normal folder inside
-// the vault is left alone. The leaf is checked on read, in readableTarget.
+// folder can still aim a note at another directory.
 export async function worktreePath(rel, root = VAULT) {
   if (!isSafeRel(rel)) throw new Error("bad path");
   const abs = safeJoin(root, rel);
@@ -725,6 +784,15 @@ export async function worktreePath(rel, root = VAULT) {
     if (!st.isDirectory()) throw new Error("bad path");
   }
   return abs;
+}
+
+// Listing has no leaf file, so check the folder by asking about a child.
+// worktreePath's signature stays (rel, root).
+async function worktreeDir(rel, root = VAULT) {
+  const cleaned = String(rel || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!cleaned || cleaned === ".") return path.resolve(root);
+  await worktreePath(cleaned + "/note.md", root);
+  return safeJoin(root, cleaned);
 }
 
 // Last path part on read. resolveInside allows a target that stays in the
@@ -784,9 +852,24 @@ async function readRel(rel) {
 
 async function writeVaultText(rel, text) {
   const abs = await worktreePath(rel);
+  const parent = path.dirname(abs);
+  let seen = null;
   await atomicWriteFile(abs, text, async () => {
     await worktreePath(rel);
+    const st = await fs.stat(parent);
+    if (!st.isDirectory()) throw new Error("bad path");
+    seen = { dev: st.dev, ino: st.ino };
   });
+  let after;
+  try {
+    after = await fs.stat(parent);
+  } catch {
+    throw new Error("bad path");
+  }
+  if (!seen || !after.isDirectory() || after.dev !== seen.dev || after.ino !== seen.ino) {
+    await fs.unlink(abs).catch(() => {});
+    throw new Error("bad path");
+  }
 }
 
 async function gitShow(rev, rel) {
@@ -2312,7 +2395,13 @@ const server = http.createServer(async (req, res) => {
       const date = url.searchParams.get("date");
       if (!date) return json(res, 400, { error: "date required" });
       if (!isIsoDate(date)) return json(res, 400, { error: "date must be YYYY-MM-DD" });
-      const logPath = path.join(VAULT, "log", `${date}.md`);
+      const dayRel = `log/${date}.md`;
+      let logPath;
+      try {
+        logPath = await worktreePath(dayRel);
+      } catch (e) {
+        return json(res, 400, { error: publicPathError(e) });
+      }
       const raw = await readFileSafe(logPath);
       const markdown = raw == null ? "" : raw;
       const mtime = raw == null ? 0 : await fileMtimeMs(logPath);
@@ -2381,9 +2470,19 @@ const server = http.createServer(async (req, res) => {
       const clientMtime = body && typeof body === "object" && body.mtime != null
         ? Number(body.mtime)
         : NaN;
-      const logPath = path.join(VAULT, "log", `${date}.md`);
       const dayRel = `log/${date}.md`;
+      let logPath;
+      try {
+        logPath = await worktreePath(dayRel);
+      } catch (e) {
+        return json(res, 400, { error: publicPathError(e) });
+      }
       return enqueuePathWrite(dayRel, async () => {
+        try {
+          logPath = await worktreePath(dayRel);
+        } catch (e) {
+          return json(res, 400, { error: publicPathError(e) });
+        }
         let diskMtime = 0;
         let exists = false;
         try {
@@ -2490,9 +2589,9 @@ const server = http.createServer(async (req, res) => {
       if (!rel) return json(res, 400, { error: "path required" });
       let abs;
       try {
-        abs = safeJoin(VAULT, rel);
+        abs = await worktreePath(rel);
       } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
+        return json(res, 400, { error: publicPathError(e) });
       }
       const relPath = path.relative(VAULT, abs).split(path.sep).join("/");
       if (familyRoomPngPath(relPath)) {
@@ -2511,11 +2610,6 @@ const server = http.createServer(async (req, res) => {
           return json(res, 400, { error: publicPathError(e) });
         }
       }
-      try {
-        await resolveInside(VAULT, abs);
-      } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
-      }
       if (!String(relPath).endsWith(".md")) {
         return json(res, 400, { error: "markdown only" });
       }
@@ -2530,9 +2624,9 @@ const server = http.createServer(async (req, res) => {
       if (!rel) return json(res, 400, { error: "path required" });
       let abs;
       try {
-        abs = safeJoin(VAULT, rel);
+        abs = await worktreePath(rel);
       } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
+        return json(res, 400, { error: publicPathError(e) });
       }
       const relPath = path.relative(VAULT, abs).split(path.sep).join("/");
       if (familyRoomPngPath(relPath)) {
@@ -2569,11 +2663,6 @@ const server = http.createServer(async (req, res) => {
           }
         });
       }
-      try {
-        await resolveInside(VAULT, abs);
-      } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
-      }
       if (!String(relPath).endsWith(".md")) {
         return json(res, 400, { error: "markdown only" });
       }
@@ -2597,6 +2686,11 @@ const server = http.createServer(async (req, res) => {
         : NaN;
       const writeKey = "f:" + relPath;
       return enqueuePathWrite(writeKey, async () => {
+        try {
+          abs = await worktreePath(rel);
+        } catch (e) {
+          return json(res, 400, { error: publicPathError(e) });
+        }
         let diskMtime = 0;
         let exists = false;
         try {
@@ -2660,10 +2754,9 @@ const server = http.createServer(async (req, res) => {
       const dirParam = url.searchParams.get("dir") || ".";
       let abs;
       try {
-        abs = dirParam === "." || dirParam === "" ? VAULT : safeJoin(VAULT, dirParam);
-        await resolveInside(VAULT, abs);
+        abs = await worktreeDir(dirParam);
       } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
+        return json(res, 400, { error: publicPathError(e) });
       }
       let stat;
       try {
@@ -2698,8 +2791,7 @@ const server = http.createServer(async (req, res) => {
         if (relNorm.startsWith("aidanos/") && relNorm !== "aidanos/active-horse.md") continue;
         let abs;
         try {
-          abs = safeJoin(VAULT, rel);
-          await resolveInside(VAULT, abs);
+          abs = await worktreePath(rel);
         } catch {
           continue;
         }

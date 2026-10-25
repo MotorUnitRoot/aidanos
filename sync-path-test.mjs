@@ -70,7 +70,23 @@ function checkWiring() {
   assert(stage.includes("vaultRel") && stage.indexOf("worktreePath") < stage.indexOf("pathExists"), "stage checks the path first");
   assert(!stage.includes('"--", rel'), "stage does not pass the raw name");
   assert(reader.includes("readableTarget"), "note reads use the leaf check");
+  assert(write.includes(".dev") && write.includes(".ino"), "write compares the folder inode after rename");
   assert(serverSrc.includes('process.platform === "darwin" || process.platform === "win32"'), "lowercase .git name is only a second check on darwin and win32");
+  assert(serverSrc.includes('"--git-dir"'), "a .git pointer file resolves the real git dir");
+  const dayGet = sliceFn('pathname === "/api/day" && req.method === "GET"', 'pathname === "/api/month"');
+  const dayPut = sliceFn('pathname === "/api/day" && req.method === "PUT"', 'pathname === "/api/plan"');
+  const fileGet = sliceFn('pathname === "/api/file" && req.method === "GET"', 'pathname === "/api/file" && req.method === "PUT"');
+  const filePut = sliceFn('pathname === "/api/file" && req.method === "PUT"', 'pathname === "/api/tree"');
+  const tree = sliceFn('pathname === "/api/tree"', 'pathname === "/api/search"');
+  const search = sliceFn('pathname === "/api/search"', 'pathname === "/api/day-watch"');
+  const dirFn = sliceFn("async function worktreeDir(", "async function readableTarget(");
+  assert(dayGet.includes("worktreePath"), "day read uses worktreePath");
+  assert(dayPut.includes("worktreePath") && !dayPut.includes('path.join(VAULT, "log"'), "day write uses worktreePath");
+  assert(fileGet.includes("worktreePath") && !fileGet.includes("resolveInside"), "file read uses worktreePath");
+  assert(filePut.includes("worktreePath") && !filePut.includes("resolveInside"), "file write uses worktreePath");
+  assert(tree.includes("worktreeDir") && dirFn.includes("worktreePath"), "tree checks the folder through worktreePath");
+  assert(search.includes("worktreePath"), "search reads through worktreePath");
+  assert(serverSrc.includes("worktreePath(rel, root = VAULT)"), "worktreePath keeps a two-argument signature");
 }
 
 async function refusesRead(rel, root, sentinel) {
@@ -350,11 +366,135 @@ async function literalPathspecs() {
   }
 }
 
+async function gitPointerFile() {
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-pointer-"));
+  try {
+    git(["init", "-b", "main"], vault);
+    git(["config", "user.email", "t@local"], vault);
+    git(["config", "user.name", "T"], vault);
+    fs.writeFileSync(path.join(vault, "README.md"), "seed\n");
+    git(["add", "README.md"], vault);
+    git(["commit", "-m", "seed"], vault);
+    fs.renameSync(path.join(vault, ".git"), path.join(vault, "realgit"));
+    fs.writeFileSync(path.join(vault, ".git"), "gitdir: realgit\n");
+    const resolved = git(["rev-parse", "--git-dir"], vault).trim();
+    fs.symlinkSync(path.resolve(vault, resolved, "hooks"), path.join(vault, "planted"));
+    const spelled = fs.realpathSync(path.join(vault, "planted"));
+    assert(!spelled.split(path.sep).includes(".git"), "pointer target is not named .git");
+    await rejects(() => worktreePath("planted/post-update", vault));
+  } finally {
+    fs.rmSync(vault, { recursive: true, force: true });
+  }
+}
+
+async function expectRefused(res, sentinel) {
+  const text = await res.text();
+  assert(res.status === 400, "expected a refusal, got " + res.status);
+  assert(!text.includes(sentinel), "response included the target");
+}
+
+async function httpPaths() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-http-"));
+  const vault = path.join(tmp, "vault");
+  const outside = path.join(tmp, "outside");
+  fs.mkdirSync(vault);
+  fs.mkdirSync(outside);
+  const outsideDay = "OUTSIDE_DAY\n";
+  fs.writeFileSync(path.join(outside, "2026-01-05.md"), outsideDay);
+  const port = 30000 + Math.floor(Math.random() * 2000);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    fs.mkdirSync(path.join(vault, "notes"));
+    const saved = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/plain.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "hello note\n" }),
+    });
+    assert(saved.status === 200, "ordinary note save failed");
+    assert(fs.readFileSync(path.join(vault, "notes", "plain.md"), "utf8") === "hello note\n", "ordinary note was not written");
+    const readNote = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/plain.md"));
+    const noteBody = await readNote.json();
+    assert(readNote.status === 200 && noteBody.markdown === "hello note\n", "ordinary note read failed");
+    const savedDay = await fetch(base + "/api/day?date=2026-01-05", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "ordinary day\n" }),
+    });
+    assert(savedDay.status === 200, "ordinary day save failed");
+    assert(fs.readFileSync(path.join(vault, "log", "2026-01-05.md"), "utf8") === "ordinary day\n", "ordinary day was not written");
+    const readDay = await fetch(base + "/api/day?date=2026-01-05");
+    const dayBody = await readDay.json();
+    assert(readDay.status === 200 && dayBody.markdown === "ordinary day\n", "ordinary day read failed");
+    const listed = await fetch(base + "/api/tree?dir=" + encodeURIComponent("notes"));
+    const listedBody = await listed.json();
+    assert(listed.status === 200 && listedBody.files.includes("notes/plain.md"), "ordinary tree failed");
+    const found = await fetch(base + "/api/search?q=" + encodeURIComponent("hello note"));
+    const foundBody = await found.json();
+    assert(found.status === 200 && foundBody.hits.some((hit) => hit.path === "notes/plain.md"), "ordinary search failed");
+
+    fs.rmSync(path.join(vault, "log"), { recursive: true, force: true });
+    fs.symlinkSync(outside, path.join(vault, "log"));
+    const dayWrite = await fetch(base + "/api/day?date=2026-01-05", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "PWNED\n" }),
+    });
+    await expectRefused(dayWrite, "OUTSIDE_DAY");
+    assert(fs.readFileSync(path.join(outside, "2026-01-05.md"), "utf8") === outsideDay, "outside day was written");
+    assert(fs.readdirSync(outside).join(",") === "2026-01-05.md", "outside log gained a file");
+    await expectRefused(await fetch(base + "/api/day?date=2026-01-05"), "OUTSIDE_DAY");
+    await expectRefused(
+      await fetch(base + "/api/file?path=" + encodeURIComponent("log/2026-01-05.md")),
+      "OUTSIDE_DAY",
+    );
+    await expectRefused(await fetch(base + "/api/tree?dir=" + encodeURIComponent("log")), "OUTSIDE_DAY");
+
+    fs.mkdirSync(path.join(vault, ".git", "info"), { recursive: true });
+    fs.writeFileSync(path.join(vault, ".git", "info", "secret.md"), "GIT_SECRET\n");
+    fs.symlinkSync(path.join(vault, ".git"), path.join(vault, "gitdir"));
+    const gitWrite = await fetch(base + "/api/file?path=" + encodeURIComponent("gitdir/info/x.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "secret write\n" }),
+    });
+    await expectRefused(gitWrite, "GIT_SECRET");
+    assert(!fs.existsSync(path.join(vault, ".git", "info", "x.md")), "write landed in .git/info");
+    assert(fs.readFileSync(path.join(vault, ".git", "info", "secret.md"), "utf8") === "GIT_SECRET\n", ".git file was changed");
+    assert(fs.readdirSync(path.join(vault, ".git", "info")).join(",") === "secret.md", ".git/info gained a file");
+    await expectRefused(
+      await fetch(base + "/api/file?path=" + encodeURIComponent("gitdir/info/secret.md")),
+      "GIT_SECRET",
+    );
+    await expectRefused(await fetch(base + "/api/tree?dir=" + encodeURIComponent("gitdir")), "GIT_SECRET");
+    await expectRefused(await fetch(base + "/api/tree?dir=" + encodeURIComponent("gitdir/info")), "secret.md");
+    const leaked = await fetch(base + "/api/search?q=" + encodeURIComponent("GIT_SECRET"));
+    const leakedText = await leaked.text();
+    assert(!leakedText.includes("GIT_SECRET"), "search returned the git file");
+    const still = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/plain.md"));
+    const stillBody = await still.json();
+    assert(still.status === 200 && stillBody.markdown === "hello note\n", "ordinary note read broke");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 checkWiring();
 await pathChecks();
 await inodeGitDir();
 await leafChecks();
 await decodedGitPath();
 await literalPathspecs();
+await gitPointerFile();
+await httpPaths();
 await liveSyncDoesNotFollowOutside();
 console.log("sync-path-test ok");

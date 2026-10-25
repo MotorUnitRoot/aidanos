@@ -36,11 +36,12 @@ check("a timeline block keeps the words and drops the marks", () => {
   assert(!chairs.includes("- [ ]"), "checkbox mark stayed");
   assert(!chairs.includes("@"), "time tag stayed");
   const meet = stripWhen("Meet @Nim at @2026-03-20 16:45. The morning check is @2026-06-02T08:15.");
-  assert(meet === "Meet @Nim at 2026-03-20. The morning check is 2026-06-02.", meet);
+  assert(meet === "Meet @Nim at 2026-03-20. The morning check is June 2, 8:15am.", meet);
   assert(!meet.includes("@2026"), "a raw date tag stayed");
+  assert(!meet.includes("T08:15"), "the morning time stayed as a tag");
   assert(meet.includes("@Nim"), "the name was dropped");
   assert(meet.includes("2026-03-20"), "the date was dropped");
-  assert(meet.includes("2026-06-02"), "the morning date was dropped");
+  assert(meet.includes("June 2, 8:15am"), "the morning time was dropped");
 });
 
 check("done tasks are marked done and open tasks are not", () => {
@@ -58,7 +59,7 @@ check("done tasks are marked done and open tasks are not", () => {
   assert(byTime["08:00"].done === true, "the swept steps were not done");
   assert(byTime["14:00"].text === "Set out the extra chairs", byTime["14:00"].text);
   assert(byTime["14:00"].done === false, "the open chairs were done");
-  assert(byTime["16:45"].text === "Meet @Nim at 2026-03-20. The morning check is 2026-06-02.", byTime["16:45"].text);
+  assert(byTime["16:45"].text === "Meet @Nim at 2026-03-20. The morning check is June 2, 8:15am.", byTime["16:45"].text);
   assert(byTime["16:45"].done === false, "the meeting was done");
 });
 

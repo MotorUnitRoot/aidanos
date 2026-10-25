@@ -270,12 +270,13 @@ body.view-today.day-page {
   min-width: 0;
 }
 .week-month {
-  display: none;
+  display: block;
   margin: 0;
   color: var(--muted);
   font-size: 0.8rem;
   letter-spacing: 0.04em;
 }
+.view-today .day-card .moy { display: none; }
 .view-today .days {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
@@ -307,7 +308,7 @@ body.view-today.day-page {
   background: var(--surface);
   border-radius: 2px;
   padding: 0.45rem 0.2rem 0.4rem;
-  min-height: 5.4rem;
+  min-height: 4.5rem;
   cursor: pointer;
   text-align: center;
   display: flex;
@@ -353,6 +354,7 @@ body.view-today.day-page {
   min-width: 0;
   overflow-x: clip;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   display: flex;
   flex-direction: column;
   align-items: center;

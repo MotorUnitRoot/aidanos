@@ -161,10 +161,32 @@ function normalizeTime(hhmm) {
     String(parseInt(parts[1], 10)).padStart(2, "0");
 }
 
+const SPOKEN_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+function spokenClock(hhmm) {
+  const parts = normalizeTime(hhmm).split(":");
+  let hour = parseInt(parts[0], 10);
+  const minute = parts[1];
+  if (!minute || Number.isNaN(hour)) return String(hhmm || "");
+  const suffix = hour >= 12 ? "pm" : "am";
+  hour = hour % 12;
+  if (hour === 0) hour = 12;
+  return hour + ":" + minute + suffix;
+}
+
+function spokenDateTime(date, hhmm) {
+  const month = parseInt(String(date || "").slice(5, 7), 10);
+  const day = parseInt(String(date || "").slice(8, 10), 10);
+  const name = SPOKEN_MONTHS[month - 1];
+  if (!name || !day) return String(date || "") + " " + spokenClock(hhmm);
+  return name + " " + day + ", " + spokenClock(hhmm);
+}
+
 function stripWhen(line) {
   return String(line || "")
-    .replace(/@(\d{4}-\d{2}-\d{2})[ T]\d{1,2}:\d{2}\b/g, "$1")
+    .replace(/@(\d{4}-\d{2}-\d{2})[ T]\d{1,2}:\d{2}\b/, "$1")
     .replace(/@\d{1,2}:\d{2}\b/g, "")
+    .replace(/@(\d{4}-\d{2}-\d{2})[ T](\d{1,2}:\d{2})\b/g, (_, date, hhmm) => spokenDateTime(date, hhmm))
     .replace(/^\s*[-*+]\s+\[[^\]]*\]\s*/, "")
     .replace(/^\s*#{1,6}\s+/, "")
     .replace(/^\s*[-*+]\s+/, "")

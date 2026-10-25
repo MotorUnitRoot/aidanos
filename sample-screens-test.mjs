@@ -491,6 +491,17 @@ try {
     assert(ok === true, "the page scrolls sideways");
   }
 
+  let openedEdge = null;
+
+  async function paperEdge() {
+    return evalJs(`(() => {
+      const title = document.getElementById("paper-title").getBoundingClientRect();
+      const paper = document.getElementById("paper").getBoundingClientRect();
+      const head = document.querySelector(".paper-head").getBoundingClientRect();
+      return { title: title.left, paper: paper.left, head: head.left };
+    })()`);
+  }
+
   async function prepareEditorNormal() {
     await reloadSample();
     await prepareToday();
@@ -512,6 +523,14 @@ try {
       return getComputedStyle(body).color === getComputedStyle(heading).color;
     })()`);
     assert(chairs === true, "the open chairs line is dimmed");
+    const monthOnce = await evalJs(`(() => {
+      const label = document.getElementById("week-month");
+      const text = label ? label.textContent : "";
+      const shown = !!(label && getComputedStyle(label).display !== "none" && /[A-Za-z]+ \\d{4}/.test(text));
+      const repeated = [...document.querySelectorAll(".day-card .moy")].filter((el) => getComputedStyle(el).display !== "none").length;
+      return shown && repeated === 0;
+    })()`);
+    assert(monthOnce === true, "the week repeats the month on each tile");
     if (width === 390) {
       await evalJs(`(() => {
         document.getElementById("paper").focus();
@@ -546,10 +565,12 @@ try {
       })()`);
       const hidden = await evalJs(`document.getElementById("fmt-bar").hidden === true`);
       assert(hidden === true, "the Mac shows the formatting bar");
+      openedEdge = await paperEdge();
+      assert(openedEdge && Math.abs(openedEdge.title - openedEdge.paper) <= 1, "the open title and the note do not share a left edge");
       const labels = await evalJs(`[...document.querySelectorAll("#timeline .block")].map((block) => block.textContent + (block.classList.contains("done") ? "|done" : "|open")).join(" || ")`);
       assert(typeof labels === "string" && labels.includes("Set out the extra chairs|open"), "chairs block: " + labels);
       assert(labels.includes("Sweep the stone steps|done"), "sweep block: " + labels);
-      assert(labels.includes("Meet @Nim at 2026-03-20. The morning check is 2026-06-02.|open"), "meeting block: " + labels);
+      assert(labels.includes("Meet @Nim at 2026-03-20. The morning check is June 2, 8:15am.|open"), "meeting block: " + labels);
       assert(!labels.includes("- [ ]") && !labels.includes("@16:45") && !labels.includes("T08:15"), "timeline marks: " + labels);
     }
     const saved = await evalJs(`document.getElementById("status").textContent`);
@@ -608,6 +629,14 @@ try {
         && titleBox.top >= weekBox.bottom - 1;
     })()`);
     assert(ready === true, "loading did not show the week, the title, and Opening");
+    const width = await evalJs(`document.documentElement.clientWidth`);
+    if (width === 1280 && openedEdge) {
+      const loadingEdge = await paperEdge();
+      const titleShift = Math.abs(loadingEdge.title - openedEdge.title);
+      const paperShift = Math.abs(loadingEdge.paper - openedEdge.paper);
+      const shared = Math.abs(loadingEdge.title - loadingEdge.paper);
+      assert(titleShift <= 1 && paperShift <= 1 && shared <= 1, "loading left edge title " + loadingEdge.title + " paper " + loadingEdge.paper + " opened title " + openedEdge.title + " paper " + openedEdge.paper);
+    }
     await noSidewaysScroll();
   }
 

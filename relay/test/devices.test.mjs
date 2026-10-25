@@ -8,13 +8,18 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import {
+  deviceBackupPath,
   deviceFilePath,
+  devicePolicyPath,
   issueDevice,
   parseDeviceRecord,
   readDeviceFile,
+  reenableSharedKey,
+  restoreDeviceFile,
   restoreSharedKey,
   retireSharedKey,
   revokeDevice,
+  withDeviceLock,
 } from "../src/devices.mjs";
 import { connectionAllowed, parseArgs, startRelay, startupLines } from "../src/server.mjs";
 
@@ -59,9 +64,9 @@ async function runNode(args, env) {
   }
 }
 
-function connect(url, token) {
+function connect(url, token, extraHeaders = {}) {
   return new Promise((resolve) => {
-    const ws = new WebSocket(url, { headers: { Authorization: "Bearer " + token } });
+    const ws = new WebSocket(url, { headers: { Authorization: "Bearer " + token, ...extraHeaders } });
     let settled = false;
     const finish = (value) => {
       if (settled) return;
@@ -221,6 +226,10 @@ test("retiring the shared key refuses it, and restoring accepts it again", async
   }
   assert.deepEqual(await fs.readFile(tokenFile), before);
   await fs.rm(deviceFilePath(dirs.data));
+  await assert.rejects(boot(dirs), /will not start/);
+  await assert.rejects(restoreSharedKey(dirs.data), /reenable-shared-key/);
+  await assert.rejects(boot(dirs), /will not start/);
+  await reenableSharedKey(dirs.data);
   const bare = await boot(dirs);
   try {
     const shared = await connect(bare.url, TOKEN);
@@ -316,6 +325,7 @@ test("a notes reset keeps device keys and does not bring a removed key back", as
   await revokeDevice(data, "Mac");
   try {
     await fs.writeFile(path.join(vault, "leftover.txt"), "still here");
+    await fs.writeFile(path.join(vault, "devices.json"), "a note, not the relay file");
     const before = await (await fetch(relay.healthURL)).json();
     const accepted = await fetch(relay.healthURL.replace("/health", "/reset"), {
       method: "POST",
@@ -335,7 +345,12 @@ test("a notes reset keeps device keys and does not bring a removed key back", as
     }
     assert.equal(restarted, true);
     await assert.rejects(fs.stat(path.join(vault, "leftover.txt")));
+    await assert.rejects(fs.stat(path.join(vault, "devices.json")));
     const stored = await fs.readFile(deviceFilePath(data), "utf8");
+    const policy = await fs.readFile(devicePolicyPath(data), "utf8");
+    assert.equal(policy.includes("devices-issued yes"), true);
+    assert.equal(policy.includes(mac.key), false);
+    assert.equal(policy.includes(phone.key), false);
     assert.equal(stored.includes(mac.key), false);
     assert.equal(stored.includes(phone.key), false);
     assert.equal((await fs.stat(deviceFilePath(data))).mode & 0o777, 0o600);
@@ -418,6 +433,7 @@ test("the issue command shows a key once and does not change the shared-key file
   const key = keyFromAnnouncement(issued.stdout);
   assert.equal(issued.stdout.includes("shown once"), true);
   assert.equal(issued.stderr.includes(key), false);
+  assert.equal(issued.stderr.includes("Mac"), false);
   assert.equal(issued.stderr.includes("issued a device key"), true);
   const stored = await fs.readFile(deviceFilePath(dirs.data), "utf8");
   assert.equal(stored.includes(key), false);
@@ -457,4 +473,184 @@ test("the hosting note says what Colby has to do and does not open a public bind
   const design = await fs.readFile(new URL("../../docs/native/DESIGN.md", import.meta.url), "utf8");
   assert.equal(design.includes("own key"), true);
   assert.equal(design.includes("--restore-shared-key"), true);
+  assert.equal(hosting.includes("rate") || hosting.includes("Rate limiting"), true);
+  assert.equal(hosting.includes("X-Forwarded-For"), true);
+  assert.equal(hosting.includes("--data"), true);
+});
+
+test("removing a device closes an open connection", async () => {
+  const dirs = await relayDirs();
+  const seen = [];
+  const write = console.error;
+  console.error = (line) => seen.push(String(line));
+  const relay = await boot(dirs, { devicePollMs: 40 });
+  const mac = await issueDevice(dirs.data, "Mac");
+  const phone = await issueDevice(dirs.data, "iPhone");
+  try {
+    const opened = await connect(relay.url, mac.key);
+    assert.equal(opened.opened, true);
+    const shared = await connect(relay.url, TOKEN);
+    assert.equal(shared.opened, true);
+    const closed = new Promise((resolve) => {
+      opened.socket.once("close", () => resolve(true));
+    });
+    await revokeDevice(dirs.data, "Mac");
+    const result = await Promise.race([
+      closed,
+      new Promise((resolve) => setTimeout(() => resolve(false), 2000)),
+    ]);
+    assert.equal(result, true);
+    assert.equal(shared.socket.readyState, WebSocket.OPEN);
+    shared.socket.close();
+    const logs = seen.join("\n");
+    assert.equal(logs.includes(mac.key), false);
+    assert.equal(logs.includes(phone.key), false);
+    assert.equal(logs.includes(TOKEN), false);
+    assert.equal(logs.includes("Mac"), false);
+    assert.equal(logs.includes("closed a sync connection device=" + mac.id), true);
+    assert.equal(logs.includes("accepted a sync connection device=" + mac.id), true);
+    assert.equal(logs.includes("accepted a sync connection shared-key"), true);
+    assert.equal(logs.includes("WARNING: the shared key can still open a connection"), true);
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+});
+
+test("a hosted relay does not lock every device out from one address", async () => {
+  const dirs = await relayDirs();
+  const relay = await boot(dirs, { behindProxy: true, guessLimit: 1, guessBlockMs: 60_000 });
+  const mac = await issueDevice(dirs.data, "Mac");
+  try {
+    for (let i = 0; i < 6; i += 1) {
+      const bad = await connect(relay.url, "nope");
+      assert.equal(bad.opened, false);
+      assert.equal(bad.status, 401);
+    }
+    const opened = await connect(relay.url, mac.key);
+    assert.equal(opened.opened, true);
+    opened.socket.close();
+  } finally {
+    await relay.close();
+  }
+});
+
+test("X-Forwarded-For does not split the lockout", async () => {
+  const dirs = await relayDirs();
+  const relay = await boot(dirs, { guessLimit: 1, guessBlockMs: 60_000 });
+  const mac = await issueDevice(dirs.data, "Mac");
+  try {
+    const bad = await connect(relay.url, "nope", { "X-Forwarded-For": "203.0.113.4" });
+    assert.equal(bad.status, 401);
+    const still = await connect(relay.url, mac.key, { "X-Forwarded-For": "203.0.113.9" });
+    assert.equal(still.opened, false);
+    assert.equal(still.status, 401);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("the device backup is restored only when asked, and does not turn the shared key on", async () => {
+  const dirs = await relayDirs();
+  const claimed = await boot(dirs);
+  await claimed.close();
+  const mac = await issueDevice(dirs.data, "Mac");
+  const bakPath = deviceBackupPath(dirs.data);
+  const oldBak = await fs.readFile(bakPath);
+  assert.equal(oldBak.includes(Buffer.from(mac.key)), false);
+  assert.equal((await fs.stat(bakPath)).mode & 0o777, 0o600);
+  assert.equal((await fs.stat(devicePolicyPath(dirs.data))).mode & 0o777, 0o600);
+  await fs.rm(deviceFilePath(dirs.data));
+  await assert.rejects(boot(dirs), /will not start/);
+  await assert.rejects(fs.stat(deviceFilePath(dirs.data)));
+  await restoreDeviceFile(dirs.data);
+  const back = await readDeviceFile(dirs.data);
+  assert.equal(back.shared, "active");
+  assert.equal(back.devices.some((device) => device.id === mac.id && !device.revokedAt), true);
+  await retireSharedKey(dirs.data);
+  await fs.writeFile(bakPath, oldBak);
+  await fs.chmod(bakPath, 0o600);
+  await fs.rm(deviceFilePath(dirs.data));
+  await restoreDeviceFile(dirs.data);
+  const restored = await readDeviceFile(dirs.data);
+  assert.equal(restored.shared, "retired");
+  assert.equal(decision(restored, TOKEN).ok, false);
+  assert.equal(decision(restored, TOKEN).refusal, "retired");
+  assert.equal(decision(restored, mac.key).ok, true);
+  const relay = await boot(dirs);
+  try {
+    const shared = await connect(relay.url, TOKEN);
+    assert.equal(shared.opened, false);
+    assert.equal(shared.status, 401);
+    const device = await connect(relay.url, mac.key);
+    assert.equal(device.opened, true);
+    device.socket.close();
+  } finally {
+    await relay.close();
+  }
+});
+
+test("device commands wait on the same lock", async () => {
+  const dirs = await relayDirs();
+  await issueDevice(dirs.data, "Mac");
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const locking = withDeviceLock(dirs.data, () => held);
+  const lockPath = path.join(dirs.data, ".devices.lock");
+  const deadline = Date.now() + 1000;
+  let sawLock = false;
+  while (Date.now() < deadline) {
+    try {
+      await fs.stat(lockPath);
+      sawLock = true;
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  assert.equal(sawLock, true);
+  let finished = false;
+  const revoking = revokeDevice(dirs.data, "Mac").then(() => {
+    finished = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(finished, false);
+  release();
+  await locking;
+  await revoking;
+  assert.equal(finished, true);
+  const record = await readDeviceFile(dirs.data);
+  assert.equal(record.devices[0].revokedAt == null, false);
+});
+
+test("startup names whether the shared key is still on", async () => {
+  const dirs = await relayDirs();
+  const seen = [];
+  const write = console.error;
+  console.error = (line) => seen.push(String(line));
+  const relay = await boot(dirs);
+  try {
+    const text = seen.join("\n");
+    assert.equal(text.includes("WARNING: the shared key can still open a connection"), true);
+    assert.equal(text.includes(TOKEN), false);
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+  await issueDevice(dirs.data, "Mac");
+  await retireSharedKey(dirs.data);
+  const later = [];
+  console.error = (line) => later.push(String(line));
+  const again = await boot(dirs);
+  try {
+    const text = later.join("\n");
+    assert.equal(text.includes("the shared key is off"), true);
+    assert.equal(text.includes("WARNING: the shared key can still open a connection"), false);
+    assert.equal(text.includes(TOKEN), false);
+  } finally {
+    console.error = write;
+    await again.close();
+  }
 });

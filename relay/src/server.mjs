@@ -14,12 +14,15 @@ import {
   classifyPresented,
   deviceLines,
   issueDevice,
-  readDeviceBytes,
-  readDeviceFile,
+  preservedDevicePaths,
+  readDeviceState,
+  withDeviceLock,
+  reconcileDeviceState,
+  reenableSharedKey,
+  restoreDeviceFile,
   restoreSharedKey,
   retireSharedKey,
   revokeDevice,
-  writeDeviceBytes,
 } from "./devices.mjs";
 import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
@@ -52,16 +55,22 @@ export function tokensMatch(expected, got) {
 // The shared key is compared in memory. A device key is accepted only when
 // its fingerprint matches a row that has not been removed. A removed key and
 // an unknown key are both refused. The caller does not say which one it was.
-export function connectionAllowed({ sharedToken, record, presented }) {
+// The shared key is off when either the device file or the policy marker says
+// so. A missing device file, after device keys were issued, is refused here too.
+export function connectionAllowed({ sharedToken, record, presented, policy, unreadable }) {
+  const issued = Boolean(policy && policy.devicesIssued);
+  if (unreadable || (issued && !record)) {
+    return { ok: false, refusal: "device-file", deviceId: "" };
+  }
   const kind = classifyPresented(record, presented);
-  const sharedOn = !record || record.shared !== "retired";
+  const sharedRetired = Boolean(policy && policy.sharedRetired) || Boolean(record && record.shared === "retired");
   const sharedMatch = tokensMatch(sharedToken, presented);
-  const ok = kind.active || (sharedOn && sharedMatch);
+  const ok = kind.active || (!sharedRetired && sharedMatch);
   let refusal = "";
   if (!ok && kind.revoked && !sharedMatch) refusal = "removed";
-  else if (!ok && sharedMatch && !sharedOn) refusal = "retired";
+  else if (!ok && sharedMatch && sharedRetired) refusal = "retired";
   else if (!ok) refusal = "unknown";
-  return { ok, refusal };
+  return { ok, refusal, deviceId: ok ? kind.deviceId : "" };
 }
 
 export function bearerToken(header) {
@@ -181,7 +190,13 @@ export function parseArgs(argv) {
       if (out.deviceCommand) throw new Error("Use one device command at a time.");
       out.deviceCommand = { action: arg, name: takeDeviceName(argv, i) };
       i += 1;
-    } else if (arg === "--list-devices" || arg === "--retire-shared-key" || arg === "--restore-shared-key") {
+    } else if (
+      arg === "--list-devices" ||
+      arg === "--retire-shared-key" ||
+      arg === "--restore-shared-key" ||
+      arg === "--reenable-shared-key" ||
+      arg === "--restore-device-file"
+    ) {
       if (out.deviceCommand) throw new Error("Use one device command at a time.");
       out.deviceCommand = { action: arg, name: "" };
     } else if (arg === "--lan-address") out.lanAddress = argv[(i += 1)] || "";
@@ -256,20 +271,58 @@ function isInsideDirectory(parent, child) {
   return target.startsWith(prefix);
 }
 
-async function emptyDirectory(dir) {
+function keepsInside(directory, kept) {
+  const resolved = path.resolve(directory);
+  for (const item of kept) {
+    if (item === resolved || isInsideDirectory(resolved, item)) return true;
+  }
+  return false;
+}
+
+async function emptyDirectory(dir, keep = []) {
   // One name at a time. A parallel delete races a mirror rename and macOS
   // then returns ENOTEMPTY for the directory. A missing directory is already empty:
   // wiping the notes folder also removes a data folder that lives inside it.
-  let names;
-  try {
-    names = await fs.readdir(dir);
-  } catch (error) {
-    if (error && error.code === "ENOENT") return;
-    throw error;
+  // Kept paths are absolute files inside the relay data folder. A notes file
+  // with the same name, sitting in the vault, is still deleted.
+  const kept = new Set(keep.map((item) => path.resolve(item)));
+  async function removeTree(current) {
+    let names;
+    try {
+      names = await fs.readdir(current);
+    } catch (error) {
+      if (error && error.code === "ENOENT") return;
+      throw error;
+    }
+    for (const name of names) {
+      const full = path.join(current, name);
+      const resolved = path.resolve(full);
+      if (kept.has(resolved)) continue;
+      let info;
+      try {
+        info = await fs.lstat(full);
+      } catch (error) {
+        if (error && error.code === "ENOENT") continue;
+        throw error;
+      }
+      if (info.isSymbolicLink() || !info.isDirectory()) {
+        await fs.rm(full, { force: true, maxRetries: 8, retryDelay: 25 });
+        continue;
+      }
+      if (keepsInside(full, kept)) {
+        await removeTree(full);
+        try {
+          await fs.rmdir(full);
+        } catch (error) {
+          if (error && (error.code === "ENOTEMPTY" || error.code === "ENOENT" || error.code === "EEXIST")) continue;
+          throw error;
+        }
+        continue;
+      }
+      await fs.rm(full, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
   }
-  for (const name of names) {
-    await fs.rm(path.join(dir, name), { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
-  }
+  await removeTree(dir);
 }
 
 // Create only. O_EXCL refuses an existing path, and O_NOFOLLOW refuses a symlink,
@@ -509,7 +562,10 @@ export async function startRelay(options = {}) {
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
   await assertNotClientVault(vault);
   await claimRelayFolders(vault, dataDir);
-  await readDeviceFile(dataDir);
+  const opened = await reconcileDeviceState(dataDir);
+  const sharedStillOn = !(opened.policy.sharedRetired || (opened.record && opened.record.shared === "retired"));
+  if (sharedStillOn) logSafe(secrets, "WARNING: the shared key can still open a connection");
+  else logSafe(secrets, "the shared key is off");
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
   const failures = new Map();
@@ -549,23 +605,30 @@ export async function startRelay(options = {}) {
     failures.set(ip, row);
   }
 
-  // Read the device file on every attempt so removing a key takes effect on
-  // the next connection. The shared key is still the one in memory.
+  // Read the device file on every attempt. Behind a proxy every client is
+  // 127.0.0.1, so the per-address lockout is off and the proxy does that job.
+  // X-Forwarded-For is not read.
   async function allowPresented(presented, ip) {
-    if (blocked(ip)) return false;
-    let record;
+    if (!behindProxy && blocked(ip)) return { ok: false, refusal: "locked", deviceId: "" };
+    let state;
     try {
-      record = await readDeviceFile(dataDir);
+      state = await readDeviceState(dataDir);
     } catch {
-      return false;
+      return { ok: false, refusal: "device-file", deviceId: "" };
     }
-    const decision = connectionAllowed({ sharedToken: token, record, presented });
+    const decision = connectionAllowed({
+      sharedToken: token,
+      record: state.record,
+      presented,
+      policy: state.policy,
+      unreadable: state.unreadable,
+    });
     if (!decision.ok) {
-      noteFailure(ip);
-      return false;
+      if (!behindProxy && decision.refusal !== "device-file") noteFailure(ip);
+      return decision;
     }
-    failures.delete(ip);
-    return true;
+    if (!behindProxy) failures.delete(ip);
+    return decision;
   }
 
   function noteGit(result) {
@@ -644,27 +707,28 @@ export async function startRelay(options = {}) {
       logSafe(secrets, "reset refused: the folder has no current relay marker");
       return;
     }
-    // Device fingerprints survive a notes reset. Read them before anything is
-    // deleted. A crash after the delete and before they are written back can
-    // drop the file; the shared key then works again, which is why that file
-    // is kept.
-    const savedDevices = await readDeviceBytes(dataDir);
+    // Device fingerprints and the policy marker stay on disk. The reset does
+    // not delete them and does not write them back, so a crash cannot drop
+    // them and a removal during the reset is not undone.
     await disposeSession(live);
     live = null;
     let lastError;
     const marker = relayMarkerText(markerId);
     const dataInsideVault = isInsideDirectory(vault, dataDir);
+    const keep = preservedDevicePaths(dataDir);
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
-        await emptyDirectory(vault);
-        // The default data folder is vault/.aidanos/relay. Emptying the notes
-        // folder already removed it, so do not try to empty a path that is gone.
-        if (!dataInsideVault) await emptyDirectory(dataDir);
-        await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
-        await fs.mkdir(dataDir, { recursive: true });
-        await writeMarkerFile(path.join(vault, ".aidanos", "relay-folder"), marker);
-        await writeMarkerFile(path.join(dataDir, "relay-folder"), marker);
-        if (savedDevices) await writeDeviceBytes(dataDir, savedDevices);
+        await withDeviceLock(dataDir, async () => {
+          await emptyDirectory(vault, dataInsideVault ? keep : []);
+          // The default data folder is vault/.aidanos/relay. Emptying the notes
+          // folder already walked it. A data folder outside the notes is emptied
+          // on its own, still leaving the device files in place.
+          if (!dataInsideVault) await emptyDirectory(dataDir, keep);
+          await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
+          await fs.mkdir(dataDir, { recursive: true });
+          await writeMarkerFile(path.join(vault, ".aidanos", "relay-folder"), marker);
+          await writeMarkerFile(path.join(dataDir, "relay-folder"), marker);
+        });
         if (typeof options.beforeReopen === "function") await options.beforeReopen();
         live = await openSession();
         bootedAt = new Date().toISOString();
@@ -709,9 +773,11 @@ export async function startRelay(options = {}) {
         const ip = clientAddress(req);
         const presented = bearerToken(req.headers.authorization);
         allowPresented(presented, ip)
-          .then((allowed) => {
+          .then((decision) => {
             if (res.writableEnded) return undefined;
-            if (!allowed) {
+            if (!decision.ok) {
+              const listed = String(presented || "").length >= MIN_TOKEN_LENGTH ? secrets.concat(presented) : secrets;
+              logSafe(listed, "rejected a reset reason=" + (decision.refusal || "unknown"));
               res.writeHead(401, { "content-length": 0 });
               res.end();
               return undefined;
@@ -767,14 +833,16 @@ export async function startRelay(options = {}) {
       const ip = clientAddress(req);
       const presented = bearerToken(req.headers.authorization);
       allowPresented(presented, ip)
-        .then((allowed) => {
-          if (!allowed) {
+        .then((decision) => {
+          if (!decision.ok) {
             const listed = String(presented || "").length >= MIN_TOKEN_LENGTH ? secrets.concat(presented) : secrets;
-            logSafe(listed, "rejected a sync connection");
+            logSafe(listed, "rejected a sync connection reason=" + (decision.refusal || "unknown"));
             rejectUpgrade(socket);
             return;
           }
           entry.wss.handleUpgrade(req, socket, head, (ws) => {
+            ws.aidanosAuth = decision.deviceId ? "device" : "shared";
+            ws.aidanosDeviceId = decision.deviceId || "";
             const addListener = ws.addListener.bind(ws);
             let rejectedFrame = false;
             function listen(event, handler) {
@@ -810,12 +878,13 @@ export async function startRelay(options = {}) {
               logSyncFrame("out", args[0], secrets);
               return send.apply(ws, args);
             };
-            logSafe(secrets, "accepted a sync connection");
+            const who = decision.deviceId ? "device=" + decision.deviceId : "shared-key";
+            logSafe(secrets, "accepted a sync connection " + who);
             entry.wss.emit("connection", ws, req);
           });
         })
         .catch(() => {
-          logSafe(secrets, "rejected a sync connection");
+          logSafe(secrets, "rejected a sync connection reason=unknown");
           try {
             rejectUpgrade(socket);
           } catch {
@@ -855,6 +924,59 @@ export async function startRelay(options = {}) {
     if (gitTimer.unref) gitTimer.unref();
   }
 
+  let deviceFileWarned = false;
+  function closeForDeviceFile() {
+    for (const entry of servers) {
+      for (const ws of [...entry.wss.clients]) ws.terminate();
+    }
+    if (!deviceFileWarned) {
+      deviceFileWarned = true;
+      logSafe(secrets, "closing sync connections reason=device-file");
+    }
+  }
+
+  async function sweepDevices() {
+    let state;
+    try {
+      state = await readDeviceState(dataDir);
+    } catch {
+      closeForDeviceFile();
+      return;
+    }
+    if (state.unreadable || (state.policy.devicesIssued && !state.record)) {
+      closeForDeviceFile();
+      return;
+    }
+    deviceFileWarned = false;
+    const record = state.record;
+    const sharedRetired = Boolean(state.policy.sharedRetired) || Boolean(record && record.shared === "retired");
+    const devices = record && Array.isArray(record.devices) ? record.devices : [];
+    for (const entry of servers) {
+      for (const ws of [...entry.wss.clients]) {
+        if (ws.aidanosAuth === "device") {
+          const id = String(ws.aidanosDeviceId || "");
+          const row = devices.find((device) => device.id === id);
+          if (!row || row.revokedAt) {
+            logSafe(secrets, "closed a sync connection device=" + id);
+            ws.terminate();
+          }
+        } else if (ws.aidanosAuth === "shared" && sharedRetired) {
+          logSafe(secrets, "closed a sync connection reason=shared-key-retired");
+          ws.terminate();
+        }
+      }
+    }
+  }
+
+  const requestedPoll = Number(options.devicePollMs);
+  const devicePollMs = Number.isFinite(requestedPoll) && requestedPoll > 0 ? requestedPoll : 2000;
+  const deviceTimer = setInterval(() => {
+    sweepDevices().catch((error) => {
+      logSafe(secrets, "device check failed:", error instanceof Error ? error.message : error);
+    });
+  }, devicePollMs);
+  if (deviceTimer.unref) deviceTimer.unref();
+
   api = {
     port: boundPort,
     url: "ws://" + "127.0.0.1:" + boundPort,
@@ -877,6 +999,7 @@ export async function startRelay(options = {}) {
       live = null;
       if (session) session.mirror.stop();
       if (gitTimer) clearInterval(gitTimer);
+      clearInterval(deviceTimer);
       for (const entry of servers) {
         for (const ws of [...entry.wss.clients]) ws.terminate();
         entry.wss.close();
@@ -942,16 +1065,21 @@ export async function runDeviceCommand(args, env = process.env) {
   const command = args.deviceCommand;
   if (!command) throw new Error("Name the device command.");
   if (command.action === "--list-devices") {
-    const record = await readDeviceFile(dataDir);
-    return { lines: deviceLines(record) };
+    const state = await readDeviceState(dataDir);
+    if (state.unreadable || (state.policy.devicesIssued && !state.record)) {
+      throw new Error("Device keys are in use, but the device file is missing or unreadable.");
+    }
+    const lines = deviceLines(state.record);
+    if (state.policy.sharedRetired) lines[0] = "shared off";
+    return { lines };
   }
   if (command.action === "--issue-device") {
     const issued = await issueDevice(dataDir, command.name);
-    return { announcement: issued.announcement, key: issued.key, name: issued.name, token };
+    return { announcement: issued.announcement, key: issued.key, id: issued.id, token };
   }
   if (command.action === "--revoke-device") {
-    const name = await revokeDevice(dataDir, command.name);
-    return { message: "removed a device key for " + name, token };
+    const ids = await revokeDevice(dataDir, command.name);
+    return { message: "removed a device key device=" + ids.join(","), token };
   }
   if (command.action === "--retire-shared-key") {
     await retireSharedKey(dataDir);
@@ -963,6 +1091,14 @@ export async function runDeviceCommand(args, env = process.env) {
   if (command.action === "--restore-shared-key") {
     await restoreSharedKey(dataDir);
     return { message: "The shared key can open a connection again.", token };
+  }
+  if (command.action === "--reenable-shared-key") {
+    await reenableSharedKey(dataDir);
+    return { message: "The shared key can open a connection again.", token };
+  }
+  if (command.action === "--restore-device-file") {
+    await restoreDeviceFile(dataDir);
+    return { message: "Restored the device file from the last good copy.", token };
   }
   throw new Error("Name the device command.");
 }
@@ -981,7 +1117,7 @@ async function main() {
       revealed = result.key || "";
       if (result.announcement) {
         writeSync(1, result.announcement);
-        logSafe(redactList(result.token, result.key), "issued a device key for " + result.name);
+        logSafe(redactList(result.token, result.key), "issued a device key device=" + result.id);
       } else if (result.lines) {
         for (const line of result.lines) writeSync(1, line + "\n");
       } else if (result.message) {

@@ -4,9 +4,9 @@ The relay is the small sync server the iPhone and Mac apps talk to. How to run i
 
 ## Device keys
 
-Each device can have its own key. The key is shown once, when that device is added. The disk stores a fingerprint, not the key. Removing one device does not change the other. The shared token still works until you retire it, and retiring it does not edit the token file. `--restore-shared-key` turns it back on.
+Each device can have its own key. The key is shown once, when that device is added, on an interactive terminal. The disk stores a fingerprint, not the key. Removing one device does not change the other, and a connection already open with the removed key is closed. The shared token still works until you retire it, and retiring it does not edit the token file. `--restore-shared-key` turns it back on when the device file is readable. If that file is missing after a key was issued, the relay refuses to start until `--reenable-shared-key`. Deleting the device file does not turn the shared key back on.
 
-Local runs bind to `127.0.0.1` only. `--behind-proxy` is the hosted shape: the same bind, with a TLS proxy on that machine in front. It refuses `--lan`. It is not a deploy. What a later hosted machine needs is in `docs/native/HOSTING.md`.
+Local runs bind to `127.0.0.1` only. `--behind-proxy` is the hosted shape: the same bind, with a TLS proxy on that machine in front. It refuses `--lan`, and it turns the per-address guess lockout off so one client cannot block the others. The proxy should limit guesses. The relay does not trust `X-Forwarded-For`. It is not a deploy. What a later hosted machine needs is in `docs/native/HOSTING.md`. The default data folder is `vault/.aidanos/relay`. Pass `--data` to a folder outside the notes.
 
 ## Tracked, not done yet
 

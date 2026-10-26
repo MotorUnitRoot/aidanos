@@ -101,6 +101,7 @@ function checkWiring() {
   const watch = sliceFn("function startLogWatch(", "function sendFile(");
   assert(dayGet.includes("worktreePath") && dayGet.includes("gitSymlinkSet"), "day read uses worktreePath and skips a git link");
   assert(dayPut.includes("worktreePath") && dayPut.includes("gitSymlinkSet") && !dayPut.includes('path.join(VAULT, "log"'), "day write uses worktreePath and skips a git link");
+  assert(dayPut.includes('error: "not a file"'), "a day folder is refused before the write");
   assert(fileGet.includes("worktreePath") && !fileGet.includes("resolveInside"), "file read uses worktreePath");
   assert(filePut.includes("worktreePath") && !filePut.includes("resolveInside"), "file write uses worktreePath");
   assert(tree.includes("worktreeDir") && dirFn.includes("worktreePath"), "tree checks the folder through worktreePath");
@@ -1688,6 +1689,7 @@ async function swappedParentWritesNothing() {
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
+    NODE_ENV: "test",
     AIDANOS_TEST_HOLD_WRITE: hold,
   });
   const base = "http://127.0.0.1:" + port;
@@ -1730,11 +1732,15 @@ async function swappedParentWritesNothing() {
   }
 }
 
-async function taggedEisdirStops() {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-eisdir-"));
+async function folderTargetsStayUp() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-folder-"));
   const vault = path.join(tmp, "vault");
   const dayDir = path.join(vault, "log", "2026-04-02.md");
+  const noteDir = path.join(vault, "notes", "page.md");
+  const pngDir = path.join(vault, "family-room-to-office", "plan.png");
   fs.mkdirSync(dayDir, { recursive: true });
+  fs.mkdirSync(noteDir, { recursive: true });
+  fs.mkdirSync(pngDir, { recursive: true });
   const port = 39200 + Math.floor(Math.random() * 200);
   const child = spawnServer({
     PORT: String(port),
@@ -1745,31 +1751,202 @@ async function taggedEisdirStops() {
     GITHUB_TOKEN: "",
   });
   const base = "http://127.0.0.1:" + port;
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+  async function put(url, body) {
+    const res = await fetch(base + url, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    assert(res.status === 400, url + " got " + res.status + " " + text);
+    assert(text === JSON.stringify({ error: "not a file" }), url + " said " + text);
+  }
   try {
     await waitHealth(base, child);
+    await put("/api/day?date=2026-04-02", { markdown: "DAY_FOLDER_SECRET\n" });
+    await put("/api/file?path=" + encodeURIComponent("notes/page.md"), { markdown: "NOTE_FOLDER_SECRET\n" });
+    await put("/api/file?path=" + encodeURIComponent("family-room-to-office/plan.png"), { png: png.toString("base64") });
+    assert(fs.lstatSync(dayDir).isDirectory(), "day save replaced the folder");
+    assert(fs.lstatSync(noteDir).isDirectory(), "note save replaced the folder");
+    assert(fs.lstatSync(pngDir).isDirectory(), "png save replaced the folder");
+    assert(!containsBytes(vault, Buffer.from("DAY_FOLDER_SECRET")), "day folder stored the note");
+    assert(!containsBytes(vault, Buffer.from("NOTE_FOLDER_SECRET")), "note folder stored the note");
+    assert(child.exitCode == null, "a folder target exited the server");
+    assert(!child._log().includes("stopped:"), "a folder target stopped: " + child._log());
+    const health = await fetch(base + "/api/health");
+    assert(health.status === 200, "health failed after a folder target");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function folderAppearsDuringWriteStops() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-midwrite-"));
+  const vault = path.join(tmp, "vault");
+  const hold = path.join(tmp, "hold");
+  const dayDir = path.join(vault, "log", "2026-04-03.md");
+  fs.mkdirSync(path.join(vault, "log"), { recursive: true });
+  const port = 39100 + Math.floor(Math.random() * 100);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+    NODE_ENV: "test",
+    AIDANOS_TEST_HOLD_RENAME: hold,
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    const put = fetch(base + "/api/day?date=2026-04-03", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "DURING_FOLDER_SECRET\n" }),
+    });
+    const holdFile = path.join(hold, "hold");
+    const deadline = Date.now() + 4000;
+    while (!fs.existsSync(holdFile) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert(fs.existsSync(holdFile), "save did not stop before rename");
+    fs.mkdirSync(dayDir);
+    fs.writeFileSync(path.join(hold, "go"), "1");
     let status = 0;
     let text = "";
     try {
-      const res = await fetch(base + "/api/day?date=2026-04-02", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ markdown: "EISDIR_NOTE_SECRET\n" }),
-      });
+      const res = await put;
       status = res.status;
       text = await res.text();
     } catch (e) {
       text = String(e && e.message || e);
     }
     await waitExit(child, 4000);
-    assert(child.exitCode != null, "tagged EISDIR left the server up");
+    assert(child.exitCode != null, "a folder that appeared during the write left the server up");
     if (status) {
-      assert(status === 500, "tagged EISDIR got " + status + " " + text);
-      assert(!text.includes("EISDIR_NOTE_SECRET"), "tagged EISDIR leaked the note");
+      assert(status === 500, "a mid-write folder got " + status + " " + text);
+      assert(!text.includes("DURING_FOLDER_SECRET"), "a mid-write folder leaked the note");
     }
-    assert(child._log().includes("stopped: rename EISDIR"), "tagged EISDIR log was " + child._log());
-    assert(!child._log().includes("EISDIR_NOTE_SECRET"), "tagged EISDIR logged the note");
-    assert(fs.lstatSync(dayDir).isDirectory(), "tagged EISDIR replaced the folder");
-    assert(!containsBytes(path.join(vault, "log"), Buffer.from("EISDIR_NOTE_SECRET")), "tagged EISDIR stored the note");
+    assert(child._log().includes("stopped: rename EISDIR"), "mid-write folder log was " + child._log());
+    assert(fs.lstatSync(dayDir).isDirectory(), "mid-write folder was replaced");
+    assert(!containsBytes(vault, Buffer.from("DURING_FOLDER_SECRET")), "mid-write folder stored the note");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function renameFailureStops() {
+  if (runningAsRoot()) {
+    console.log("skip permission test as root");
+    return;
+  }
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-rename-"));
+  const vault = path.join(tmp, "vault");
+  const notes = path.join(vault, "notes");
+  const hold = path.join(tmp, "hold");
+  fs.mkdirSync(notes, { recursive: true });
+  fs.writeFileSync(path.join(notes, "page.md"), "old\n");
+  const port = 39300 + Math.floor(Math.random() * 100);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+    NODE_ENV: "test",
+    AIDANOS_TEST_HOLD_RENAME: hold,
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    const put = fetch(base + "/api/file?path=" + encodeURIComponent("notes/page.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "RENAME_SECRET\n" }),
+    });
+    const holdFile = path.join(hold, "hold");
+    const deadline = Date.now() + 4000;
+    while (!fs.existsSync(holdFile) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert(fs.existsSync(holdFile), "save did not stop before rename");
+    fs.chmodSync(notes, 0o555);
+    fs.writeFileSync(path.join(hold, "go"), "1");
+    let status = 0;
+    let text = "";
+    try {
+      const res = await put;
+      status = res.status;
+      text = await res.text();
+    } catch (e) {
+      text = String(e && e.message || e);
+    }
+    await waitExit(child, 4000);
+    fs.chmodSync(notes, 0o755);
+    assert(child.exitCode != null, "rename EACCES left the server up");
+    if (status) {
+      assert(status === 500, "rename EACCES got " + status + " " + text);
+      assert(!text.includes("RENAME_SECRET"), "rename EACCES leaked the note");
+    }
+    assert(child._log().includes("stopped: rename EACCES"), "rename failure log was " + child._log());
+    assert(!child._log().includes("RENAME_SECRET"), "rename failure logged the note");
+    assert(fs.readFileSync(path.join(notes, "page.md"), "utf8") === "old\n", "rename failure replaced the note");
+  } finally {
+    try { fs.chmodSync(notes, 0o755); } catch {}
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function ownGitConfigIsLeftAlone() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-ownkeys-"));
+  const vault = path.join(tmp, "vault");
+  const bare = path.join(tmp, "bare.git");
+  const ownHooks = path.join(tmp, "my-hooks");
+  fs.mkdirSync(vault);
+  gitQuiet(tmp, ["init", "--bare", "-b", "main", bare]);
+  gitQuiet(tmp, ["init", "-b", "main", vault]);
+  gitQuiet(vault, ["config", "user.email", "t@local"]);
+  gitQuiet(vault, ["config", "user.name", "t"]);
+  fs.writeFileSync(path.join(vault, "README.md"), "vault\n");
+  gitQuiet(vault, ["add", "README.md"]);
+  gitQuiet(vault, ["commit", "-m", "init"]);
+  gitQuiet(vault, ["remote", "add", "origin", bare]);
+  gitQuiet(vault, ["push", "-u", "origin", "HEAD"]);
+  gitQuiet(vault, ["config", "core.symlinks", "false"]);
+  gitQuiet(vault, ["config", "core.fsmonitor", "false"]);
+  gitQuiet(vault, ["config", "protocol.allow", "never"]);
+  gitQuiet(vault, ["config", "core.hooksPath", ownHooks]);
+  gitQuiet(vault, ["config", "credential.helper", "SECRET_HELPER_VALUE"]);
+  const port = 39500 + Math.floor(Math.random() * 100);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: bare,
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+    AIDANOS_VAULT_GIT_SYNC_MS: "0",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline && !child._log().includes("vault git config:")) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    assert(child._log().includes("credential.helper"), "startup did not finish reading git config");
+    assert(!child._log().includes("SECRET_HELPER_VALUE"), "git config warning included a value");
+    assert(localConfig(vault, "core.symlinks") === "false", "own core.symlinks was removed");
+    assert(localConfig(vault, "core.fsmonitor") === "false", "own core.fsmonitor was removed");
+    assert(localConfig(vault, "protocol.allow") === "never", "own protocol.allow was removed");
+    assert(localConfig(vault, "core.hooksPath") === ownHooks, "own hooksPath was removed");
+    assert(child.exitCode == null, "own git config refused startup");
   } finally {
     await stop(child);
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -1799,6 +1976,8 @@ async function oldSafetyKeysAreRemoved() {
   gitQuiet(vault, ["config", "protocol.file.allow", "always"]);
   gitQuiet(vault, ["config", "protocol.ssh.allow", "never"]);
   gitQuiet(vault, ["config", "core.editor", "vim"]);
+  gitQuiet(vault, ["config", "credential.helper", "SECRET_HELPER_VALUE"]);
+  gitQuiet(vault, ["config", "http.extraheader", "SECRET_HEADER_VALUE"]);
   const port = 39400 + Math.floor(Math.random() * 200);
   const child = spawnServer({
     PORT: String(port),
@@ -1826,6 +2005,15 @@ async function oldSafetyKeysAreRemoved() {
     assert(localConfig(vault, "core.editor") === "vim", "an unrelated git setting was removed");
     assert(localConfig(vault, "user.name") !== "", "git identity was removed");
     assert(!fs.existsSync(hooks), "hooks directory was created");
+    const warnDeadline = Date.now() + 4000;
+    while (Date.now() < warnDeadline && !child._log().includes("vault git config:")) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    const logged = child._log();
+    assert(logged.includes("vault git config: "), "risky git keys were not named");
+    assert(logged.includes("credential.helper") && logged.includes("http.extraheader"), "risky git keys were missing: " + logged);
+    assert(!logged.includes("SECRET_HELPER_VALUE") && !logged.includes("SECRET_HEADER_VALUE"), "git config warning included a value");
+    assert(child.exitCode == null, "a risky git key refused startup");
   } finally {
     await stop(child);
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -1941,7 +2129,10 @@ await gitSafetyAndIndexLink();
 await pngDirectoryDoesNotStop();
 await pauseClearsOnlyAfterSuccess();
 await swappedParentWritesNothing();
-await taggedEisdirStops();
+await folderTargetsStayUp();
+await folderAppearsDuringWriteStops();
+await renameFailureStops();
+await ownGitConfigIsLeftAlone();
 await oldSafetyKeysAreRemoved();
 await pausedWordingFollowsTheVault();
 await aggregateSkipsLinks();

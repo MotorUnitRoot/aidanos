@@ -293,8 +293,10 @@ function sameConfigPath(cwd, value, expected) {
 }
 
 // Drop the safety keys an older build wrote into the vault config.
-// Only an exact match is removed. A different value is the operator's.
+// That build is the only one that set core.hooksPath to .git/aidanos-no-hooks.
+// Any other hooks path means the remaining keys are the operator's.
 async function unsetOldGitSafety(cwd) {
+  const hooks = path.join(cwd, ".git", "aidanos-no-hooks");
   const exact = [
     ["core.symlinks", "false"],
     ["core.fsmonitor", "false"],
@@ -304,18 +306,59 @@ async function unsetOldGitSafety(cwd) {
     ["protocol.file.allow", "always"],
   ];
   try {
-    for (const [key, value] of exact) {
-      if ((await localGitValue(cwd, key)) !== value) continue;
-      await runGit(["-C", cwd, "config", "--local", "--unset", key], { timeoutMs: 4000 }).catch(() => {});
-    }
-    const hooks = path.join(cwd, ".git", "aidanos-no-hooks");
     const hooksPath = await localGitValue(cwd, "core.hooksPath");
     if (sameConfigPath(cwd, hooksPath, hooks)) {
+      for (const [key, value] of exact) {
+        if ((await localGitValue(cwd, key)) !== value) continue;
+        await runGit(["-C", cwd, "config", "--local", "--unset", key], { timeoutMs: 4000 }).catch(() => {});
+      }
       await runGit(["-C", cwd, "config", "--local", "--unset", "core.hooksPath"], { timeoutMs: 4000 }).catch(() => {});
     }
   } catch {
     // The command-line -c flags still override whatever is left in the file.
   }
+  await warnRiskyGitConfig(cwd);
+}
+
+function riskyGitKeyLabel(key) {
+  const words = [
+    ["includeif", "includeIf"],
+    ["include", "include"],
+    ["credential", "credential"],
+    ["sshcommand", "sshCommand"],
+    ["askpass", "askpass"],
+    ["insteadof", "insteadOf"],
+    ["extraheader", "extraheader"],
+    ["pager", "pager"],
+    ["proxy", "proxy"],
+  ];
+  const lower = String(key || "").toLowerCase();
+  for (const [word, label] of words) {
+    if (!lower.includes(word)) continue;
+    return /^[A-Za-z0-9_.-]+$/.test(key) ? key : label;
+  }
+  return "";
+}
+
+async function warnRiskyGitConfig(cwd) {
+  let text = "";
+  try {
+    const { out } = await runGit(
+      ["-C", cwd, "config", "--local", "--name-only", "--list"],
+      { timeoutMs: 4000 },
+    );
+    text = out || "";
+  } catch {
+    return;
+  }
+  const names = [];
+  for (const line of text.split("\n")) {
+    const label = riskyGitKeyLabel(line.trim());
+    if (label && !names.includes(label)) names.push(label);
+  }
+  if (!names.length) return;
+  names.sort();
+  console.error("vault git config: " + names.join(", "));
 }
 
 async function ensureOrigin(cwd) {
@@ -2426,8 +2469,30 @@ function sameTextAlreadyStored(exists, raw, markdown, conflict, resolve) {
   return true;
 }
 
+function testHoldDir(name) {
+  if (process.env.NODE_ENV !== "test") return "";
+  return String(process.env[name] || "").trim();
+}
+
+async function holdRenameForTest() {
+  const dir = testHoldDir("AIDANOS_TEST_HOLD_RENAME");
+  if (!dir) return;
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, "hold"), "1");
+  const go = path.join(dir, "go");
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    try {
+      await fs.access(go);
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+}
+
 async function holdWriteForTest() {
-  const dir = String(process.env.AIDANOS_TEST_HOLD_WRITE || "").trim();
+  const dir = testHoldDir("AIDANOS_TEST_HOLD_WRITE");
   if (!dir) return;
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(path.join(dir, "hold"), "1");
@@ -2460,6 +2525,7 @@ async function atomicWriteFile(filePath, markdown, beforeRename) {
     fh = null;
     if (beforeRename) await beforeRename();
     await assertParents(seen);
+    await holdRenameForTest();
     try {
       await fs.rename(tmpPath, filePath);
     } catch (e) {
@@ -2520,7 +2586,7 @@ function isPngBuffer(buf) {
 function refusalMessage(err) {
   if (err && err.code === "BAD_PATH") return "bad path";
   const msg = err && err.message;
-  if (msg === "bad path" || msg === "path escapes vault" || msg === "bad png") return msg;
+  if (msg === "bad path" || msg === "path escapes vault" || msg === "bad png" || msg === "not a file") return msg;
   if (typeof msg === "string" && msg.startsWith("symlink: ")) {
     const named = msg.slice("symlink: ".length);
     if (!named || named.startsWith("/") || named.includes("..") || named.includes("\\") || named.includes("\0")) {
@@ -3100,10 +3166,11 @@ const server = http.createServer(async (req, res) => {
           if (st.isSymbolicLink()) {
             return refuse(res, "symlink: " + dayRel);
           }
-          if (st.isFile()) {
-            exists = true;
-            diskMtime = Math.trunc(st.mtimeMs);
+          if (!st.isFile()) {
+            return json(res, 400, { error: "not a file" });
           }
+          exists = true;
+          diskMtime = Math.trunc(st.mtimeMs);
         } catch (e) {
           if (e.code !== "ENOENT") throw e;
         }

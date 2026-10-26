@@ -1,7 +1,8 @@
-FROM node:20-slim
+FROM node:22.23.4-slim
 WORKDIR /app
 COPY package.json ./
 COPY server.mjs app.js index.html day.css styles.css start.sh ./
+COPY editor ./editor
 COPY manifest.webmanifest sw.js ./
 COPY vault ./vault
 # PWA icons: write known PNGs at build time so Cloud Run never fails on missing repo blobs

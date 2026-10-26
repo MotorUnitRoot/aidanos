@@ -320,6 +320,30 @@ await check("writeVaultText in NotePlan mode keeps the note and its new text", a
     await writeVaultText("notes/day.md", "new text\n");
     assert(fs.statSync(file).ino === inode, "the note was replaced");
     assert(fs.readFileSync(file, "utf8") === "new text\n", "the new text was not saved");
+    const outside = path.join(dir, "outside.md");
+    fs.writeFileSync(outside, "outside-secret\n");
+    fs.symlinkSync(outside, path.join(vault, "notes", "link.md"));
+    await rejects(() => writeVaultText("notes/link.md", "through-link\n"));
+    assert(fs.readFileSync(outside, "utf8") === "outside-secret\n", "a linked save wrote the target");
+    assert(fs.lstatSync(path.join(vault, "notes", "link.md")).isSymbolicLink(), "the link was replaced");
+    fs.linkSync(file, path.join(vault, "notes", "hard.md"));
+    await rejects(() => writeVaultText("notes/hard.md", "through-hard\n"));
+    assert(fs.readFileSync(file, "utf8") === "new text\n", "a hard link save changed the note");
+    assert(fs.statSync(file).nlink > 1, "the hard link was replaced");
+    const pipe = path.join(vault, "notes", "pipe.md");
+    execFileSync("mkfifo", [pipe]);
+    await rejects(() => writeVaultText("notes/pipe.md", "through-fifo\n"));
+    assert(fs.lstatSync(pipe).isFIFO(), "the fifo was replaced");
+    fs.mkdirSync(path.join(vault, "notes", "folder.md"));
+    let folderMessage = "";
+    try {
+      await writeVaultText("notes/folder.md", "into-folder\n");
+    } catch (error) {
+      folderMessage = error && error.message;
+    }
+    assert(folderMessage === "not a file", "a folder target said " + folderMessage);
+    assert(fs.lstatSync(path.join(vault, "notes", "folder.md")).isDirectory(), "the folder was replaced");
+    assert(fs.readFileSync(file, "utf8") === "new text\n", "a refused save emptied the note");
   } finally {
     if (previous.vault === undefined) delete process.env.AIDANOS_VAULT;
     else process.env.AIDANOS_VAULT = previous.vault;

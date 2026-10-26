@@ -18,7 +18,7 @@ The vault is the `vault/` folder next to the app, or the folder named in `AIDANO
 
 The durable disk is a private git repo of markdown. The intended remote is `MotorUnitRoot/aidanos-vault`. This app repo does not create that remote.
 
-On a Mac, keep a working tree of that same repo on disk and point `AIDANOS_VAULT` at it. The phone uses the hosted app; the server reads and writes the files.
+On a Mac, the launchd agent in `launchd/com.aidanos.plist` starts the app from `~/Grok/motorunit/dashboard` and sets `AIDANOS_VAULT` to `~/Grok/motorunit`. That parent folder is the vault. The private remote is still `MotorUnitRoot/aidanos-vault`. The phone uses the hosted app; the server reads and writes these files.
 
 Cloud Run (and any host) can clone that repo when these are set:
 
@@ -26,6 +26,8 @@ Cloud Run (and any host) can clone that repo when these are set:
 - `AIDANOS_VAULT_GIT_TOKEN` or `GITHUB_TOKEN` — token that can clone and push
 - `AIDANOS_VAULT` — working tree path (optional; if unset with a git URL, the server clones into a dedicated directory and uses that as the vault)
 - `AIDANOS_VAULT_CLONE` — override that dedicated clone path
+
+The server's git ignores the host's global and system git config.
 
 If the git env is unset, today’s local `vault/` behavior is unchanged. A missing remote must not stop the app: writes stay on local disk, and push failures are logged plus a `git` hint on `/api/health` and successful PUT bodies.
 
@@ -67,3 +69,30 @@ AidanOS are not granted by this license.
 
 Prior releases under MIT remain available under MIT for those tagged versions
 only. New commits and releases after this change are FSL-1.1-ALv2.
+
+## Pins and the weekly scan
+
+GitHub Actions installs Node from `.nvmrc`. That file says `22.23.4`. Every workflow reads the file, so the jobs stay on the same version.
+
+Third-party actions are pinned to a full commit. The release number sits in a comment at the end of that line. GitHub's checkout and Node setup actions stay on the commits already recorded here, and they take the Node version from `.nvmrc`.
+
+Dependabot checks GitHub Actions and Docker once a week. An ordinary version update waits 7 days before a pull request is opened. Security updates are a separate Dependabot feed. The 7-day wait applies to ordinary version updates.
+
+`.github/workflows/flaw-scan.yml` runs every week, and whenever someone starts it by hand. It checks this repository and the built container image against public vulnerability databases (Trivy), CISA's Known Exploited Vulnerabilities list, and the published end-of-support dates for the Node version and the Linux distribution inside the hosted image. End of support is the day security fixes stop.
+
+A finding is urgent in any of these cases:
+
+- It is on CISA's Known Exploited Vulnerabilities list, the list of vulnerabilities already used in real attacks.
+- It is critical severity and reachable from the internet. The hosted app's container image is reachable, and so is the server code that image runs. A critical finding in dev-only or CI-only tooling stays in the weekly summary.
+- The hosted image's Node version, or the Linux distribution that image is built on, has reached its end-of-support date. The date itself counts.
+
+The weekly summary names an end-of-support date starting 60 days before it. On that date, and after it, the same fact is urgent. That rule uses the hosted image. The summary also prints the Node version GitHub Actions installs from `.nvmrc`. The run fails when something is urgent. Everything else is listed in the summary, in severity order, with urgent items first. This scan is not a required check on pull requests.
+
+The app still has no runtime npm dependencies.
+
+### Tracked, not done yet
+
+- Keep the Trivy download's sha256 in this repo, or check its cosign signature in an install step we own.
+- Dependabot does not bump the Trivy version written in the workflow. A daily version check should cover that pin.
+- An urgent finding should later open an issue or send an alert. Today the run only fails.
+- GitHub turns off a scheduled workflow after 60 days with no activity. A daily check should confirm this scan ran.

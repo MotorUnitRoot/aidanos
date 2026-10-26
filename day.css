@@ -1592,8 +1592,8 @@ body.doc-capture #job-actions {
   }
 }
 
-/* Phone formatting bar. Paper colors, hairline, square. Hidden on the Mac. */
-.fmt-bar {
+/* Formatting bar above keyboard */
+.format-bar {
   position: fixed;
   left: 0;
   right: 0;
@@ -1607,6 +1607,7 @@ body.doc-capture #job-actions {
   max-width: 100%;
   margin: 0;
   padding: 0;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
   box-sizing: border-box;
   overflow: hidden;
   background: var(--bg);
@@ -1615,23 +1616,22 @@ body.doc-capture #job-actions {
   border-top: 1px solid var(--border);
   border-radius: 0;
   box-shadow: none;
-  transform: none;
 }
-.fmt-bar.hidden,
-.fmt-bar[hidden] { display: none !important; }
-.fmt-btn {
+.format-bar[hidden] { display: none !important; }
+.format-btn {
   appearance: none;
+  flex: 1 1 0;
   border: 0;
   background: transparent;
   color: inherit;
-  flex: 1 1 0;
-  width: auto;
   min-width: 0;
-  height: 2.75rem;
-  min-height: 0;
+  width: auto;
+  height: max(44px, var(--tap));
+  min-height: max(44px, var(--tap));
+  margin: 0;
+  padding: 0;
   border-radius: 0;
-  box-shadow: none;
-  font-size: 1rem;
+  font: inherit;
   line-height: 1;
   display: inline-flex;
   align-items: center;
@@ -1639,22 +1639,33 @@ body.doc-capture #job-actions {
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
 }
-.fmt-ico {
+.format-ico {
   width: 1.35rem;
   height: 1.35rem;
   display: block;
   pointer-events: none;
 }
-.fmt-bar.hidden { display: none !important; }
-.fmt-btn:active {
-  background: transparent;
+.format-btn:active,
+.format-btn:focus-visible {
   color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+.format-btn:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: -2px;
+}
+@media (min-width: 641px) {
+  .format-bar { display: none !important; }
 }
 @media (max-width: 640px) {
-  body.fmt-bar-on .paper-wrap {
+  body.format-bar-on .paper-wrap {
     scroll-padding-bottom: 3rem;
   }
+  body.format-bar-on .paper {
+    scroll-padding-bottom: max(44px, var(--tap));
+  }
 }
+
 
 /* Conflict — paper, not Door. Hairline actions. Designer owns look. */
 .conflict-sheet {

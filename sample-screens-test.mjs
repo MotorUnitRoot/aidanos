@@ -329,7 +329,7 @@ try {
     })()`);
     await waitFor(async () => {
       const ok = await evalJs(`(() => {
-        const bar = document.getElementById("fmt-bar");
+        const bar = document.getElementById("format-bar");
         const rail = document.querySelector(".today-rail");
         if (!bar || !rail) return "missing";
         const hidden = bar.hidden || getComputedStyle(bar).display === "none";
@@ -560,12 +560,12 @@ try {
         window.dispatchEvent(new Event("resize"));
         return true;
       })()`);
-      const order = await evalJs(`[...document.querySelectorAll("#fmt-bar [data-fmt]")].map((button) => button.getAttribute("data-fmt")).join(",")`);
+      const order = await evalJs(`[...document.querySelectorAll("#format-bar [data-fmt]")].map((button) => button.getAttribute("data-fmt")).join(",")`);
       assert(order === "task,heading,list,indent,outdent,undo,find,hide", "format bar order " + order);
-      const icons = await evalJs(`[...document.querySelectorAll("#fmt-bar svg")].map((svg) => svg.innerHTML).join(" ")`);
+      const icons = await evalJs(`[...document.querySelectorAll("#format-bar svg")].map((svg) => svg.innerHTML).join(" ")`);
       assert(icons.includes("M5.5 5v14") && icons.includes("M4 7h2") && icons.includes("9.6 12") && icons.includes("14.4 12") && icons.includes("M4.3 5.15h2.15"), "format icons drifted");
       const flush = await evalJs(`(() => {
-        const bar = document.getElementById("fmt-bar").getBoundingClientRect();
+        const bar = document.getElementById("format-bar").getBoundingClientRect();
         const ask = document.getElementById("ask-open").getBoundingClientRect();
         return Math.abs(ask.top - bar.bottom);
       })()`);
@@ -574,7 +574,7 @@ try {
         const wrap = document.querySelector(".paper-wrap");
         wrap.scrollTop = wrap.scrollHeight;
         const last = [...document.querySelectorAll("#paper .md-line")].pop();
-        const barTop = document.getElementById("fmt-bar").getBoundingClientRect().top;
+        const barTop = document.getElementById("format-bar").getBoundingClientRect().top;
         if (!last) return "no line";
         return last.getBoundingClientRect().bottom <= barTop + 1;
       })()`);
@@ -582,11 +582,11 @@ try {
       await evalJs(`document.querySelector(".paper-wrap").scrollTop = 0`);
     } else {
       await evalJs(`(() => {
-        const bar = document.getElementById("fmt-bar");
+        const bar = document.getElementById("format-bar");
         bar.setAttribute("hidden", "");
         return bar.hidden;
       })()`);
-      const hidden = await evalJs(`document.getElementById("fmt-bar").hidden === true`);
+      const hidden = await evalJs(`document.getElementById("format-bar").hidden === true`);
       assert(hidden === true, "the Mac shows the formatting bar");
       openedEdge = await paperEdge();
       assert(openedEdge && Math.abs(openedEdge.title - openedEdge.paper) <= 1, "the open title and the note do not share a left edge");
@@ -763,7 +763,7 @@ try {
     return true;
   })()`);
   const paperTone = await evalJs(`(() => {
-    const bar = getComputedStyle(document.getElementById("fmt-bar"));
+    const bar = getComputedStyle(document.getElementById("format-bar"));
     const page = getComputedStyle(document.body);
     const barRgb = bar.backgroundColor.replace(/\\s/g, "");
     const pageRgb = page.backgroundColor.replace(/\\s/g, "");
@@ -787,7 +787,7 @@ try {
     window.dispatchEvent(new Event("resize"));
     return true;
   })()`);
-  const wideBar = await evalJs(`document.getElementById("fmt-bar").hidden === true || getComputedStyle(document.getElementById("fmt-bar")).display === "none"`);
+  const wideBar = await evalJs(`document.getElementById("format-bar").hidden === true || getComputedStyle(document.getElementById("format-bar")).display === "none"`);
   assert(wideBar === true, "the wide layout shows the formatting bar");
 
   await setWidth(390);
@@ -798,7 +798,7 @@ try {
     return true;
   })()`);
   const editing = await evalJs(`(() => {
-    const bar = document.getElementById("fmt-bar");
+    const bar = document.getElementById("format-bar");
     const rail = document.querySelector(".today-rail");
     const ask = document.getElementById("ask-open");
     const barBox = bar.getBoundingClientRect();

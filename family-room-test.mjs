@@ -565,7 +565,7 @@ check("a narrow map starts at the left edge and scrolls", () => {
   const css = fs.readFileSync(path.join(root, "day.css"), "utf8");
   const at = css.indexOf(".map-board {\n    align-items: flex-start;");
   assert(at > css.indexOf("@media (max-width: 720px)"), "the left start is the phone map");
-  const narrow = css.slice(at, css.indexOf("/* NotePlan", at));
+  const narrow = css.slice(at, css.indexOf("/* Formatting bar", at));
   const board = narrow.slice(0, narrow.indexOf(".map-flow {"));
   assert(/align-items:\s*flex-start/.test(board), "rows start at the left");
   assert(/overflow:\s*auto/.test(board), "the map scrolls");

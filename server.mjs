@@ -178,34 +178,17 @@ function gitHint() {
 }
 
 export function gitEnv() {
-  const env = {
-    ...process.env,
-    GIT_TERMINAL_PROMPT: "0",
-    GIT_EDITOR: "true",
-    GIT_MERGE_AUTOEDIT: "no",
-    // Pathspecs stay literal after "--". Otherwise `Q?.md` also matches QA.md.
-    GIT_LITERAL_PATHSPECS: "1",
-  };
-  delete env.GIT_ASKPASS;
-  // These point git at another repository or inject config. Drop them from
-  // every child. Leave other GIT_* alone: wiping the rest would drop the
-  // editor settings above.
-  const drop = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_CONFIG",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_COUNT",
-  ];
+  const env = { ...process.env };
+  // Drop every inherited GIT_* name first. A short list misses
+  // GIT_CONFIG_PARAMETERS and GIT_COMMON_DIR, and git reads both.
+  // The settings below are applied after that, so the scrub does not drop them.
   for (const key of Object.keys(env)) {
-    if (drop.includes(key) || key.startsWith("GIT_CONFIG_KEY_") || key.startsWith("GIT_CONFIG_VALUE_")) {
-      delete env[key];
-    }
+    if (key.startsWith("GIT_")) delete env[key];
   }
+  env.GIT_EDITOR = "true";
+  env.GIT_MERGE_AUTOEDIT = "no";
+  // Pathspecs stay literal after "--". Otherwise `Q?.md` also matches QA.md.
+  env.GIT_LITERAL_PATHSPECS = "1";
   return env;
 }
 

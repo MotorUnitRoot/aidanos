@@ -55,9 +55,11 @@ function checkWiring() {
   const stage = sliceFn("async function stageAndCommit(", "async function commitAppPaths(");
   const atomic = sliceFn("async function atomicWriteFile(", "function atomicWriteDay(");
   const reader = sliceFn("async function readFileSafe(", "function parseFrontmatter(");
-  assert(envFn.includes('GIT_LITERAL_PATHSPECS: "1"'), "git pathspecs are literal");
-  assert(envFn.includes('"GIT_DIR"') && envFn.includes("GIT_CONFIG_KEY_"), "git children drop inherited repo pointers");
-  assert(envFn.includes('GIT_EDITOR: "true"') && envFn.includes('GIT_MERGE_AUTOEDIT: "no"'), "editor settings stay on git children");
+  assert(envFn.includes('GIT_LITERAL_PATHSPECS = "1"') || envFn.includes('GIT_LITERAL_PATHSPECS: "1"'), "git pathspecs are literal");
+  assert(envFn.includes('startsWith("GIT_")'), "git children drop every inherited GIT_ variable");
+  assert(envFn.indexOf('startsWith("GIT_")') < envFn.indexOf("GIT_EDITOR"), "editor settings are set after the scrub");
+  assert(!envFn.includes("Leave other GIT_"), "the scrub comment no longer says a full wipe is impossible");
+  assert(envFn.includes('GIT_EDITOR = "true"') && envFn.includes('GIT_MERGE_AUTOEDIT = "no"'), "editor settings stay on git children");
   assert(run.includes("gitEnv()"), "git commands use that environment");
   assert(read.includes("worktreePath") && read.includes("readableTarget") && read.includes("readRegularText"), "read checks parents and the leaf");
   assert(reader.includes("readRegularText"), "note reads open the checked file");
@@ -389,6 +391,42 @@ async function inheritedGitDirIsIgnored() {
   }
 }
 
+async function plantedGitEnvIsIgnored() {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-gitplant-"));
+  const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-hooks-"));
+  const decoy = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-common-"));
+  const saved = {
+    GIT_CONFIG_PARAMETERS: process.env.GIT_CONFIG_PARAMETERS,
+    GIT_COMMON_DIR: process.env.GIT_COMMON_DIR,
+  };
+  try {
+    git(["init", "-b", "main"], repo);
+    git(["init", "-b", "main"], decoy);
+    process.env.GIT_CONFIG_PARAMETERS = "'core.hookspath'='" + hooks + "'";
+    delete process.env.GIT_COMMON_DIR;
+    const hooked = gitWithEnv(["config", "--get", "core.hookspath"], repo, true).trim();
+    assert(hooked !== hooks, "git read core.hookspath from GIT_CONFIG_PARAMETERS");
+    delete process.env.GIT_CONFIG_PARAMETERS;
+    process.env.GIT_COMMON_DIR = path.join(decoy, ".git");
+    const shown = gitWithEnv(["rev-parse", "--git-common-dir"], repo).trim();
+    assert(path.resolve(shown) !== path.resolve(decoy, ".git"), "git used the decoy GIT_COMMON_DIR " + shown);
+    assert(path.resolve(repo, shown) === path.resolve(repo, ".git"), "common dir left the repo " + shown);
+    const left = Object.keys(gitEnv()).filter((key) => key.startsWith("GIT_")).sort();
+    assert(
+      left.join(",") === "GIT_EDITOR,GIT_LITERAL_PATHSPECS,GIT_MERGE_AUTOEDIT",
+      "git child kept " + left.join(","),
+    );
+  } finally {
+    for (const key of Object.keys(saved)) {
+      if (saved[key] == null) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(hooks, { recursive: true, force: true });
+    fs.rmSync(decoy, { recursive: true, force: true });
+  }
+}
+
 async function hardLinkAndPipe() {
   const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-nlink-"));
   const sentinel = "git-config-sentinel";
@@ -699,6 +737,7 @@ await leafChecks();
 await decodedGitPath();
 await literalPathspecs();
 await inheritedGitDirIsIgnored();
+await plantedGitEnvIsIgnored();
 await hardLinkAndPipe();
 await gitPointerFile();
 await httpPaths();

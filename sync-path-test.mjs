@@ -5,6 +5,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { gitEnv, readWorktree, vaultRel, worktreePath } from "./server.mjs";
@@ -76,6 +77,7 @@ function checkWiring() {
   assert(!stage.includes('"--", rel'), "stage does not pass the raw name");
   assert(reader.includes("readableTarget"), "note reads use the leaf check");
   assert(write.includes(".dev") && write.includes(".ino"), "write compares the folder inode after rename");
+  assert(!write.includes("unlink"), "a failed parent check does not delete the file");
   assert(serverSrc.includes('process.platform === "darwin" || process.platform === "win32"'), "lowercase .git name is only a second check on darwin and win32");
   assert(serverSrc.includes('"--git-dir"'), "a .git pointer file resolves the real git dir");
   const dayGet = sliceFn('pathname === "/api/day" && req.method === "GET"', 'pathname === "/api/month"');
@@ -110,8 +112,13 @@ function checkWiring() {
   assert(serverSrc.includes("Point AIDANOS_VAULT at the real folder."), "startup names the real folder");
   assert(!serverSrc.includes("fs.realpath(logicalRoot)"), "the vault root is not realpath'd open");
   const treeFn = sliceFn("async function listMdTree(", "function dayMarkdownFromBody(");
-  assert(treeFn.includes("symlinkError"), "a listing names a nested symlink");
-  assert(serverSrc.includes("stopAfterResponse"), "a dangerous failure stops the process");
+  assert(treeFn.includes("rememberSkip"), "a listing skips a symlink and remembers it");
+  assert(!treeFn.includes("symlinkError"), "a listing does not fail the whole view");
+  assert(serverSrc.includes("stopAfterResponse"), "a tagged failure stops the process");
+  assert(serverSrc.includes("aidanosStop"), "stop is tagged on the step that failed");
+  assert(serverSrc.includes('["core.symlinks", "false"]'), "git does not check out symlinks");
+  assert(serverSrc.includes("aidanos-no-hooks"), "git hooks point at a directory we never create");
+  assert(skin.includes("X-Skipped-Links"), "skin reports a skipped link in a header");
 }
 
 async function refusesNamed(fn, named) {
@@ -618,18 +625,18 @@ async function httpPaths() {
     fs.writeFileSync(path.join(vault, "aidanos", "weeks", "2026-01-05.md"), "week\n");
     const weekRes = await fetch(base + "/api/week?start=2026-01-05");
     const weekText = await weekRes.text();
-    assert(weekRes.status === 400, "week followed a linked log");
-    assert(weekText.includes("symlink: log"), "week did not name the linked log");
+    assert(weekRes.status === 200, "week failed closed on a linked log: " + weekText);
+    assert(weekText.includes('"log"'), "week did not report the linked log");
     assert(!weekText.includes("OUTSIDE_DAY") && !weekText.includes("OUTSIDE_TASK_SENTINEL"), "week included an outside day");
     const monthRes = await fetch(base + "/api/month?date=2026-01-05");
     const monthText = await monthRes.text();
-    assert(monthRes.status === 400, "month followed a linked log");
-    assert(monthText.includes("symlink: log"), "month did not name the linked log");
+    assert(monthRes.status === 200, "month failed closed on a linked log: " + monthText);
+    assert(monthText.includes('"log"'), "month did not report the linked log");
     assert(!monthText.includes("OUTSIDE_DAY") && !monthText.includes("OUTSIDE_TASK_SENTINEL"), "month included outside text");
     const taskRes = await fetch(base + "/api/open-tasks");
     const taskText = await taskRes.text();
-    assert(taskRes.status === 400, "open tasks followed a linked log");
-    assert(taskText.includes("symlink: log"), "open tasks did not name the linked log");
+    assert(taskRes.status === 200, "open tasks failed closed on a linked log: " + taskText);
+    assert(taskText.includes('"log"'), "open tasks did not report the linked log");
     assert(!taskText.includes("OUTSIDE_DAY") && !taskText.includes("OUTSIDE_TASK_SENTINEL"), "open tasks included an outside task");
 
     fs.mkdirSync(path.join(vault, ".git", "info"), { recursive: true });
@@ -670,10 +677,13 @@ async function assertPlanAndSkin(base, sentinel, mode) {
   assert(!skinText.includes(sentinel), "skin served git config");
   assert(!planText.includes(sentinel), "plan served git config");
   if (mode === "symlink") {
-    assert(skin.status === 400, "skin symlink got " + skin.status + " " + skinText);
-    assert(skinText.includes("symlink: aidanos/skin.css"), "skin did not name the link");
-    assert(plan.status === 400, "plan symlink got " + plan.status + " " + planText);
-    assert(planText.includes("symlink: aidanos/active-horse.md"), "plan did not name the link");
+    assert(skin.status === 200, "skin symlink got " + skin.status + " " + skinText);
+    assert(skinText.includes("no personal skin"), "skin followed the link");
+    assert(String(skin.headers.get("x-skipped-links") || "").includes("aidanos/skin.css"), "skin did not name the link");
+    assert(plan.status === 200, "plan symlink got " + plan.status + " " + planText);
+    const linked = JSON.parse(planText);
+    assert(linked.exists === false, "plan followed the link");
+    assert(linked.skippedLinks.includes("aidanos/active-horse.md"), "plan did not name the link");
     return;
   }
   assert(skin.status === 200, "skin got " + skin.status);
@@ -813,9 +823,11 @@ async function writeErrorStops() {
     assert(!text.includes("nope"), "write response included the note");
     assert(!text.includes(vault) && !text.includes(tmp), "write response included a path");
     const logged = child._log().slice(loggedBefore);
+    assert(logged.includes("stopped: write EACCES"), "write log did not name the step and code: " + logged);
     assert(!logged.includes(vault), "write log included the vault path");
     assert(!logged.includes(tmp), "write log included the temp path");
     assert(!logged.includes("nope"), "write log included the note");
+    assert(!logged.includes("ro/x"), "write log included the note path");
     assert(!fs.existsSync(path.join(ro, "x.md")), "read-only folder was written");
   } finally {
     try { fs.chmodSync(ro, 0o755); } catch {}
@@ -856,10 +868,12 @@ async function nestedAndFileSymlinks() {
     assert(fileText.includes("symlink: notes/box/alias.md"), "file response did not name the link");
     assert(!fileText.includes("NESTED_SECRET"), "file response followed the link");
     const tree = await fetch(base + "/api/tree?dir=" + encodeURIComponent("notes/box"));
-    const treeText = await tree.text();
-    assert(tree.status === 400, "nested listing got " + tree.status);
-    assert(treeText.includes("symlink: notes/box/"), "listing did not name the nested link");
-    assert(!treeText.includes("NESTED_SECRET"), "listing followed the link");
+    const treeBody = await tree.json();
+    assert(tree.status === 200, "nested listing got " + tree.status);
+    assert(treeBody.files.includes("notes/box/real.md"), "listing dropped the real note");
+    assert(treeBody.skippedLinks.includes("notes/box/alias.md"), "listing did not name the file link");
+    assert(treeBody.skippedLinks.includes("notes/box/gone"), "listing did not name the folder link");
+    assert(!JSON.stringify(treeBody).includes("NESTED_SECRET"), "listing followed the link");
     const health = await fetch(base + "/api/health");
     assert(health.status === 200, "server stopped after a symlink refusal");
   } finally {
@@ -904,6 +918,474 @@ async function symlinkedVaultRootRefused() {
   }
 }
 
+function quietLines(log, ...banned) {
+  for (const line of log.split("\n")) {
+    if (!/sync paused|stopped:|vault seed|vault git|refused:|request failed/.test(line)) continue;
+    for (const word of banned) {
+      if (word) assert(!line.includes(word), "log leaked " + word + " in " + line);
+    }
+  }
+}
+
+function cutOffUpload(port, rel) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    const sock = net.connect(port, "127.0.0.1", () => {
+      const target = "/api/file?path=" + encodeURIComponent(rel);
+      sock.write("PUT " + target + " HTTP/1.1\r\n");
+      sock.write("Host: 127.0.0.1:" + port + "\r\n");
+      sock.write("Content-Type: application/json\r\n");
+      sock.write("Content-Length: 1000\r\n");
+      sock.write("Connection: close\r\n\r\n");
+      sock.write('{"markdown":"abc');
+      sock.end();
+      setTimeout(() => {
+        sock.destroy();
+        finish();
+      }, 300);
+    });
+    sock.on("error", finish);
+    sock.on("close", finish);
+  });
+}
+
+async function abortAndLongNameStayUp() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-len-"));
+  const vault = path.join(tmp, "vault");
+  fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
+  const port = 37000 + Math.floor(Math.random() * 2000);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    await cutOffUpload(port, "notes/cut.md");
+    await new Promise((r) => setTimeout(r, 200));
+    assert(child.exitCode == null, "server exited after a cut-off upload");
+    const health = await fetch(base + "/api/health");
+    assert(health.status === 200, "health failed after a cut-off upload");
+    assert(!fs.existsSync(path.join(vault, "notes", "cut.md")), "cut-off upload was stored");
+    const longName = "n".repeat(401) + ".md";
+    const longRes = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/" + longName), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "too long\n" }),
+    });
+    assert(longRes.status === 400, "401-character name got " + longRes.status);
+    const wide = "p".repeat(250) + ".md";
+    const wideRes = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/" + wide), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "too wide\n" }),
+    });
+    assert(wideRes.status === 400, "250-character name got " + wideRes.status);
+    assert(child.exitCode == null, "server exited after a long name");
+    const again = await fetch(base + "/api/health");
+    assert(again.status === 200, "health failed after a long name");
+    assert(!fs.existsSync(path.join(vault, "notes", wide)), "long name was written");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+function gitQuiet(dir, args) {
+  return execFileSync("git", args, {
+    cwd: dir,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+async function syncRequestStops() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-syncstop-"));
+  const vault = path.join(tmp, "vault");
+  const bare = path.join(tmp, "bare.git");
+  fs.mkdirSync(vault);
+  gitQuiet(tmp, ["init", "--bare", "-b", "main", bare]);
+  gitQuiet(tmp, ["init", "-b", "main", vault]);
+  gitQuiet(vault, ["config", "user.email", "t@local"]);
+  gitQuiet(vault, ["config", "user.name", "t"]);
+  const port = 37200 + Math.floor(Math.random() * 200);
+  const token = "TOKEN_SENTINEL_sync";
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: bare,
+    AIDANOS_VAULT_GIT_TOKEN: token,
+    GITHUB_TOKEN: "",
+    AIDANOS_VAULT_GIT_SYNC_MS: "0",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    fs.chmodSync(vault, 0);
+    const loggedBefore = child._log().length;
+    let status = 0;
+    let text = "";
+    try {
+      const res = await fetch(base + "/api/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ join: true }),
+      });
+      status = res.status;
+      text = await res.text();
+    } catch (e) {
+      text = String(e && e.message || e);
+    }
+    await waitExit(child, 4000);
+    assert(child.exitCode != null, "server stayed up after a sync filesystem error");
+    if (status) {
+      assert(status === 500, "sync filesystem error got " + status + " " + text);
+      assert(text === JSON.stringify({ error: "internal error" }), "sync error leaked " + text);
+    }
+    const logged = child._log().slice(loggedBefore);
+    assert(logged.includes("stopped: git EACCES"), "sync stop log was " + logged);
+    quietLines(logged, token, bare, vault, "note body");
+  } finally {
+    try { fs.chmodSync(vault, 0o755); } catch {}
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function backgroundSyncPauses() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-pause-"));
+  const vault = path.join(tmp, "vault");
+  const bare = path.join(tmp, "bare.git");
+  fs.mkdirSync(vault);
+  gitQuiet(tmp, ["init", "--bare", "-b", "main", bare]);
+  gitQuiet(tmp, ["init", "-b", "main", vault]);
+  gitQuiet(vault, ["config", "user.email", "t@local"]);
+  gitQuiet(vault, ["config", "user.name", "t"]);
+  const port = 37400 + Math.floor(Math.random() * 200);
+  const token = "TOKEN_SENTINEL_bg";
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: bare,
+    AIDANOS_VAULT_GIT_TOKEN: token,
+    GITHUB_TOKEN: "",
+    AIDANOS_VAULT_GIT_SYNC_MS: "400",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    const loggedBefore = child._log().length;
+    fs.chmodSync(vault, 0);
+    const deadline = Date.now() + 4000;
+    let logged = "";
+    while (Date.now() < deadline) {
+      logged = child._log().slice(loggedBefore);
+      if (logged.includes("sync paused:")) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert(child.exitCode == null, "background sync exited the server");
+    assert(logged.includes("sync paused: git EACCES"), "background sync did not pause: " + logged);
+    quietLines(logged, token, bare, vault);
+    const health = await fetch(base + "/api/health");
+    const body = await health.json();
+    assert(health.status === 200, "health failed while sync is paused");
+    assert(body.git && body.git.error === "sync paused", "health did not mark git paused");
+    await new Promise((r) => setTimeout(r, 500));
+    assert(child.exitCode == null, "a later sync exited the server");
+  } finally {
+    try { fs.chmodSync(vault, 0o755); } catch {}
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function bootSyncPauses() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-boot-"));
+  const vault = path.join(tmp, "vault");
+  const bare = path.join(tmp, "bare.git");
+  fs.mkdirSync(vault);
+  gitQuiet(tmp, ["init", "--bare", "-b", "main", bare]);
+  fs.chmodSync(vault, 0);
+  const port = 37600 + Math.floor(Math.random() * 200);
+  const token = "TOKEN_SENTINEL_boot";
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: bare,
+    AIDANOS_VAULT_GIT_TOKEN: token,
+    GITHUB_TOKEN: "",
+    AIDANOS_VAULT_GIT_SYNC_MS: "0",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    assert(child.exitCode == null, "boot filesystem error exited");
+    const health = await fetch(base + "/api/health");
+    const body = await health.json();
+    assert(health.status === 200 && body.git && body.git.error === "sync paused", "boot did not mark git paused");
+    quietLines(child._log(), token, bare, vault);
+    assert(child._log().includes("sync paused: git EACCES"), "boot did not pause: " + child._log());
+  } finally {
+    try { fs.chmodSync(vault, 0o755); } catch {}
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function rejectedPushStaysUp() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-push-"));
+  const vault = path.join(tmp, "vault");
+  const bare = path.join(tmp, "bare.git");
+  fs.mkdirSync(vault);
+  gitQuiet(tmp, ["init", "--bare", "-b", "main", bare]);
+  gitQuiet(tmp, ["init", "-b", "main", vault]);
+  gitQuiet(vault, ["config", "user.email", "t@local"]);
+  gitQuiet(vault, ["config", "user.name", "t"]);
+  const port = 37800 + Math.floor(Math.random() * 200);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: bare,
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+    AIDANOS_VAULT_GIT_SYNC_MS: "0",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    gitQuiet(vault, ["remote", "set-url", "origin", path.join(tmp, "missing")]);
+    const res = await fetch(base + "/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ join: true }),
+    });
+    const text = await res.text();
+    assert(res.status === 409, "rejected push got " + res.status + " " + text);
+    assert(child.exitCode == null, "rejected push exited the server");
+    const health = await fetch(base + "/api/health");
+    assert(health.status === 200, "health failed after a rejected push");
+    assert(!child._log().includes("stopped:"), "rejected push stopped the process");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitSafetyAndIndexLink() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-safe-"));
+  const bare = path.join(tmp, "bare.git");
+  const src = path.join(tmp, "src");
+  const vault = path.join(tmp, "vault");
+  gitQuiet(tmp, ["init", "--bare", "-b", "main", bare]);
+  gitQuiet(tmp, ["clone", bare, src]);
+  fs.writeFileSync(path.join(src, "target.md"), "LINK_TARGET_SECRET\n");
+  fs.symlinkSync("target.md", path.join(src, "link.md"));
+  gitQuiet(src, ["config", "user.email", "t@local"]);
+  gitQuiet(src, ["config", "user.name", "t"]);
+  gitQuiet(src, ["add", "target.md", "link.md"]);
+  gitQuiet(src, ["commit", "-m", "link"]);
+  gitQuiet(src, ["push", "origin", "HEAD"]);
+  const port = 38000 + Math.floor(Math.random() * 200);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: bare,
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+    AIDANOS_VAULT_GIT_SYNC_MS: "0",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    const symlinks = gitQuiet(vault, ["config", "--get", "core.symlinks"]).trim();
+    const hooks = gitQuiet(vault, ["config", "--get", "core.hooksPath"]).trim();
+    const monitor = gitQuiet(vault, ["config", "--get", "core.fsmonitor"]).trim();
+    const allow = gitQuiet(vault, ["config", "--get", "protocol.allow"]).trim();
+    assert(symlinks === "false", "core.symlinks was " + symlinks);
+    assert(hooks.endsWith("aidanos-no-hooks"), "hooksPath was " + hooks);
+    assert(!fs.existsSync(hooks), "hooks directory was created");
+    assert(monitor === "false", "fsmonitor was " + monitor);
+    assert(allow === "never", "protocol.allow was " + allow);
+    const listed = gitQuiet(vault, ["ls-files", "-s", "link.md"]);
+    assert(listed.startsWith("120000 "), "index mode was " + listed);
+    assert(!fs.lstatSync(path.join(vault, "link.md")).isSymbolicLink(), "clone checked out a symlink");
+    const file = await fetch(base + "/api/file?path=" + encodeURIComponent("link.md"));
+    const fileText = await file.text();
+    assert(file.status === 400, "git link got " + file.status + " " + fileText);
+    assert(!fileText.includes("LINK_TARGET_SECRET"), "git link returned the target");
+    const tree = await fetch(base + "/api/tree");
+    const treeBody = await tree.json();
+    assert(tree.status === 200, "tree failed on a git link");
+    assert(treeBody.skippedLinks.includes("link.md"), "tree did not report the git link");
+    assert(!JSON.stringify(treeBody).includes("LINK_TARGET_SECRET"), "tree followed the git link");
+    assert(treeBody.files.includes("target.md"), "tree dropped the real note");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function aggregateSkipsLinks() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-skip-"));
+  const vault = path.join(tmp, "vault");
+  const outside = path.join(tmp, "outside");
+  fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
+  fs.mkdirSync(path.join(vault, "log"), { recursive: true });
+  fs.mkdirSync(path.join(vault, "aidanos", "weeks"), { recursive: true });
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, "secret.md"), "SKIP_FILE_SECRET\n");
+  fs.writeFileSync(path.join(outside, "day.md"), "SKIP_DAY_SECRET\n- [ ] SKIP_TASK_SECRET\n");
+  fs.mkdirSync(path.join(outside, "box"));
+  fs.writeFileSync(path.join(outside, "box", "x.md"), "SKIP_DIR_SECRET\n");
+  fs.writeFileSync(path.join(vault, "notes", "real.md"), "kept note\n");
+  fs.writeFileSync(path.join(vault, "log", "2026-01-05.md"), "- [ ] kept task\n");
+  fs.writeFileSync(path.join(vault, "aidanos", "weeks", "2026-01-05.md"), "# week\n");
+  fs.symlinkSync(path.join(outside, "secret.md"), path.join(vault, "notes", "alias.md"));
+  fs.symlinkSync(path.join(outside, "box"), path.join(vault, "notes", "gone"));
+  fs.symlinkSync(outside, path.join(vault, "extra"));
+  fs.symlinkSync(path.join(outside, "day.md"), path.join(vault, "log", "2026-01-06.md"));
+  fs.symlinkSync(path.join(outside, "box"), path.join(vault, "log", "box"));
+  fs.symlinkSync(path.join(outside, "secret.md"), path.join(vault, "aidanos", "active-horse.md"));
+  fs.symlinkSync(path.join(outside, "secret.md"), path.join(vault, "aidanos", "skin.css"));
+  const port = 38200 + Math.floor(Math.random() * 200);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+  });
+  const base = "http://127.0.0.1:" + port;
+  const secrets = ["SKIP_FILE_SECRET", "SKIP_DAY_SECRET", "SKIP_TASK_SECRET", "SKIP_DIR_SECRET"];
+  function noSecrets(text, label) {
+    for (const secret of secrets) assert(!text.includes(secret), label + " included " + secret);
+    assert(!text.includes(outside) && !text.includes(tmp), label + " included a full path");
+  }
+  try {
+    await waitHealth(base, child);
+    const search = await fetch(base + "/api/search?q=" + encodeURIComponent("kept"));
+    const searchText = await search.text();
+    const searchBody = JSON.parse(searchText);
+    assert(search.status === 200 && searchBody.hits.some((hit) => hit.path === "notes/real.md"), "search dropped the real note");
+    assert(searchBody.skippedLinks.includes("notes/alias.md"), "search did not report the file link");
+    assert(searchBody.skippedLinks.includes("notes/gone"), "search did not report the folder link");
+    noSecrets(searchText, "search");
+    const folders = await fetch(base + "/api/folders");
+    const folderText = await folders.text();
+    const folderBody = JSON.parse(folderText);
+    assert(folders.status === 200, "folders failed");
+    assert(folderBody.folders.some((item) => item.name === "notes"), "folders dropped notes");
+    assert(!folderBody.folders.some((item) => item.name === "extra"), "folders followed extra");
+    assert(folderBody.skippedLinks.includes("extra"), "folders did not report extra");
+    noSecrets(folderText, "folders");
+    const tree = await fetch(base + "/api/tree?dir=" + encodeURIComponent("notes"));
+    const treeText = await tree.text();
+    const treeBody = JSON.parse(treeText);
+    assert(tree.status === 200 && treeBody.files.includes("notes/real.md"), "tree dropped the real note");
+    assert(treeBody.skippedLinks.includes("notes/alias.md") && treeBody.skippedLinks.includes("notes/gone"), "tree did not report both links");
+    noSecrets(treeText, "tree");
+    const week = await fetch(base + "/api/week?start=2026-01-05");
+    const weekText = await week.text();
+    const weekBody = JSON.parse(weekText);
+    assert(week.status === 200 && weekBody.exists === true, "week failed");
+    assert(weekBody.skippedLinks.includes("log/2026-01-06.md"), "week did not report the day link");
+    assert(weekBody.skippedLinks.includes("log/box"), "week did not report the log folder link");
+    noSecrets(weekText, "week");
+    const month = await fetch(base + "/api/month?date=2026-01-05");
+    const monthText = await month.text();
+    const monthBody = JSON.parse(monthText);
+    assert(month.status === 200 && monthBody.days.includes("2026-01-05"), "month dropped the real day");
+    assert(!monthBody.days.includes("2026-01-06"), "month followed the day link");
+    assert(monthBody.skippedLinks.includes("log/2026-01-06.md"), "month did not report the day link");
+    noSecrets(monthText, "month");
+    const tasks = await fetch(base + "/api/open-tasks");
+    const taskText = await tasks.text();
+    const taskBody = JSON.parse(taskText);
+    assert(tasks.status === 200 && taskBody.items.some((item) => item.text === "kept task"), "open tasks dropped the real task");
+    assert(taskBody.skippedLinks.includes("log/2026-01-06.md"), "open tasks did not report the day link");
+    noSecrets(taskText, "open tasks");
+    const plan = await fetch(base + "/api/plan");
+    const planText = await plan.text();
+    const planBody = JSON.parse(planText);
+    assert(plan.status === 200 && planBody.exists === false, "plan followed the link");
+    assert(planBody.skippedLinks.includes("aidanos/active-horse.md"), "plan did not report the link");
+    noSecrets(planText, "plan");
+    const skin = await fetch(base + "/api/skin.css");
+    const skinText = await skin.text();
+    assert(skin.status === 200 && skinText.includes("no personal skin"), "skin followed the link");
+    assert(String(skin.headers.get("x-skipped-links") || "").includes("aidanos/skin.css"), "skin header did not name the link");
+    noSecrets(skinText + String(skin.headers.get("x-skipped-links") || ""), "skin");
+    const direct = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/alias.md"));
+    const directText = await direct.text();
+    assert(direct.status === 400, "direct read of a link got " + direct.status);
+    noSecrets(directText, "direct");
+    const logged = child._log();
+    const skipLines = logged.split("\n").filter((line) => line.includes("skipped symlink:"));
+    assert(skipLines.length > 0, "skips were not logged");
+    for (const line of skipLines) {
+      assert(!line.includes(outside) && !line.includes(vault) && !line.includes(tmp), "skip log included a full path: " + line);
+    }
+    const health = await fetch(base + "/api/health");
+    assert(health.status === 200 && child.exitCode == null, "server stopped after skip-and-report");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function parentSymlinkIsNotFollowed() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-race-"));
+  const vault = path.join(tmp, "vault");
+  const outside = path.join(tmp, "outside");
+  fs.mkdirSync(vault);
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, "marker.md"), "unchanged\n");
+  fs.symlinkSync(outside, path.join(vault, "linked"));
+  const port = 38400 + Math.floor(Math.random() * 200);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    const res = await fetch(base + "/api/file?path=" + encodeURIComponent("linked/note.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "pwned\n" }),
+    });
+    const text = await res.text();
+    assert(res.status === 400, "write through a linked parent got " + res.status + " " + text);
+    assert(!text.includes(outside), "refusal included the outside path");
+    assert(fs.readdirSync(outside).join(",") === "marker.md", "mkdir followed the linked parent");
+    assert(fs.readFileSync(path.join(outside, "marker.md"), "utf8") === "unchanged\n", "outside file changed");
+    const health = await fetch(base + "/api/health");
+    assert(health.status === 200 && child.exitCode == null, "server stopped after the linked parent");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 checkWiring();
 await pathChecks();
 await inodeGitDir();
@@ -921,4 +1403,12 @@ await writeErrorStops();
 await nestedAndFileSymlinks();
 await symlinkedVaultRootRefused();
 await liveSyncDoesNotFollowOutside();
+await abortAndLongNameStayUp();
+await syncRequestStops();
+await backgroundSyncPauses();
+await bootSyncPauses();
+await rejectedPushStaysUp();
+await gitSafetyAndIndexLink();
+await aggregateSkipsLinks();
+await parentSymlinkIsNotFollowed();
 console.log("sync-path-test ok");

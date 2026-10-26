@@ -24,7 +24,7 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -88,6 +88,7 @@ const vaultGit = {
   pending: new Set(),
   timer: null,
   syncTimer: null,
+  syncPaused: false,
   chain: Promise.resolve(),
   conflicts: new Map(),
   notice: "",
@@ -167,30 +168,51 @@ function logSafe(...parts) {
   console.error(text);
 }
 
+function notesStayLocalSentence() {
+  const cloud = Boolean(String(process.env.K_SERVICE || "").trim());
+  const ownClone = !String(process.env.AIDANOS_VAULT || "").trim() && Boolean(GIT_URL);
+  if (cloud || ownClone) {
+    return "Sync is paused. Notes are saved on this server only and may be lost if it restarts.";
+  }
+  return "Sync is paused. Notes are saved on this computer only.";
+}
+
 function gitHint() {
   if (!vaultGit.enabled) return { enabled: false };
   const open = [...vaultGit.conflicts.values()].filter((item) => !item.resolved);
-  const hint = { enabled: true, ok: !vaultGit.error && open.length === 0 };
-  if (vaultGit.error) hint.error = vaultGit.error;
+  const hint = { enabled: true, ok: !vaultGit.error && !vaultGit.syncPaused && open.length === 0 };
+  if (vaultGit.syncPaused) {
+    hint.paused = true;
+    hint.error = "sync paused";
+    hint.localOnly = notesStayLocalSentence();
+  } else if (vaultGit.error) hint.error = vaultGit.error;
   if (vaultGit.lastPushAt) hint.pushed = true;
   if (open.length) hint.conflicts = open.map((item) => item.path);
   return hint;
 }
 
-function gitEnv() {
-  const env = {
-    ...process.env,
-    GIT_TERMINAL_PROMPT: "0",
-    GIT_EDITOR: "true",
-    GIT_MERGE_AUTOEDIT: "no",
-  };
-  delete env.GIT_ASKPASS;
+export function gitEnv() {
+  const env = { ...process.env };
+  // Drop every inherited GIT_* name first. A short list misses
+  // GIT_CONFIG_PARAMETERS, GIT_COMMON_DIR, and GIT_GLOB_PATHSPECS, and git
+  // reads all three. The settings below are applied after that scrub.
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("GIT_")) delete env[key];
+  }
+  env.GIT_EDITOR = "true";
+  env.GIT_MERGE_AUTOEDIT = "no";
+  env.GIT_TERMINAL_PROMPT = "0";
+  // Pathspecs stay literal after "--". Otherwise `Q?.md` also matches QA.md.
+  env.GIT_LITERAL_PATHSPECS = "1";
+  // Repo identity stays in the vault config. Ignore the home and system files.
+  env.GIT_CONFIG_GLOBAL = "/dev/null";
+  env.GIT_CONFIG_NOSYSTEM = "1";
   return env;
 }
 
 function runGit(args, { cwd, timeoutMs = 20000 } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn("git", args, {
+    const child = spawn("git", [...gitSafetyPrefix(), ...args], {
       cwd: cwd || undefined,
       env: gitEnv(),
       stdio: ["ignore", "pipe", "pipe"],
@@ -215,11 +237,128 @@ function runGit(args, { cwd, timeoutMs = 20000 } = {}) {
   });
 }
 
+function gitRemoteKind(url) {
+  const u = String(url || "").trim();
+  if (!u) return "none";
+  if (/^https?:\/\//i.test(u)) return "https";
+  if (/^ssh:\/\//i.test(u) || /^[^/\s]+@[^/\s:]+:/.test(u)) return "ssh";
+  return "file";
+}
+
+function gitSafetyConfigs(cwd) {
+  const hooks = path.join(cwd, ".git", "aidanos-no-hooks");
+  const pairs = [
+    ["core.symlinks", "false"],
+    ["core.hooksPath", hooks],
+    ["core.fsmonitor", "false"],
+    ["protocol.allow", "never"],
+    ["protocol.https.allow", "always"],
+    // An empty credential helper keeps a helper from replacing the token in the remote URL.
+    // ssh stays the plain client. An empty include.path is rejected by git itself, so it is not set.
+    ["credential.helper", ""],
+    ["core.sshCommand", "ssh"],
+  ];
+  const kind = gitRemoteKind(GIT_URL);
+  if (kind === "ssh") pairs.push(["protocol.ssh.allow", "always"]);
+  if (kind === "file") pairs.push(["protocol.file.allow", "always"]);
+  return pairs;
+}
+
+function gitSafetyPrefix() {
+  const args = [];
+  for (const [key, value] of gitSafetyConfigs(VAULT)) args.push("-c", key + "=" + value);
+  return args;
+}
+
 async function ensureGitIdentity(cwd) {
   const name = process.env.AIDANOS_VAULT_GIT_NAME || "AidanOS";
   const email = process.env.AIDANOS_VAULT_GIT_EMAIL || "aidanos@local";
   await runGit(["-C", cwd, "config", "user.name", name], { timeoutMs: 4000 });
   await runGit(["-C", cwd, "config", "user.email", email], { timeoutMs: 4000 });
+}
+
+async function localGitValue(cwd, key) {
+  try {
+    const { out } = await runGit(["-C", cwd, "config", "--local", "--get", key], { timeoutMs: 4000 });
+    return String(out || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function sameConfigPath(cwd, value, expected) {
+  if (!value) return false;
+  const want = path.resolve(expected);
+  return path.resolve(value) === want || path.resolve(cwd, value) === want;
+}
+
+// Drop the safety keys an older build wrote into the vault config.
+// That build is the only one that set core.hooksPath to .git/aidanos-no-hooks.
+// Any other hooks path means the remaining keys are the operator's.
+async function unsetOldGitSafety(cwd) {
+  const hooks = path.join(cwd, ".git", "aidanos-no-hooks");
+  const exact = [
+    ["core.symlinks", "false"],
+    ["core.fsmonitor", "false"],
+    ["protocol.allow", "never"],
+    ["protocol.https.allow", "always"],
+    ["protocol.ssh.allow", "always"],
+    ["protocol.file.allow", "always"],
+  ];
+  try {
+    const hooksPath = await localGitValue(cwd, "core.hooksPath");
+    if (sameConfigPath(cwd, hooksPath, hooks)) {
+      for (const [key, value] of exact) {
+        if ((await localGitValue(cwd, key)) !== value) continue;
+        await runGit(["-C", cwd, "config", "--local", "--unset", key], { timeoutMs: 4000 }).catch(() => {});
+      }
+      await runGit(["-C", cwd, "config", "--local", "--unset", "core.hooksPath"], { timeoutMs: 4000 }).catch(() => {});
+    }
+  } catch {
+    // The command-line -c flags still override whatever is left in the file.
+  }
+  await warnRiskyGitConfig(cwd);
+}
+
+function riskyGitKeyLabel(key) {
+  const words = [
+    ["includeif", "includeIf"],
+    ["include", "include"],
+    ["credential", "credential"],
+    ["sshcommand", "sshCommand"],
+    ["askpass", "askpass"],
+    ["insteadof", "insteadOf"],
+    ["extraheader", "extraheader"],
+    ["pager", "pager"],
+    ["proxy", "proxy"],
+  ];
+  const lower = String(key || "").toLowerCase();
+  for (const [word, label] of words) {
+    if (!lower.includes(word)) continue;
+    return /^[A-Za-z0-9_.-]+$/.test(key) ? key : label;
+  }
+  return "";
+}
+
+async function warnRiskyGitConfig(cwd) {
+  let text = "";
+  try {
+    const { out } = await runGit(
+      ["-C", cwd, "config", "--local", "--name-only", "--list"],
+      { timeoutMs: 4000 },
+    );
+    text = out || "";
+  } catch {
+    return;
+  }
+  const names = [];
+  for (const line of text.split("\n")) {
+    const label = riskyGitKeyLabel(line.trim());
+    if (label && !names.includes(label)) names.push(label);
+  }
+  if (!names.length) return;
+  names.sort();
+  console.error("vault git config: " + names.join(", "));
 }
 
 async function ensureOrigin(cwd) {
@@ -259,8 +398,42 @@ async function vaultHasDemo(dir) {
   return (await pathExists(plan)) && (await pathExists(map));
 }
 
-async function copyBundledTree(src, dest) {
-  await fs.mkdir(dest, { recursive: true });
+// A planted link in the destination must not receive the sample files.
+// lstat each part under the seed root. A symlink, including a broken one,
+// stops that branch. COPYFILE_EXCL then refuses to replace a real file.
+async function linkedDestination(root, abs) {
+  const base = path.resolve(root);
+  const target = path.resolve(abs);
+  if (target === base) return false;
+  const rel = path.relative(base, target);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return true;
+  let cursor = base;
+  for (const part of rel.split(path.sep)) {
+    cursor = path.join(cursor, part);
+    let st;
+    try {
+      st = await fs.lstat(cursor);
+    } catch (e) {
+      if (e.code === "ENOENT") return false;
+      throw e;
+    }
+    if (st.isSymbolicLink()) return true;
+  }
+  return false;
+}
+
+async function copyBundledTree(src, dest, root) {
+  const top = root || dest;
+  if (await linkedDestination(top, dest)) return;
+  let destStat = null;
+  try {
+    destStat = await fs.lstat(dest);
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
+  if (destStat && destStat.isSymbolicLink()) return;
+  if (destStat && !destStat.isDirectory()) return;
+  if (!destStat) await fs.mkdir(dest, { recursive: true });
   let entries = [];
   try {
     entries = await fs.readdir(src, { withFileTypes: true });
@@ -271,13 +444,18 @@ async function copyBundledTree(src, dest) {
     if (ent.name === ".git") continue;
     const from = path.join(src, ent.name);
     const to = path.join(dest, ent.name);
+    if (await linkedDestination(top, to)) continue;
     if (ent.isDirectory()) {
-      await copyBundledTree(from, to);
+      await copyBundledTree(from, to, top);
       continue;
     }
     if (!ent.isFile()) continue;
-    if (await pathExists(to)) continue;
-    await fs.copyFile(from, to);
+    try {
+      await fs.copyFile(from, to, fsSync.constants.COPYFILE_EXCL);
+    } catch (e) {
+      if (e.code === "EEXIST") continue;
+      throw e;
+    }
   }
 }
 
@@ -304,7 +482,7 @@ async function seedBundledVaultIfNeeded(reason) {
 }
 
 function scheduleVaultGitRetry() {
-  if (!GIT_URL || !GIT_RETRY_MS) return;
+  if (!GIT_URL || !GIT_RETRY_MS || vaultGit.syncPaused) return;
   setTimeout(() => {
     enqueueVaultGit(() => retryVaultGit()).catch((e) => {
       vaultGit.error = sanitizeGitError(e && e.message || "retry failed");
@@ -323,6 +501,7 @@ async function retryVaultGit() {
   try {
     if (await isGitRepo(VAULT)) {
       await ensureGitIdentity(VAULT);
+      await unsetOldGitSafety(VAULT);
       await ensureOrigin(VAULT);
       vaultGit.ready = true;
       loadPending();
@@ -337,6 +516,7 @@ async function retryVaultGit() {
       await runGit(["clone", "--depth", "1", gitRemoteUrl(), VAULT], { timeoutMs: 25000 });
       vaultGit.error = "";
       await ensureGitIdentity(VAULT);
+      await unsetOldGitSafety(VAULT);
       vaultGit.ready = await isGitRepo(VAULT);
     }
   } catch (e) {
@@ -359,6 +539,7 @@ async function initVaultGit() {
     await fs.mkdir(VAULT, { recursive: true });
     if (await isGitRepo(VAULT)) {
       await ensureGitIdentity(VAULT);
+      await unsetOldGitSafety(VAULT);
       await ensureOrigin(VAULT);
       vaultGit.ready = true;
       loadPending();
@@ -388,6 +569,7 @@ async function initVaultGit() {
         scheduleVaultGitRetry();
       }
       await ensureGitIdentity(VAULT);
+      await unsetOldGitSafety(VAULT);
       vaultGit.ready = await isGitRepo(VAULT);
       if (vaultGit.ready) {
         loadPending();
@@ -398,16 +580,25 @@ async function initVaultGit() {
     vaultGit.error = "vault path is not a git checkout";
     console.error("vault git:", vaultGit.error);
   } catch (e) {
-    vaultGit.error = sanitizeGitError(e && e.message || "vault git failed");
-    console.error("vault git:", vaultGit.error);
+    if (e && e.code) {
+      pauseBackgroundSync(tagStop(e, "git"));
+    } else {
+      vaultGit.error = sanitizeGitError(e && e.message || "vault git failed");
+      console.error("vault git:", vaultGit.error);
+    }
     await seedBundledVaultIfNeeded("vault git failed");
-    scheduleVaultGitRetry();
+    if (!vaultGit.syncPaused) scheduleVaultGitRetry();
   }
 }
 
 function isSafeRel(rel) {
   const s = String(rel || "").replace(/\\/g, "/");
   if (!s || s.startsWith("/") || s.includes("..") || s.includes("\0")) return false;
+  if (s.length > 400) return false;
+  const parts = s.split("/");
+  for (const part of parts) {
+    if (part.length > 200 || Buffer.byteLength(part) > 200) return false;
+  }
   return true;
 }
 
@@ -423,8 +614,16 @@ function setGitError(msg) {
   if (next) console.error("vault git:", next);
 }
 
+let vaultWork = Promise.resolve();
+
+function enqueueVaultWork(fn) {
+  const run = vaultWork.then(fn, fn);
+  vaultWork = run.then(() => {}, () => {});
+  return run;
+}
+
 function enqueueVaultGit(work) {
-  const run = vaultGit.chain.then(work, work);
+  const run = enqueueVaultWork(work);
   vaultGit.chain = run.then(() => {}, () => {});
   return run;
 }
@@ -510,11 +709,16 @@ function scheduleVaultSync(relPath, resolve) {
   vaultGit.pending.add(rel);
   if (resolve) vaultGit.resolvePending.add(rel);
   persistPending();
+  if (vaultGit.syncPaused) return;
   if (vaultGit.timer) clearTimeout(vaultGit.timer);
   const started = new Set(vaultGit.pending);
   vaultGit.timer = setTimeout(() => {
     vaultGit.timer = null;
     enqueueVaultGit(() => syncVault(null)).catch((e) => {
+      if (e && e.aidanosStop) {
+        pauseBackgroundSync(e);
+        return;
+      }
       setGitError(e && e.message || "git failed");
     }).finally(() => {
       for (const extra of vaultGit.pending) {
@@ -529,11 +733,19 @@ function scheduleVaultSync(relPath, resolve) {
 function startVaultSyncLoop() {
   if (!GIT_URL || !GIT_SYNC_MS) return;
   const arm = () => {
+    if (vaultGit.syncPaused) return;
     vaultGit.syncTimer = setTimeout(() => {
       vaultGit.syncTimer = null;
+      if (vaultGit.syncPaused) return;
       enqueueVaultGit(() => syncVault(null)).catch((e) => {
+        if (e && e.aidanosStop) {
+          pauseBackgroundSync(e);
+          return;
+        }
         setGitError(e && e.message || "git failed");
-      }).finally(arm);
+      }).finally(() => {
+        if (!vaultGit.syncPaused) arm();
+      });
     }, GIT_SYNC_MS);
     if (vaultGit.syncTimer && typeof vaultGit.syncTimer.unref === "function") {
       vaultGit.syncTimer.unref();
@@ -626,15 +838,336 @@ function resolvedChoices() {
   return out;
 }
 
+// APFS and Windows fold `.GIT` onto `.git`. Linux does not, so the name
+// check stays exact there and the inode check does the real work.
+const FOLD_GIT_NAME = process.platform === "darwin" || process.platform === "win32";
+
+const gitDirCache = new Map();
+
+function resolveGitDirPointer(rootReal) {
+  const child = spawnSync("git", [...gitSafetyPrefix(), "-C", rootReal, "rev-parse", "--git-dir"], {
+    encoding: "utf8",
+    timeout: 4000,
+    env: gitEnv(),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (!child || child.status !== 0) return null;
+  const text = String(child.stdout || "").trim();
+  if (!text || text.includes("\0") || text.includes("\n")) return null;
+  return path.resolve(rootReal, text);
+}
+
+// `.git` may be a directory, or a pointer file in a linked worktree.
+// The pointer's own inode is not the real git dir, so resolve that with
+// git and check it too. A normal directory does not spawn git.
+function gitDirIds(rootReal) {
+  const gitPath = path.join(rootReal, ".git");
+  let listed;
+  try {
+    listed = fsSync.lstatSync(gitPath);
+  } catch {
+    return [];
+  }
+  let followed;
+  try {
+    followed = fsSync.statSync(gitPath);
+  } catch {
+    return [];
+  }
+  const ids = [{ dev: followed.dev, ino: followed.ino }];
+  if (!listed.isFile() && !followed.isFile()) return ids;
+  const cached = gitDirCache.get(rootReal);
+  if (cached && cached.fileDev === listed.dev && cached.fileIno === listed.ino) {
+    try {
+      const gst = fsSync.statSync(cached.resolved);
+      if (gst.dev === cached.dirDev && gst.ino === cached.dirIno) return cached.ids;
+    } catch {
+      // The resolved directory moved. Look it up again.
+    }
+  }
+  const resolved = resolveGitDirPointer(rootReal);
+  if (!resolved) return ids;
+  try {
+    const gst = fsSync.statSync(resolved);
+    if (gst.dev !== followed.dev || gst.ino !== followed.ino) {
+      ids.push({ dev: gst.dev, ino: gst.ino });
+    }
+    gitDirCache.set(rootReal, {
+      fileDev: listed.dev,
+      fileIno: listed.ino,
+      resolved,
+      dirDev: gst.dev,
+      dirIno: gst.ino,
+      ids,
+    });
+  } catch {
+    return ids;
+  }
+  return ids;
+}
+
+// `real` is a resolved path. Refuse it when it is the vault .git directory,
+// sits inside that directory, or has a .git part at any depth (a nested
+// repo). Match the directory by device and inode, not by the spelling of
+// the path: a link can resolve to a folder `.git` merely points at.
+function realPathInGit(real, rootReal) {
+  const resolved = path.resolve(real);
+  const root = path.resolve(rootReal);
+  const rel = path.relative(root, resolved);
+  const outside = !rel || rel.startsWith("..") || path.isAbsolute(rel);
+  const parts = (outside ? resolved : rel).split(path.sep);
+  for (const part of parts) {
+    if (part === ".git") return true;
+    if (FOLD_GIT_NAME && part.toLowerCase() === ".git") return true;
+  }
+  const ids = gitDirIds(root);
+  if (!ids.length) return false;
+  let cursor = resolved;
+  for (;;) {
+    let st;
+    try {
+      st = fsSync.statSync(cursor);
+    } catch {
+      return true;
+    }
+    if (ids.some((id) => st.dev === id.dev && st.ino === id.ino)) return true;
+    if (cursor === root) break;
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  return false;
+}
+
+export function vaultRel(abs, root = VAULT) {
+  const rel = path.relative(path.resolve(root), path.resolve(abs));
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) throw new Error("bad path");
+  return rel.split(path.sep).join("/");
+}
+
+// Stable signature: worktreePath(rel, root = VAULT) -> absolute path.
+// rel is vault-relative. Callers pass one or two arguments and no more.
+// Every symlink is refused, including one that stays inside the vault.
+// The error names that vault-relative path ("symlink: notes/alias.md").
+// A missing tail is still the logical path, so a new note can be created.
+// The vault root is lstat'd and refused when it is a symlink. It is not
+// realpath'd into acceptance. Parents above the root are not checked.
+function symlinkError(rel) {
+  const named = String(rel || ".").replace(/\\/g, "/").replace(/\/+$/, "") || ".";
+  return new Error("symlink: " + named);
+}
+
+async function lstatOrMissing(abs) {
+  try {
+    return await fs.lstat(abs);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw new Error("bad path");
+  }
+}
+
+export async function worktreePath(rel, root = VAULT) {
+  if (!isSafeRel(rel)) throw new Error("bad path");
+  const logicalRoot = path.resolve(root);
+  const rootSt = await lstatOrMissing(logicalRoot);
+  if (rootSt && rootSt.isSymbolicLink()) throw symlinkError(".");
+  if (rootSt && !rootSt.isDirectory()) throw new Error("bad path");
+  const abs = safeJoin(root, rel);
+  const logical = path.resolve(abs);
+  const relPath = path.relative(logicalRoot, logical);
+  if (!relPath || relPath.startsWith("..") || path.isAbsolute(relPath)) {
+    throw new Error("bad path");
+  }
+  const parts = relPath.split(path.sep);
+  let cursor = logicalRoot;
+  for (let i = 0; i < parts.length; i++) {
+    cursor = path.join(cursor, parts[i]);
+    const relSoFar = parts.slice(0, i + 1).join("/");
+    const st = await lstatOrMissing(cursor);
+    if (!st) return abs;
+    if (st.isSymbolicLink()) throw symlinkError(relSoFar);
+    // A directory can be the git dir without the name ".git" (a mount, or a
+    // pointer file). Symlinks are already refused above, so this does not
+    // follow one, and the root itself is not realpath'd.
+    if (realPathInGit(cursor, logicalRoot)) throw new Error("bad path");
+    if (i < parts.length - 1 && !st.isDirectory()) throw new Error("bad path");
+  }
+  return abs;
+}
+
+// Listing has no leaf file, so check the folder by asking about a child.
+// worktreePath's signature stays (rel, root).
+async function worktreeDir(rel, root = VAULT) {
+  const cleaned = String(rel || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!cleaned || cleaned === ".") {
+    const resolved = path.resolve(root);
+    const st = await lstatOrMissing(resolved);
+    if (st && st.isSymbolicLink()) throw symlinkError(".");
+    return resolved;
+  }
+  await worktreePath(cleaned + "/note.md", root);
+  return safeJoin(root, cleaned);
+}
+
+function rememberSkip(skipped, rel) {
+  if (!skipped) return;
+  const named = String(rel || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!named || named.startsWith("/") || named.includes("..") || named.includes("\0")) return;
+  if (path.isAbsolute(named) || skipped.includes(named)) return;
+  skipped.push(named);
+}
+
+function oneLine(text) {
+  let out = "";
+  const s = String(text || "");
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    out += code <= 31 || code === 127 ? "?" : s[i];
+  }
+  return out;
+}
+
+function logSkips(skipped) {
+  if (!skipped || !skipped.length) return;
+  console.error("skipped symlink: " + skipped.map(oneLine).join(", "));
+}
+
+async function readVaultRel(rel, skipped, gitLinks) {
+  const cleaned = String(rel || "").replace(/\\/g, "/");
+  if (gitLinks && gitLinks.has(cleaned)) {
+    if (skipped) {
+      rememberSkip(skipped, cleaned);
+      return null;
+    }
+    throw symlinkError(cleaned);
+  }
+  try {
+    return await readFileSafe(await worktreePath(rel));
+  } catch (e) {
+    const msg = String(e && e.message || "");
+    if (skipped && msg.startsWith("symlink: ")) {
+      rememberSkip(skipped, msg.slice("symlink: ".length));
+      return null;
+    }
+    throw e;
+  }
+}
+
+async function readLogNames(skipped, gitLinks) {
+  await assertRealVaultRoot();
+  const logDir = path.join(VAULT, "log");
+  let st;
+  try {
+    st = await fs.lstat(logDir);
+  } catch (e) {
+    if (e.code === "ENOENT") return [];
+    throw e;
+  }
+  if (st.isSymbolicLink() || (gitLinks && gitLinks.has("log"))) {
+    if (skipped) {
+      rememberSkip(skipped, "log");
+      return [];
+    }
+    throw symlinkError("log");
+  }
+  if (!st.isDirectory()) return [];
+  const entries = await fs.readdir(logDir, { withFileTypes: true });
+  const names = [];
+  for (const ent of entries) {
+    if (ent.name.startsWith(".")) continue;
+    const rel = "log/" + ent.name;
+    if (ent.isSymbolicLink() || (gitLinks && gitLinks.has(rel))) {
+      if (skipped) rememberSkip(skipped, rel);
+      else throw symlinkError(rel);
+      continue;
+    }
+    if (!ent.isFile()) continue;
+    names.push(ent.name);
+  }
+  return names;
+}
+
+// Last path part on read. A symlink is refused and named. It is not followed,
+// even when the target is another note inside the vault.
+async function readableTarget(abs, root) {
+  let st;
+  try {
+    st = await fs.lstat(abs);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw new Error("bad path");
+  }
+  if (st.isSymbolicLink()) {
+    let rel = path.basename(abs);
+    try { rel = vaultRel(abs, root); } catch { /* keep the leaf name */ }
+    throw symlinkError(rel);
+  }
+  return abs;
+}
+
+// A fifo, socket, or device can block the read. A second directory entry
+// can be .git/config. Notes are not hard-linked, so every extra link is
+// refused: walking .git to prove the other name is safe can miss one.
+function refuseServedFile(st) {
+  if (!st.isFile() || st.nlink > 1) throw new Error("bad path");
+}
+
+const VAULT_READ_FLAGS = fsSync.constants.O_RDONLY
+  | (fsSync.constants.O_NOFOLLOW || 0)
+  | (fsSync.constants.O_NONBLOCK || 0);
+
+async function readRegularText(abs) {
+  let fh;
+  try {
+    fh = await fs.open(abs, VAULT_READ_FLAGS);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    // Permission and I/O failures are unexpected. Path refusals stay "bad path".
+    if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EIO" || e.code === "ENOSPC") throw e;
+    throw new Error("bad path");
+  }
+  try {
+    const st = await fh.stat();
+    refuseServedFile(st);
+    return await fh.readFile({ encoding: "utf8" });
+  } finally {
+    await fh.close();
+  }
+}
+
+export async function readWorktree(rel, root = VAULT) {
+  if (!isSafeRel(rel)) throw new Error("bad path");
+  const abs = await worktreePath(rel, root);
+  const target = await readableTarget(abs, root);
+  if (target == null) return null;
+  return await readRegularText(target);
+}
+
 async function readRel(rel) {
   if (!isSafeRel(rel)) return "";
-  const text = await readFileSafe(safeJoin(VAULT, rel));
+  const text = await readWorktree(rel);
   return text == null ? "" : text;
 }
 
 async function writeVaultText(rel, text) {
-  if (!isSafeRel(rel)) throw new Error("bad path");
-  await atomicWriteFile(safeJoin(VAULT, rel), text);
+  const abs = await worktreePath(rel);
+  const parent = path.dirname(abs);
+  let seen = null;
+  await atomicWriteFile(abs, text, async () => {
+    await worktreePath(rel);
+    const st = await fs.lstat(parent);
+    if (st.isSymbolicLink() || !st.isDirectory()) throw parentChanged();
+    seen = { dev: st.dev, ino: st.ino };
+  });
+  let after;
+  try {
+    after = await fs.lstat(parent);
+  } catch {
+    throw parentChanged();
+  }
+  if (!seen || after.isSymbolicLink() || !after.isDirectory() || after.dev !== seen.dev || after.ino !== seen.ino) {
+    throw parentChanged();
+  }
 }
 
 async function gitShow(rev, rel) {
@@ -778,17 +1311,21 @@ async function compareToRemote() {
 
 async function detachFile(rel) {
   if (!isSafeRel(rel)) return;
+  const abs = await worktreePath(rel);
+  const gitPath = vaultRel(abs);
+  const seen = await snapshotParents(abs);
   let tracked = true;
   try {
-    await runGit(["-C", VAULT, "ls-files", "--error-unmatch", "--", rel], { timeoutMs: 4000 });
+    await runGit(["-C", VAULT, "ls-files", "--error-unmatch", "--", gitPath], { timeoutMs: 4000 });
   } catch {
     tracked = false;
   }
+  await assertParents(seen);
   if (tracked) {
-    await runGit(["-C", VAULT, "checkout", "HEAD", "--", rel], { timeoutMs: 8000 });
+    await runGit(["-C", VAULT, "checkout", "HEAD", "--", gitPath], { timeoutMs: 8000 });
     return;
   }
-  await fs.unlink(safeJoin(VAULT, rel)).catch(() => {});
+  await fs.unlink(abs);
 }
 
 async function fastForward(rev, parkList) {
@@ -817,8 +1354,10 @@ async function announcePaths(rels) {
   for (const rel of rels) {
     if (!isSafeRel(rel) || seen.has(rel)) continue;
     seen.add(rel);
+    let abs;
+    try { abs = await worktreePath(rel); } catch { continue; }
     let mtime = 0;
-    try { mtime = await fileMtimeMs(safeJoin(VAULT, rel)); } catch { mtime = 0; }
+    try { mtime = await fileMtimeMs(abs); } catch { mtime = 0; }
     const date = dayFromRel(rel);
     if (date) sendDayWatch(date, mtime);
     else if (rel.endsWith(".md")) sendWatch({ path: rel, mtime });
@@ -847,7 +1386,7 @@ async function recordConflicts(rels, rev) {
       forgot = true;
     }
     let mtime = 0;
-    try { mtime = await fileMtimeMs(safeJoin(VAULT, rel)); } catch { mtime = 0; }
+    try { mtime = await fileMtimeMs(await worktreePath(rel)); } catch { mtime = 0; }
     vaultGit.conflicts.set(rel, {
       path: rel,
       mine,
@@ -905,7 +1444,7 @@ async function noteChoices(paths) {
     const text = await readRel(rel);
     item.choice = text;
     item.mine = text;
-    try { item.mtime = await fileMtimeMs(safeJoin(VAULT, rel)); } catch { item.mtime = 0; }
+    try { item.mtime = await fileMtimeMs(await worktreePath(rel)); } catch { item.mtime = 0; }
     item.against = bound || item.theirsBlob || "";
     if (item.against) vaultGit.choiceAgainst.set(rel, item.against);
     item.theirsBlob = item.theirsBlob || item.against;
@@ -937,7 +1476,7 @@ async function dropStaleChoices(rev) {
       continue;
     }
     let mtime = 0;
-    try { mtime = await fileMtimeMs(safeJoin(VAULT, item.path)); } catch { mtime = 0; }
+    try { mtime = await fileMtimeMs(await worktreePath(item.path)); } catch { mtime = 0; }
     vaultGit.conflicts.set(item.path, {
       path: item.path,
       mine,
@@ -981,20 +1520,25 @@ async function noteDivergence(rel) {
 }
 
 async function stageAndCommit(paths) {
+  await assertRealVaultRoot();
   const safe = [];
   for (const rel of paths || []) {
     if (!isAppNotePath(rel) || safe.includes(rel)) continue;
     safe.push(rel);
   }
   if (!safe.length) return false;
+  const gitPaths = [];
   let stagedAny = false;
   for (const rel of safe) {
-    if (await pathExists(safeJoin(VAULT, rel))) {
-      await runGit(["-C", VAULT, "add", "--", rel], { timeoutMs: 8000 });
+    const abs = await worktreePath(rel);
+    const gitPath = vaultRel(abs);
+    if (!gitPaths.includes(gitPath)) gitPaths.push(gitPath);
+    if (await pathExists(abs)) {
+      await runGit(["-C", VAULT, "add", "--", gitPath], { timeoutMs: 8000 });
       stagedAny = true;
     } else {
       try {
-        await runGit(["-C", VAULT, "rm", "--", rel], { timeoutMs: 8000 });
+        await runGit(["-C", VAULT, "rm", "--", gitPath], { timeoutMs: 8000 });
         stagedAny = true;
       } catch {
         // This one path was never tracked.
@@ -1003,12 +1547,12 @@ async function stageAndCommit(paths) {
   }
   if (!stagedAny) return false;
   const staged = await runGit(
-    ["-C", VAULT, "diff", "--cached", "--name-only", "--", ...safe],
+    ["-C", VAULT, "diff", "--cached", "--name-only", "--", ...gitPaths],
     { timeoutMs: 8000 },
   );
   if (!String(staged.out || "").trim()) return false;
   await runGit(
-    ["-C", VAULT, "commit", "-m", "vault: " + safe.join(", "), "--", ...safe],
+    ["-C", VAULT, "commit", "-m", "vault: " + gitPaths.join(", "), "--", ...gitPaths],
     { timeoutMs: 8000 },
   );
   return true;
@@ -1088,7 +1632,7 @@ async function publishDiverged(rel) {
       await dropStaleChoices(again.rev);
     }
   } catch (e) {
-    setGitError(e && e.message || "fetch failed");
+    throwIfStop(e); setGitError(e && e.message || "fetch failed");
     vaultGit.join = false;
     return;
   }
@@ -1103,7 +1647,7 @@ async function publishDiverged(rel) {
     return;
   }
   if (useRel.kind === "ahead") {
-    try { await publishPush(); } catch (e) { setGitError(e && e.message || "push failed"); }
+    try { await publishPush(); } catch (e) { throwIfStop(e); setGitError(e && e.message || "push failed"); }
     return;
   }
   if (useRel.kind !== "diverged") {
@@ -1160,7 +1704,7 @@ async function publishDiverged(rel) {
       try { await writeVaultText(file, text); } catch {}
     }
     for (const item of vaultGit.conflicts.values()) item.resolved = false;
-    setGitError(e && e.message || "push refused");
+    throwIfStop(e); setGitError(e && e.message || "push refused");
   } finally {
     popWatchSilence();
   }
@@ -1178,6 +1722,7 @@ async function refuseJoin(rel) {
 }
 
 async function joinVault() {
+  await assertVaultOpen();
   await fetchOrigin();
   let rel = await compareToRemote();
   if (rel && rel.rev) await dropStaleChoices(rel.rev);
@@ -1211,7 +1756,7 @@ async function joinVault() {
   try {
     await commitPendingNotes(blocked);
   } catch (e) {
-    setGitError(e && e.message || "git failed");
+    throwIfStop(e); setGitError(e && e.message || "git failed");
   }
   await fetchOrigin();
   rel = await compareToRemote();
@@ -1242,7 +1787,7 @@ async function joinVault() {
       await dropStaleChoices(again.rev);
     }
   } catch (e) {
-    setGitError(e && e.message || "fetch failed");
+    throwIfStop(e); setGitError(e && e.message || "fetch failed");
     vaultGit.join = false;
     return { status: 409, body: syncStatus() };
   }
@@ -1257,7 +1802,7 @@ async function joinVault() {
     return { status: 200, body: syncStatus() };
   }
   if (rel.kind === "ahead") {
-    try { await publishPush(); } catch (e) { setGitError(e && e.message || "push failed"); }
+    try { await publishPush(); } catch (e) { throwIfStop(e); setGitError(e && e.message || "push failed"); }
     const status = syncStatus();
     return { status: status.ok ? 200 : 409, body: status };
   }
@@ -1299,12 +1844,28 @@ async function joinVault() {
     return { status: 200, body: syncStatus() };
   } catch (e) {
     if (await isMerging()) await runGit(["-C", VAULT, "merge", "--abort"], { timeoutMs: 8000 }).catch(() => {});
-    setGitError(e && e.message || "push refused");
+    throwIfStop(e); setGitError(e && e.message || "push refused");
     vaultGit.join = true;
     return { status: 409, body: syncStatus() };
   } finally {
     popWatchSilence();
   }
+}
+
+function resumeBackgroundSync() {
+  const wasPaused = vaultGit.syncPaused;
+  vaultGit.syncPaused = false;
+  if (vaultGit.error === "sync paused") vaultGit.error = "";
+  if (wasPaused && vaultGit.pending.size) {
+    enqueueVaultGit(() => syncVault(null)).catch((e) => {
+      if (e && e.aidanosStop) {
+        pauseBackgroundSync(e);
+        return;
+      }
+      setGitError(e && e.message || "git failed");
+    });
+  }
+  if (!vaultGit.syncTimer) startVaultSyncLoop();
 }
 
 async function syncVault(commitPaths, resolvePaths) {
@@ -1326,9 +1887,22 @@ async function syncVault(commitPaths, resolvePaths) {
     }
     if (changed) persistPending();
   }
+  if (vaultGit.syncPaused) return;
   try {
+    await assertVaultOpen();
     await syncVaultBody();
   } catch (e) {
+    if (e && e.aidanosStop) {
+      pauseBackgroundSync(e);
+      return;
+    }
+    if (clientRefusal(e) && String(e && e.message || "") === "symlink: .") {
+      const err = new Error("root");
+      err.code = "ELOOP";
+      pauseBackgroundSync(tagStop(err, "git"));
+      return;
+    }
+    throwIfStop(e);
     setGitError(e && e.message || "git failed");
   } finally {
     if (!vaultGit.fetchFailed) refreshHold();
@@ -1354,7 +1928,7 @@ async function syncVaultBody() {
     rel = await compareToRemote();
   } catch (e) {
     vaultGit.fetchFailed = true;
-    setGitError(e && e.message || "fetch failed");
+    throwIfStop(e); setGitError(e && e.message || "fetch failed");
     try {
       if (await commitPendingNow()) await publishPush();
     } catch (pushErr) {
@@ -1367,14 +1941,14 @@ async function syncVaultBody() {
     try {
       if (await commitPendingNow()) await publishPush();
     } catch (e) {
-      setGitError(e && e.message || "push failed");
+      throwIfStop(e); setGitError(e && e.message || "push failed");
     }
     return;
   }
 
   if (rel.kind === "unknown") {
     setGitError("push refused");
-    try { await commitPendingNow(); } catch (e) { setGitError(e && e.message || "git failed"); }
+    try { await commitPendingNow(); } catch (e) { throwIfStop(e); setGitError(e && e.message || "git failed"); }
     return;
   }
 
@@ -1402,7 +1976,7 @@ async function syncVaultBody() {
       await fastForward(rel.rev, park);
     } catch (e) {
       await recordConflicts(overlap, rel.rev);
-      setGitError(e && e.message || "push refused");
+      throwIfStop(e); setGitError(e && e.message || "push refused");
       return;
     }
     await announcePaths(incoming);
@@ -1421,14 +1995,14 @@ async function syncVaultBody() {
     try {
       await commitAppPaths(pendingList(), blocked);
     } catch (e) {
-      setGitError(e && e.message || "git failed");
+      throwIfStop(e); setGitError(e && e.message || "git failed");
     }
     if (noted.blocking.length || hasUnresolved()) {
       vaultGit.join = false;
       try {
         await publishPush();
       } catch (e) {
-        setGitError(e && e.message || "push refused");
+        throwIfStop(e); setGitError(e && e.message || "push refused");
       }
       if ((noted.blocking.length || hasUnresolved()) && !vaultGit.error) setGitError("push refused");
       return;
@@ -1442,7 +2016,7 @@ async function syncVaultBody() {
         try {
           await publishPush();
         } catch (e) {
-          setGitError(e && e.message || "push refused");
+          throwIfStop(e); setGitError(e && e.message || "push refused");
           vaultGit.join = true;
         }
         if (vaultGit.join && !vaultGit.error) setGitError("push refused");
@@ -1456,7 +2030,7 @@ async function syncVaultBody() {
     try {
       await publishPush();
     } catch (e) {
-      setGitError(e && e.message || "push refused");
+      throwIfStop(e); setGitError(e && e.message || "push refused");
       vaultGit.join = true;
     }
     if (vaultGit.join && !vaultGit.error) setGitError("push refused");
@@ -1470,7 +2044,7 @@ async function syncVaultBody() {
   try {
     committed = await commitPendingNow();
   } catch (e) {
-    setGitError(e && e.message || "git failed");
+    throwIfStop(e); setGitError(e && e.message || "git failed");
     return;
   }
   let ahead = rel.kind === "ahead";
@@ -1488,7 +2062,7 @@ async function syncVaultBody() {
     try {
       await publishPush();
     } catch (e) {
-      setGitError(e && e.message || "push failed");
+      throwIfStop(e); setGitError(e && e.message || "push failed");
       try {
         await fetchOrigin();
         const again = await compareToRemote();
@@ -1550,10 +2124,18 @@ function addDays(iso, n) {
 }
 
 async function readFileSafe(p) {
+  let target;
   try {
-    return await fs.readFile(p, "utf8");
+    target = await readableTarget(p, VAULT);
   } catch (e) {
-    if (e.code === "ENOENT") return null;
+    if (e.message === "bad path" || e.message === "path escapes vault") return null;
+    throw e;
+  }
+  if (target == null) return null;
+  try {
+    return await readRegularText(target);
+  } catch (e) {
+    if (e.message === "bad path" || e.code === "ENOENT") return null;
     throw e;
   }
 }
@@ -1712,7 +2294,11 @@ function safeJoin(root, rel) {
   if (!cleaned || cleaned.includes("\0")) {
     throw new Error("bad path");
   }
+  if (cleaned.length > 400) throw new Error("bad path");
   const parts = cleaned.split("/").filter((p) => p && p !== ".");
+  if (parts.some((p) => p.length > 200 || Buffer.byteLength(p) > 200)) {
+    throw new Error("bad path");
+  }
   if (parts.some((p) => p === ".." || p.startsWith("."))) {
     throw new Error("path escapes vault");
   }
@@ -1769,20 +2355,23 @@ function isMutating(method) {
   return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
 }
 
-async function listMdTree(dir, vaultRoot) {
+async function listMdTree(dir, vaultRoot, skipped, gitLinks) {
   const out = [];
   const entries = await fs.readdir(dir, { withFileTypes: true });
   for (const e of entries) {
     if (e.name.startsWith(".")) continue;
     if (e.name.endsWith(".tmp")) continue;
-    if (e.isSymbolicLink()) continue;
     const p = path.join(dir, e.name);
-    const rel = path.relative(vaultRoot, p);
+    const rel = path.relative(vaultRoot, p).split(path.sep).join("/");
     if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) continue;
+    if (e.isSymbolicLink() || (gitLinks && gitLinks.has(rel))) {
+      rememberSkip(skipped, rel);
+      continue;
+    }
     if (e.isDirectory()) {
-      out.push(...(await listMdTree(p, vaultRoot)));
+      out.push(...(await listMdTree(p, vaultRoot, skipped, gitLinks)));
     } else if (e.isFile() && e.name.endsWith(".md")) {
-      out.push(rel.split(path.sep).join("/"));
+      out.push(rel);
     }
   }
   return out.sort((a, b) => a.localeCompare(b));
@@ -1798,14 +2387,35 @@ function dayMarkdownFromBody(body) {
 async function readBody(req) {
   const chunks = [];
   let n = 0;
-  for await (const c of req) {
-    n += c.length;
-    if (n > MAX_BODY) {
-      const err = new Error("too large");
-      err.code = "BODY_TOO_LARGE";
+  try {
+    for await (const c of req) {
+      n += c.length;
+      if (n > MAX_BODY) {
+        const err = new Error("too large");
+        err.code = "BODY_TOO_LARGE";
+        throw err;
+      }
+      chunks.push(c);
+    }
+  } catch (e) {
+    if (e && e.code === "BODY_TOO_LARGE") throw e;
+    if (isClientAbort(e) || req.aborted) {
+      const err = e instanceof Error ? e : new Error("aborted");
+      if (!err.code) err.code = "ECONNRESET";
       throw err;
     }
-    chunks.push(c);
+    throw e;
+  }
+  if (req.aborted) {
+    const err = new Error("aborted");
+    err.code = "ECONNRESET";
+    throw err;
+  }
+  const declared = req.headers["content-length"];
+  if (declared != null && declared !== "" && Number(declared) !== n) {
+    const err = new Error("aborted");
+    err.code = "ECONNRESET";
+    throw err;
   }
   return Buffer.concat(chunks).toString("utf8");
 }
@@ -1840,7 +2450,7 @@ const pathWriteChains = new Map();
 
 function enqueuePathWrite(key, fn) {
   const prev = pathWriteChains.get(key) || Promise.resolve();
-  const run = prev.then(fn, fn);
+  const run = enqueueVaultWork(() => prev.then(fn, fn));
   pathWriteChains.set(key, run);
   run.then(
     () => {
@@ -1859,15 +2469,83 @@ function sameTextAlreadyStored(exists, raw, markdown, conflict, resolve) {
   return true;
 }
 
-async function atomicWriteFile(filePath, markdown) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
+function testHoldDir(name) {
+  if (process.env.NODE_ENV !== "test") return "";
+  return String(process.env[name] || "").trim();
+}
+
+async function holdRenameForTest() {
+  const dir = testHoldDir("AIDANOS_TEST_HOLD_RENAME");
+  if (!dir) return;
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, "hold"), "1");
+  const go = path.join(dir, "go");
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    try {
+      await fs.access(go);
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+}
+
+async function holdWriteForTest() {
+  const dir = testHoldDir("AIDANOS_TEST_HOLD_WRITE");
+  if (!dir) return;
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, "hold"), "1");
+  const go = path.join(dir, "go");
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    try {
+      await fs.access(go);
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+}
+
+async function atomicWriteFile(filePath, markdown, beforeRename) {
+  await mkdirNoFollow(path.dirname(filePath));
+  const seen = await snapshotParents(filePath);
+  await holdWriteForTest();
   const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+  let fh = null;
+  let openedId = null;
   try {
-    await fs.writeFile(tmpPath, markdown, { encoding: "utf8", flag: "wx" });
-    await fs.rename(tmpPath, filePath);
+    fh = await fs.open(tmpPath, "wx");
+    openedId = await assertOpenedTemp(fh, tmpPath);
+    await assertParents(seen);
+    if (Buffer.isBuffer(markdown)) await fh.writeFile(markdown);
+    else await fh.writeFile(markdown, { encoding: "utf8" });
+    await fh.close();
+    fh = null;
+    if (beforeRename) await beforeRename();
+    await assertParents(seen);
+    await holdRenameForTest();
+    try {
+      await fs.rename(tmpPath, filePath);
+    } catch (e) {
+      throw tagStop(e, "rename");
+    }
+    await assertParents(seen);
   } catch (e) {
-    try { await fs.unlink(tmpPath); } catch {}
-    throw e;
+    if (fh) {
+      try { await fh.close(); } catch { /* closed */ }
+    }
+    if (openedId) await unlinkIfSameFile(tmpPath, openedId);
+    const code = e && e.code;
+    if ((code === "EISDIR" || code === "ENOTDIR") && !e.aidanosStop) {
+      const err = new Error("not a file");
+      err.code = code;
+      throw err;
+    }
+    throwIfStop(e);
+    if (clientRefusal(e)) throw e;
+    throw tagStop(e, "write");
   }
 }
 
@@ -1905,41 +2583,278 @@ function isPngBuffer(buf) {
   return Buffer.isBuffer(buf) && buf.length >= PNG_SIG.length && buf.subarray(0, PNG_SIG.length).equals(PNG_SIG);
 }
 
+function refusalMessage(err) {
+  if (err && err.code === "BAD_PATH") return "bad path";
+  const msg = err && err.message;
+  if (msg === "bad path" || msg === "path escapes vault" || msg === "bad png" || msg === "not a file") return msg;
+  if (typeof msg === "string" && msg.startsWith("symlink: ")) {
+    const named = msg.slice("symlink: ".length);
+    if (!named || named.startsWith("/") || named.includes("..") || named.includes("\\") || named.includes("\0")) {
+      return "bad path";
+    }
+    return msg;
+  }
+  return "";
+}
+
 function publicPathError(e) {
-  const msg = e && e.message;
-  if (msg === "bad path" || msg === "path escapes vault" || msg === "bad png") return msg;
-  return "bad path";
+  return refusalMessage(e) || "bad path";
+}
+
+// Bad path, containment, and a named symlink stay 400. Anything else is unexpected.
+function clientRefusal(err) {
+  return refusalMessage(err);
+}
+
+function tagStop(err, step) {
+  const error = err instanceof Error ? err : new Error("failed");
+  error.aidanosStop = step;
+  if (!error.code) error.code = "EIO";
+  return error;
+}
+
+function throwIfStop(err) {
+  if (err && err.aidanosStop) throw err;
+}
+
+function parentChanged(step) {
+  const err = new Error("parent changed");
+  err.code = "PARENT";
+  return tagStop(err, step || "write");
+}
+
+function pauseBackgroundSync(err) {
+  vaultGit.syncPaused = true;
+  if (vaultGit.syncTimer) {
+    clearTimeout(vaultGit.syncTimer);
+    vaultGit.syncTimer = null;
+  }
+  if (vaultGit.timer) {
+    clearTimeout(vaultGit.timer);
+    vaultGit.timer = null;
+  }
+  vaultGit.error = "sync paused";
+  const step = err && err.aidanosStop ? String(err.aidanosStop) : "git";
+  const code = err && err.code ? String(err.code) : "EIO";
+  console.error("sync paused: " + step + " " + code);
+}
+
+async function assertRealVaultRoot() {
+  let st;
+  try {
+    st = await fs.lstat(VAULT);
+  } catch (e) {
+    if (e.code === "ENOENT") return;
+    throw e;
+  }
+  if (st.isSymbolicLink()) throw symlinkError(".");
+}
+
+async function assertVaultOpen() {
+  await assertRealVaultRoot();
+  let dh;
+  try {
+    dh = await fs.opendir(VAULT);
+  } catch (e) {
+    throw tagStop(e, "git");
+  }
+  await dh.close();
+}
+
+async function mkdirNoFollow(dir) {
+  await assertRealVaultRoot();
+  const root = path.resolve(VAULT);
+  const target = path.resolve(dir);
+  const rel = path.relative(root, target);
+  if (target !== root && (!rel || rel.startsWith("..") || path.isAbsolute(rel))) {
+    throw parentChanged();
+  }
+  const parts = !rel || rel === "." ? [] : rel.split(path.sep);
+  let cursor = root;
+  for (const part of parts) {
+    cursor = path.join(cursor, part);
+    let st = null;
+    try {
+      st = await fs.lstat(cursor);
+    } catch (e) {
+      if (e.code !== "ENOENT") throw tagStop(e, "write");
+    }
+    if (reservedDirName(part)) throw new Error("bad path");
+    if (!st) {
+      try {
+        await fs.mkdir(cursor);
+      } catch (e) {
+        if (e.code !== "EEXIST") throw tagStop(e, "write");
+      }
+      try {
+        st = await fs.lstat(cursor);
+      } catch (e) {
+        throw tagStop(e, "write");
+      }
+    }
+    if (st.isSymbolicLink()) throw symlinkError(vaultRel(cursor));
+    if (!st.isDirectory()) throw new Error("bad path");
+  }
+}
+
+async function snapshotParents(filePath) {
+  await assertRealVaultRoot();
+  const root = path.resolve(VAULT);
+  const parent = path.resolve(path.dirname(filePath));
+  const rel = path.relative(root, parent);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) throw parentChanged();
+  const parts = !rel || rel === "." ? [] : rel.split(path.sep);
+  const seen = [];
+  let cursor = root;
+  const rootSt = await fs.lstat(cursor);
+  if (rootSt.isSymbolicLink()) throw symlinkError(".");
+  if (!rootSt.isDirectory()) throw new Error("bad path");
+  seen.push({ abs: cursor, dev: rootSt.dev, ino: rootSt.ino });
+  for (const part of parts) {
+    cursor = path.join(cursor, part);
+    let st;
+    try {
+      st = await fs.lstat(cursor);
+    } catch {
+      throw parentChanged();
+    }
+    if (st.isSymbolicLink()) throw symlinkError(vaultRel(cursor));
+    if (!st.isDirectory()) throw new Error("bad path");
+    seen.push({ abs: cursor, dev: st.dev, ino: st.ino });
+  }
+  return seen;
+}
+
+async function assertParents(seen) {
+  for (const item of seen) {
+    let st;
+    try {
+      st = await fs.lstat(item.abs);
+    } catch {
+      throw parentChanged();
+    }
+    if (st.isSymbolicLink() || !st.isDirectory() || st.dev !== item.dev || st.ino !== item.ino) {
+      throw parentChanged();
+    }
+  }
+}
+
+function reservedDirName(part) {
+  const name = String(part || "").toLowerCase();
+  return name.endsWith(".png") || name.endsWith(".md") || name.endsWith(".css");
+}
+
+async function assertOpenedTemp(fh, tmpPath) {
+  const opened = await fh.stat();
+  let listed;
+  try {
+    listed = await fs.lstat(tmpPath);
+  } catch (e) {
+    throw tagStop(e, "write");
+  }
+  if (listed.isSymbolicLink() || !listed.isFile() || listed.dev !== opened.dev || listed.ino !== opened.ino) {
+    throw parentChanged();
+  }
+  return { dev: opened.dev, ino: opened.ino };
+}
+
+async function unlinkIfSameFile(filePath, id) {
+  let st;
+  try {
+    st = await fs.lstat(filePath);
+  } catch {
+    return;
+  }
+  if (st.isSymbolicLink() || st.dev !== id.dev || st.ino !== id.ino) return;
+  try { await fs.unlink(filePath); } catch { /* already gone */ }
+}
+
+async function gitSymlinkSet() {
+  try {
+    const st = await fs.lstat(path.join(VAULT, ".git"));
+    if (!st || st.isSymbolicLink()) return new Set();
+  } catch {
+    return new Set();
+  }
+  try {
+    const { out } = await runGit(["-C", VAULT, "ls-files", "-s", "-z"], { timeoutMs: 8000 });
+    const set = new Set();
+    for (const rec of String(out || "").split("\0")) {
+      if (!rec.startsWith("120000 ")) continue;
+      const tab = rec.lastIndexOf("\t");
+      if (tab === -1) continue;
+      const rel = rec.slice(tab + 1).replace(/\\/g, "/");
+      if (isSafeRel(rel)) set.add(rel);
+    }
+    return set;
+  } catch {
+    return new Set();
+  }
+}
+
+function isClientAbort(err) {
+  if (!err || typeof err !== "object") return false;
+  const code = err.code;
+  if (code === "ECONNRESET" || code === "EPIPE" || code === "ECONNABORTED" || code === "ERR_STREAM_PREMATURE_CLOSE") {
+    return true;
+  }
+  const msg = String(err.message || "");
+  return msg === "aborted" || msg === "request aborted";
+}
+
+function refuse(res, err) {
+  const msg = typeof err === "string" ? err : publicPathError(err);
+  console.error("refused: " + oneLine(msg));
+  return json(res, 400, { error: msg });
+}
+
+function stopLine(err) {
+  const step = err && err.aidanosStop ? String(err.aidanosStop) : "write";
+  const code = err && err.code ? String(err.code) : "EIO";
+  if (!/^[a-z]+$/.test(step) || !/^[A-Za-z0-9_]+$/.test(code)) return "stopped: write EIO";
+  return "stopped: " + step + " " + code;
+}
+
+function stopAfterResponse(res, err) {
+  console.error(stopLine(err));
+  const finish = () => process.exit(1);
+  if (!res || res.headersSent) {
+    finish();
+    return;
+  }
+  const body = JSON.stringify({ error: "internal error" });
+  res.writeHead(500, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  res.end(body, finish);
+  setTimeout(finish, 2000).unref();
 }
 
 async function familyRoomPngReal(relPath, abs) {
   const want = familyRoomPngPath(relPath);
   if (!want) throw new Error("bad path");
-  let rootReal;
-  try {
-    rootReal = await fs.realpath(VAULT);
-  } catch {
-    throw new Error("bad path");
-  }
-  let cursor = path.resolve(abs);
-  const missing = [];
-  let base = null;
-  for (;;) {
-    try {
-      base = await fs.realpath(cursor);
-      break;
-    } catch (e) {
-      // A raw realpath error includes the vault's absolute path.
-      if (e.code !== "ENOENT") throw new Error("bad path");
-      const parent = path.dirname(cursor);
-      if (parent === cursor) throw new Error("bad path");
-      missing.push(path.basename(cursor));
-      cursor = parent;
-    }
-  }
-  const real = missing.length ? path.join(base, ...missing.reverse()) : base;
-  const rel = path.relative(rootReal, real).split(path.sep).join("/");
+  await assertRealVaultRoot();
+  const logicalRoot = path.resolve(VAULT);
+  const logical = path.resolve(abs);
+  const rel = path.relative(logicalRoot, logical).split(path.sep).join("/");
   if (rel !== want) throw new Error("path escapes vault");
-  return real;
+  const parts = rel.split("/");
+  let cursor = logicalRoot;
+  for (let i = 0; i < parts.length; i++) {
+    cursor = path.join(cursor, parts[i]);
+    let st;
+    try {
+      st = await fs.lstat(cursor);
+    } catch (e) {
+      if (e.code === "ENOENT") return logical;
+      throw new Error("bad path");
+    }
+    if (st.isSymbolicLink()) throw symlinkError(parts.slice(0, i + 1).join("/"));
+    if (i < parts.length - 1 && !st.isDirectory()) throw new Error("bad path");
+  }
+  return logical;
 }
 
 async function readFamilyRoomPng(filePath) {
@@ -1979,15 +2894,7 @@ async function readFamilyRoomPng(filePath) {
 }
 
 async function atomicWriteBuffer(filePath, buf) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-  try {
-    await fs.writeFile(tmpPath, buf, { flag: "wx" });
-    await fs.rename(tmpPath, filePath);
-  } catch (e) {
-    try { await fs.unlink(tmpPath); } catch {}
-    throw e;
-  }
+  await atomicWriteFile(filePath, buf);
 }
 
 function sendDayWatch(date, mtime) {
@@ -1998,33 +2905,36 @@ function sendDayWatch(date, mtime) {
 }
 
 function startLogWatch() {
-  const logDir = path.join(VAULT, "log");
-  try {
-    fsSync.mkdirSync(logDir, { recursive: true });
-  } catch {}
-  try {
-    const watcher = fsSync.watch(logDir, { persistent: true, recursive: false }, (_eventType, filename) => {
-      if (!filename) return;
-      const name = path.basename(String(filename));
-      if (name.endsWith(".tmp")) return;
-      if (!DAY_FILE_RE.test(name)) return;
-      const date = name.slice(0, 10);
-      const logPath = path.join(logDir, name);
-      fsSync.stat(logPath, (err, st) => {
-        if (vaultGit.suppressWatch) return;
-        if (err || !st) return;
-        const mtime = Math.trunc(st.mtimeMs);
-        // Own writes are already announced by the save. Ignore the echo.
-        if (isSelfWrite(date, mtime)) return;
-        sendDayWatch(date, mtime);
+  worktreeDir("log").then((logDir) => {
+    try {
+      fsSync.mkdirSync(logDir, { recursive: true });
+    } catch {}
+    try {
+      const watcher = fsSync.watch(logDir, { persistent: true, recursive: false }, (_eventType, filename) => {
+        if (!filename) return;
+        const name = path.basename(String(filename));
+        if (name.endsWith(".tmp")) return;
+        if (!DAY_FILE_RE.test(name)) return;
+        const date = name.slice(0, 10);
+        const logPath = path.join(logDir, name);
+        fsSync.lstat(logPath, (err, st) => {
+          if (vaultGit.suppressWatch) return;
+          if (err || !st || !st.isFile()) return;
+          const mtime = Math.trunc(st.mtimeMs);
+          // Own writes are already announced by the save. Ignore the echo.
+          if (isSelfWrite(date, mtime)) return;
+          sendDayWatch(date, mtime);
+        });
       });
-    });
-    watcher.on("error", (err) => {
+      watcher.on("error", (err) => {
+        logSafe("log watch", err);
+      });
+    } catch (err) {
       logSafe("log watch", err);
-    });
-  } catch (err) {
+    }
+  }).catch((err) => {
     logSafe("log watch", err);
-  }
+  });
 }
 
 function sendFile(res, filePath, contentType) {
@@ -2081,21 +2991,30 @@ const server = http.createServer(async (req, res) => {
         body = {};
       }
       if (!body || body.join !== true) return json(res, 400, { error: "join required" });
+      const wasPaused = vaultGit.syncPaused;
       let status = 200;
       let payload = null;
       try {
         await enqueueVaultGit(async () => {
+          await assertVaultOpen();
           const result = await joinVault();
           await noteUnrelated().catch(() => {});
           status = result.status;
           payload = syncStatus();
         });
       } catch (e) {
+        throwIfStop(e);
         setGitError(e && e.message || "push refused");
         if (!hasUnresolved()) vaultGit.join = true;
         status = 409;
         payload = syncStatus();
       }
+      if (status === 200) resumeBackgroundSync();
+      else if (wasPaused) {
+        vaultGit.syncPaused = true;
+        vaultGit.error = "sync paused";
+      }
+      payload = syncStatus();
       finishGitNotice();
       return json(res, status, payload || syncStatus());
     }
@@ -2106,8 +3025,9 @@ const server = http.createServer(async (req, res) => {
       else if (!isIsoDate(start)) {
         return json(res, 400, { error: "start must be YYYY-MM-DD" });
       }
-      const weekPath = path.join(VAULT, "aidanos", "weeks", `${start}.md`);
-      let raw = await readFileSafe(weekPath);
+      const skipped = [];
+      const gitLinks = await gitSymlinkSet();
+      const raw = await readVaultRel(`aidanos/weeks/${start}.md`, skipped, gitLinks);
       if (!raw) {
         const days = [];
         for (let i = 0; i < 7; i++) {
@@ -2120,11 +3040,13 @@ const server = http.createServer(async (req, res) => {
             summary: "",
           });
         }
-        return json(res, 200, { week_start: start, days, exists: false });
+        logSkips(skipped);
+        return json(res, 200, { week_start: start, days, exists: false, skippedLinks: skipped });
       }
       const days = parseWeekMarkdown(raw, start);
+      await readLogNames(skipped, gitLinks);
       for (const d of days) {
-        const logRaw = await readFileSafe(path.join(VAULT, "log", `${d.date}.md`));
+        const logRaw = await readVaultRel(`log/${d.date}.md`, skipped, gitLinks);
         if (logRaw) {
           const items = parseCheckboxes(logRaw);
           d.rx_total = items.length;
@@ -2136,18 +3058,31 @@ const server = http.createServer(async (req, res) => {
           d.task_open = 0;
         }
       }
-      return json(res, 200, { week_start: start, days, exists: true });
+      logSkips(skipped);
+      return json(res, 200, { week_start: start, days, exists: true, skippedLinks: skipped });
     }
 
     if (pathname === "/api/day" && req.method === "GET") {
       const date = url.searchParams.get("date");
       if (!date) return json(res, 400, { error: "date required" });
       if (!isIsoDate(date)) return json(res, 400, { error: "date must be YYYY-MM-DD" });
-      const logPath = path.join(VAULT, "log", `${date}.md`);
+      const dayRel = `log/${date}.md`;
+      const gitLinks = await gitSymlinkSet();
+      if (gitLinks.has(dayRel)) {
+        const skipped = [dayRel];
+        logSkips(skipped);
+        return json(res, 200, { date, markdown: "", mtime: 0, skippedLinks: skipped });
+      }
+      let logPath;
+      try {
+        logPath = await worktreePath(dayRel);
+      } catch (e) {
+        return refuse(res, e);
+      }
       const raw = await readFileSafe(logPath);
       const markdown = raw == null ? "" : raw;
       const mtime = raw == null ? 0 : await fileMtimeMs(logPath);
-      return json(res, 200, { date, markdown, mtime });
+      return json(res, 200, { date, markdown, mtime, skippedLinks: [] });
     }
 
     if (pathname === "/api/month" && req.method === "GET") {
@@ -2174,27 +3109,24 @@ const server = http.createServer(async (req, res) => {
         }
       }
       const prefix = `${year}-${String(month).padStart(2, "0")}-`;
-      const logDir = path.join(VAULT, "log");
-      let names = [];
-      try {
-        names = await fs.readdir(logDir);
-      } catch (e) {
-        if (e.code === "ENOENT") return json(res, 200, { year, month, days: [] });
-        throw e;
-      }
+      const skipped = [];
+      const gitLinks = await gitSymlinkSet();
+      const names = await readLogNames(skipped, gitLinks);
+      if (names == null) return json(res, 200, { year, month, days: [], skippedLinks: skipped });
       const days = [];
       for (const name of names) {
         if (name.endsWith(".tmp")) continue;
         if (!DAY_FILE_RE.test(name)) continue;
         if (!name.startsWith(prefix)) continue;
         const date = name.slice(0, 10);
-        const raw = await readFileSafe(path.join(logDir, name));
+        const raw = await readVaultRel(`log/${name}`, skipped, gitLinks);
         if (raw == null) continue;
         if (!String(raw).trim()) continue;
         days.push(date);
       }
       days.sort((a, b) => a.localeCompare(b));
-      return json(res, 200, { year, month, days });
+      logSkips(skipped);
+      return json(res, 200, { year, month, days, skippedLinks: skipped });
     }
 
     if (pathname === "/api/day" && req.method === "PUT") {
@@ -2212,14 +3144,32 @@ const server = http.createServer(async (req, res) => {
       const clientMtime = body && typeof body === "object" && body.mtime != null
         ? Number(body.mtime)
         : NaN;
-      const logPath = path.join(VAULT, "log", `${date}.md`);
       const dayRel = `log/${date}.md`;
-      return enqueuePathWrite(dayRel, async () => {
+      let logPath;
+      try {
+        logPath = await worktreePath(dayRel);
+      } catch (e) {
+        return refuse(res, e);
+      }
+      return await enqueuePathWrite(dayRel, async () => {
+        const dayLinks = await gitSymlinkSet();
+        if (dayLinks.has(dayRel)) return refuse(res, "symlink: " + dayRel);
+        try {
+          logPath = await worktreePath(dayRel);
+        } catch (e) {
+          return refuse(res, e);
+        }
         let diskMtime = 0;
         let exists = false;
         try {
-          const st = await fs.stat(logPath);
-          exists = st.isFile();
+          const st = await fs.lstat(logPath);
+          if (st.isSymbolicLink()) {
+            return refuse(res, "symlink: " + dayRel);
+          }
+          if (!st.isFile()) {
+            return json(res, 400, { error: "not a file" });
+          }
+          exists = true;
           diskMtime = Math.trunc(st.mtimeMs);
         } catch (e) {
           if (e.code !== "ENOENT") throw e;
@@ -2269,18 +3219,20 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/plan" && req.method === "GET") {
-      const raw = await readFileSafe(path.join(VAULT, "aidanos", "active-horse.md"));
-      return json(res, 200, { plan: parsePlan(raw), exists: Boolean(raw) });
+      const skipped = [];
+      const gitLinks = await gitSymlinkSet();
+      const raw = await readVaultRel("aidanos/active-horse.md", skipped, gitLinks);
+      logSkips(skipped);
+      return json(res, 200, { plan: parsePlan(raw), exists: Boolean(raw), skippedLinks: skipped });
     }
 
     if (pathname === "/api/open-tasks" && req.method === "GET") {
-      const logDir = path.join(VAULT, "log");
-      let names = [];
-      try {
-        names = await fs.readdir(logDir);
-      } catch (e) {
-        if (e.code === "ENOENT") return json(res, 200, { items: [] });
-        throw e;
+      const skipped = [];
+      const gitLinks = await gitSymlinkSet();
+      const names = await readLogNames(skipped, gitLinks);
+      if (names == null) {
+        logSkips(skipped);
+        return json(res, 200, { items: [], skippedLinks: skipped });
       }
       const items = [];
       names.sort((a, b) => a.localeCompare(b));
@@ -2288,7 +3240,7 @@ const server = http.createServer(async (req, res) => {
         if (name.endsWith(".tmp")) continue;
         if (!DAY_FILE_RE.test(name)) continue;
         const date = name.slice(0, 10);
-        const raw = await readFileSafe(path.join(logDir, name));
+        const raw = await readVaultRel(`log/${name}`, skipped, gitLinks);
         if (raw == null) continue;
         const lines = raw.split("\n");
         for (let i = 0; i < lines.length; i++) {
@@ -2298,19 +3250,29 @@ const server = http.createServer(async (req, res) => {
           }
         }
       }
-      return json(res, 200, { items });
+      logSkips(skipped);
+      return json(res, 200, { items, skippedLinks: skipped });
     }
 
     if (pathname === "/api/folders" && req.method === "GET") {
+      await assertRealVaultRoot();
+      const skipped = [];
+      const gitLinks = await gitSymlinkSet();
       const entries = await fs.readdir(VAULT, { withFileTypes: true });
       const folders = [];
       for (const e of entries) {
-        if (!e.isDirectory() || e.name.startsWith(".")) continue;
+        if (e.name.startsWith(".")) continue;
+        if (e.isSymbolicLink() || gitLinks.has(e.name)) {
+          rememberSkip(skipped, e.name);
+          continue;
+        }
+        if (!e.isDirectory()) continue;
         if (e.name === "log" || e.name === "tasks" || e.name === "aidanos") continue;
         folders.push({ name: e.name, path: e.name });
       }
       folders.sort((a, b) => a.name.localeCompare(b.name));
-      return json(res, 200, { folders });
+      logSkips(skipped);
+      return json(res, 200, { folders, skippedLinks: skipped });
     }
 
     if (pathname === "/api/file" && req.method === "GET") {
@@ -2318,11 +3280,14 @@ const server = http.createServer(async (req, res) => {
       if (!rel) return json(res, 400, { error: "path required" });
       let abs;
       try {
-        abs = safeJoin(VAULT, rel);
+        abs = await worktreePath(rel);
+        await readableTarget(abs, VAULT);
       } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
+        return refuse(res, e);
       }
       const relPath = path.relative(VAULT, abs).split(path.sep).join("/");
+      const gitLinks = await gitSymlinkSet();
+      if (gitLinks.has(relPath)) return refuse(res, "symlink: " + relPath);
       if (familyRoomPngPath(relPath)) {
         try {
           const real = await familyRoomPngReal(relPath, abs);
@@ -2336,13 +3301,8 @@ const server = http.createServer(async (req, res) => {
           res.end(buf);
           return;
         } catch (e) {
-          return json(res, 400, { error: publicPathError(e) });
+          return refuse(res, e);
         }
-      }
-      try {
-        await resolveInside(VAULT, abs);
-      } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
       }
       if (!String(relPath).endsWith(".md")) {
         return json(res, 400, { error: "markdown only" });
@@ -2358,17 +3318,20 @@ const server = http.createServer(async (req, res) => {
       if (!rel) return json(res, 400, { error: "path required" });
       let abs;
       try {
-        abs = safeJoin(VAULT, rel);
+        abs = await worktreePath(rel);
+        await readableTarget(abs, VAULT);
       } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
+        return refuse(res, e);
       }
       const relPath = path.relative(VAULT, abs).split(path.sep).join("/");
+      const gitLinks = await gitSymlinkSet();
+      if (gitLinks.has(relPath)) return refuse(res, "symlink: " + relPath);
       if (familyRoomPngPath(relPath)) {
         let real;
         try {
           real = await familyRoomPngReal(relPath, abs);
         } catch (e) {
-          return json(res, 400, { error: publicPathError(e) });
+          return refuse(res, e);
         }
         const incoming = await readBody(req);
         let body;
@@ -2384,7 +3347,15 @@ const server = http.createServer(async (req, res) => {
           return json(res, 400, { error: "bad png" });
         }
         const pngKey = "f:" + relPath;
-        return enqueuePathWrite(pngKey, async () => {
+        return await enqueuePathWrite(pngKey, async () => {
+          let listed = null;
+          try {
+            listed = await fs.lstat(real);
+          } catch (e) {
+            if (e.code !== "ENOENT") throw e;
+          }
+          if (listed && listed.isSymbolicLink()) return refuse(res, "symlink: " + relPath);
+          if (listed && !listed.isFile()) return json(res, 400, { error: "not a file" });
           pendingSelfWrites.add(pngKey);
           try {
             await atomicWriteBuffer(real, buf);
@@ -2396,11 +3367,6 @@ const server = http.createServer(async (req, res) => {
             pendingSelfWrites.delete(pngKey);
           }
         });
-      }
-      try {
-        await resolveInside(VAULT, abs);
-      } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
       }
       if (!String(relPath).endsWith(".md")) {
         return json(res, 400, { error: "markdown only" });
@@ -2424,14 +3390,26 @@ const server = http.createServer(async (req, res) => {
         ? Number(body.mtime)
         : NaN;
       const writeKey = "f:" + relPath;
-      return enqueuePathWrite(writeKey, async () => {
+      return await enqueuePathWrite(writeKey, async () => {
+        try {
+          abs = await worktreePath(rel);
+          await readableTarget(abs, VAULT);
+        } catch (e) {
+          return refuse(res, e);
+        }
         let diskMtime = 0;
         let exists = false;
         try {
-          const st = await fs.stat(abs);
-          if (st.isDirectory()) return json(res, 400, { error: "not a file" });
-          exists = st.isFile();
-          diskMtime = Math.trunc(st.mtimeMs);
+          const st = await fs.lstat(abs);
+          if (st.isSymbolicLink()) {
+            return refuse(res, "symlink: " + relPath);
+          }
+          if (st.isDirectory()) {
+            return json(res, 400, { error: "not a file" });
+          } else {
+            exists = st.isFile();
+            diskMtime = Math.trunc(st.mtimeMs);
+          }
         } catch (e) {
           if (e.code !== "ENOENT") throw e;
         }
@@ -2482,32 +3460,37 @@ const server = http.createServer(async (req, res) => {
       const dirParam = url.searchParams.get("dir") || ".";
       let abs;
       try {
-        abs = dirParam === "." || dirParam === "" ? VAULT : safeJoin(VAULT, dirParam);
-        await resolveInside(VAULT, abs);
+        abs = await worktreeDir(dirParam);
       } catch (e) {
-        return json(res, 400, { error: e.message || "bad path" });
+        return refuse(res, e);
       }
       let stat;
       try {
-        stat = await fs.stat(abs);
+        stat = await fs.lstat(abs);
       } catch (e) {
         if (e.code === "ENOENT") {
           return json(res, 404, { error: "directory not found", dir: dirParam });
         }
         throw e;
       }
+      if (stat.isSymbolicLink()) return refuse(res, "symlink: " + String(dirParam || ".").replace(/\\/g, "/"));
       if (!stat.isDirectory()) {
         return json(res, 400, { error: "not a directory", dir: dirParam });
       }
-      const files = await listMdTree(abs, VAULT);
-      return json(res, 200, { dir: dirParam, files });
+      const skipped = [];
+      const gitLinks = await gitSymlinkSet();
+      const files = await listMdTree(abs, VAULT, skipped, gitLinks);
+      logSkips(skipped);
+      return json(res, 200, { dir: dirParam, files, skippedLinks: skipped });
     }
 
     if (pathname === "/api/search" && req.method === "GET") {
       const q = String(url.searchParams.get("q") || "").trim();
-      if (!q) return json(res, 200, { hits: [] });
+      if (!q) return json(res, 200, { hits: [], skippedLinks: [] });
       const needle = q.toLowerCase();
-      const files = await listMdTree(VAULT, VAULT);
+      const skipped = [];
+      const gitLinks = await gitSymlinkSet();
+      const files = await listMdTree(VAULT, VAULT, skipped, gitLinks);
       const hits = [];
       const MAX_HITS = 40;
       const MAX_PER_FILE = 3;
@@ -2518,17 +3501,26 @@ const server = http.createServer(async (req, res) => {
         const relBase = relNorm.split("/").pop() || "";
         if (/^TODAY\.md$/i.test(relBase)) continue;
         if (relNorm.startsWith("aidanos/") && relNorm !== "aidanos/active-horse.md") continue;
+        if (gitLinks.has(relNorm)) {
+          rememberSkip(skipped, relNorm);
+          continue;
+        }
         let abs;
         try {
-          abs = safeJoin(VAULT, rel);
-          await resolveInside(VAULT, abs);
-        } catch {
+          abs = await worktreePath(rel);
+        } catch (e) {
+          const msg = String(e && e.message || "");
+          if (msg.startsWith("symlink: ")) rememberSkip(skipped, msg.slice("symlink: ".length));
           continue;
         }
         let st;
         try {
-          st = await fs.stat(abs);
+          st = await fs.lstat(abs);
         } catch {
+          continue;
+        }
+        if (st.isSymbolicLink()) {
+          rememberSkip(skipped, relNorm);
           continue;
         }
         if (!st.isFile() || st.size > MAX_BYTES) continue;
@@ -2541,12 +3533,16 @@ const server = http.createServer(async (req, res) => {
           if (text.toLowerCase().includes(needle)) {
             hits.push({ path: relNorm, line: i, text });
             nThis += 1;
-            if (hits.length >= MAX_HITS) return json(res, 200, { hits });
+            if (hits.length >= MAX_HITS) {
+              logSkips(skipped);
+              return json(res, 200, { hits, skippedLinks: skipped });
+            }
             if (nThis >= MAX_PER_FILE) break;
           }
         }
       }
-      return json(res, 200, { hits });
+      logSkips(skipped);
+      return json(res, 200, { hits, skippedLinks: skipped });
     }
 
     if (pathname === "/api/day-watch" && req.method === "GET") {
@@ -2569,12 +3565,16 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/skin.css" && req.method === "GET") {
-      const skinPath = path.join(VAULT, "aidanos", "skin.css");
-      const raw = await readFileSafe(skinPath);
-      res.writeHead(200, {
+      const skipped = [];
+      const gitLinks = await gitSymlinkSet();
+      const raw = await readVaultRel("aidanos/skin.css", skipped, gitLinks);
+      logSkips(skipped);
+      const headers = {
         "Content-Type": "text/css; charset=utf-8",
         "Cache-Control": "no-store",
-      });
+      };
+      if (skipped.length) headers["X-Skipped-Links"] = skipped.join(",");
+      res.writeHead(200, headers);
       res.end(raw || "/* no personal skin */\n");
       return;
     }
@@ -2610,12 +3610,57 @@ const server = http.createServer(async (req, res) => {
       if (!res.headersSent) return json(res, 413, { error: "too large" });
       return;
     }
-    logSafe(err);
-    if (!res.headersSent) json(res, 500, { error: "internal error" });
+    if (err && (err.code === "EISDIR" || err.code === "ENOTDIR") && !err.aidanosStop) {
+      console.error("refused: not a file");
+      if (res.headersSent) return;
+      return json(res, 400, { error: "not a file" });
+    }
+    if (err && err.code === "EACCES" && !err.aidanosStop) {
+      console.error("request failed: EACCES");
+      if (res.headersSent) return;
+      return json(res, 403, { error: "not readable" });
+    }
+    if (isClientAbort(err)) {
+      if (res.headersSent) return;
+      res.writeHead(400, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify({ error: "bad request" }));
+      return;
+    }
+    const refusal = clientRefusal(err);
+    if (refusal) {
+      console.error("refused: " + oneLine(refusal));
+      if (res.headersSent) return;
+      return json(res, 400, { error: refusal });
+    }
+    // Only a tagged write, rename, unlink, or git step stops the process.
+    // A cut-off upload, a long name, and a background sync failure stay up.
+    if (err && err.aidanosStop) return stopAfterResponse(res, err);
+    console.error("request failed: " + (err && err.code ? String(err.code) : "ERROR"));
+    if (res.headersSent) return;
+    return json(res, 500, { error: "internal error" });
   }
 });
 
+function refuseSymlinkedVaultRoot() {
+  let st;
+  try {
+    st = fsSync.lstatSync(VAULT);
+  } catch (e) {
+    if (e.code === "ENOENT") return;
+    throw e;
+  }
+  if (!st.isSymbolicLink()) return;
+  // Name the configured path. logSafe would hide it, and realpath would accept the link.
+  console.error(VAULT);
+  console.error("Point AIDANOS_VAULT at the real folder.");
+  process.exit(1);
+}
+
 async function boot() {
+  refuseSymlinkedVaultRoot();
   await initVaultGit();
   startLogWatch();
   startVaultSyncLoop();
@@ -2641,6 +3686,13 @@ function isMainModule() {
 }
 
 if (isMainModule()) {
+  // A rejection that escaped a handler is logged and the process stays up.
+  // Write and sync failures exit from the request path, where the operation is known.
+  // This log is redacted: no vault path, token, or note body.
+  process.on("unhandledRejection", (reason) => {
+    const err = reason instanceof Error ? reason : new Error(String(reason || "error"));
+    logSafe("unhandled rejection", err);
+  });
   boot().catch((err) => {
     logSafe(err);
     process.exit(1);

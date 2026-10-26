@@ -9,20 +9,20 @@
   <key>RunAtLoad</key>
   <true/>
   <key>WorkingDirectory</key>
-  <string>/Users/colby/Grok/motorunit/dashboard</string>
+  <string>/Users/colbynricker/Grok/motorunit/dashboard</string>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/node</string>
-    <string>/Users/colby/Grok/motorunit/dashboard/server.mjs</string>
+    <string>/Users/colbynricker/Grok/motorunit/dashboard/server.mjs</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>AIDANOS_VAULT</key>
-    <string>/Users/colby/Grok/motorunit</string>
+    <string>/Users/colbynricker/Grok/motorunit</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>/Users/colby/Library/Logs/aidanos/stdout.log</string>
+  <string>/Users/colbynricker/Library/Logs/aidanos/stdout.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/colby/Library/Logs/aidanos/stderr.log</string>
+  <string>/Users/colbynricker/Library/Logs/aidanos/stderr.log</string>
 </dict>
 </plist>

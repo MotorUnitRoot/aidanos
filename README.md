@@ -18,7 +18,7 @@ The vault is the `vault/` folder next to the app, or the folder named in `AIDANO
 
 The durable disk is a private git repo of markdown. The intended remote is `MotorUnitRoot/aidanos-vault`. This app repo does not create that remote.
 
-On a Mac, keep a working tree of that same repo on disk and point `AIDANOS_VAULT` at it. The phone uses the hosted app; the server reads and writes the files.
+On a Mac, the launchd agent in `launchd/com.aidanos.plist` starts the app from `~/Grok/motorunit/dashboard` and sets `AIDANOS_VAULT` to `~/Grok/motorunit`. That parent folder is the vault. The private remote is still `MotorUnitRoot/aidanos-vault`. The phone uses the hosted app; the server reads and writes these files.
 
 Cloud Run (and any host) can clone that repo when these are set:
 
@@ -26,6 +26,8 @@ Cloud Run (and any host) can clone that repo when these are set:
 - `AIDANOS_VAULT_GIT_TOKEN` or `GITHUB_TOKEN` — token that can clone and push
 - `AIDANOS_VAULT` — working tree path (optional; if unset with a git URL, the server clones into a dedicated directory and uses that as the vault)
 - `AIDANOS_VAULT_CLONE` — override that dedicated clone path
+
+The server's git ignores the host's global and system git config.
 
 If the git env is unset, today’s local `vault/` behavior is unchanged. A missing remote must not stop the app: writes stay on local disk, and push failures are logged plus a `git` hint on `/api/health` and successful PUT bodies.
 

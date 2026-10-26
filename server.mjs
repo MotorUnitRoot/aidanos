@@ -778,24 +778,33 @@ export function vaultRel(abs, root = VAULT) {
 }
 
 // Stable signature: worktreePath(rel, root = VAULT) -> absolute path.
-// rel is vault-relative. Throws Error("bad path") when a parent symlink
-// leaves the vault or lands in .git. A parent link that stays inside the
-// vault is allowed. The last path part is not checked here: reads use
-// readableTarget, and writes replace a leaf link. Callers (including the
-// live-editor branch) pass one or two arguments and no more.
-// A directory symlink is followed by a later read, write, or unlink.
-// O_NOFOLLOW applies only to the last path part, so a link named like a
-// folder can still aim a note at another directory.
+// rel is vault-relative. Callers pass one or two arguments and no more.
+// Every symlink is refused, including one that stays inside the vault.
+// The error names that vault-relative path ("symlink: notes/alias.md").
+// A missing tail is still the logical path, so a new note can be created.
+// The vault root is lstat'd and refused when it is a symlink. It is not
+// realpath'd into acceptance. Parents above the root are not checked.
+function symlinkError(rel) {
+  const named = String(rel || ".").replace(/\\/g, "/").replace(/\/+$/, "") || ".";
+  return new Error("symlink: " + named);
+}
+
+async function lstatOrMissing(abs) {
+  try {
+    return await fs.lstat(abs);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw new Error("bad path");
+  }
+}
+
 export async function worktreePath(rel, root = VAULT) {
   if (!isSafeRel(rel)) throw new Error("bad path");
-  const abs = safeJoin(root, rel);
   const logicalRoot = path.resolve(root);
-  let rootReal = logicalRoot;
-  try {
-    rootReal = await fs.realpath(logicalRoot);
-  } catch (e) {
-    if (e.code !== "ENOENT") throw new Error("bad path");
-  }
+  const rootSt = await lstatOrMissing(logicalRoot);
+  if (rootSt && rootSt.isSymbolicLink()) throw symlinkError(".");
+  if (rootSt && !rootSt.isDirectory()) throw new Error("bad path");
+  const abs = safeJoin(root, rel);
   const logical = path.resolve(abs);
   const relPath = path.relative(logicalRoot, logical);
   if (!relPath || relPath.startsWith("..") || path.isAbsolute(relPath)) {
@@ -803,27 +812,17 @@ export async function worktreePath(rel, root = VAULT) {
   }
   const parts = relPath.split(path.sep);
   let cursor = logicalRoot;
-  for (let i = 0; i < parts.length - 1; i++) {
+  for (let i = 0; i < parts.length; i++) {
     cursor = path.join(cursor, parts[i]);
-    let st;
-    try {
-      st = await fs.lstat(cursor);
-    } catch (e) {
-      if (e.code === "ENOENT") return abs;
-      throw new Error("bad path");
-    }
-    if (st.isSymbolicLink()) {
-      let real;
-      try {
-        real = await fs.realpath(cursor);
-      } catch {
-        throw new Error("bad path");
-      }
-      if (!contained(real, rootReal)) throw new Error("bad path");
-      if (realPathInGit(real, rootReal)) throw new Error("bad path");
-      continue;
-    }
-    if (!st.isDirectory()) throw new Error("bad path");
+    const relSoFar = parts.slice(0, i + 1).join("/");
+    const st = await lstatOrMissing(cursor);
+    if (!st) return abs;
+    if (st.isSymbolicLink()) throw symlinkError(relSoFar);
+    // A directory can be the git dir without the name ".git" (a mount, or a
+    // pointer file). Symlinks are already refused above, so this does not
+    // follow one, and the root itself is not realpath'd.
+    if (realPathInGit(cursor, logicalRoot)) throw new Error("bad path");
+    if (i < parts.length - 1 && !st.isDirectory()) throw new Error("bad path");
   }
   return abs;
 }
@@ -838,20 +837,11 @@ async function worktreeDir(rel, root = VAULT) {
 }
 
 async function readVaultRel(rel) {
-  try {
-    return await readFileSafe(await worktreePath(rel));
-  } catch {
-    return null;
-  }
+  return await readFileSafe(await worktreePath(rel));
 }
 
 async function readLogNames() {
-  let logDir;
-  try {
-    logDir = await worktreeDir("log");
-  } catch {
-    return null;
-  }
+  const logDir = await worktreeDir("log");
   try {
     return await fs.readdir(logDir);
   } catch (e) {
@@ -860,9 +850,8 @@ async function readLogNames() {
   }
 }
 
-// Last path part on read. resolveInside allows a target that stays in the
-// vault, including .git/config, so the git check is separate. Returns the
-// path to read: the real file for a link, the logical path otherwise.
+// Last path part on read. A symlink is refused and named. It is not followed,
+// even when the target is another note inside the vault.
 async function readableTarget(abs, root) {
   let st;
   try {
@@ -871,29 +860,12 @@ async function readableTarget(abs, root) {
     if (e.code === "ENOENT") return null;
     throw new Error("bad path");
   }
-  if (!st.isSymbolicLink()) return abs;
-  try {
-    await resolveInside(root, abs);
-  } catch (e) {
-    if (e.message === "path escapes vault" || e.message === "bad path") throw new Error("bad path");
-    if (e.code === "ENOENT" || e.code === "ELOOP" || e.code === "ENOTDIR") throw new Error("bad path");
-    throw e;
+  if (st.isSymbolicLink()) {
+    let rel = path.basename(abs);
+    try { rel = vaultRel(abs, root); } catch { /* keep the leaf name */ }
+    throw symlinkError(rel);
   }
-  let rootReal = path.resolve(root);
-  try {
-    rootReal = await fs.realpath(root);
-  } catch (e) {
-    if (e.code !== "ENOENT") throw new Error("bad path");
-  }
-  let real;
-  try {
-    real = await fs.realpath(abs);
-  } catch (e) {
-    if (e.code === "ENOENT") return null;
-    throw new Error("bad path");
-  }
-  if (!contained(real, rootReal) || realPathInGit(real, rootReal)) throw new Error("bad path");
-  return real;
+  return abs;
 }
 
 // A fifo, socket, or device can block the read. A second directory entry
@@ -913,6 +885,8 @@ async function readRegularText(abs) {
     fh = await fs.open(abs, VAULT_READ_FLAGS);
   } catch (e) {
     if (e.code === "ENOENT") return null;
+    // Permission and I/O failures are unexpected. Path refusals stay "bad path".
+    if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EIO" || e.code === "ENOSPC") throw e;
     throw new Error("bad path");
   }
   try {
@@ -1660,6 +1634,7 @@ async function syncVault(commitPaths, resolvePaths) {
   try {
     await syncVaultBody();
   } catch (e) {
+    if (unexpectedDanger(e)) stopProcess(e);
     setGitError(e && e.message || "git failed");
   } finally {
     if (!vaultGit.fetchFailed) refreshHold();
@@ -2114,7 +2089,10 @@ async function listMdTree(dir, vaultRoot) {
   for (const e of entries) {
     if (e.name.startsWith(".")) continue;
     if (e.name.endsWith(".tmp")) continue;
-    if (e.isSymbolicLink()) continue;
+    if (e.isSymbolicLink()) {
+      const rel = path.relative(vaultRoot, path.join(dir, e.name)).split(path.sep).join("/");
+      throw symlinkError(rel);
+    }
     const p = path.join(dir, e.name);
     const rel = path.relative(vaultRoot, p);
     if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) continue;
@@ -2245,19 +2223,65 @@ function isPngBuffer(buf) {
   return Buffer.isBuffer(buf) && buf.length >= PNG_SIG.length && buf.subarray(0, PNG_SIG.length).equals(PNG_SIG);
 }
 
-function publicPathError(e) {
-  const msg = e && e.message;
-  if (msg === "bad path" || msg === "path escapes vault" || msg === "bad png") return msg;
-  return "bad path";
-}
-
-// Bad path and containment stay 400. Anything else, including EACCES,
-// is a 500 whose text is fixed and never the filesystem path.
-function clientRefusal(err) {
+function refusalMessage(err) {
   if (err && err.code === "BAD_PATH") return "bad path";
   const msg = err && err.message;
   if (msg === "bad path" || msg === "path escapes vault" || msg === "bad png") return msg;
+  if (typeof msg === "string" && msg.startsWith("symlink: ")) {
+    const named = msg.slice("symlink: ".length);
+    if (!named || named.startsWith("/") || named.includes("..") || named.includes("\\") || named.includes("\0")) {
+      return "bad path";
+    }
+    return msg;
+  }
   return "";
+}
+
+function publicPathError(e) {
+  return refusalMessage(e) || "bad path";
+}
+
+// Bad path, containment, and a named symlink stay 400. Anything else is unexpected.
+function clientRefusal(err) {
+  return refusalMessage(err);
+}
+
+// A git command that exits non-zero is an expected sync result. A filesystem
+// or programmer error during that work is not.
+function isOperationalGitFailure(err) {
+  if (!err || typeof err !== "object") return false;
+  if (err.code) return false;
+  if (err.name && err.name !== "Error") return false;
+  return true;
+}
+
+function unexpectedDanger(err) {
+  if (clientRefusal(err)) return false;
+  if (err && err.code === "BODY_TOO_LARGE") return false;
+  return !isOperationalGitFailure(err);
+}
+
+function stopProcess(err) {
+  const error = err instanceof Error ? err : new Error("failed");
+  logSafe("stopped", error);
+  process.exit(1);
+}
+
+function stopAfterResponse(res, err) {
+  logSafe("stopped", err instanceof Error ? err : new Error("failed"));
+  const finish = () => process.exit(1);
+  if (!res || res.headersSent) {
+    finish();
+    return;
+  }
+  const body = JSON.stringify({ error: "internal error" });
+  res.writeHead(500, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  res.end(body, finish);
+  setTimeout(finish, 2000).unref();
 }
 
 async function familyRoomPngReal(relPath, abs) {
@@ -2443,6 +2467,7 @@ const server = http.createServer(async (req, res) => {
           payload = syncStatus();
         });
       } catch (e) {
+        if (unexpectedDanger(e)) throw e;
         setGitError(e && e.message || "push refused");
         if (!hasUnresolved()) vaultGit.join = true;
         status = 409;
@@ -2580,8 +2605,10 @@ const server = http.createServer(async (req, res) => {
         let exists = false;
         try {
           const st = await fs.lstat(logPath);
-          // A leaf symlink is replaced by the write below. Do not follow it.
-          if (!st.isSymbolicLink() && st.isFile()) {
+          if (st.isSymbolicLink()) {
+            return json(res, 400, { error: "symlink: " + dayRel });
+          }
+          if (st.isFile()) {
             exists = true;
             diskMtime = Math.trunc(st.mtimeMs);
           }
@@ -2663,7 +2690,9 @@ const server = http.createServer(async (req, res) => {
       const entries = await fs.readdir(VAULT, { withFileTypes: true });
       const folders = [];
       for (const e of entries) {
-        if (!e.isDirectory() || e.name.startsWith(".")) continue;
+        if (e.name.startsWith(".")) continue;
+        if (e.isSymbolicLink()) throw symlinkError(e.name);
+        if (!e.isDirectory()) continue;
         if (e.name === "log" || e.name === "tasks" || e.name === "aidanos") continue;
         folders.push({ name: e.name, path: e.name });
       }
@@ -2785,10 +2814,10 @@ const server = http.createServer(async (req, res) => {
         let exists = false;
         try {
           const st = await fs.lstat(abs);
-          // A leaf symlink is replaced by the write below. Do not follow it.
           if (st.isSymbolicLink()) {
-            exists = false;
-          } else if (st.isDirectory()) {
+            return json(res, 400, { error: "symlink: " + relPath });
+          }
+          if (st.isDirectory()) {
             return json(res, 400, { error: "not a file" });
           } else {
             exists = st.isFile();
@@ -2970,14 +2999,37 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const refusal = clientRefusal(err);
+    if (refusal) {
+      logSafe(err);
+      if (res.headersSent) return;
+      return json(res, 400, { error: refusal });
+    }
+    // A write, rename, move, sync, or git step can leave a half-written file.
+    // Stop so launchd or the host starts a clean process. A read stays up.
+    if (isMutating(req.method)) return stopAfterResponse(res, err);
     logSafe(err);
     if (res.headersSent) return;
-    if (refusal) return json(res, 400, { error: refusal });
     return json(res, 500, { error: "internal error" });
   }
 });
 
+function refuseSymlinkedVaultRoot() {
+  let st;
+  try {
+    st = fsSync.lstatSync(VAULT);
+  } catch (e) {
+    if (e.code === "ENOENT") return;
+    throw e;
+  }
+  if (!st.isSymbolicLink()) return;
+  // Name the configured path. logSafe would hide it, and realpath would accept the link.
+  console.error(VAULT);
+  console.error("Point AIDANOS_VAULT at the real folder.");
+  process.exit(1);
+}
+
 async function boot() {
+  refuseSymlinkedVaultRoot();
   await initVaultGit();
   startLogWatch();
   startVaultSyncLoop();
@@ -3003,7 +3055,9 @@ function isMainModule() {
 }
 
 if (isMainModule()) {
-  // A rejected request promise must not print the vault path or exit.
+  // A rejection that escaped a handler is logged and the process stays up.
+  // Write and sync failures exit from the request path, where the operation is known.
+  // This log is redacted: no vault path, token, or note body.
   process.on("unhandledRejection", (reason) => {
     const err = reason instanceof Error ? reason : new Error(String(reason || "error"));
     logSafe("unhandled rejection", err);

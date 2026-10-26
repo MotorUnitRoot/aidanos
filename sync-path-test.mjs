@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-// A folder symlink under the vault is followed by read, write, and unlink.
-// Refuse a parent or a leaf that leaves the vault or lands in .git.
-// A link that stays on a normal file or folder inside the vault still works.
-// Writes replace a leaf link; they do not follow it.
+// Every symlink under the vault is refused, including one that stays inside.
+// The error names that path. A symlinked vault root refuses to start.
+// An unexpected write stops the process. An unexpected read fails that request.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -107,6 +106,24 @@ function checkWiring() {
   assert(skin.includes("readVaultRel"), "skin reads use the checked path");
   assert(watch.includes("worktreeDir") && watch.includes("lstat"), "log watch skips a linked folder");
   assert(serverSrc.includes("worktreePath(rel, root = VAULT)"), "worktreePath keeps a two-argument signature");
+  assert(serverSrc.includes('throw symlinkError(relSoFar)'), "every path part refuses a symlink");
+  assert(serverSrc.includes("Point AIDANOS_VAULT at the real folder."), "startup names the real folder");
+  assert(!serverSrc.includes("fs.realpath(logicalRoot)"), "the vault root is not realpath'd open");
+  const treeFn = sliceFn("async function listMdTree(", "function dayMarkdownFromBody(");
+  assert(treeFn.includes("symlinkError"), "a listing names a nested symlink");
+  assert(serverSrc.includes("stopAfterResponse"), "a dangerous failure stops the process");
+}
+
+async function refusesNamed(fn, named) {
+  try {
+    await fn();
+  } catch (e) {
+    const msg = String(e && e.message || e);
+    assert(msg.includes(named), "refusal did not name " + named + ": " + msg);
+    assert(!path.isAbsolute(msg), "refusal included an absolute path");
+    return;
+  }
+  throw new Error("expected a refusal of " + named);
 }
 
 async function refusesRead(rel, root, sentinel) {
@@ -131,9 +148,11 @@ async function pathChecks() {
     assert(missing === path.join(vault, "newbox", "note.md"), "missing folder is not a link");
 
     fs.mkdirSync(path.join(vault, "real"));
+    fs.writeFileSync(path.join(vault, "real", "note.md"), "inside\n");
     fs.symlinkSync(path.join(vault, "real"), path.join(vault, "alias"));
-    const inside = await worktreePath("alias/note.md", vault);
-    assert(inside === path.join(vault, "alias", "note.md"), "link that stays inside the vault");
+    await refusesNamed(() => worktreePath("alias/note.md", vault), "alias");
+    await refusesNamed(() => readWorktree("alias/note.md", vault), "alias");
+    assert(fs.readFileSync(path.join(vault, "real", "note.md"), "utf8") === "inside\n", "in-vault link was followed");
 
     fs.writeFileSync(path.join(outside, "note.md"), "sentinel\n", "utf8");
     fs.symlinkSync(outside, path.join(vault, "maps-out"));
@@ -293,8 +312,7 @@ async function inodeGitDir() {
     if (process.platform !== "darwin" && process.platform !== "win32") {
       fs.mkdirSync(path.join(vault, ".GIT", "hooks"), { recursive: true });
       fs.symlinkSync(path.join(vault, ".GIT"), path.join(vault, "caps"));
-      const allowed = await worktreePath("caps/hooks/x", vault);
-      assert(allowed === path.join(vault, "caps", "hooks", "x"), "a different-inode .GIT folder is not the vault git dir");
+      await refusesNamed(() => worktreePath("caps/hooks/x", vault), "caps");
     }
   } finally {
     fs.rmSync(vault, { recursive: true, force: true });
@@ -308,7 +326,8 @@ async function leafChecks() {
     fs.mkdirSync(path.join(vault, "notes"));
     fs.writeFileSync(path.join(vault, "notes", "real.md"), "inside\n");
     fs.symlinkSync(path.join(vault, "notes", "real.md"), path.join(vault, "notes", "alias.md"));
-    assert(await readWorktree("notes/alias.md", vault) === "inside\n", "in-vault leaf link still reads");
+    await refusesNamed(() => readWorktree("notes/alias.md", vault), "notes/alias.md");
+    assert(fs.readFileSync(path.join(vault, "notes", "real.md"), "utf8") === "inside\n", "in-vault file link was followed");
     assert(await readWorktree("notes/missing.md", vault) == null, "missing note");
 
     fs.writeFileSync(path.join(outside, "secret.md"), "OUTSIDE_LEAF\n");
@@ -599,19 +618,18 @@ async function httpPaths() {
     fs.writeFileSync(path.join(vault, "aidanos", "weeks", "2026-01-05.md"), "week\n");
     const weekRes = await fetch(base + "/api/week?start=2026-01-05");
     const weekText = await weekRes.text();
-    assert(weekRes.status === 200, "week failed");
+    assert(weekRes.status === 400, "week followed a linked log");
+    assert(weekText.includes("symlink: log"), "week did not name the linked log");
     assert(!weekText.includes("OUTSIDE_DAY") && !weekText.includes("OUTSIDE_TASK_SENTINEL"), "week included an outside day");
-    const weekBody = JSON.parse(weekText);
-    const tuesday = (weekBody.days || []).find((d) => d.date === "2026-01-06");
-    assert(tuesday && !tuesday.task_open && !tuesday.rx_total, "week counted an outside task");
     const monthRes = await fetch(base + "/api/month?date=2026-01-05");
     const monthText = await monthRes.text();
-    assert(monthRes.status === 200, "month failed");
-    assert(!monthText.includes("2026-01-05") && !monthText.includes("2026-01-06"), "month listed an outside day");
+    assert(monthRes.status === 400, "month followed a linked log");
+    assert(monthText.includes("symlink: log"), "month did not name the linked log");
     assert(!monthText.includes("OUTSIDE_DAY") && !monthText.includes("OUTSIDE_TASK_SENTINEL"), "month included outside text");
     const taskRes = await fetch(base + "/api/open-tasks");
     const taskText = await taskRes.text();
-    assert(taskRes.status === 200, "open tasks failed");
+    assert(taskRes.status === 400, "open tasks followed a linked log");
+    assert(taskText.includes("symlink: log"), "open tasks did not name the linked log");
     assert(!taskText.includes("OUTSIDE_DAY") && !taskText.includes("OUTSIDE_TASK_SENTINEL"), "open tasks included an outside task");
 
     fs.mkdirSync(path.join(vault, ".git", "info"), { recursive: true });
@@ -644,18 +662,25 @@ async function httpPaths() {
   }
 }
 
-async function assertPlanAndSkin(base, sentinel) {
+async function assertPlanAndSkin(base, sentinel, mode) {
   const skin = await fetch(base + "/api/skin.css");
   const skinText = await skin.text();
-  assert(skin.status === 200, "skin got " + skin.status);
-  assert(skinText.includes("no personal skin"), "skin followed an alias of git config");
-  assert(!skinText.includes(sentinel), "skin served git config");
   const plan = await fetch(base + "/api/plan");
   const planText = await plan.text();
-  assert(plan.status === 200, "plan got " + plan.status);
+  assert(!skinText.includes(sentinel), "skin served git config");
   assert(!planText.includes(sentinel), "plan served git config");
+  if (mode === "symlink") {
+    assert(skin.status === 400, "skin symlink got " + skin.status + " " + skinText);
+    assert(skinText.includes("symlink: aidanos/skin.css"), "skin did not name the link");
+    assert(plan.status === 400, "plan symlink got " + plan.status + " " + planText);
+    assert(planText.includes("symlink: aidanos/active-horse.md"), "plan did not name the link");
+    return;
+  }
+  assert(skin.status === 200, "skin got " + skin.status);
+  assert(skinText.includes("no personal skin"), "skin followed a hard link of git config");
+  assert(plan.status === 200, "plan got " + plan.status);
   const body = JSON.parse(planText);
-  assert(body.exists === false, "plan read an alias of git config");
+  assert(body.exists === false, "plan read a hard link of git config");
 }
 
 async function planAndSkinDoNotServeGit() {
@@ -683,12 +708,12 @@ async function planAndSkinDoNotServeGit() {
     fs.mkdirSync(path.join(vault, "aidanos"));
     fs.symlinkSync(config, skinPath);
     fs.symlinkSync(config, planPath);
-    await assertPlanAndSkin(base, sentinel);
+    await assertPlanAndSkin(base, sentinel, "symlink");
     fs.unlinkSync(skinPath);
     fs.unlinkSync(planPath);
     fs.linkSync(config, skinPath);
     fs.linkSync(config, planPath);
-    await assertPlanAndSkin(base, sentinel);
+    await assertPlanAndSkin(base, sentinel, "hardlink");
     const health = await fetch(base + "/api/health");
     assert(health.status === 200, "server stopped after the alias reads");
   } finally {
@@ -697,7 +722,56 @@ async function planAndSkinDoNotServeGit() {
   }
 }
 
-async function readOnlySaveStaysUp() {
+async function waitExit(child, ms) {
+  const deadline = Date.now() + ms;
+  while (child.exitCode == null && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 40));
+  }
+  await new Promise((r) => setTimeout(r, 30));
+}
+
+async function readErrorStaysUp() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-read-"));
+  const vault = path.join(tmp, "vault");
+  fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
+  const note = path.join(vault, "notes", "secret.md");
+  fs.writeFileSync(note, "NOTE_BODY_SECRET\n");
+  const port = 33000 + Math.floor(Math.random() * 2000);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    fs.chmodSync(note, 0);
+    const loggedBefore = child._log().length;
+    const res = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/secret.md"));
+    const text = await res.text();
+    assert(res.status === 500, "unreadable note got " + res.status + " " + text);
+    assert(text === JSON.stringify({ error: "internal error" }), "unreadable note leaked " + text);
+    assert(!text.includes("NOTE_BODY_SECRET"), "read response included the note");
+    assert(!text.includes(vault) && !text.includes(tmp), "read response included a path");
+    await new Promise((r) => setTimeout(r, 200));
+    assert(child.exitCode == null, "server exited after a failed read");
+    const health = await fetch(base + "/api/health");
+    assert(health.status === 200, "server was not up after the failed read");
+    const logged = child._log().slice(loggedBefore);
+    assert(!logged.includes(vault), "read log included the vault path");
+    assert(!logged.includes(tmp), "read log included the temp path");
+    assert(!logged.includes("NOTE_BODY_SECRET"), "read log included the note");
+  } finally {
+    try { fs.chmodSync(note, 0o644); } catch {}
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function writeErrorStops() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-ro-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault);
@@ -717,31 +791,114 @@ async function readOnlySaveStaysUp() {
     fs.mkdirSync(ro);
     fs.chmodSync(ro, 0o555);
     const loggedBefore = child._log().length;
-    const res = await fetch(base + "/api/file?path=" + encodeURIComponent("ro/x.md"), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ markdown: "nope\n" }),
-    });
-    const text = await res.text();
-    assert(res.status === 500, "read-only save got " + res.status + " " + text);
-    assert(text === JSON.stringify({ error: "internal error" }), "read-only save leaked " + text);
-    assert(!text.includes(vault) && !text.includes(tmp), "save response included a path");
-    await new Promise((r) => setTimeout(r, 300));
-    assert(child.exitCode == null, "server exited after a failed save");
-    const health = await fetch(base + "/api/health");
-    assert(health.status === 200, "server was not up after the failed save");
+    let status = 0;
+    let text = "";
+    try {
+      const res = await fetch(base + "/api/file?path=" + encodeURIComponent("ro/x.md"), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ markdown: "nope\n" }),
+      });
+      status = res.status;
+      text = await res.text();
+    } catch (e) {
+      text = String(e && e.message || e);
+    }
+    await waitExit(child, 4000);
+    assert(child.exitCode != null, "server stayed up after a failed write");
+    if (status) {
+      assert(status === 500, "failed write got " + status + " " + text);
+      assert(text === JSON.stringify({ error: "internal error" }), "failed write leaked " + text);
+    }
+    assert(!text.includes("nope"), "write response included the note");
+    assert(!text.includes(vault) && !text.includes(tmp), "write response included a path");
     const logged = child._log().slice(loggedBefore);
-    assert(!logged.includes(vault), "save log included the vault path");
-    assert(!logged.includes(tmp), "save log included the temp path");
+    assert(!logged.includes(vault), "write log included the vault path");
+    assert(!logged.includes(tmp), "write log included the temp path");
+    assert(!logged.includes("nope"), "write log included the note");
     assert(!fs.existsSync(path.join(ro, "x.md")), "read-only folder was written");
-    const again = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/ok.md"), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ markdown: "still up\n" }),
-    });
-    assert(again.status === 200, "later save failed after the read-only put");
   } finally {
     try { fs.chmodSync(ro, 0o755); } catch {}
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function nestedAndFileSymlinks() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-nest-"));
+  const vault = path.join(tmp, "vault");
+  const outside = path.join(tmp, "outside");
+  fs.mkdirSync(path.join(vault, "notes", "box"), { recursive: true });
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(vault, "notes", "box", "real.md"), "inside\n");
+  fs.writeFileSync(path.join(outside, "secret.md"), "NESTED_SECRET\n");
+  fs.symlinkSync(path.join(outside, "secret.md"), path.join(vault, "notes", "box", "alias.md"));
+  fs.symlinkSync(outside, path.join(vault, "notes", "box", "gone"));
+  await refusesNamed(() => readWorktree("notes/box/alias.md", vault), "notes/box/alias.md");
+  await refusesNamed(() => worktreePath("notes/box/gone/note.md", vault), "notes/box/gone");
+  assert(fs.readFileSync(path.join(outside, "secret.md"), "utf8") === "NESTED_SECRET\n", "nested link was followed");
+
+  const port = 35000 + Math.floor(Math.random() * 2000);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    const file = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/box/alias.md"));
+    const fileText = await file.text();
+    assert(file.status === 400, "symlinked file got " + file.status);
+    assert(fileText.includes("symlink: notes/box/alias.md"), "file response did not name the link");
+    assert(!fileText.includes("NESTED_SECRET"), "file response followed the link");
+    const tree = await fetch(base + "/api/tree?dir=" + encodeURIComponent("notes/box"));
+    const treeText = await tree.text();
+    assert(tree.status === 400, "nested listing got " + tree.status);
+    assert(treeText.includes("symlink: notes/box/"), "listing did not name the nested link");
+    assert(!treeText.includes("NESTED_SECRET"), "listing followed the link");
+    const health = await fetch(base + "/api/health");
+    assert(health.status === 200, "server stopped after a symlink refusal");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function symlinkedVaultRootRefused() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-root-"));
+  const real = path.join(tmp, "real");
+  const link = path.join(tmp, "link");
+  fs.mkdirSync(real);
+  fs.writeFileSync(path.join(real, "note.md"), "ROOT_SECRET\n");
+  fs.symlinkSync(real, link);
+  const port = 36000 + Math.floor(Math.random() * 2000);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: link,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+  });
+  try {
+    await waitExit(child, 4000);
+    const log = child._log();
+    assert(child.exitCode != null, "server stayed up with a symlinked vault");
+    assert(log.includes(link), "startup did not name the configured path");
+    assert(log.includes("Point AIDANOS_VAULT at the real folder."), "startup did not say to point at the real folder");
+    assert(!log.includes("ROOT_SECRET"), "startup read the linked vault");
+    let served = false;
+    try {
+      const res = await fetch("http://127.0.0.1:" + port + "/api/health", { signal: AbortSignal.timeout(400) });
+      if (res.ok) served = true;
+    } catch { /* not listening */ }
+    assert(!served, "symlinked vault served traffic");
+    assert(fs.readFileSync(path.join(real, "note.md"), "utf8") === "ROOT_SECRET\n", "linked vault was written");
+  } finally {
     await stop(child);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -759,6 +916,9 @@ await hardLinkAndPipe();
 await gitPointerFile();
 await httpPaths();
 await planAndSkinDoNotServeGit();
-await readOnlySaveStaysUp();
+await readErrorStaysUp();
+await writeErrorStops();
+await nestedAndFileSymlinks();
+await symlinkedVaultRootRefused();
 await liveSyncDoesNotFollowOutside();
 console.log("sync-path-test ok");

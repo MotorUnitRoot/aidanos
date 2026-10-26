@@ -187,6 +187,25 @@ export function gitEnv() {
     GIT_LITERAL_PATHSPECS: "1",
   };
   delete env.GIT_ASKPASS;
+  // These point git at another repository or inject config. Drop them from
+  // every child. Leave other GIT_* alone: wiping the rest would drop the
+  // editor settings above.
+  const drop = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+  ];
+  for (const key of Object.keys(env)) {
+    if (drop.includes(key) || key.startsWith("GIT_CONFIG_KEY_") || key.startsWith("GIT_CONFIG_VALUE_")) {
+      delete env[key];
+    }
+  }
   return env;
 }
 
@@ -868,7 +887,10 @@ async function readableTarget(abs, root) {
     if (e.code === "ENOENT") return null;
     throw new Error("bad path");
   }
-  if (!st.isSymbolicLink()) return abs;
+  if (!st.isSymbolicLink()) {
+    refuseServedFile(st);
+    return abs;
+  }
   try {
     await resolveInside(root, abs);
   } catch (e) {
@@ -890,7 +912,43 @@ async function readableTarget(abs, root) {
     throw new Error("bad path");
   }
   if (!contained(real, rootReal) || realPathInGit(real, rootReal)) throw new Error("bad path");
+  let followed;
+  try {
+    followed = await fs.lstat(real);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw new Error("bad path");
+  }
+  refuseServedFile(followed);
   return real;
+}
+
+// A fifo, socket, or device can block the read. A second directory entry
+// can be .git/config. Notes are not hard-linked, so every extra link is
+// refused: walking .git to prove the other name is safe can miss one.
+function refuseServedFile(st) {
+  if (!st.isFile() || st.nlink > 1) throw new Error("bad path");
+}
+
+const VAULT_READ_FLAGS = fsSync.constants.O_RDONLY
+  | (fsSync.constants.O_NOFOLLOW || 0)
+  | (fsSync.constants.O_NONBLOCK || 0);
+
+async function readRegularText(abs) {
+  let fh;
+  try {
+    fh = await fs.open(abs, VAULT_READ_FLAGS);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw new Error("bad path");
+  }
+  try {
+    const st = await fh.stat();
+    refuseServedFile(st);
+    return await fh.readFile({ encoding: "utf8" });
+  } finally {
+    await fh.close();
+  }
 }
 
 export async function readWorktree(rel, root = VAULT) {
@@ -898,12 +956,7 @@ export async function readWorktree(rel, root = VAULT) {
   const abs = await worktreePath(rel, root);
   const target = await readableTarget(abs, root);
   if (target == null) return null;
-  try {
-    return await fs.readFile(target, "utf8");
-  } catch (e) {
-    if (e.code === "ENOENT") return null;
-    throw e;
-  }
+  return await readRegularText(target);
 }
 
 async function readRel(rel) {
@@ -1864,9 +1917,9 @@ async function readFileSafe(p) {
   }
   if (target == null) return null;
   try {
-    return await fs.readFile(target, "utf8");
+    return await readRegularText(target);
   } catch (e) {
-    if (e.code === "ENOENT") return null;
+    if (e.message === "bad path" || e.code === "ENOENT") return null;
     throw e;
   }
 }

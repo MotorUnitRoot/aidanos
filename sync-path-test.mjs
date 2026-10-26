@@ -56,8 +56,11 @@ function checkWiring() {
   const atomic = sliceFn("async function atomicWriteFile(", "function atomicWriteDay(");
   const reader = sliceFn("async function readFileSafe(", "function parseFrontmatter(");
   assert(envFn.includes('GIT_LITERAL_PATHSPECS: "1"'), "git pathspecs are literal");
+  assert(envFn.includes('"GIT_DIR"') && envFn.includes("GIT_CONFIG_KEY_"), "git children drop inherited repo pointers");
+  assert(envFn.includes('GIT_EDITOR: "true"') && envFn.includes('GIT_MERGE_AUTOEDIT: "no"'), "editor settings stay on git children");
   assert(run.includes("gitEnv()"), "git commands use that environment");
-  assert(read.includes("worktreePath") && read.includes("readableTarget"), "read checks parents and the leaf");
+  assert(read.includes("worktreePath") && read.includes("readableTarget") && read.includes("readRegularText"), "read checks parents and the leaf");
+  assert(reader.includes("readRegularText"), "note reads open the checked file");
   assert(rel.includes("readWorktree"), "sync read uses the leaf check");
   assert(write.indexOf("worktreePath") !== write.lastIndexOf("worktreePath"), "write rechecks the folder");
   assert(atomic.includes("beforeRename") && atomic.indexOf("beforeRename") < atomic.indexOf("fs.rename"), "recheck sits before rename");
@@ -345,6 +348,68 @@ function gitWithEnv(args, cwd, allowFail) {
   }
 }
 
+async function inheritedGitDirIsIgnored() {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-gitdir-"));
+  const decoy = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-gitdir-decoy-"));
+  const planted = {
+    GIT_DIR: decoy,
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "core.editor",
+    GIT_CONFIG_VALUE_0: "evil-editor",
+  };
+  const saved = {};
+  try {
+    git(["init", "-b", "main"], repo);
+    git(["config", "user.email", "t@local"], repo);
+    git(["config", "user.name", "T"], repo);
+    fs.writeFileSync(path.join(repo, "note.md"), "real\n");
+    git(["add", "note.md"], repo);
+    git(["commit", "-m", "seed"], repo);
+    for (const key of Object.keys(planted)) {
+      saved[key] = process.env[key];
+      process.env[key] = planted[key];
+    }
+    const env = gitEnv();
+    for (const key of Object.keys(planted)) {
+      assert(!(key in env), key + " reached a git child");
+    }
+    assert(env.GIT_EDITOR === "true", "GIT_EDITOR was dropped");
+    assert(env.GIT_MERGE_AUTOEDIT === "no", "GIT_MERGE_AUTOEDIT was dropped");
+    assert(env.GIT_LITERAL_PATHSPECS === "1", "literal pathspecs were dropped");
+    const shown = gitWithEnv(["rev-parse", "--git-dir"], repo).trim();
+    const resolved = path.resolve(repo, shown);
+    assert(resolved === path.resolve(repo, ".git"), "git used the decoy directory " + shown);
+  } finally {
+    for (const key of Object.keys(planted)) {
+      if (saved[key] == null) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(decoy, { recursive: true, force: true });
+  }
+}
+
+async function hardLinkAndPipe() {
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-nlink-"));
+  const sentinel = "git-config-sentinel";
+  try {
+    git(["init", "-b", "main"], vault);
+    fs.appendFileSync(path.join(vault, ".git", "config"), "\n# " + sentinel + "\n");
+    fs.mkdirSync(path.join(vault, "notes"));
+    fs.linkSync(path.join(vault, ".git", "config"), path.join(vault, "notes", "alias.md"));
+    await refusesRead("notes/alias.md", vault, sentinel);
+    execFileSync("mkfifo", [path.join(vault, "notes", "pipe.md")]);
+    const hung = Symbol("hung");
+    const result = await Promise.race([
+      refusesRead("notes/pipe.md", vault, sentinel).then(() => "refused"),
+      new Promise((resolve) => setTimeout(() => resolve(hung), 1500)),
+    ]);
+    assert(result === "refused", "fifo read hung");
+  } finally {
+    fs.rmSync(vault, { recursive: true, force: true });
+  }
+}
+
 async function literalPathspecs() {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-literal-"));
   try {
@@ -524,6 +589,59 @@ async function httpPaths() {
   }
 }
 
+async function assertPlanAndSkin(base, sentinel) {
+  const skin = await fetch(base + "/api/skin.css");
+  const skinText = await skin.text();
+  assert(skin.status === 200, "skin got " + skin.status);
+  assert(skinText.includes("no personal skin"), "skin followed an alias of git config");
+  assert(!skinText.includes(sentinel), "skin served git config");
+  const plan = await fetch(base + "/api/plan");
+  const planText = await plan.text();
+  assert(plan.status === 200, "plan got " + plan.status);
+  assert(!planText.includes(sentinel), "plan served git config");
+  const body = JSON.parse(planText);
+  assert(body.exists === false, "plan read an alias of git config");
+}
+
+async function planAndSkinDoNotServeGit() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-alias-"));
+  const vault = path.join(tmp, "vault");
+  fs.mkdirSync(vault);
+  git(["init", "-b", "main"], vault);
+  const sentinel = "GIT_CONFIG_SENTINEL";
+  const config = path.join(vault, ".git", "config");
+  fs.appendFileSync(config, "\n# " + sentinel + "\n");
+  const port = 34000 + Math.floor(Math.random() * 2000);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+  });
+  const base = "http://127.0.0.1:" + port;
+  const skinPath = path.join(vault, "aidanos", "skin.css");
+  const planPath = path.join(vault, "aidanos", "active-horse.md");
+  try {
+    await waitHealth(base, child);
+    fs.mkdirSync(path.join(vault, "aidanos"));
+    fs.symlinkSync(config, skinPath);
+    fs.symlinkSync(config, planPath);
+    await assertPlanAndSkin(base, sentinel);
+    fs.unlinkSync(skinPath);
+    fs.unlinkSync(planPath);
+    fs.linkSync(config, skinPath);
+    fs.linkSync(config, planPath);
+    await assertPlanAndSkin(base, sentinel);
+    const health = await fetch(base + "/api/health");
+    assert(health.status === 200, "server stopped after the alias reads");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 async function readOnlySaveStaysUp() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-ro-"));
   const vault = path.join(tmp, "vault");
@@ -580,8 +698,11 @@ await inodeGitDir();
 await leafChecks();
 await decodedGitPath();
 await literalPathspecs();
+await inheritedGitDirIsIgnored();
+await hardLinkAndPipe();
 await gitPointerFile();
 await httpPaths();
+await planAndSkinDoNotServeGit();
 await readOnlySaveStaysUp();
 await liveSyncDoesNotFollowOutside();
 console.log("sync-path-test ok");

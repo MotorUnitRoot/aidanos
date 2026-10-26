@@ -2510,7 +2510,7 @@ async function holdWriteForTest() {
   }
 }
 
-async function refuseExistingTarget(filePath) {
+async function refuseExistingTarget(filePath, notes) {
   let st;
   try {
     st = await fs.lstat(filePath);
@@ -2524,7 +2524,9 @@ async function refuseExistingTarget(filePath) {
     err.code = "EISDIR";
     throw err;
   }
-  if (!st.isFile() || st.nlink > 1) {
+  // A note must not be written through a hard link or a pipe. A picture
+  // replaces the directory entry and leaves the other name's bytes alone.
+  if (notes && (!st.isFile() || st.nlink > 1)) {
     const err = new Error("bad path");
     err.code = "BAD_PATH";
     throw err;
@@ -2532,8 +2534,9 @@ async function refuseExistingTarget(filePath) {
 }
 
 async function atomicWriteFile(filePath, markdown, beforeRename) {
-  await refuseExistingTarget(filePath);
-  if (noteSaveStyle(filePath) === "in-place") {
+  const notes = !Buffer.isBuffer(markdown);
+  await refuseExistingTarget(filePath, notes);
+  if (notes && noteSaveStyle(filePath) === "in-place") {
     await mkdirNoFollow(path.dirname(filePath));
     const seen = await snapshotParents(filePath);
     await holdWriteForTest();

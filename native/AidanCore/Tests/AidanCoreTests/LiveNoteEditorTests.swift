@@ -218,6 +218,56 @@ final class LiveNoteEditorTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), "original-text\n")
     }
 
+    func testAPartialWriteRestoresTheOriginalText() throws {
+        let folder = try makeFolder(named: "notes")
+        let note = folder.appendingPathComponent("day.md")
+        try NoteFolderSave.writeInPlace(Data("original-text\n".utf8), to: note)
+        XCTAssertThrowsError(try NoteFolderSave.writeInPlace(
+            Data("NEW-TEXT-THAT-DIFFERS\n".utf8),
+            to: note,
+            failAfterBytes: 4
+        ))
+        XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), "original-text\n")
+    }
+
+    func testSwappedParentDoesNotWriteTheOutsideFile() throws {
+        let root = try makeFolder(named: "vault")
+        let notes = root.appendingPathComponent("notes", isDirectory: true)
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
+        let note = notes.appendingPathComponent("page.md")
+        try Data("original text\n".utf8).write(to: note)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let outsideNote = outside.appendingPathComponent("page.md")
+        try Data("outside-original\n".utf8).write(to: outsideNote)
+        let real = root.appendingPathComponent("notes-real")
+        XCTAssertThrowsError(try NoteFolderSave.writeInPlace(Data("SWAPPED_SECRET\n".utf8), to: note, beforeOpen: {
+            try? FileManager.default.moveItem(at: notes, to: real)
+            try? FileManager.default.createSymbolicLink(at: notes, withDestinationURL: outside)
+        }))
+        XCTAssertEqual(try String(contentsOf: real.appendingPathComponent("page.md"), encoding: .utf8), "original text\n")
+        XCTAssertEqual(try String(contentsOf: outsideNote, encoding: .utf8), "outside-original\n")
+    }
+
+    func testParentsAreRecheckedAfterOpen() throws {
+        let root = try makeFolder(named: "vault")
+        let notes = root.appendingPathComponent("notes", isDirectory: true)
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
+        let note = notes.appendingPathComponent("page.md")
+        try Data("original text\n".utf8).write(to: note)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let outsideNote = outside.appendingPathComponent("page.md")
+        try Data("outside-original\n".utf8).write(to: outsideNote)
+        let real = root.appendingPathComponent("notes-real")
+        XCTAssertThrowsError(try NoteFolderSave.writeInPlace(Data("SWAPPED_SECRET\n".utf8), to: note, afterOpen: {
+            try? FileManager.default.moveItem(at: notes, to: real)
+            try? FileManager.default.createSymbolicLink(at: notes, withDestinationURL: outside)
+        }))
+        XCTAssertEqual(try String(contentsOf: real.appendingPathComponent("page.md"), encoding: .utf8), "original text\n")
+        XCTAssertEqual(try String(contentsOf: outsideNote, encoding: .utf8), "outside-original\n")
+    }
+
     func testTypedWeekMatchesTheFiles() throws {
         let root = try sampleVault()
         let week = [

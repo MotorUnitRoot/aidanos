@@ -11,10 +11,16 @@
 // setting turns it off.
 //
 // An in-place save never follows a link, a hard link, or any file that is
-// not a regular file. It opens a new note with O_CREAT|O_EXCL, writes the
-// new bytes, and only then truncates to that length. The swap-in path still
-// writes a temp file and renames it, and beforeRename runs after that temp
-// file is ready and before the rename.
+// not a regular file. It opens a new note with O_CREAT|O_EXCL. The previous
+// bytes are read from the opened file before the first new byte. If that
+// write or the truncate fails, those bytes are written back over the same
+// file and the error is raised again. Writing the new bytes and truncating
+// afterwards does not by itself keep the previous text: a write that stops
+// partway has already replaced the start of the note. After the open, and
+// before that write, the opened file is compared with the file recorded
+// inside the vault and the caller can recheck the parent directories. The
+// swap-in path still writes a temp file and renames it, and beforeRename
+// runs after that temp file is ready and before the rename.
 
 import { constants as fsConstants, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -70,6 +76,12 @@ function badPath() {
   return error;
 }
 
+function mismatchedFile() {
+  const error = new Error("parent changed");
+  error.code = "RACE";
+  return error;
+}
+
 function isRegularFile(stats) {
   return !!stats && (stats.mode & fsConstants.S_IFMT) === fsConstants.S_IFREG;
 }
@@ -88,16 +100,54 @@ async function lstatOrMissing(filePath) {
   }
 }
 
+async function readOpened(handle, size) {
+  const previous = Buffer.alloc(size);
+  let got = 0;
+  while (got < size) {
+    const result = await handle.read(previous, got, size - got, got);
+    if (!result.bytesRead) break;
+    got += result.bytesRead;
+  }
+  if (got !== size) {
+    const error = new Error("write failed");
+    error.code = "EIO";
+    throw error;
+  }
+  return previous;
+}
+
+async function writeOpened(handle, payload) {
+  let written = 0;
+  while (written < payload.length) {
+    const result = await handle.write(payload, written, payload.length - written, written);
+    if (!result.bytesWritten) {
+      const error = new Error("write failed");
+      error.code = "EIO";
+      throw error;
+    }
+    written += result.bytesWritten;
+  }
+}
+
+async function restoreOpened(handle, previous) {
+  await writeOpened(handle, previous);
+  await handle.truncate(previous.length);
+}
+
 async function writeInPlace(filePath, body, options) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const before = await lstatOrMissing(filePath);
   if (before && before.isSymbolicLink()) throw badPath();
   if (before && !isRegularFile(before)) throw badPath();
   if (typeof options.beforeOpen === "function") await options.beforeOpen(filePath);
-  const flags = fsConstants.O_WRONLY
+  // O_RDWR so the previous bytes can be read back and restored. A file the
+  // caller already saw inside the vault is never created here: the open has
+  // to land on that inode, not on a new file reached through a swapped parent.
+  const creating = options.expectFile ? false : !before;
+  const flags = fsConstants.O_RDWR
     | fsConstants.O_NOFOLLOW
     | fsConstants.O_NONBLOCK
-    | (before ? 0 : (fsConstants.O_CREAT | fsConstants.O_EXCL));
+    | (creating ? (fsConstants.O_CREAT | fsConstants.O_EXCL) : 0);
   let handle;
   try {
     handle = await fs.open(filePath, flags, 0o644);
@@ -111,15 +161,29 @@ async function writeInPlace(filePath, body, options) {
       if (opened.dev !== before.dev || opened.ino !== before.ino) throw badPath();
     }
     if (!isRegularFile(opened) || opened.nlink > 1) throw badPath();
-    if (typeof options.failWrite === "function") await options.failWrite();
-    const payload = Buffer.from(body, "utf8");
-    let written = 0;
-    while (written < payload.length) {
-      const result = await handle.write(payload, written, payload.length - written, written);
-      if (!result.bytesWritten) throw new Error("write failed");
-      written += result.bytesWritten;
+    let raced = false;
+    if (options.expectFile && (opened.dev !== options.expectFile.dev || opened.ino !== options.expectFile.ino)) {
+      raced = true;
     }
-    await handle.truncate(payload.length);
+    if (typeof options.afterOpen === "function") await options.afterOpen(opened);
+    if (raced) throw mismatchedFile();
+    const previous = before ? await readOpened(handle, opened.size) : Buffer.alloc(0);
+    const payload = Buffer.from(body, "utf8");
+    try {
+      if (typeof options.failWrite === "function") await options.failWrite();
+      if (Number.isInteger(options.failAfterBytes)) {
+        const count = Math.max(0, Math.min(options.failAfterBytes, payload.length));
+        if (count > 0) await writeOpened(handle, payload.subarray(0, count));
+        const error = new Error("write failed");
+        error.code = "EIO";
+        throw error;
+      }
+      await writeOpened(handle, payload);
+      await handle.truncate(payload.length);
+    } catch (error) {
+      await restoreOpened(handle, previous);
+      throw error;
+    }
     await handle.sync();
   } finally {
     await handle.close();

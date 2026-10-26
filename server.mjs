@@ -2510,12 +2510,12 @@ async function holdWriteForTest() {
   }
 }
 
-async function refuseExistingTarget(filePath, notes) {
+async function refuseExistingTarget(filePath) {
   let st;
   try {
     st = await fs.lstat(filePath);
   } catch (e) {
-    if (e.code === "ENOENT") return;
+    if (e.code === "ENOENT") return null;
     throw e;
   }
   if (st.isSymbolicLink()) throw symlinkError(vaultRel(filePath));
@@ -2524,27 +2524,35 @@ async function refuseExistingTarget(filePath, notes) {
     err.code = "EISDIR";
     throw err;
   }
-  // A note must not be written through a hard link or a pipe. A picture
-  // replaces the directory entry and leaves the other name's bytes alone.
-  if (notes && (!st.isFile() || st.nlink > 1)) {
+  // A note and a picture must not be written through a hard link or a pipe.
+  if (!st.isFile() || st.nlink > 1) {
     const err = new Error("bad path");
     err.code = "BAD_PATH";
     throw err;
   }
+  return { dev: st.dev, ino: st.ino };
 }
 
 async function atomicWriteFile(filePath, markdown, beforeRename) {
   const notes = !Buffer.isBuffer(markdown);
-  await refuseExistingTarget(filePath, notes);
+  const existing = await refuseExistingTarget(filePath);
   if (notes && noteSaveStyle(filePath) === "in-place") {
     await mkdirNoFollow(path.dirname(filePath));
     const seen = await snapshotParents(filePath);
-    await holdWriteForTest();
     await assertParents(seen);
     if (beforeRename) await beforeRename();
     await assertParents(seen);
+    // The hold sits after the last parent check and before the open, which
+    // is the window where a swapped parent used to be written.
+    await holdWriteForTest();
     try {
-      await writeNoteText(filePath, markdown, { swapInRequested: false });
+      await writeNoteText(filePath, markdown, {
+        swapInRequested: false,
+        expectFile: existing,
+        async afterOpen() {
+          await assertParents(seen);
+        },
+      });
     } catch (e) {
       throwIfStop(e);
       if (clientRefusal(e)) throw e;
@@ -3405,7 +3413,7 @@ const server = http.createServer(async (req, res) => {
             if (e.code !== "ENOENT") throw e;
           }
           if (listed && listed.isSymbolicLink()) return refuse(res, "symlink: " + relPath);
-          if (listed && !listed.isFile()) return json(res, 400, { error: "not a file" });
+          if (listed && listed.isDirectory()) return json(res, 400, { error: "not a file" });
           pendingSelfWrites.add(pngKey);
           try {
             await atomicWriteBuffer(real, buf);

@@ -261,7 +261,7 @@ await check("a fifo named as a note is refused", async () => {
   assert(fs.lstatSync(raced).isFIFO(), "the swapped fifo was replaced");
 });
 
-await check("a failed write leaves the existing note", async () => {
+await check("a failure before any byte leaves the existing note", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-fail-"));
   const note = path.join(dir, "day.md");
   await writeNoteText(note, "original-text\n", { swapInRequested: false });
@@ -275,6 +275,20 @@ await check("a failed write leaves the existing note", async () => {
   assert(error.message === "disk full", error.message);
   assert(fs.readFileSync(note, "utf8") === "original-text\n", "the note was emptied");
   assert(fs.statSync(note).ino === inode, "the note was replaced");
+});
+
+await check("a write that fails partway puts the original text back", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-partial-"));
+  const note = path.join(dir, "day.md");
+  await writeNoteText(note, "original-text\n", { swapInRequested: false });
+  const inode = fs.statSync(note).ino;
+  const error = await rejects(() => writeNoteText(note, "NEW-TEXT-THAT-DIFFERS\n", {
+    swapInRequested: false,
+    failAfterBytes: 4,
+  }));
+  assert(error.message === "write failed", error.message);
+  assert(fs.readFileSync(note, "utf8") === "original-text\n", "a partial write left mixed text");
+  assert(fs.statSync(note).ino === inode, "a partial write replaced the note");
 });
 
 await check("an empty env overlay keeps the vault kind", async () => {
@@ -365,6 +379,14 @@ await check("the server passes beforeRename into the save", async () => {
   const renameAt = save.indexOf("fs.rename");
   const hookAt = save.lastIndexOf("beforeRename", renameAt);
   assert(hookAt !== -1 && hookAt < renameAt, "beforeRename does not sit before rename");
+  const placeStart = save.indexOf("async function writeInPlace");
+  const placeEnd = save.indexOf("async function writeSwapIn", placeStart);
+  const place = save.slice(placeStart, placeEnd);
+  const checkedAt = place.indexOf("afterOpen");
+  const writeAt = place.indexOf("writeOpened");
+  assert(checkedAt !== -1 && writeAt !== -1 && checkedAt < writeAt, "the opened file is checked before the first byte");
+  assert(place.includes("restoreOpened"), "a failed write does not put the previous text back");
+  assert(place.includes("expectFile"), "the opened file is not compared with the vault file");
 });
 
 if (process.exitCode) process.exit(process.exitCode);

@@ -133,6 +133,11 @@ function checkWiring() {
   const inPlace = atomic.slice(inPlaceAt, atomic.indexOf("return;", inPlaceAt));
   assert(inPlace.indexOf("assertParents") !== -1 && inPlace.indexOf("assertParents") < inPlace.indexOf("writeNoteText"), "in-place rechecks parents before the write");
   assert(inPlace.indexOf("beforeRename") !== -1 && inPlace.indexOf("beforeRename") < inPlace.indexOf("writeNoteText"), "in-place runs the parent hook before the write");
+  assert(inPlace.includes("expectFile") && inPlace.includes("afterOpen"), "in-place checks the opened file before it writes");
+  const heldAt = inPlace.lastIndexOf("holdWriteForTest");
+  const openAt = inPlace.indexOf("writeNoteText");
+  assert(heldAt !== -1 && heldAt < openAt, "the in-place hold is not after the last parent check");
+  assert(inPlace.lastIndexOf("assertParents", openAt) < heldAt, "a parent check still runs after the in-place hold and before the open");
   assert(!inPlace.includes("fs.rename") && !inPlace.includes("unlink"), "an in-place save does not rename or delete the note");
 }
 
@@ -2215,6 +2220,7 @@ async function inPlaceSwappedParentKeepsText() {
   fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
   fs.mkdirSync(outside);
   fs.writeFileSync(path.join(outside, "marker.md"), "unchanged\n");
+  fs.writeFileSync(path.join(outside, "page.md"), "outside-original\n");
   const note = path.join(vault, "notes", "page.md");
   fs.writeFileSync(note, "original text\n");
   const inode = fs.statSync(note).ino;
@@ -2249,9 +2255,11 @@ async function inPlaceSwappedParentKeepsText() {
     await waitExit(child, 4000);
     assert(child.exitCode != null, "in-place swapped parent left the server up");
     if (status) assert(status === 500, "in-place swapped parent got " + status + " " + text);
-    assert(child._log().includes("stopped: write PARENT"), "in-place swapped parent log was " + child._log());
+    const log = child._log();
+    assert(log.includes("stopped: write PARENT") || log.includes("stopped: write RACE"), "in-place swapped parent log was " + log);
     assert(fs.readFileSync(path.join(real, "page.md"), "utf8") === "original text\n", "in-place swapped parent changed the note");
     assert(fs.statSync(path.join(real, "page.md")).ino === inode, "in-place swapped parent replaced the note");
+    assert(fs.readFileSync(path.join(outside, "page.md"), "utf8") === "outside-original\n", "in-place swapped parent wrote the outside note");
     assert(!containsBytes(outside, Buffer.from("SWAPPED_SECRET")), "in-place swapped parent wrote outside");
     assert(fs.readFileSync(path.join(outside, "marker.md"), "utf8") === "unchanged\n", "outside file changed");
   } finally {
@@ -2346,8 +2354,64 @@ await oldSafetyKeysAreRemoved();
 await pausedWordingFollowsTheVault();
 await aggregateSkipsLinks();
 await parentSymlinkIsNotFollowed();
+async function putPng(base, rel, png) {
+  const res = await fetch(base + "/api/file?path=" + encodeURIComponent(rel), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ png }),
+  });
+  const text = await res.text();
+  let body = null;
+  try { body = JSON.parse(text); } catch { body = null; }
+  return { status: res.status, text, body };
+}
+
+async function refusedPictureSavesStayUp(kind) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-picture-" + (kind || "swap") + "-"));
+  const vault = path.join(tmp, "vault");
+  const room = path.join(vault, "family-room-to-office");
+  fs.mkdirSync(room, { recursive: true });
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const pngBytes = Buffer.from(png, "base64");
+  const other = path.join(room, "other.png");
+  const plan = path.join(room, "plan.png");
+  const walk = path.join(room, "walk.png");
+  fs.writeFileSync(other, pngBytes);
+  fs.linkSync(other, plan);
+  execFileSync("mkfifo", [walk]);
+  const port = 39920 + Math.floor(Math.random() * 70);
+  const child = spawnServer(childEnv(port, vault, kind ? { AIDANOS_VAULT_KIND: kind } : {}));
+  const base = "http://127.0.0.1:" + port;
+  const label = kind || "swap-in";
+  try {
+    await waitHealth(base, child);
+    const hard = await putPng(base, "family-room-to-office/plan.png", png);
+    assert(hard.status === 400, label + " picture hard link got " + hard.status + " " + hard.text);
+    assert(hard.body && hard.body.error === "bad path", label + " picture hard link said " + hard.text);
+    assert(Buffer.compare(fs.readFileSync(other), pngBytes) === 0, label + " picture hard link changed the other name");
+    assert(Buffer.compare(fs.readFileSync(plan), pngBytes) === 0, label + " picture hard link changed the picture name");
+    assert(fs.statSync(plan).nlink > 1, label + " picture hard link was replaced");
+    const fifo = await Promise.race([
+      putPng(base, "family-room-to-office/walk.png", png),
+      new Promise((resolve) => setTimeout(() => resolve({ status: 0, text: "hung", body: null }), 4000)),
+    ]);
+    assert(fifo.status === 400, label + " picture fifo got " + fifo.status + " " + fifo.text);
+    assert(fifo.body && fifo.body.error === "bad path", label + " picture fifo said " + fifo.text);
+    assert(fs.lstatSync(walk).isFIFO(), label + " picture fifo was replaced");
+    assert(child.exitCode == null, label + " picture refusal exited the server");
+    assert(!child._log().includes("stopped:"), label + " picture refusal stopped: " + child._log());
+    const health = await fetch(base + "/api/health");
+    assert(health.status === 200, label + " health failed after a picture refusal");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 await refusedSavesStayUp("");
 await refusedSavesStayUp("noteplan");
+await refusedPictureSavesStayUp("");
+await refusedPictureSavesStayUp("noteplan");
 await inPlaceSwappedParentKeepsText();
 await inPlaceWriteFailureExits();
 console.log("sync-path-test ok");

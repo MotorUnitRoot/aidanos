@@ -32,7 +32,13 @@ function sleep(ms) {
 function chromeBin() {
   const names = [];
   if (process.env.CHROME_PATH) names.push(process.env.CHROME_PATH);
-  names.push("google-chrome-stable", "google-chrome", "chromium", "chromium-browser");
+  names.push(
+    "google-chrome-stable",
+    "google-chrome",
+    "chromium",
+    "chromium-browser",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  );
   const errors = [];
   for (const name of names) {
     try {

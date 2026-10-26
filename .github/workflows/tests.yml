@@ -2,7 +2,6 @@ name: tests
 
 on:
   pull_request:
-    branches: [main]
   push:
     branches: [main]
 
@@ -21,13 +20,14 @@ jobs:
         with:
           node-version-file: ".nvmrc"
       - name: Chrome for the phone width check
-        run: |
-          if ! google-chrome-stable --version >/dev/null 2>&1 && ! google-chrome --version >/dev/null 2>&1; then
-            curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-            sudo apt-get update
-            sudo apt-get install -y /tmp/chrome.deb
-          fi
+        id: chrome
+        uses: browser-actions/setup-chrome@54e7c7bf1c147ffca98dc47b796907454c8c1787 # v2.2.0
+        with:
+          chrome-version: "156.0.8078.47"
+          install-dependencies: true
       - name: npm test
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: npm test
       - name: flaw-scan rules
         run: node .github/flaw-scan.mjs --self-test
@@ -42,5 +42,13 @@ jobs:
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version-file: ".nvmrc"
+      - name: Chrome for the phone width check
+        id: chrome
+        uses: browser-actions/setup-chrome@54e7c7bf1c147ffca98dc47b796907454c8c1787 # v2.2.0
+        with:
+          chrome-version: "156.0.8078.47"
+          install-dependencies: true
       - name: npm test
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: npm test

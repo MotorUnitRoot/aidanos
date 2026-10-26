@@ -49,11 +49,16 @@ public enum NoteSaveStyle: Equatable, Sendable {
     case swapIn
 }
 
-/// Notes inside a NotePlan vault are saved in place. The vault is recognized
-/// from the real path: a path part starting with "iCloud~co~noteplan~" or
-/// "co.noteplan.", in any letter case. A folder merely named NotePlan is not
-/// one. AIDANOS_VAULT_KIND=noteplan forces the same in-place save. A caller
-/// cannot choose swap-in there. Other folders may swap in.
+    /// Notes inside a NotePlan vault are saved in place. The vault is recognized
+    /// from the real path: a path part starting with "iCloud~co~noteplan~" or
+    /// "co.noteplan.", in any letter case. A folder merely named NotePlan is not
+    /// one. AIDANOS_VAULT_KIND=noteplan forces the same in-place save. A caller
+    /// cannot choose swap-in there. Other folders may swap in.
+    ///
+    /// An in-place save reads the previous bytes before it writes. A failed
+    /// write or truncate puts those bytes back. The opened descriptor is
+    /// compared with the file seen before the open, and the parent directory
+    /// is checked again, both before the first new byte.
 public enum NoteFolderSave {
     private static let prefixes = ["icloud~co~noteplan~", "co.noteplan."]
 
@@ -93,16 +98,22 @@ public enum NoteFolderSave {
         _ data: Data,
         to url: URL,
         beforeOpen: (() -> Void)? = nil,
-        beforeWrite: (() throws -> Void)? = nil
+        beforeWrite: (() throws -> Void)? = nil,
+        afterOpen: (() -> Void)? = nil,
+        failAfterBytes: Int? = nil
     ) throws {
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let parent = try parentIdentity(directory.path, url.lastPathComponent)
         let before = try identity(url.path)
         if let before, before.isLink || !before.isRegular {
             throw AidanError.io("Could not save \(url.lastPathComponent).")
         }
         beforeOpen?()
-        let flags: Int32 = O_WRONLY | O_NOFOLLOW | O_NONBLOCK | (before == nil ? (O_CREAT | O_EXCL) : 0)
+        // O_RDWR so a failed write can read the previous bytes back onto the
+        // same descriptor. An existing note is not created: a swapped parent
+        // must not receive a new file.
+        let flags: Int32 = O_RDWR | O_NOFOLLOW | O_NONBLOCK | (before == nil ? (O_CREAT | O_EXCL) : 0)
         let fd = url.path.withCString { open($0, flags, mode_t(0o644)) }
         if fd < 0 {
             throw AidanError.io("Could not save \(url.lastPathComponent).")
@@ -120,10 +131,25 @@ public enum NoteFolderSave {
         if (opened.st_mode & S_IFMT) != S_IFREG || opened.st_nlink > 1 {
             throw AidanError.io("Could not save \(url.lastPathComponent).")
         }
+        afterOpen?()
+        try assertParent(parent, url.lastPathComponent)
+        let previous = before == nil ? Data() : try readAll(fd, Int(opened.st_size), url.lastPathComponent)
         try beforeWrite?()
-        try writeAll(fd, data, url.lastPathComponent)
-        if ftruncate(fd, off_t(data.count)) != 0 {
-            throw AidanError.io("Could not save \(url.lastPathComponent).")
+        do {
+            if let failAfterBytes {
+                let count = min(max(failAfterBytes, 0), data.count)
+                if count > 0 {
+                    try writeAll(fd, Data(data.prefix(count)), url.lastPathComponent)
+                }
+                throw AidanError.io("Could not save \(url.lastPathComponent).")
+            }
+            try writeAll(fd, data, url.lastPathComponent)
+            if ftruncate(fd, off_t(data.count)) != 0 {
+                throw AidanError.io("Could not save \(url.lastPathComponent).")
+            }
+        } catch {
+            try restore(fd, previous, url.lastPathComponent)
+            throw error
         }
         if fsync(fd) != 0 {
             throw AidanError.io("Could not save \(url.lastPathComponent).")
@@ -139,6 +165,61 @@ public enum NoteFolderSave {
         let ino: ino_t
         let isLink: Bool
         let isRegular: Bool
+    }
+
+    private struct ParentIdentity {
+        let path: String
+        let dev: dev_t
+        let ino: ino_t
+    }
+
+    private static func parentIdentity(_ path: String, _ name: String) throws -> ParentIdentity {
+        var info = stat()
+        if lstat(path, &info) != 0 || (info.st_mode & S_IFMT) != S_IFDIR {
+            throw AidanError.io("Could not save \(name).")
+        }
+        return ParentIdentity(path: path, dev: info.st_dev, ino: info.st_ino)
+    }
+
+    private static func assertParent(_ parent: ParentIdentity, _ name: String) throws {
+        var info = stat()
+        if lstat(parent.path, &info) != 0
+            || (info.st_mode & S_IFMT) != S_IFDIR
+            || info.st_dev != parent.dev
+            || info.st_ino != parent.ino {
+            throw AidanError.io("Could not save \(name).")
+        }
+    }
+
+    private static func readAll(_ fd: Int32, _ count: Int, _ name: String) throws -> Data {
+        if count == 0 { return Data() }
+        var data = Data(count: count)
+        var offset = 0
+        try data.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else {
+                throw AidanError.io("Could not save \(name).")
+            }
+            while offset < count {
+                let got = pread(fd, base.advanced(by: offset), count - offset, off_t(offset))
+                if got < 0 {
+                    if errno == EINTR { continue }
+                    throw AidanError.io("Could not save \(name).")
+                }
+                if got == 0 { break }
+                offset += Int(got)
+            }
+        }
+        if offset != count {
+            throw AidanError.io("Could not save \(name).")
+        }
+        return data
+    }
+
+    private static func restore(_ fd: Int32, _ previous: Data, _ name: String) throws {
+        try writeAll(fd, previous, name)
+        if ftruncate(fd, off_t(previous.count)) != 0 {
+            throw AidanError.io("Could not save \(name).")
+        }
     }
 
     private static func identity(_ path: String) throws -> FileIdentity? {

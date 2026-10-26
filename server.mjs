@@ -171,8 +171,12 @@ function logSafe(...parts) {
 function gitHint() {
   if (!vaultGit.enabled) return { enabled: false };
   const open = [...vaultGit.conflicts.values()].filter((item) => !item.resolved);
-  const hint = { enabled: true, ok: !vaultGit.error && open.length === 0 };
-  if (vaultGit.error) hint.error = vaultGit.error;
+  const hint = { enabled: true, ok: !vaultGit.error && !vaultGit.syncPaused && open.length === 0 };
+  if (vaultGit.syncPaused) {
+    hint.paused = true;
+    hint.error = "sync paused";
+    hint.localOnly = "Sync is paused. Notes are saved on this computer only.";
+  } else if (vaultGit.error) hint.error = vaultGit.error;
   if (vaultGit.lastPushAt) hint.pushed = true;
   if (open.length) hint.conflicts = open.map((item) => item.path);
   return hint;
@@ -191,12 +195,15 @@ export function gitEnv() {
   env.GIT_TERMINAL_PROMPT = "0";
   // Pathspecs stay literal after "--". Otherwise `Q?.md` also matches QA.md.
   env.GIT_LITERAL_PATHSPECS = "1";
+  // Repo identity stays in the vault config. Ignore the home and system files.
+  env.GIT_CONFIG_GLOBAL = "/dev/null";
+  env.GIT_CONFIG_NOSYSTEM = "1";
   return env;
 }
 
 function runGit(args, { cwd, timeoutMs = 20000 } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn("git", args, {
+    const child = spawn("git", [...gitSafetyPrefix(), ...args], {
       cwd: cwd || undefined,
       env: gitEnv(),
       stdio: ["ignore", "pipe", "pipe"],
@@ -244,16 +251,10 @@ function gitSafetyConfigs(cwd) {
   return pairs;
 }
 
-function gitSafetyCloneArgs(cwd) {
+function gitSafetyPrefix() {
   const args = [];
-  for (const [key, value] of gitSafetyConfigs(cwd)) args.push("-c", key + "=" + value);
+  for (const [key, value] of gitSafetyConfigs(VAULT)) args.push("-c", key + "=" + value);
   return args;
-}
-
-async function ensureGitSafety(cwd) {
-  for (const [key, value] of gitSafetyConfigs(cwd)) {
-    await runGit(["-C", cwd, "config", key, value], { timeoutMs: 4000 });
-  }
 }
 
 async function ensureGitIdentity(cwd) {
@@ -261,7 +262,6 @@ async function ensureGitIdentity(cwd) {
   const email = process.env.AIDANOS_VAULT_GIT_EMAIL || "aidanos@local";
   await runGit(["-C", cwd, "config", "user.name", name], { timeoutMs: 4000 });
   await runGit(["-C", cwd, "config", "user.email", email], { timeoutMs: 4000 });
-  await ensureGitSafety(cwd);
 }
 
 async function ensureOrigin(cwd) {
@@ -415,7 +415,7 @@ async function retryVaultGit() {
     const names = await fs.readdir(VAULT);
     const nonempty = names.filter((n) => n !== "." && n !== "..");
     if (nonempty.length === 0) {
-      await runGit(["clone", "--depth", "1", ...gitSafetyCloneArgs(VAULT), gitRemoteUrl(), VAULT], { timeoutMs: 25000 });
+      await runGit(["clone", "--depth", "1", gitRemoteUrl(), VAULT], { timeoutMs: 25000 });
       vaultGit.error = "";
       await ensureGitIdentity(VAULT);
       vaultGit.ready = await isGitRepo(VAULT);
@@ -454,7 +454,7 @@ async function initVaultGit() {
     const nonempty = names.filter((n) => n !== "." && n !== "..");
     if (nonempty.length === 0) {
       try {
-        await runGit(["clone", "--depth", "1", ...gitSafetyCloneArgs(VAULT), gitRemoteUrl(), VAULT], { timeoutMs: 25000 });
+        await runGit(["clone", "--depth", "1", gitRemoteUrl(), VAULT], { timeoutMs: 25000 });
         vaultGit.error = "";
       } catch (e) {
         vaultGit.error = sanitizeGitError(e && e.message || "clone failed");
@@ -602,12 +602,13 @@ function refreshHold() {
 }
 
 function scheduleVaultSync(relPath, resolve) {
-  if (vaultGit.syncPaused || !vaultGit.enabled || !vaultGit.ready) return;
+  if (!vaultGit.enabled || !vaultGit.ready) return;
   const rel = String(relPath || "").replace(/\\/g, "/");
   if (!isAppNotePath(rel)) return;
   vaultGit.pending.add(rel);
   if (resolve) vaultGit.resolvePending.add(rel);
   persistPending();
+  if (vaultGit.syncPaused) return;
   if (vaultGit.timer) clearTimeout(vaultGit.timer);
   const started = new Set(vaultGit.pending);
   vaultGit.timer = setTimeout(() => {
@@ -743,7 +744,7 @@ const FOLD_GIT_NAME = process.platform === "darwin" || process.platform === "win
 const gitDirCache = new Map();
 
 function resolveGitDirPointer(rootReal) {
-  const child = spawnSync("git", ["-C", rootReal, "rev-parse", "--git-dir"], {
+  const child = spawnSync("git", [...gitSafetyPrefix(), "-C", rootReal, "rev-parse", "--git-dir"], {
     encoding: "utf8",
     timeout: 4000,
     env: gitEnv(),
@@ -915,9 +916,19 @@ function rememberSkip(skipped, rel) {
   skipped.push(named);
 }
 
+function oneLine(text) {
+  let out = "";
+  const s = String(text || "");
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    out += code <= 31 || code === 127 ? "?" : s[i];
+  }
+  return out;
+}
+
 function logSkips(skipped) {
   if (!skipped || !skipped.length) return;
-  console.error("skipped symlink: " + skipped.join(", "));
+  console.error("skipped symlink: " + skipped.map(oneLine).join(", "));
 }
 
 async function readVaultRel(rel, skipped, gitLinks) {
@@ -1201,22 +1212,17 @@ async function detachFile(rel) {
   if (!isSafeRel(rel)) return;
   const abs = await worktreePath(rel);
   const gitPath = vaultRel(abs);
+  const seen = await snapshotParents(abs);
   let tracked = true;
   try {
     await runGit(["-C", VAULT, "ls-files", "--error-unmatch", "--", gitPath], { timeoutMs: 4000 });
   } catch {
     tracked = false;
   }
+  await assertParents(seen);
   if (tracked) {
     await runGit(["-C", VAULT, "checkout", "HEAD", "--", gitPath], { timeoutMs: 8000 });
     return;
-  }
-  const parent = path.dirname(abs);
-  const before = await fs.lstat(parent);
-  if (before.isSymbolicLink() || !before.isDirectory()) throw parentChanged("unlink");
-  const again = await fs.lstat(parent);
-  if (again.isSymbolicLink() || !again.isDirectory() || again.dev !== before.dev || again.ino !== before.ino) {
-    throw parentChanged("unlink");
   }
   await fs.unlink(abs);
 }
@@ -1745,8 +1751,24 @@ async function joinVault() {
   }
 }
 
+function resumeBackgroundSync() {
+  const wasPaused = vaultGit.syncPaused;
+  vaultGit.syncPaused = false;
+  if (vaultGit.error === "sync paused") vaultGit.error = "";
+  if (wasPaused && vaultGit.pending.size) {
+    enqueueVaultGit(() => syncVault(null)).catch((e) => {
+      if (e && e.aidanosStop) {
+        pauseBackgroundSync(e);
+        return;
+      }
+      setGitError(e && e.message || "git failed");
+    });
+  }
+  if (!vaultGit.syncTimer) startVaultSyncLoop();
+}
+
 async function syncVault(commitPaths, resolvePaths) {
-  if (!vaultGit.enabled || !vaultGit.ready || vaultGit.syncPaused) return;
+  if (!vaultGit.enabled || !vaultGit.ready) return;
   if (Array.isArray(commitPaths)) {
     let changed = false;
     for (const rel of commitPaths) {
@@ -1764,6 +1786,7 @@ async function syncVault(commitPaths, resolvePaths) {
     }
     if (changed) persistPending();
   }
+  if (vaultGit.syncPaused) return;
   try {
     await assertVaultOpen();
     await syncVaultBody();
@@ -2350,11 +2373,10 @@ async function atomicWriteFile(filePath, markdown, beforeRename) {
   const seen = await snapshotParents(filePath);
   const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
   let fh = null;
-  let inside = false;
+  let openedId = null;
   try {
     fh = await fs.open(tmpPath, "wx");
-    await assertFdInsideVault(fh);
-    inside = true;
+    openedId = await assertOpenedTemp(fh, tmpPath);
     if (Buffer.isBuffer(markdown)) await fh.writeFile(markdown);
     else await fh.writeFile(markdown, { encoding: "utf8" });
     await fh.close();
@@ -2371,8 +2393,12 @@ async function atomicWriteFile(filePath, markdown, beforeRename) {
     if (fh) {
       try { await fh.close(); } catch { /* closed */ }
     }
-    if (inside && !(e && e.code === "PARENT")) {
-      try { await fs.unlink(tmpPath); } catch { /* only after the fd check */ }
+    if (openedId) await unlinkIfSameFile(tmpPath, openedId);
+    const code = e && e.code;
+    if (code === "EISDIR" || code === "ENOTDIR") {
+      const err = new Error("not a file");
+      err.code = code;
+      throw err;
     }
     throwIfStop(e);
     if (clientRefusal(e)) throw e;
@@ -2510,6 +2536,7 @@ async function mkdirNoFollow(dir) {
     } catch (e) {
       if (e.code !== "ENOENT") throw tagStop(e, "write");
     }
+    if (reservedDirName(part)) throw new Error("bad path");
     if (!st) {
       try {
         await fs.mkdir(cursor);
@@ -2569,31 +2596,34 @@ async function assertParents(seen) {
   }
 }
 
-async function openedPath(fh) {
-  try {
-    return await fs.readlink("/proc/self/fd/" + fh.fd);
-  } catch (e) {
-    if (e.code !== "ENOENT") throw tagStop(e, "write");
-  }
-  try {
-    return await fs.realpath("/dev/fd/" + fh.fd);
-  } catch (e) {
-    throw tagStop(e, "write");
-  }
+function reservedDirName(part) {
+  const name = String(part || "").toLowerCase();
+  return name.endsWith(".png") || name.endsWith(".md") || name.endsWith(".css");
 }
 
-async function assertFdInsideVault(fh) {
-  await assertRealVaultRoot();
-  let rootReal;
+async function assertOpenedTemp(fh, tmpPath) {
+  const opened = await fh.stat();
+  let listed;
   try {
-    rootReal = await fs.realpath(VAULT);
+    listed = await fs.lstat(tmpPath);
   } catch (e) {
     throw tagStop(e, "write");
   }
-  let pointed = await openedPath(fh);
-  if (pointed.endsWith(" (deleted)")) pointed = pointed.slice(0, -" (deleted)".length);
-  const prefix = rootReal.endsWith(path.sep) ? rootReal : rootReal + path.sep;
-  if (pointed !== rootReal && !pointed.startsWith(prefix)) throw parentChanged();
+  if (listed.isSymbolicLink() || !listed.isFile() || listed.dev !== opened.dev || listed.ino !== opened.ino) {
+    throw parentChanged();
+  }
+  return { dev: opened.dev, ino: opened.ino };
+}
+
+async function unlinkIfSameFile(filePath, id) {
+  let st;
+  try {
+    st = await fs.lstat(filePath);
+  } catch {
+    return;
+  }
+  if (st.isSymbolicLink() || st.dev !== id.dev || st.ino !== id.ino) return;
+  try { await fs.unlink(filePath); } catch { /* already gone */ }
 }
 
 async function gitSymlinkSet() {
@@ -2631,7 +2661,7 @@ function isClientAbort(err) {
 
 function refuse(res, err) {
   const msg = typeof err === "string" ? err : publicPathError(err);
-  console.error("refused: " + msg);
+  console.error("refused: " + oneLine(msg));
   return json(res, 400, { error: msg });
 }
 
@@ -2818,6 +2848,7 @@ const server = http.createServer(async (req, res) => {
         body = {};
       }
       if (!body || body.join !== true) return json(res, 400, { error: "join required" });
+      const wasPaused = vaultGit.syncPaused;
       let status = 200;
       let payload = null;
       try {
@@ -2835,6 +2866,12 @@ const server = http.createServer(async (req, res) => {
         status = 409;
         payload = syncStatus();
       }
+      if (status === 200) resumeBackgroundSync();
+      else if (wasPaused) {
+        vaultGit.syncPaused = true;
+        vaultGit.error = "sync paused";
+      }
+      payload = syncStatus();
       finishGitNotice();
       return json(res, status, payload || syncStatus());
     }
@@ -2887,6 +2924,12 @@ const server = http.createServer(async (req, res) => {
       if (!date) return json(res, 400, { error: "date required" });
       if (!isIsoDate(date)) return json(res, 400, { error: "date must be YYYY-MM-DD" });
       const dayRel = `log/${date}.md`;
+      const gitLinks = await gitSymlinkSet();
+      if (gitLinks.has(dayRel)) {
+        const skipped = [dayRel];
+        logSkips(skipped);
+        return json(res, 200, { date, markdown: "", mtime: 0, skippedLinks: skipped });
+      }
       let logPath;
       try {
         logPath = await worktreePath(dayRel);
@@ -2896,7 +2939,7 @@ const server = http.createServer(async (req, res) => {
       const raw = await readFileSafe(logPath);
       const markdown = raw == null ? "" : raw;
       const mtime = raw == null ? 0 : await fileMtimeMs(logPath);
-      return json(res, 200, { date, markdown, mtime });
+      return json(res, 200, { date, markdown, mtime, skippedLinks: [] });
     }
 
     if (pathname === "/api/month" && req.method === "GET") {
@@ -2966,6 +3009,8 @@ const server = http.createServer(async (req, res) => {
         return refuse(res, e);
       }
       return await enqueuePathWrite(dayRel, async () => {
+        const dayLinks = await gitSymlinkSet();
+        if (dayLinks.has(dayRel)) return refuse(res, "symlink: " + dayRel);
         try {
           logPath = await worktreePath(dayRel);
         } catch (e) {
@@ -3159,6 +3204,14 @@ const server = http.createServer(async (req, res) => {
         }
         const pngKey = "f:" + relPath;
         return await enqueuePathWrite(pngKey, async () => {
+          let listed = null;
+          try {
+            listed = await fs.lstat(real);
+          } catch (e) {
+            if (e.code !== "ENOENT") throw e;
+          }
+          if (listed && listed.isSymbolicLink()) return refuse(res, "symlink: " + relPath);
+          if (listed && !listed.isFile()) return json(res, 400, { error: "not a file" });
           pendingSelfWrites.add(pngKey);
           try {
             await atomicWriteBuffer(real, buf);
@@ -3413,6 +3466,16 @@ const server = http.createServer(async (req, res) => {
       if (!res.headersSent) return json(res, 413, { error: "too large" });
       return;
     }
+    if (err && (err.code === "EISDIR" || err.code === "ENOTDIR")) {
+      console.error("refused: not a file");
+      if (res.headersSent) return;
+      return json(res, 400, { error: "not a file" });
+    }
+    if (err && err.code === "EACCES" && !err.aidanosStop) {
+      console.error("request failed: EACCES");
+      if (res.headersSent) return;
+      return json(res, 403, { error: "not readable" });
+    }
     if (isClientAbort(err)) {
       if (res.headersSent) return;
       res.writeHead(400, {
@@ -3424,7 +3487,7 @@ const server = http.createServer(async (req, res) => {
     }
     const refusal = clientRefusal(err);
     if (refusal) {
-      console.error("refused: " + refusal);
+      console.error("refused: " + oneLine(refusal));
       if (res.headersSent) return;
       return json(res, 400, { error: refusal });
     }

@@ -61,13 +61,16 @@ function checkWiring() {
   assert(!envFn.includes("Leave other GIT_"), "the scrub comment no longer says a full wipe is impossible");
   assert(envFn.includes('GIT_EDITOR = "true"') && envFn.includes('GIT_MERGE_AUTOEDIT = "no"'), "editor settings stay on git children");
   assert(envFn.includes('GIT_TERMINAL_PROMPT = "0"'), "git prompts stay off");
-  assert(run.includes("gitEnv()"), "git commands use that environment");
+  assert(envFn.includes('GIT_CONFIG_GLOBAL = "/dev/null"') && envFn.includes('GIT_CONFIG_NOSYSTEM = "1"'), "git ignores home and system config");
+  assert(run.includes("gitEnv()") && run.includes("gitSafetyPrefix()"), "git commands use that environment and per-command safety");
   assert(read.includes("worktreePath") && read.includes("readableTarget") && read.includes("readRegularText"), "read checks parents and the leaf");
   assert(reader.includes("readRegularText"), "note reads open the checked file");
   assert(rel.includes("readWorktree"), "sync read uses the leaf check");
   assert(write.indexOf("worktreePath") !== write.lastIndexOf("worktreePath"), "write rechecks the folder");
   assert(atomic.includes("beforeRename") && atomic.indexOf("beforeRename") < atomic.indexOf("fs.rename"), "recheck sits before rename");
+  assert(atomic.includes("assertOpenedTemp") && atomic.includes("unlinkIfSameFile"), "a failed save removes only the opened temp file");
   assert(detach.includes("vaultRel") && detach.indexOf("worktreePath") < detach.indexOf("unlink"), "unlink checks the path and git gets the checked name");
+  assert(detach.includes("snapshotParents") && detach.indexOf("snapshotParents") < detach.indexOf("assertParents") && detach.indexOf("assertParents") < detach.indexOf("unlink"), "detach rechecks the parent snapshot before delete");
   assert(!detach.includes('"--", rel'), "detach does not pass the raw name");
   assert(announce.includes("worktreePath"), "watch stat checks the parent path");
   assert(conflicts.includes("worktreePath") && !conflicts.includes("safeJoin(VAULT"), "conflict mtime uses the checked path");
@@ -94,8 +97,8 @@ function checkWiring() {
   const plan = sliceFn('pathname === "/api/plan"', 'pathname === "/api/open-tasks"');
   const skin = sliceFn('pathname === "/api/skin.css"', "let file = pathname");
   const watch = sliceFn("function startLogWatch(", "function sendFile(");
-  assert(dayGet.includes("worktreePath"), "day read uses worktreePath");
-  assert(dayPut.includes("worktreePath") && !dayPut.includes('path.join(VAULT, "log"'), "day write uses worktreePath");
+  assert(dayGet.includes("worktreePath") && dayGet.includes("gitSymlinkSet"), "day read uses worktreePath and skips a git link");
+  assert(dayPut.includes("worktreePath") && dayPut.includes("gitSymlinkSet") && !dayPut.includes('path.join(VAULT, "log"'), "day write uses worktreePath and skips a git link");
   assert(fileGet.includes("worktreePath") && !fileGet.includes("resolveInside"), "file read uses worktreePath");
   assert(filePut.includes("worktreePath") && !filePut.includes("resolveInside"), "file write uses worktreePath");
   assert(tree.includes("worktreeDir") && dirFn.includes("worktreePath"), "tree checks the folder through worktreePath");
@@ -456,7 +459,7 @@ async function plantedGitEnvIsIgnored() {
     assert(path.resolve(repo, shown) === path.resolve(repo, ".git"), "common dir left the repo " + shown);
     const left = Object.keys(gitEnv()).filter((key) => key.startsWith("GIT_")).sort();
     assert(
-      left.join(",") === "GIT_EDITOR,GIT_LITERAL_PATHSPECS,GIT_MERGE_AUTOEDIT,GIT_TERMINAL_PROMPT",
+      left.join(",") === "GIT_CONFIG_GLOBAL,GIT_CONFIG_NOSYSTEM,GIT_EDITOR,GIT_LITERAL_PATHSPECS,GIT_MERGE_AUTOEDIT,GIT_TERMINAL_PROMPT",
       "git child kept " + left.join(","),
     );
   } finally {
@@ -740,7 +743,15 @@ async function waitExit(child, ms) {
   await new Promise((r) => setTimeout(r, 30));
 }
 
+function runningAsRoot() {
+  return typeof process.getuid === "function" && process.getuid() === 0;
+}
+
 async function readErrorStaysUp() {
+  if (runningAsRoot()) {
+    console.log("skip permission test as root");
+    return;
+  }
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-read-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
@@ -762,8 +773,8 @@ async function readErrorStaysUp() {
     const loggedBefore = child._log().length;
     const res = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/secret.md"));
     const text = await res.text();
-    assert(res.status === 500, "unreadable note got " + res.status + " " + text);
-    assert(text === JSON.stringify({ error: "internal error" }), "unreadable note leaked " + text);
+    assert(res.status === 403, "unreadable note got " + res.status + " " + text);
+    assert(text === JSON.stringify({ error: "not readable" }), "unreadable note leaked " + text);
     assert(!text.includes("NOTE_BODY_SECRET"), "read response included the note");
     assert(!text.includes(vault) && !text.includes(tmp), "read response included a path");
     await new Promise((r) => setTimeout(r, 200));
@@ -782,6 +793,10 @@ async function readErrorStaysUp() {
 }
 
 async function writeErrorStops() {
+  if (runningAsRoot()) {
+    console.log("skip permission test as root");
+    return;
+  }
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-ro-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault);
@@ -976,8 +991,20 @@ async function abortAndLongNameStayUp() {
     const health = await fetch(base + "/api/health");
     assert(health.status === 200, "health failed after a cut-off upload");
     assert(!fs.existsSync(path.join(vault, "notes", "cut.md")), "cut-off upload was stored");
-    const longName = "n".repeat(401) + ".md";
-    const longRes = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/" + longName), {
+    const exact = ("ab/".repeat(132) + "x.md");
+    assert(exact.length === 400, "fixture length " + exact.length);
+    assert(exact.split("/").every((part) => part.length < 200), "fixture part is too long");
+    const saved = await fetch(base + "/api/file?path=" + encodeURIComponent(exact), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "fits\n" }),
+    });
+    assert(saved.status === 200, "400-character name got " + saved.status);
+    assert(fs.readFileSync(path.join(vault, ...exact.split("/")), "utf8") === "fits\n", "400-character name was not saved");
+    const longName = "ab/".repeat(132) + "xy.md";
+    assert(longName.length === 401, "401 fixture length " + longName.length);
+    assert(longName.split("/").every((part) => part.length < 200), "401 fixture part is too long");
+    const longRes = await fetch(base + "/api/file?path=" + encodeURIComponent(longName), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ markdown: "too long\n" }),
@@ -1008,7 +1035,19 @@ function gitQuiet(dir, args) {
   });
 }
 
+function localConfig(dir, key) {
+  try {
+    return gitQuiet(dir, ["config", "--local", "--get", key]).trim();
+  } catch {
+    return "";
+  }
+}
+
 async function syncRequestStops() {
+  if (runningAsRoot()) {
+    console.log("skip permission test as root");
+    return;
+  }
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-syncstop-"));
   const vault = path.join(tmp, "vault");
   const bare = path.join(tmp, "bare.git");
@@ -1063,6 +1102,10 @@ async function syncRequestStops() {
 }
 
 async function backgroundSyncPauses() {
+  if (runningAsRoot()) {
+    console.log("skip permission test as root");
+    return;
+  }
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-pause-"));
   const vault = path.join(tmp, "vault");
   const bare = path.join(tmp, "bare.git");
@@ -1111,6 +1154,10 @@ async function backgroundSyncPauses() {
 }
 
 async function bootSyncPauses() {
+  if (runningAsRoot()) {
+    console.log("skip permission test as root");
+    return;
+  }
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-boot-"));
   const vault = path.join(tmp, "vault");
   const bare = path.join(tmp, "bare.git");
@@ -1193,9 +1240,12 @@ async function gitSafetyAndIndexLink() {
   gitQuiet(tmp, ["clone", bare, src]);
   fs.writeFileSync(path.join(src, "target.md"), "LINK_TARGET_SECRET\n");
   fs.symlinkSync("target.md", path.join(src, "link.md"));
+  fs.mkdirSync(path.join(src, "log"));
+  fs.writeFileSync(path.join(src, "log", "day-target.md"), "DAY_LINK_SECRET\n");
+  fs.symlinkSync("day-target.md", path.join(src, "log", "2026-04-01.md"));
   gitQuiet(src, ["config", "user.email", "t@local"]);
   gitQuiet(src, ["config", "user.name", "t"]);
-  gitQuiet(src, ["add", "target.md", "link.md"]);
+  gitQuiet(src, ["add", "target.md", "link.md", "log/day-target.md", "log/2026-04-01.md"]);
   gitQuiet(src, ["commit", "-m", "link"]);
   gitQuiet(src, ["push", "origin", "HEAD"]);
   const port = 38000 + Math.floor(Math.random() * 200);
@@ -1211,15 +1261,13 @@ async function gitSafetyAndIndexLink() {
   const base = "http://127.0.0.1:" + port;
   try {
     await waitHealth(base, child);
-    const symlinks = gitQuiet(vault, ["config", "--get", "core.symlinks"]).trim();
-    const hooks = gitQuiet(vault, ["config", "--get", "core.hooksPath"]).trim();
-    const monitor = gitQuiet(vault, ["config", "--get", "core.fsmonitor"]).trim();
-    const allow = gitQuiet(vault, ["config", "--get", "protocol.allow"]).trim();
-    assert(symlinks === "false", "core.symlinks was " + symlinks);
-    assert(hooks.endsWith("aidanos-no-hooks"), "hooksPath was " + hooks);
+    assert(localConfig(vault, "core.symlinks") === "", "core.symlinks was written into the repo");
+    assert(localConfig(vault, "core.hooksPath") === "", "hooksPath was written into the repo");
+    assert(localConfig(vault, "core.fsmonitor") === "", "fsmonitor was written into the repo");
+    assert(localConfig(vault, "protocol.allow") === "", "protocol.allow was written into the repo");
+    assert(localConfig(vault, "user.name") !== "", "git identity was not stored in the repo");
+    const hooks = path.join(vault, ".git", "aidanos-no-hooks");
     assert(!fs.existsSync(hooks), "hooks directory was created");
-    assert(monitor === "false", "fsmonitor was " + monitor);
-    assert(allow === "never", "protocol.allow was " + allow);
     const listed = gitQuiet(vault, ["ls-files", "-s", "link.md"]);
     assert(listed.startsWith("120000 "), "index mode was " + listed);
     assert(!fs.lstatSync(path.join(vault, "link.md")).isSymbolicLink(), "clone checked out a symlink");
@@ -1233,6 +1281,27 @@ async function gitSafetyAndIndexLink() {
     assert(treeBody.skippedLinks.includes("link.md"), "tree did not report the git link");
     assert(!JSON.stringify(treeBody).includes("LINK_TARGET_SECRET"), "tree followed the git link");
     assert(treeBody.files.includes("target.md"), "tree dropped the real note");
+    const dayPath = path.join(vault, "log", "2026-04-01.md");
+    const dayBefore = fs.readFileSync(dayPath);
+    assert(!fs.lstatSync(dayPath).isSymbolicLink(), "day checkout followed the git link");
+    const day = await fetch(base + "/api/day?date=2026-04-01");
+    const dayText = await day.text();
+    const dayBody = JSON.parse(dayText);
+    assert(day.status === 200, "day read failed " + day.status + " " + dayText);
+    assert(dayBody.markdown === "", "day read served the git link");
+    assert(dayBody.skippedLinks.includes("log/2026-04-01.md"), "day read did not report the git link");
+    assert(!dayText.includes("DAY_LINK_SECRET") && !dayText.includes("day-target.md"), "day read followed the git link");
+    const dayPut = await fetch(base + "/api/day?date=2026-04-01", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "replaced\n" }),
+    });
+    const dayPutText = await dayPut.text();
+    assert(dayPut.status === 400, "day write of a git link got " + dayPut.status + " " + dayPutText);
+    assert(dayPutText.includes("symlink: log/2026-04-01.md"), "day write did not name the git link");
+    assert(!dayPutText.includes("DAY_LINK_SECRET"), "day write leaked the target");
+    assert(Buffer.compare(fs.readFileSync(dayPath), dayBefore) === 0, "day write replaced the git link");
+    assert(!fs.lstatSync(dayPath).isSymbolicLink(), "day write turned the git link into a symlink");
   } finally {
     await stop(child);
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -1255,6 +1324,7 @@ async function aggregateSkipsLinks() {
   fs.writeFileSync(path.join(vault, "log", "2026-01-05.md"), "- [ ] kept task\n");
   fs.writeFileSync(path.join(vault, "aidanos", "weeks", "2026-01-05.md"), "# week\n");
   fs.symlinkSync(path.join(outside, "secret.md"), path.join(vault, "notes", "alias.md"));
+  fs.symlinkSync(path.join(outside, "secret.md"), path.join(vault, "notes", "line\nbreak\u007f.md"));
   fs.symlinkSync(path.join(outside, "box"), path.join(vault, "notes", "gone"));
   fs.symlinkSync(outside, path.join(vault, "extra"));
   fs.symlinkSync(path.join(outside, "day.md"), path.join(vault, "log", "2026-01-06.md"));
@@ -1334,7 +1404,13 @@ async function aggregateSkipsLinks() {
     const directText = await direct.text();
     assert(direct.status === 400, "direct read of a link got " + direct.status);
     noSecrets(directText, "direct");
+    const weird = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/line\nbreak\u007f.md"));
+    const weirdText = await weird.text();
+    assert(weird.status === 400, "direct read of a broken name got " + weird.status);
+    noSecrets(weirdText, "broken name");
     const logged = child._log();
+    assert(!logged.includes("line\nbreak"), "a note name split a log line");
+    assert(logged.includes("notes/line?break?.md"), "control characters stayed in a log line");
     const skipLines = logged.split("\n").filter((line) => line.includes("skipped symlink:"));
     assert(skipLines.length > 0, "skips were not logged");
     for (const line of skipLines) {
@@ -1386,6 +1462,193 @@ async function parentSymlinkIsNotFollowed() {
   }
 }
 
+async function pngDirectoryDoesNotStop() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-pngdir-"));
+  const vault = path.join(tmp, "vault");
+  fs.mkdirSync(vault);
+  const port = 38600 + Math.floor(Math.random() * 200);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+  });
+  const base = "http://127.0.0.1:" + port;
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+  try {
+    await waitHealth(base, child);
+    const nested = await fetch(base + "/api/file?path=" + encodeURIComponent("family-room-to-office/plan.png/x.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "nope\n" }),
+    });
+    const nestedText = await nested.text();
+    assert(nested.status === 400, "note inside plan.png got " + nested.status + " " + nestedText);
+    const planDir = path.join(vault, "family-room-to-office", "plan.png");
+    assert(!fs.existsSync(planDir), "a note created a plan.png folder");
+    fs.mkdirSync(planDir, { recursive: true });
+    const put = await fetch(base + "/api/file?path=" + encodeURIComponent("family-room-to-office/plan.png"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ png: png.toString("base64") }),
+    });
+    const putText = await put.text();
+    assert(put.status === 400, "png onto a folder got " + put.status + " " + putText);
+    assert(putText === JSON.stringify({ error: "not a file" }), "png onto a folder said " + putText);
+    assert(fs.lstatSync(planDir).isDirectory(), "png save replaced the folder");
+    assert(child.exitCode == null, "png onto a folder exited");
+    assert(!child._log().includes("stopped:"), "png onto a folder stopped: " + child._log());
+    const health = await fetch(base + "/api/health");
+    assert(health.status === 200, "health failed after a png folder");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function pauseClearsOnlyAfterSuccess() {
+  if (runningAsRoot()) {
+    console.log("skip permission test as root");
+    return;
+  }
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-resume-"));
+  const vault = path.join(tmp, "vault");
+  const bare = path.join(tmp, "bare.git");
+  fs.mkdirSync(vault);
+  gitQuiet(tmp, ["init", "--bare", "-b", "main", bare]);
+  gitQuiet(tmp, ["init", "-b", "main", vault]);
+  gitQuiet(vault, ["config", "user.email", "t@local"]);
+  gitQuiet(vault, ["config", "user.name", "t"]);
+  fs.writeFileSync(path.join(vault, "README.md"), "vault\n");
+  gitQuiet(vault, ["add", "README.md"]);
+  gitQuiet(vault, ["commit", "-m", "init"]);
+  gitQuiet(vault, ["remote", "add", "origin", bare]);
+  gitQuiet(vault, ["push", "-u", "origin", "HEAD"]);
+  const port = 38800 + Math.floor(Math.random() * 200);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: bare,
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+    AIDANOS_VAULT_GIT_SYNC_MS: "400",
+    AIDANOS_VAULT_GIT_DEBOUNCE_MS: "200",
+  });
+  const base = "http://127.0.0.1:" + port;
+  const localOnly = "Sync is paused. Notes are saved on this computer only.";
+  function showBare(rel) {
+    try {
+      return gitQuiet(bare, ["show", "HEAD:" + rel]);
+    } catch {
+      return null;
+    }
+  }
+  async function pauseWithChmod() {
+    const loggedBefore = child._log().length;
+    fs.chmodSync(vault, 0);
+    const deadline = Date.now() + 4000;
+    let logged = "";
+    while (Date.now() < deadline) {
+      logged = child._log().slice(loggedBefore);
+      if (logged.includes("sync paused:")) break;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    fs.chmodSync(vault, 0o755);
+    assert(child.exitCode == null, "pause exited the server");
+    assert(logged.includes("sync paused:"), "sync did not pause: " + logged);
+  }
+  async function putNote(rel, markdown) {
+    const res = await fetch(base + "/api/file?path=" + encodeURIComponent(rel), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown }),
+    });
+    const body = await res.json();
+    return { status: res.status, body };
+  }
+  async function postSync() {
+    const res = await fetch(base + "/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ join: true }),
+    });
+    const text = await res.text();
+    let body = {};
+    try { body = JSON.parse(text); } catch { body = { raw: text }; }
+    return { status: res.status, body, text };
+  }
+  try {
+    await waitHealth(base, child);
+    await pauseWithChmod();
+    const idle = await postSync();
+    assert(idle.status === 200, "idle sync got " + idle.status + " " + idle.text);
+    assert(idle.body.error !== "sync paused", "idle sync left the warning: " + idle.text);
+    const cleared = await fetch(base + "/api/health");
+    const clearedBody = await cleared.json();
+    assert(cleared.status === 200, "health failed after an idle sync");
+    assert(!clearedBody.git.paused && clearedBody.git.error !== "sync paused" && !clearedBody.git.localOnly, "idle sync left the pause: " + JSON.stringify(clearedBody.git));
+    const timed = await putNote("notes/timer.md", "timer note\n");
+    assert(timed.status === 200, "save after resume got " + timed.status);
+    assert(timed.body.git && timed.body.git.error !== "sync paused" && !timed.body.git.localOnly, "save after resume still said paused");
+    const timerDeadline = Date.now() + 8000;
+    while (showBare("notes/timer.md") !== "timer note\n" && Date.now() < timerDeadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert(showBare("notes/timer.md") === "timer note\n", "restarted timers did not sync the note");
+
+    await pauseWithChmod();
+    const queued = await putNote("notes/queued.md", "queued note\n");
+    assert(queued.status === 200, "paused save got " + queued.status);
+    assert(queued.body.git && queued.body.git.error === "sync paused", "paused save dropped the warning");
+    assert(queued.body.git.localOnly === localOnly, "paused save did not say it is local only");
+    const pausedHealth = await fetch(base + "/api/health");
+    const pausedBody = await pausedHealth.json();
+    assert(pausedBody.git && pausedBody.git.error === "sync paused" && pausedBody.git.paused === true, "health hid the pause");
+    assert(pausedBody.git.localOnly === localOnly, "health did not say notes stay on this computer");
+    const pending = fs.readFileSync(path.join(vault, ".git", "aidanos-pending"), "utf8");
+    assert(pending.includes("notes/queued.md"), "paused save was not queued");
+    await new Promise((r) => setTimeout(r, 500));
+    assert(showBare("notes/queued.md") == null, "a paused save synced on its own");
+    const resumed = await postSync();
+    assert(resumed.status === 200, "resume sync got " + resumed.status + " " + resumed.text);
+    assert(resumed.body.error !== "sync paused", "resume sync left the warning");
+    const queuedDeadline = Date.now() + 8000;
+    while (showBare("notes/queued.md") !== "queued note\n" && Date.now() < queuedDeadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert(showBare("notes/queued.md") === "queued note\n", "queued note did not sync after resume");
+    const open = await fetch(base + "/api/health");
+    const openBody = await open.json();
+    assert(!openBody.git.paused && openBody.git.error !== "sync paused", "resume left the pause on");
+
+    await pauseWithChmod();
+    const stuck = await putNote("notes/stuck.md", "stuck note\n");
+    assert(stuck.status === 200 && stuck.body.git && stuck.body.git.error === "sync paused", "second pause did not warn");
+    gitQuiet(vault, ["remote", "set-url", "origin", path.join(tmp, "missing")]);
+    const failed = await postSync();
+    assert(failed.status === 409, "failed sync got " + failed.status + " " + failed.text);
+    assert(failed.body.error === "sync paused", "failed sync cleared the warning: " + failed.text);
+    const still = await fetch(base + "/api/health");
+    const stillBody = await still.json();
+    assert(still.status === 200, "health failed after a failed sync");
+    assert(stillBody.git && stillBody.git.paused === true && stillBody.git.error === "sync paused", "failed sync cleared the pause");
+    assert(stillBody.git.localOnly === localOnly, "failed sync dropped the local-only sentence");
+    await new Promise((r) => setTimeout(r, 500));
+    const later = await fetch(base + "/api/health");
+    const laterBody = await later.json();
+    assert(laterBody.git && laterBody.git.paused === true && laterBody.git.error === "sync paused", "the pause cleared itself");
+    assert(showBare("notes/stuck.md") == null, "a failed sync pushed the paused note");
+    assert(child.exitCode == null, "failed sync exited the server");
+  } finally {
+    try { fs.chmodSync(vault, 0o755); } catch {}
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 checkWiring();
 await pathChecks();
 await inodeGitDir();
@@ -1409,6 +1672,8 @@ await backgroundSyncPauses();
 await bootSyncPauses();
 await rejectedPushStaysUp();
 await gitSafetyAndIndexLink();
+await pngDirectoryDoesNotStop();
+await pauseClearsOnlyAfterSuccess();
 await aggregateSkipsLinks();
 await parentSymlinkIsNotFollowed();
 console.log("sync-path-test ok");

@@ -21,7 +21,7 @@ jobs:
           node-version-file: ".nvmrc"
       - name: Chrome for the phone width check
         id: chrome
-        uses: browser-actions/setup-chrome@54e7c7bf1c147ffca98dc47b796907454c8c1787 # v2.2.0
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0 release
         with:
           chrome-version: "156.0.8078.47"
           install-dependencies: true
@@ -44,7 +44,7 @@ jobs:
           node-version-file: ".nvmrc"
       - name: Chrome for the phone width check
         id: chrome
-        uses: browser-actions/setup-chrome@54e7c7bf1c147ffca98dc47b796907454c8c1787 # v2.2.0
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0 release
         with:
           chrome-version: "156.0.8078.47"
           install-dependencies: true

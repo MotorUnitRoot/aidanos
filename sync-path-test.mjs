@@ -68,7 +68,9 @@ function checkWiring() {
   assert(rel.includes("readWorktree"), "sync read uses the leaf check");
   assert(write.indexOf("worktreePath") !== write.lastIndexOf("worktreePath"), "write rechecks the folder");
   assert(atomic.includes("beforeRename") && atomic.indexOf("beforeRename") < atomic.indexOf("fs.rename"), "recheck sits before rename");
+  assert(atomic.indexOf("assertParents") < atomic.indexOf("writeFile"), "parent snapshot is checked before any bytes are written");
   assert(atomic.includes("assertOpenedTemp") && atomic.includes("unlinkIfSameFile"), "a failed save removes only the opened temp file");
+  assert(atomic.includes("!e.aidanosStop"), "a tagged directory error stays a stop");
   assert(detach.includes("vaultRel") && detach.indexOf("worktreePath") < detach.indexOf("unlink"), "unlink checks the path and git gets the checked name");
   assert(detach.includes("snapshotParents") && detach.indexOf("snapshotParents") < detach.indexOf("assertParents") && detach.indexOf("assertParents") < detach.indexOf("unlink"), "detach rechecks the parent snapshot before delete");
   assert(!detach.includes('"--", rel'), "detach does not pass the raw name");
@@ -120,6 +122,9 @@ function checkWiring() {
   assert(serverSrc.includes("stopAfterResponse"), "a tagged failure stops the process");
   assert(serverSrc.includes("aidanosStop"), "stop is tagged on the step that failed");
   assert(serverSrc.includes('["core.symlinks", "false"]'), "git does not check out symlinks");
+  assert(serverSrc.includes('["credential.helper", ""]') && serverSrc.includes('["core.sshCommand", "ssh"]'), "git ignores credential helpers and a custom ssh command");
+  const top = sliceFn('if (err && err.code === "BODY_TOO_LARGE")', "function refuseSymlinkedVaultRoot(");
+  assert(top.includes('(err.code === "EISDIR" || err.code === "ENOTDIR") && !err.aidanosStop'), "only an untagged directory error is a 400");
   assert(serverSrc.includes("aidanos-no-hooks"), "git hooks point at a directory we never create");
   assert(skin.includes("X-Skipped-Links"), "skin reports a skipped link in a header");
 }
@@ -1649,6 +1654,267 @@ async function pauseClearsOnlyAfterSuccess() {
   }
 }
 
+function containsBytes(dir, needle) {
+  if (!fs.existsSync(dir)) return false;
+  for (const name of fs.readdirSync(dir)) {
+    const p = path.join(dir, name);
+    const st = fs.lstatSync(p);
+    if (st.isSymbolicLink()) continue;
+    if (st.isDirectory()) {
+      if (containsBytes(p, needle)) return true;
+      continue;
+    }
+    if (st.isFile() && fs.readFileSync(p).includes(needle)) return true;
+  }
+  return false;
+}
+
+async function swappedParentWritesNothing() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-swap-"));
+  const vault = path.join(tmp, "vault");
+  const outside = path.join(tmp, "outside");
+  const hold = path.join(tmp, "hold");
+  const real = path.join(tmp, "notes-real");
+  fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, "marker.md"), "unchanged\n");
+  const port = 39000 + Math.floor(Math.random() * 200);
+  const note = Buffer.from("0123456789abcd");
+  assert(note.length === 14, "note is not 14 bytes");
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+    AIDANOS_TEST_HOLD_WRITE: hold,
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    const put = fetch(base + "/api/file?path=" + encodeURIComponent("notes/out.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: note.toString("utf8") }),
+    });
+    const holdFile = path.join(hold, "hold");
+    const deadline = Date.now() + 4000;
+    while (!fs.existsSync(holdFile) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert(fs.existsSync(holdFile), "save did not stop before the open");
+    fs.renameSync(path.join(vault, "notes"), real);
+    fs.symlinkSync(outside, path.join(vault, "notes"));
+    fs.writeFileSync(path.join(hold, "go"), "1");
+    let status = 0;
+    let text = "";
+    try {
+      const res = await put;
+      status = res.status;
+      text = await res.text();
+    } catch (e) {
+      text = String(e && e.message || e);
+    }
+    await waitExit(child, 4000);
+    assert(child.exitCode != null, "swapped parent left the server up");
+    if (status) assert(status === 500, "swapped parent got " + status + " " + text);
+    assert(child._log().includes("stopped: write PARENT"), "swapped parent log was " + child._log());
+    assert(!containsBytes(outside, note), "swapped parent wrote the note outside the vault");
+    assert(!containsBytes(real, note), "swapped parent wrote the note into the old folder");
+    assert(fs.readFileSync(path.join(outside, "marker.md"), "utf8") === "unchanged\n", "outside file changed");
+    assert(fs.readdirSync(outside).join(",") === "marker.md", "a temp file was left outside: " + fs.readdirSync(outside).join(","));
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function taggedEisdirStops() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-eisdir-"));
+  const vault = path.join(tmp, "vault");
+  const dayDir = path.join(vault, "log", "2026-04-02.md");
+  fs.mkdirSync(dayDir, { recursive: true });
+  const port = 39200 + Math.floor(Math.random() * 200);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: "",
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    let status = 0;
+    let text = "";
+    try {
+      const res = await fetch(base + "/api/day?date=2026-04-02", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ markdown: "EISDIR_NOTE_SECRET\n" }),
+      });
+      status = res.status;
+      text = await res.text();
+    } catch (e) {
+      text = String(e && e.message || e);
+    }
+    await waitExit(child, 4000);
+    assert(child.exitCode != null, "tagged EISDIR left the server up");
+    if (status) {
+      assert(status === 500, "tagged EISDIR got " + status + " " + text);
+      assert(!text.includes("EISDIR_NOTE_SECRET"), "tagged EISDIR leaked the note");
+    }
+    assert(child._log().includes("stopped: rename EISDIR"), "tagged EISDIR log was " + child._log());
+    assert(!child._log().includes("EISDIR_NOTE_SECRET"), "tagged EISDIR logged the note");
+    assert(fs.lstatSync(dayDir).isDirectory(), "tagged EISDIR replaced the folder");
+    assert(!containsBytes(path.join(vault, "log"), Buffer.from("EISDIR_NOTE_SECRET")), "tagged EISDIR stored the note");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function oldSafetyKeysAreRemoved() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-oldkeys-"));
+  const vault = path.join(tmp, "vault");
+  const bare = path.join(tmp, "bare.git");
+  fs.mkdirSync(vault);
+  gitQuiet(tmp, ["init", "--bare", "-b", "main", bare]);
+  gitQuiet(tmp, ["init", "-b", "main", vault]);
+  gitQuiet(vault, ["config", "user.email", "t@local"]);
+  gitQuiet(vault, ["config", "user.name", "t"]);
+  fs.writeFileSync(path.join(vault, "README.md"), "vault\n");
+  gitQuiet(vault, ["add", "README.md"]);
+  gitQuiet(vault, ["commit", "-m", "init"]);
+  gitQuiet(vault, ["remote", "add", "origin", bare]);
+  gitQuiet(vault, ["push", "-u", "origin", "HEAD"]);
+  const hooks = path.join(vault, ".git", "aidanos-no-hooks");
+  gitQuiet(vault, ["config", "core.symlinks", "false"]);
+  gitQuiet(vault, ["config", "core.hooksPath", hooks]);
+  gitQuiet(vault, ["config", "core.fsmonitor", "false"]);
+  gitQuiet(vault, ["config", "protocol.allow", "never"]);
+  gitQuiet(vault, ["config", "protocol.https.allow", "always"]);
+  gitQuiet(vault, ["config", "protocol.file.allow", "always"]);
+  gitQuiet(vault, ["config", "protocol.ssh.allow", "never"]);
+  gitQuiet(vault, ["config", "core.editor", "vim"]);
+  const port = 39400 + Math.floor(Math.random() * 200);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: bare,
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+    AIDANOS_VAULT_GIT_SYNC_MS: "0",
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline && (localConfig(vault, "core.symlinks") !== "" || localConfig(vault, "core.hooksPath") !== "")) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    assert(localConfig(vault, "core.symlinks") === "", "core.symlinks was left in the repo");
+    assert(localConfig(vault, "core.hooksPath") === "", "hooksPath was left in the repo");
+    assert(localConfig(vault, "core.fsmonitor") === "", "fsmonitor was left in the repo");
+    assert(localConfig(vault, "protocol.allow") === "", "protocol.allow was left in the repo");
+    assert(localConfig(vault, "protocol.https.allow") === "", "protocol.https.allow was left in the repo");
+    assert(localConfig(vault, "protocol.file.allow") === "", "protocol.file.allow was left in the repo");
+    assert(localConfig(vault, "protocol.ssh.allow") === "never", "a different protocol value was removed");
+    assert(localConfig(vault, "core.editor") === "vim", "an unrelated git setting was removed");
+    assert(localConfig(vault, "user.name") !== "", "git identity was removed");
+    assert(!fs.existsSync(hooks), "hooks directory was created");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function pausedSentenceFor(vault, bare, extra) {
+  const port = 39600 + Math.floor(Math.random() * 200);
+  const child = spawnServer({
+    PORT: String(port),
+    AIDANOS_HOST: "127.0.0.1",
+    AIDANOS_VAULT: vault,
+    AIDANOS_VAULT_GIT_URL: bare,
+    AIDANOS_VAULT_GIT_TOKEN: "",
+    GITHUB_TOKEN: "",
+    AIDANOS_VAULT_GIT_SYNC_MS: "400",
+    K_SERVICE: "",
+    ...extra,
+  });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    const loggedBefore = child._log().length;
+    fs.chmodSync(vault, 0);
+    const deadline = Date.now() + 4000;
+    let logged = "";
+    while (Date.now() < deadline) {
+      logged = child._log().slice(loggedBefore);
+      if (logged.includes("sync paused:")) break;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    fs.chmodSync(vault, 0o755);
+    assert(child.exitCode == null, "pause exited the server");
+    assert(logged.includes("sync paused:"), "sync did not pause: " + logged);
+    const health = await fetch(base + "/api/health");
+    const body = await health.json();
+    assert(health.status === 200 && body.git && body.git.error === "sync paused", "health did not mark the pause");
+    return body.git.localOnly;
+  } finally {
+    try { fs.chmodSync(vault, 0o755); } catch {}
+    await stop(child);
+  }
+}
+
+async function pausedWordingFollowsTheVault() {
+  if (runningAsRoot()) {
+    console.log("skip permission test as root");
+    return;
+  }
+  const serverSentence = "Sync is paused. Notes are saved on this server only and may be lost if it restarts.";
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-wording-"));
+  try {
+    const cloudVault = path.join(tmp, "cloud");
+    const cloudBare = path.join(tmp, "cloud.git");
+    fs.mkdirSync(cloudVault);
+    gitQuiet(tmp, ["init", "--bare", "-b", "main", cloudBare]);
+    gitQuiet(tmp, ["init", "-b", "main", cloudVault]);
+    gitQuiet(cloudVault, ["config", "user.email", "t@local"]);
+    gitQuiet(cloudVault, ["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(cloudVault, "README.md"), "vault\n");
+    gitQuiet(cloudVault, ["add", "README.md"]);
+    gitQuiet(cloudVault, ["commit", "-m", "init"]);
+    gitQuiet(cloudVault, ["remote", "add", "origin", cloudBare]);
+    gitQuiet(cloudVault, ["push", "-u", "origin", "HEAD"]);
+    const cloud = await pausedSentenceFor(cloudVault, cloudBare, { K_SERVICE: "aidanos" });
+    assert(cloud === serverSentence, "Cloud Run pause said " + cloud);
+
+    const cloneVault = path.join(tmp, "clone");
+    const cloneBare = path.join(tmp, "clone.git");
+    fs.mkdirSync(cloneVault);
+    gitQuiet(tmp, ["init", "--bare", "-b", "main", cloneBare]);
+    gitQuiet(tmp, ["init", "-b", "main", cloneVault]);
+    gitQuiet(cloneVault, ["config", "user.email", "t@local"]);
+    gitQuiet(cloneVault, ["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(cloneVault, "README.md"), "vault\n");
+    gitQuiet(cloneVault, ["add", "README.md"]);
+    gitQuiet(cloneVault, ["commit", "-m", "init"]);
+    gitQuiet(cloneVault, ["remote", "add", "origin", cloneBare]);
+    gitQuiet(cloneVault, ["push", "-u", "origin", "HEAD"]);
+    const clone = await pausedSentenceFor(cloneVault, cloneBare, {
+      AIDANOS_VAULT: "",
+      AIDANOS_VAULT_CLONE: cloneVault,
+    });
+    assert(clone === serverSentence, "temp clone pause said " + clone);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 checkWiring();
 await pathChecks();
 await inodeGitDir();
@@ -1674,6 +1940,10 @@ await rejectedPushStaysUp();
 await gitSafetyAndIndexLink();
 await pngDirectoryDoesNotStop();
 await pauseClearsOnlyAfterSuccess();
+await swappedParentWritesNothing();
+await taggedEisdirStops();
+await oldSafetyKeysAreRemoved();
+await pausedWordingFollowsTheVault();
 await aggregateSkipsLinks();
 await parentSymlinkIsNotFollowed();
 console.log("sync-path-test ok");

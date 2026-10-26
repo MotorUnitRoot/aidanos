@@ -168,6 +168,15 @@ function logSafe(...parts) {
   console.error(text);
 }
 
+function notesStayLocalSentence() {
+  const cloud = Boolean(String(process.env.K_SERVICE || "").trim());
+  const ownClone = !String(process.env.AIDANOS_VAULT || "").trim() && Boolean(GIT_URL);
+  if (cloud || ownClone) {
+    return "Sync is paused. Notes are saved on this server only and may be lost if it restarts.";
+  }
+  return "Sync is paused. Notes are saved on this computer only.";
+}
+
 function gitHint() {
   if (!vaultGit.enabled) return { enabled: false };
   const open = [...vaultGit.conflicts.values()].filter((item) => !item.resolved);
@@ -175,7 +184,7 @@ function gitHint() {
   if (vaultGit.syncPaused) {
     hint.paused = true;
     hint.error = "sync paused";
-    hint.localOnly = "Sync is paused. Notes are saved on this computer only.";
+    hint.localOnly = notesStayLocalSentence();
   } else if (vaultGit.error) hint.error = vaultGit.error;
   if (vaultGit.lastPushAt) hint.pushed = true;
   if (open.length) hint.conflicts = open.map((item) => item.path);
@@ -244,6 +253,10 @@ function gitSafetyConfigs(cwd) {
     ["core.fsmonitor", "false"],
     ["protocol.allow", "never"],
     ["protocol.https.allow", "always"],
+    // An empty credential helper keeps a helper from replacing the token in the remote URL.
+    // ssh stays the plain client. An empty include.path is rejected by git itself, so it is not set.
+    ["credential.helper", ""],
+    ["core.sshCommand", "ssh"],
   ];
   const kind = gitRemoteKind(GIT_URL);
   if (kind === "ssh") pairs.push(["protocol.ssh.allow", "always"]);
@@ -262,6 +275,47 @@ async function ensureGitIdentity(cwd) {
   const email = process.env.AIDANOS_VAULT_GIT_EMAIL || "aidanos@local";
   await runGit(["-C", cwd, "config", "user.name", name], { timeoutMs: 4000 });
   await runGit(["-C", cwd, "config", "user.email", email], { timeoutMs: 4000 });
+}
+
+async function localGitValue(cwd, key) {
+  try {
+    const { out } = await runGit(["-C", cwd, "config", "--local", "--get", key], { timeoutMs: 4000 });
+    return String(out || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function sameConfigPath(cwd, value, expected) {
+  if (!value) return false;
+  const want = path.resolve(expected);
+  return path.resolve(value) === want || path.resolve(cwd, value) === want;
+}
+
+// Drop the safety keys an older build wrote into the vault config.
+// Only an exact match is removed. A different value is the operator's.
+async function unsetOldGitSafety(cwd) {
+  const exact = [
+    ["core.symlinks", "false"],
+    ["core.fsmonitor", "false"],
+    ["protocol.allow", "never"],
+    ["protocol.https.allow", "always"],
+    ["protocol.ssh.allow", "always"],
+    ["protocol.file.allow", "always"],
+  ];
+  try {
+    for (const [key, value] of exact) {
+      if ((await localGitValue(cwd, key)) !== value) continue;
+      await runGit(["-C", cwd, "config", "--local", "--unset", key], { timeoutMs: 4000 }).catch(() => {});
+    }
+    const hooks = path.join(cwd, ".git", "aidanos-no-hooks");
+    const hooksPath = await localGitValue(cwd, "core.hooksPath");
+    if (sameConfigPath(cwd, hooksPath, hooks)) {
+      await runGit(["-C", cwd, "config", "--local", "--unset", "core.hooksPath"], { timeoutMs: 4000 }).catch(() => {});
+    }
+  } catch {
+    // The command-line -c flags still override whatever is left in the file.
+  }
 }
 
 async function ensureOrigin(cwd) {
@@ -404,6 +458,7 @@ async function retryVaultGit() {
   try {
     if (await isGitRepo(VAULT)) {
       await ensureGitIdentity(VAULT);
+      await unsetOldGitSafety(VAULT);
       await ensureOrigin(VAULT);
       vaultGit.ready = true;
       loadPending();
@@ -418,6 +473,7 @@ async function retryVaultGit() {
       await runGit(["clone", "--depth", "1", gitRemoteUrl(), VAULT], { timeoutMs: 25000 });
       vaultGit.error = "";
       await ensureGitIdentity(VAULT);
+      await unsetOldGitSafety(VAULT);
       vaultGit.ready = await isGitRepo(VAULT);
     }
   } catch (e) {
@@ -440,6 +496,7 @@ async function initVaultGit() {
     await fs.mkdir(VAULT, { recursive: true });
     if (await isGitRepo(VAULT)) {
       await ensureGitIdentity(VAULT);
+      await unsetOldGitSafety(VAULT);
       await ensureOrigin(VAULT);
       vaultGit.ready = true;
       loadPending();
@@ -469,6 +526,7 @@ async function initVaultGit() {
         scheduleVaultGitRetry();
       }
       await ensureGitIdentity(VAULT);
+      await unsetOldGitSafety(VAULT);
       vaultGit.ready = await isGitRepo(VAULT);
       if (vaultGit.ready) {
         loadPending();
@@ -2368,15 +2426,34 @@ function sameTextAlreadyStored(exists, raw, markdown, conflict, resolve) {
   return true;
 }
 
+async function holdWriteForTest() {
+  const dir = String(process.env.AIDANOS_TEST_HOLD_WRITE || "").trim();
+  if (!dir) return;
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, "hold"), "1");
+  const go = path.join(dir, "go");
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    try {
+      await fs.access(go);
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+}
+
 async function atomicWriteFile(filePath, markdown, beforeRename) {
   await mkdirNoFollow(path.dirname(filePath));
   const seen = await snapshotParents(filePath);
+  await holdWriteForTest();
   const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
   let fh = null;
   let openedId = null;
   try {
     fh = await fs.open(tmpPath, "wx");
     openedId = await assertOpenedTemp(fh, tmpPath);
+    await assertParents(seen);
     if (Buffer.isBuffer(markdown)) await fh.writeFile(markdown);
     else await fh.writeFile(markdown, { encoding: "utf8" });
     await fh.close();
@@ -2395,7 +2472,7 @@ async function atomicWriteFile(filePath, markdown, beforeRename) {
     }
     if (openedId) await unlinkIfSameFile(tmpPath, openedId);
     const code = e && e.code;
-    if (code === "EISDIR" || code === "ENOTDIR") {
+    if ((code === "EISDIR" || code === "ENOTDIR") && !e.aidanosStop) {
       const err = new Error("not a file");
       err.code = code;
       throw err;
@@ -3466,7 +3543,7 @@ const server = http.createServer(async (req, res) => {
       if (!res.headersSent) return json(res, 413, { error: "too large" });
       return;
     }
-    if (err && (err.code === "EISDIR" || err.code === "ENOTDIR")) {
+    if (err && (err.code === "EISDIR" || err.code === "ENOTDIR") && !err.aidanosStop) {
       console.error("refused: not a file");
       if (res.headersSent) return;
       return json(res, 400, { error: "not a file" });

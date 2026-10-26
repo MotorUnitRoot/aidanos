@@ -27,6 +27,8 @@ Cloud Run (and any host) can clone that repo when these are set:
 - `AIDANOS_VAULT` — working tree path (optional; if unset with a git URL, the server clones into a dedicated directory and uses that as the vault)
 - `AIDANOS_VAULT_CLONE` — override that dedicated clone path
 
+The server's git ignores the host's global and system git config.
+
 If the git env is unset, today’s local `vault/` behavior is unchanged. A missing remote must not stop the app: writes stay on local disk, and push failures are logged plus a `git` hint on `/api/health` and successful PUT bodies.
 
 Two people (or the Mac and the phone) writing the same file at once is a conflict. The server refuses a silent overwrite (409 with the disk markdown and mtime). The paper then asks Keep mine, Take theirs, or Edit.

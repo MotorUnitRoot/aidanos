@@ -19,7 +19,7 @@ There is no fixed public URL. A Cloudflare quick tunnel in front of port 3847 is
 3. Name stays **AidanOS**; tap **Add**.
 4. Launch from the home screen icon — runs standalone.
 
-The home-screen icons `icon-180.png`, `icon-192.png`, and `apple-touch-icon.png` are in the repo at the root, next to `server.mjs`, so a local `npm start` serves them too.
+The home-screen icons `icon-180.png`, `icon-192.png`, and `apple-touch-icon.png` are written into the container image by the `Dockerfile` when it is built. They are not in the repository yet, so a local `npm start` returns 'not found' for them.
 
 ## LAN bind — usable without GCP
 

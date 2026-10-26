@@ -60,6 +60,7 @@ function checkWiring() {
   assert(envFn.indexOf('startsWith("GIT_")') < envFn.indexOf("GIT_EDITOR"), "editor settings are set after the scrub");
   assert(!envFn.includes("Leave other GIT_"), "the scrub comment no longer says a full wipe is impossible");
   assert(envFn.includes('GIT_EDITOR = "true"') && envFn.includes('GIT_MERGE_AUTOEDIT = "no"'), "editor settings stay on git children");
+  assert(envFn.includes('GIT_TERMINAL_PROMPT = "0"'), "git prompts stay off");
   assert(run.includes("gitEnv()"), "git commands use that environment");
   assert(read.includes("worktreePath") && read.includes("readableTarget") && read.includes("readRegularText"), "read checks parents and the leaf");
   assert(reader.includes("readRegularText"), "note reads open the checked file");
@@ -377,6 +378,7 @@ async function inheritedGitDirIsIgnored() {
     }
     assert(env.GIT_EDITOR === "true", "GIT_EDITOR was dropped");
     assert(env.GIT_MERGE_AUTOEDIT === "no", "GIT_MERGE_AUTOEDIT was dropped");
+    assert(env.GIT_TERMINAL_PROMPT === "0", "GIT_TERMINAL_PROMPT was dropped");
     assert(env.GIT_LITERAL_PATHSPECS === "1", "literal pathspecs were dropped");
     const shown = gitWithEnv(["rev-parse", "--git-dir"], repo).trim();
     const resolved = path.resolve(repo, shown);
@@ -398,22 +400,37 @@ async function plantedGitEnvIsIgnored() {
   const saved = {
     GIT_CONFIG_PARAMETERS: process.env.GIT_CONFIG_PARAMETERS,
     GIT_COMMON_DIR: process.env.GIT_COMMON_DIR,
+    GIT_GLOB_PATHSPECS: process.env.GIT_GLOB_PATHSPECS,
   };
   try {
     git(["init", "-b", "main"], repo);
+    git(["config", "user.email", "t@local"], repo);
+    git(["config", "user.name", "T"], repo);
     git(["init", "-b", "main"], decoy);
+    fs.writeFileSync(path.join(repo, "QA.md"), "qa\n");
+    fs.writeFileSync(path.join(repo, "Q?.md"), "qq\n");
+    git(["add", "-A"], repo);
+    git(["commit", "-m", "seed"], repo);
+    fs.writeFileSync(path.join(repo, "QA.md"), "changed-qa\n");
+    fs.writeFileSync(path.join(repo, "Q?.md"), "changed-qq\n");
     process.env.GIT_CONFIG_PARAMETERS = "'core.hookspath'='" + hooks + "'";
+    process.env.GIT_GLOB_PATHSPECS = "1";
     delete process.env.GIT_COMMON_DIR;
     const hooked = gitWithEnv(["config", "--get", "core.hookspath"], repo, true).trim();
     assert(hooked !== hooks, "git read core.hookspath from GIT_CONFIG_PARAMETERS");
+    gitWithEnv(["add", "--", "Q?.md"], repo);
+    const staged = git(["diff", "--cached", "--name-only"], repo).split("\n").map((s) => s.trim()).filter(Boolean);
+    assert(staged.includes("Q?.md"), "literal Q?.md was not staged");
+    assert(!staged.includes("QA.md"), "git honored GIT_GLOB_PATHSPECS");
     delete process.env.GIT_CONFIG_PARAMETERS;
+    delete process.env.GIT_GLOB_PATHSPECS;
     process.env.GIT_COMMON_DIR = path.join(decoy, ".git");
     const shown = gitWithEnv(["rev-parse", "--git-common-dir"], repo).trim();
     assert(path.resolve(shown) !== path.resolve(decoy, ".git"), "git used the decoy GIT_COMMON_DIR " + shown);
     assert(path.resolve(repo, shown) === path.resolve(repo, ".git"), "common dir left the repo " + shown);
     const left = Object.keys(gitEnv()).filter((key) => key.startsWith("GIT_")).sort();
     assert(
-      left.join(",") === "GIT_EDITOR,GIT_LITERAL_PATHSPECS,GIT_MERGE_AUTOEDIT",
+      left.join(",") === "GIT_EDITOR,GIT_LITERAL_PATHSPECS,GIT_MERGE_AUTOEDIT,GIT_TERMINAL_PROMPT",
       "git child kept " + left.join(","),
     );
   } finally {

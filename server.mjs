@@ -180,13 +180,14 @@ function gitHint() {
 export function gitEnv() {
   const env = { ...process.env };
   // Drop every inherited GIT_* name first. A short list misses
-  // GIT_CONFIG_PARAMETERS and GIT_COMMON_DIR, and git reads both.
-  // The settings below are applied after that, so the scrub does not drop them.
+  // GIT_CONFIG_PARAMETERS, GIT_COMMON_DIR, and GIT_GLOB_PATHSPECS, and git
+  // reads all three. The settings below are applied after that scrub.
   for (const key of Object.keys(env)) {
     if (key.startsWith("GIT_")) delete env[key];
   }
   env.GIT_EDITOR = "true";
   env.GIT_MERGE_AUTOEDIT = "no";
+  env.GIT_TERMINAL_PROMPT = "0";
   // Pathspecs stay literal after "--". Otherwise `Q?.md` also matches QA.md.
   env.GIT_LITERAL_PATHSPECS = "1";
   return env;

@@ -11,15 +11,20 @@
 // setting turns it off.
 //
 // An in-place save never follows a link, a hard link, or any file that is
-// not a regular file. It opens a new note with O_CREAT|O_EXCL. The previous
-// bytes are read from the opened file before the first new byte. If that
-// write or the truncate fails, those bytes are written back over the same
-// file and the error is raised again. Writing the new bytes and truncating
-// afterwards does not by itself keep the previous text: a write that stops
-// partway has already replaced the start of the note. After the open, and
-// before that write, the opened file is compared with the file recorded
-// inside the vault and the caller can recheck the parent directories. The
-// swap-in path still writes a temp file and renames it, and beforeRename
+// not a regular file. It opens a new note with O_CREAT|O_EXCL. After the
+// open, and before the first new byte, the opened file is compared with the
+// file recorded inside the vault and the caller rechecks the parent
+// directories. If that check fails on a file this call just created, that
+// file is removed once its dev+ino still matches the descriptor, so a
+// swapped parent does not leave an empty file outside the vault.
+//
+// The previous bytes are then written to a recovery file in the same folder,
+// created with O_EXCL. If the new write or the truncate fails, those bytes
+// are written back over the same file. The recovery file is removed after a
+// successful save or a successful restore. If the restore itself fails, the
+// recovery file stays and its vault-relative name is logged. Writing the new
+// bytes and truncating afterwards does not by itself keep the previous text.
+// The swap-in path still writes a temp file and renames it, and beforeRename
 // runs after that temp file is ready and before the rename.
 
 import { constants as fsConstants, realpathSync } from "node:fs";
@@ -134,6 +139,70 @@ async function restoreOpened(handle, previous) {
   await handle.truncate(previous.length);
 }
 
+async function removeSameFile(filePath, id) {
+  if (!id) return;
+  let listed;
+  try {
+    listed = await fs.lstat(filePath);
+  } catch (e) {
+    if (e.code === "ENOENT") return;
+    throw e;
+  }
+  if (listed.isSymbolicLink() || listed.dev !== id.dev || listed.ino !== id.ino) return;
+  await fs.unlink(filePath);
+}
+
+async function removeCreatedNote(filePath, handle) {
+  const opened = await handle.stat();
+  await removeSameFile(filePath, opened);
+}
+
+function recoveryRelativeName(recoveryPath, vaultRoot) {
+  if (!vaultRoot) return path.basename(recoveryPath);
+  const rel = path.relative(path.resolve(String(vaultRoot)), recoveryPath);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return path.basename(recoveryPath);
+  return rel.split(path.sep).join("/");
+}
+
+function logRestoreFailure(recoveryPath, options) {
+  const name = recoveryRelativeName(recoveryPath, options && options.vaultRoot);
+  console.error("restore failed: " + name);
+}
+
+async function writeRecoveryFile(notePath, previous) {
+  const recoveryPath = path.join(
+    path.dirname(notePath),
+    path.basename(notePath) + "." + process.pid + "." + Math.random().toString(16).slice(2) + ".recover",
+  );
+  const flags = fsConstants.O_WRONLY
+    | fsConstants.O_CREAT
+    | fsConstants.O_EXCL
+    | fsConstants.O_NOFOLLOW
+    | fsConstants.O_NONBLOCK;
+  let handle;
+  try {
+    handle = await fs.open(recoveryPath, flags, 0o644);
+  } catch (e) {
+    if (e.code === "ELOOP" || e.code === "EEXIST" || e.code === "ENXIO") throw badPath();
+    throw e;
+  }
+  let id = null;
+  try {
+    const opened = await handle.stat();
+    id = { dev: opened.dev, ino: opened.ino };
+    await writeOpened(handle, previous);
+    await handle.sync();
+    return { path: recoveryPath, dev: id.dev, ino: id.ino };
+  } catch (error) {
+    await handle.close();
+    handle = null;
+    try { await removeSameFile(recoveryPath, id); } catch { /* the note is still unchanged */ }
+    throw error;
+  } finally {
+    if (handle) await handle.close();
+  }
+}
+
 async function writeInPlace(filePath, body, options) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const before = await lstatOrMissing(filePath);
@@ -165,9 +234,15 @@ async function writeInPlace(filePath, body, options) {
     if (options.expectFile && (opened.dev !== options.expectFile.dev || opened.ino !== options.expectFile.ino)) {
       raced = true;
     }
-    if (typeof options.afterOpen === "function") await options.afterOpen(opened);
-    if (raced) throw mismatchedFile();
+    try {
+      if (typeof options.afterOpen === "function") await options.afterOpen(opened);
+      if (raced) throw mismatchedFile();
+    } catch (error) {
+      if (creating) await removeCreatedNote(filePath, handle);
+      throw error;
+    }
     const previous = before ? await readOpened(handle, opened.size) : Buffer.alloc(0);
+    const recovery = await writeRecoveryFile(filePath, previous);
     const payload = Buffer.from(body, "utf8");
     try {
       if (typeof options.failWrite === "function") await options.failWrite();
@@ -181,10 +256,18 @@ async function writeInPlace(filePath, body, options) {
       await writeOpened(handle, payload);
       await handle.truncate(payload.length);
     } catch (error) {
-      await restoreOpened(handle, previous);
+      try {
+        if (typeof options.failRestore === "function") await options.failRestore();
+        await restoreOpened(handle, previous);
+        await removeSameFile(recovery.path, recovery);
+      } catch {
+        logRestoreFailure(recovery.path, options);
+        throw error;
+      }
       throw error;
     }
     await handle.sync();
+    await removeSameFile(recovery.path, recovery);
   } finally {
     await handle.close();
   }

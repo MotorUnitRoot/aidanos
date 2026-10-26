@@ -289,6 +289,65 @@ await check("a write that fails partway puts the original text back", async () =
   assert(error.message === "write failed", error.message);
   assert(fs.readFileSync(note, "utf8") === "original-text\n", "a partial write left mixed text");
   assert(fs.statSync(note).ino === inode, "a partial write replaced the note");
+  assert(!fs.readdirSync(dir).some((entry) => entry.endsWith(".recover")), "a successful restore left the recovery file");
+});
+
+await check("a new file created through a swapped parent is removed", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-create-"));
+  const notes = path.join(dir, "notes");
+  const outside = path.join(dir, "outside");
+  const real = path.join(dir, "notes-real");
+  fs.mkdirSync(notes);
+  fs.mkdirSync(outside);
+  const note = path.join(notes, "page.md");
+  const error = await rejects(() => writeNoteText(note, "NEW\n", {
+    swapInRequested: false,
+    beforeOpen() {
+      fs.renameSync(notes, real);
+      fs.symlinkSync(outside, notes);
+    },
+    afterOpen() {
+      const refused = new Error("parent changed");
+      refused.code = "PARENT";
+      throw refused;
+    },
+  }));
+  assert(error.code === "PARENT", error.message);
+  assert(!fs.existsSync(path.join(outside, "page.md")), "an empty file was left outside");
+  assert(!fs.existsSync(path.join(real, "page.md")), "the create landed in the real folder");
+});
+
+await check("a failed restore keeps the recovery file and logs its name", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-recover-"));
+  const vault = path.join(dir, "vault");
+  const notes = path.join(vault, "notes");
+  fs.mkdirSync(notes, { recursive: true });
+  const note = path.join(notes, "day.md");
+  await writeNoteText(note, "original-text\n", { swapInRequested: false, vaultRoot: vault });
+  assert(!fs.readdirSync(notes).some((entry) => entry.endsWith(".recover")), "a successful save left the recovery file");
+  const logged = [];
+  const previous = console.error;
+  console.error = (...args) => logged.push(args.join(" "));
+  try {
+    const error = await rejects(() => writeNoteText(note, "NEW-TEXT-THAT-DIFFERS\n", {
+      swapInRequested: false,
+      vaultRoot: vault,
+      failAfterBytes: 4,
+      failRestore() {
+        throw new Error("restore failed");
+      },
+    }));
+    assert(error.message === "write failed", error.message);
+  } finally {
+    console.error = previous;
+  }
+  const recovery = fs.readdirSync(notes).filter((entry) => entry.endsWith(".recover"));
+  assert(recovery.length === 1, "the recovery file was removed or duplicated: " + recovery.join(","));
+  assert(fs.readFileSync(path.join(notes, recovery[0]), "utf8") === "original-text\n", "the recovery file is not the old text");
+  assert(fs.readFileSync(note, "utf8").startsWith("NEW-"), "the failed restore rewrote the note");
+  const line = logged.find((entry) => entry.startsWith("restore failed: "));
+  assert(line === "restore failed: notes/" + recovery[0], "restore log was " + logged.join(" | "));
+  assert(!line.includes(dir), "restore log included a filesystem path");
 });
 
 await check("an empty env overlay keeps the vault kind", async () => {

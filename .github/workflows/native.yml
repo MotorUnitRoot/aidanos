@@ -154,7 +154,7 @@ jobs:
           test -n "$sim_id"
           curl -sf http://127.0.0.1:3757/health
           set +e
-          xcodebuild test -scheme AidanCore -destination "id=${sim_id}" -onlyUsePackageVersionsFromResolvedFile CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          xcodebuild test -scheme AidanCore -destination "id=${sim_id}" -parallel-testing-enabled NO -onlyUsePackageVersionsFromResolvedFile CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
           status=$?
           set -e
           if [ "$status" != 0 ]; then

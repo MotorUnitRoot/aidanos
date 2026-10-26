@@ -678,16 +678,56 @@ test("an allowed reset checks the token and empties the folder", async () => {
       headers: { Authorization: "Bearer " + TOKEN },
     });
     assert.equal(accepted.status, 200);
-    assert.deepEqual(await accepted.json(), { ok: true, resetting: true });
+    const acceptedBody = await accepted.json();
+    assert.equal(acceptedBody.ok, true);
+    assert.equal(acceptedBody.resetting, true);
+    assert.equal(acceptedBody.resetGeneration, 1);
     const deadline = Date.now() + 5000;
     let booted = body.bootedAt;
-    while (Date.now() < deadline && booted === body.bootedAt) {
+    let generation = body.resetGeneration;
+    while (Date.now() < deadline && (booted === body.bootedAt || generation !== acceptedBody.resetGeneration)) {
       await new Promise((resolve) => setTimeout(resolve, 20));
       const again = await fetch(relay.healthURL + "?n=" + Date.now());
-      booted = (await again.json()).bootedAt;
+      const parsed = await again.json();
+      if (again.status !== 200) continue;
+      booted = parsed.bootedAt;
+      generation = parsed.resetGeneration;
     }
     assert.notEqual(booted, body.bootedAt);
+    assert.equal(generation, acceptedBody.resetGeneration);
     assert.equal(resets, 1);
+    const [firstAgain, secondAgain] = await Promise.all([
+      fetch(relay.healthURL.replace("/health", "/reset"), {
+        method: "POST",
+        headers: { Authorization: "Bearer " + TOKEN },
+      }),
+      fetch(relay.healthURL.replace("/health", "/reset"), {
+        method: "POST",
+        headers: { Authorization: "Bearer " + TOKEN },
+      }),
+    ]);
+    assert.equal(firstAgain.status, 200);
+    assert.equal(secondAgain.status, 200);
+    const tickets = [(await firstAgain.json()).resetGeneration, (await secondAgain.json()).resetGeneration].sort(
+      (left, right) => left - right,
+    );
+    assert.deepEqual(tickets, [acceptedBody.resetGeneration + 1, acceptedBody.resetGeneration + 2]);
+    const laterTicket = tickets[1];
+    const later = Date.now() + 5000;
+    let finished = 0;
+    let finishedStatus = 0;
+    while (Date.now() < later) {
+      const again = await fetch(relay.healthURL + "?n=" + Date.now());
+      const parsed = await again.json();
+      finishedStatus = again.status;
+      finished = parsed.resetGeneration;
+      if (finishedStatus === 200 && finished >= laterTicket) break;
+      assert.ok(finished < laterTicket);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(finishedStatus, 200);
+    assert.equal(finished, laterTicket);
+    assert.equal(resets, 3);
     assert.notEqual(relay.repo, previous);
     await assert.rejects(fs.stat(path.join(vault, "leftover.txt")));
     await assert.rejects(fs.stat(path.join(vault, "notes", "hello.md")));

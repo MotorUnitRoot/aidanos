@@ -2549,6 +2549,7 @@ async function atomicWriteFile(filePath, markdown, beforeRename) {
       await writeNoteText(filePath, markdown, {
         swapInRequested: false,
         expectFile: existing,
+        vaultRoot: VAULT,
         async afterOpen() {
           await assertParents(seen);
         },

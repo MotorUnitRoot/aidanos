@@ -2412,6 +2412,59 @@ await refusedSavesStayUp("");
 await refusedSavesStayUp("noteplan");
 await refusedPictureSavesStayUp("");
 await refusedPictureSavesStayUp("noteplan");
+async function inPlaceCreateLeavesNothingOutside() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-inplace-create-"));
+  const vault = path.join(tmp, "vault");
+  const outside = path.join(tmp, "outside");
+  const hold = path.join(tmp, "hold");
+  const real = path.join(tmp, "notes-real");
+  fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, "marker.md"), "unchanged\n");
+  const port = 39640 + Math.floor(Math.random() * 70);
+  const child = spawnServer(childEnv(port, vault, {
+    AIDANOS_VAULT_KIND: "noteplan",
+    NODE_ENV: "test",
+    AIDANOS_TEST_HOLD_WRITE: hold,
+  }));
+  const base = "http://127.0.0.1:" + port;
+  try {
+    await waitHealth(base, child);
+    const put = putMarkdown(base, "/api/file?path=" + encodeURIComponent("notes/page.md"), "NEW_OUTSIDE\n");
+    const holdFile = path.join(hold, "hold");
+    const deadline = Date.now() + 4000;
+    while (!fs.existsSync(holdFile) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert(fs.existsSync(holdFile), "in-place create did not stop before the open");
+    fs.renameSync(path.join(vault, "notes"), real);
+    fs.symlinkSync(outside, path.join(vault, "notes"));
+    fs.writeFileSync(path.join(hold, "go"), "1");
+    let status = 0;
+    let text = "";
+    try {
+      const res = await put;
+      status = res.status;
+      text = res.text;
+    } catch (e) {
+      text = String(e && e.message || e);
+    }
+    await waitExit(child, 4000);
+    assert(child.exitCode != null, "in-place create through a swapped parent left the server up");
+    if (status) assert(status === 500, "in-place create got " + status + " " + text);
+    const log = child._log();
+    assert(log.includes("stopped: write PARENT") || log.includes("stopped: write RACE"), "in-place create log was " + log);
+    assert(!fs.existsSync(path.join(outside, "page.md")), "an empty created file was left outside");
+    assert(!fs.readdirSync(outside).some((entry) => entry.endsWith(".recover")), "a recovery file was left outside");
+    assert(!fs.existsSync(path.join(real, "page.md")), "the create landed in the real folder");
+    assert(fs.readFileSync(path.join(outside, "marker.md"), "utf8") === "unchanged\n", "outside file changed");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 await inPlaceSwappedParentKeepsText();
+await inPlaceCreateLeavesNothingOutside();
 await inPlaceWriteFailureExits();
 console.log("sync-path-test ok");

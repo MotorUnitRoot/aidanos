@@ -843,8 +843,8 @@ public final class AidanSession: SyncHost {
     }
 
     private func writeFileLocked(_ path: String, _ text: String) throws {
-        let url = try VaultPaths.fileURL(vault: vault, path: path)
-        try NoteFolderSave.write(Data(text.utf8), to: url)
+        let located = try VaultPaths.locate(vault: vault, path: path)
+        try NoteFolderSave.write(Data(text.utf8), to: located.url, parents: located.parents, vaultRoot: vault)
         lastWritten[path] = text
         writtenHash[path] = Self.sha(text)
         persistWritten()

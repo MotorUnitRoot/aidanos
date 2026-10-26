@@ -55,10 +55,14 @@ public enum NoteSaveStyle: Equatable, Sendable {
     /// one. AIDANOS_VAULT_KIND=noteplan forces the same in-place save. A caller
     /// cannot choose swap-in there. Other folders may swap in.
     ///
-    /// An in-place save reads the previous bytes before it writes. A failed
-    /// write or truncate puts those bytes back. The opened descriptor is
-    /// compared with the file seen before the open, and the parent directory
-    /// is checked again, both before the first new byte.
+    /// An in-place save compares the opened descriptor with the file seen
+    /// before the open, then checks every directory recorded from the vault
+    /// root down, before the first new byte. A file this call just created is
+    /// removed when that check fails, once its dev+ino still matches the
+    /// descriptor. The previous bytes are written to a recovery file in the
+    /// same folder, created with O_EXCL. A failed write or truncate puts those
+    /// bytes back and removes the recovery file. If the restore itself fails,
+    /// the recovery file stays and its vault-relative name is logged.
 public enum NoteFolderSave {
     private static let prefixes = ["icloud~co~noteplan~", "co.noteplan."]
 
@@ -86,12 +90,41 @@ public enum NoteFolderSave {
     }
 
     public static func write(_ data: Data, to url: URL, beforeRename: (() throws -> Void)? = nil) throws {
+        try write(data, to: url, parents: [], beforeRename: beforeRename)
+    }
+
+    static func write(
+        _ data: Data,
+        to url: URL,
+        parents: [DirectoryIdentity],
+        vaultRoot: URL? = nil,
+        beforeRename: (() throws -> Void)? = nil
+    ) throws {
+        let name = url.lastPathComponent
+        if !parents.isEmpty {
+            try assertParents(parents, name)
+        }
         switch style(for: url, swapInRequested: swapInRequested()) {
         case .inPlace:
-            try writeInPlace(data, to: url)
+            try writeInPlace(data, to: url, parents: parents, vaultRoot: vaultRoot)
         case .swapIn:
-            try AtomicFile.write(data, to: url, beforeRename: beforeRename)
+            try AtomicFile.write(data, to: url, beforeRename: {
+                if !parents.isEmpty {
+                    try assertParents(parents, name)
+                }
+                try beforeRename?()
+            })
         }
+    }
+
+    struct DirectoryIdentity {
+        let path: String
+        let dev: dev_t
+        let ino: ino_t
+    }
+
+    static var logRestoreFailure: (String) -> Void = { name in
+        fputs("restore failed: \(name)\n", stderr)
     }
 
     static func writeInPlace(
@@ -100,60 +133,79 @@ public enum NoteFolderSave {
         beforeOpen: (() -> Void)? = nil,
         beforeWrite: (() throws -> Void)? = nil,
         afterOpen: (() -> Void)? = nil,
-        failAfterBytes: Int? = nil
+        failAfterBytes: Int? = nil,
+        failRestore: (() throws -> Void)? = nil,
+        parents: [DirectoryIdentity] = [],
+        vaultRoot: URL? = nil
     ) throws {
+        let name = url.lastPathComponent
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let parent = try parentIdentity(directory.path, url.lastPathComponent)
+        let chain = parents.isEmpty ? [try directoryIdentity(directory.path, name)] : parents
         let before = try identity(url.path)
         if let before, before.isLink || !before.isRegular {
-            throw AidanError.io("Could not save \(url.lastPathComponent).")
+            throw AidanError.io("Could not save \(name).")
         }
         beforeOpen?()
         // O_RDWR so a failed write can read the previous bytes back onto the
         // same descriptor. An existing note is not created: a swapped parent
         // must not receive a new file.
-        let flags: Int32 = O_RDWR | O_NOFOLLOW | O_NONBLOCK | (before == nil ? (O_CREAT | O_EXCL) : 0)
+        let creating = before == nil
+        let flags: Int32 = O_RDWR | O_NOFOLLOW | O_NONBLOCK | (creating ? (O_CREAT | O_EXCL) : 0)
         let fd = url.path.withCString { open($0, flags, mode_t(0o644)) }
         if fd < 0 {
-            throw AidanError.io("Could not save \(url.lastPathComponent).")
+            throw AidanError.io("Could not save \(name).")
         }
         defer { _ = close(fd) }
         var opened = stat()
         if fstat(fd, &opened) != 0 {
-            throw AidanError.io("Could not save \(url.lastPathComponent).")
+            throw AidanError.io("Could not save \(name).")
         }
         if let before {
             if opened.st_dev != before.dev || opened.st_ino != before.ino {
-                throw AidanError.io("Could not save \(url.lastPathComponent).")
+                throw AidanError.io("Could not save \(name).")
             }
         }
         if (opened.st_mode & S_IFMT) != S_IFREG || opened.st_nlink > 1 {
-            throw AidanError.io("Could not save \(url.lastPathComponent).")
+            throw AidanError.io("Could not save \(name).")
         }
-        afterOpen?()
-        try assertParent(parent, url.lastPathComponent)
-        let previous = before == nil ? Data() : try readAll(fd, Int(opened.st_size), url.lastPathComponent)
-        try beforeWrite?()
         do {
+            afterOpen?()
+            try assertParents(chain, name)
+        } catch {
+            if creating { unlinkIfSame(url.path, fd) }
+            throw error
+        }
+        let previous = before == nil ? Data() : try readAll(fd, Int(opened.st_size), name)
+        let recovery = try writeRecovery(previous, nextTo: url, name: name)
+        do {
+            try beforeWrite?()
             if let failAfterBytes {
                 let count = min(max(failAfterBytes, 0), data.count)
                 if count > 0 {
-                    try writeAll(fd, Data(data.prefix(count)), url.lastPathComponent)
+                    try writeAll(fd, Data(data.prefix(count)), name)
                 }
-                throw AidanError.io("Could not save \(url.lastPathComponent).")
+                throw AidanError.io("Could not save \(name).")
             }
-            try writeAll(fd, data, url.lastPathComponent)
+            try writeAll(fd, data, name)
             if ftruncate(fd, off_t(data.count)) != 0 {
-                throw AidanError.io("Could not save \(url.lastPathComponent).")
+                throw AidanError.io("Could not save \(name).")
             }
-        } catch {
-            try restore(fd, previous, url.lastPathComponent)
-            throw error
+        } catch let writeError {
+            do {
+                try failRestore?()
+                try restore(fd, previous, name)
+                unlinkIfSame(recovery.url.path, recovery.dev, recovery.ino)
+            } catch {
+                logRestoreFailure(recoveryRelativeName(vaultRoot: vaultRoot, file: recovery.url))
+                throw writeError
+            }
+            throw writeError
         }
         if fsync(fd) != 0 {
-            throw AidanError.io("Could not save \(url.lastPathComponent).")
+            throw AidanError.io("Could not save \(name).")
         }
+        unlinkIfSame(recovery.url.path, recovery.dev, recovery.ino)
     }
 
     static func isSymbolicLink(_ path: String) -> Bool {
@@ -167,28 +219,79 @@ public enum NoteFolderSave {
         let isRegular: Bool
     }
 
-    private struct ParentIdentity {
-        let path: String
+    private struct RecoveryFile {
+        let url: URL
         let dev: dev_t
         let ino: ino_t
     }
 
-    private static func parentIdentity(_ path: String, _ name: String) throws -> ParentIdentity {
+    static func directoryIdentity(_ path: String, _ name: String) throws -> DirectoryIdentity {
         var info = stat()
         if lstat(path, &info) != 0 || (info.st_mode & S_IFMT) != S_IFDIR {
             throw AidanError.io("Could not save \(name).")
         }
-        return ParentIdentity(path: path, dev: info.st_dev, ino: info.st_ino)
+        return DirectoryIdentity(path: path, dev: info.st_dev, ino: info.st_ino)
     }
 
-    private static func assertParent(_ parent: ParentIdentity, _ name: String) throws {
-        var info = stat()
-        if lstat(parent.path, &info) != 0
-            || (info.st_mode & S_IFMT) != S_IFDIR
-            || info.st_dev != parent.dev
-            || info.st_ino != parent.ino {
+    private static func assertParents(_ parents: [DirectoryIdentity], _ name: String) throws {
+        for parent in parents {
+            var info = stat()
+            if lstat(parent.path, &info) != 0
+                || (info.st_mode & S_IFMT) != S_IFDIR
+                || info.st_dev != parent.dev
+                || info.st_ino != parent.ino {
+                throw AidanError.io("Could not save \(name).")
+            }
+        }
+    }
+
+    private static func unlinkIfSame(_ path: String, _ fd: Int32) {
+        var opened = stat()
+        if fstat(fd, &opened) != 0 { return }
+        unlinkIfSame(path, opened.st_dev, opened.st_ino)
+    }
+
+    private static func unlinkIfSame(_ path: String, _ dev: dev_t, _ ino: ino_t) {
+        var listed = stat()
+        if lstat(path, &listed) != 0 { return }
+        if (listed.st_mode & S_IFMT) == S_IFLNK { return }
+        if listed.st_dev != dev || listed.st_ino != ino { return }
+        _ = path.withCString { unlink($0) }
+    }
+
+    private static func writeRecovery(_ previous: Data, nextTo url: URL, name: String) throws -> RecoveryFile {
+        let recovery = url.deletingLastPathComponent()
+            .appendingPathComponent("\(url.lastPathComponent).\(UUID().uuidString).recover")
+        let fd = recovery.path.withCString { open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK, mode_t(0o644)) }
+        if fd < 0 {
             throw AidanError.io("Could not save \(name).")
         }
+        defer { _ = close(fd) }
+        var opened = stat()
+        if fstat(fd, &opened) != 0 {
+            throw AidanError.io("Could not save \(name).")
+        }
+        do {
+            try writeAll(fd, previous, name)
+            if fsync(fd) != 0 {
+                throw AidanError.io("Could not save \(name).")
+            }
+        } catch {
+            unlinkIfSame(recovery.path, fd)
+            throw error
+        }
+        return RecoveryFile(url: recovery, dev: opened.st_dev, ino: opened.st_ino)
+    }
+
+    private static func recoveryRelativeName(vaultRoot: URL?, file: URL) -> String {
+        guard let root = vaultRoot?.standardizedFileURL.path, !root.isEmpty else {
+            return file.lastPathComponent
+        }
+        let prefix = root.hasSuffix("/") ? root : root + "/"
+        if file.path.hasPrefix(prefix) {
+            return String(file.path.dropFirst(prefix.count))
+        }
+        return file.lastPathComponent
     }
 
     private static func readAll(_ fd: Int32, _ count: Int, _ name: String) throws -> Data {
@@ -305,10 +408,18 @@ enum VaultPaths {
         return parts.joined(separator: "/")
     }
 
+    struct LocatedFile {
+        let url: URL
+        let parents: [NoteFolderSave.DirectoryIdentity]
+    }
+
     /// The file inside the vault. A symlink anywhere along the path is refused.
-    static func fileURL(vault: URL, path: String) throws -> URL {
+    /// Each directory from the vault root down is recorded by dev+ino so the
+    /// save can check the same folders after it opens the note.
+    static func locate(vault: URL, path: String) throws -> LocatedFile {
         let safe = try check(path)
         let root = URL(fileURLWithPath: vault.path).standardizedFileURL.path
+        var parents = [try NoteFolderSave.directoryIdentity(root, safe)]
         var current = root
         let parts = safe.split(separator: "/").map(String.init)
         for (index, part) in parts.enumerated() {
@@ -325,12 +436,19 @@ enum VaultPaths {
             if !exists && !isLast {
                 try FileManager.default.createDirectory(atPath: current, withIntermediateDirectories: false)
             }
+            if !isLast {
+                parents.append(try NoteFolderSave.directoryIdentity(current, safe))
+            }
         }
         let target = URL(fileURLWithPath: current).standardizedFileURL.path
         if target != root && !target.hasPrefix(root.hasSuffix("/") ? root : root + "/") {
             throw AidanError.badPath(path)
         }
-        return URL(fileURLWithPath: current)
+        return LocatedFile(url: URL(fileURLWithPath: current), parents: parents)
+    }
+
+    static func fileURL(vault: URL, path: String) throws -> URL {
+        try locate(vault: vault, path: path).url
     }
 
     private static func isSymbolicLink(_ path: String) -> Bool {

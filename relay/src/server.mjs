@@ -115,13 +115,14 @@ function rejectUpgrade(socket) {
   socket.destroy();
 }
 
-function health(gitState, bootedAt, syncUp) {
+function health(gitState, bootedAt, syncUp, resetGeneration) {
   return JSON.stringify({
     ok: syncUp,
     status: syncUp ? "ok" : "sync down",
     git: gitState.status === "ok",
     gitStatus: gitState.status,
     bootedAt,
+    resetGeneration,
   });
 }
 
@@ -489,6 +490,10 @@ export async function startRelay(options = {}) {
   }
 
   let bootedAt = new Date().toISOString();
+  // Finished resets. A caller waits for its own ticket: an earlier queued
+  // reset can change bootedAt before this request's rotate runs.
+  let resetGeneration = 0;
+  let resetQueued = 0;
   const allowReset = options.allowReset === true;
   const servers = [];
   let live = null;
@@ -576,6 +581,7 @@ export async function startRelay(options = {}) {
         if (typeof options.beforeReopen === "function") await options.beforeReopen();
         live = await openSession();
         bootedAt = new Date().toISOString();
+        resetGeneration += 1;
         if (api) api.repo = live.repo;
         logSafe(secrets, "reset complete");
         if (typeof options.onReset === "function") options.onReset();
@@ -599,7 +605,7 @@ export async function startRelay(options = {}) {
       const pathOnly = String(req.url || "").split("?")[0];
       if (pathOnly === "/health") {
         const syncUp = live != null;
-        const body = health(gitState, bootedAt, syncUp);
+        const body = health(gitState, bootedAt, syncUp, resetGeneration);
         res.writeHead(syncUp ? 200 : 503, {
           "content-type": "application/json",
           "content-length": Buffer.byteLength(body),
@@ -634,7 +640,9 @@ export async function startRelay(options = {}) {
               res.end(refused);
               return;
             }
-            const body = JSON.stringify({ ok: true, resetting: true });
+            resetQueued += 1;
+            const ticket = resetQueued;
+            const body = JSON.stringify({ ok: true, resetting: true, resetGeneration: ticket });
             res.writeHead(200, {
               "content-type": "application/json",
               "content-length": Buffer.byteLength(body),

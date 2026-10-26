@@ -23,6 +23,10 @@ final class SyncTests: XCTestCase {
         let path = "log/\(UUID().uuidString)/2026-10-21.md"
         let phone = try AidanSession(vault: phoneVault)
         let mac = try AidanSession(vault: macVault)
+        defer {
+            phone.disconnect()
+            mac.disconnect()
+        }
         try phone.connect(relayURL: relay.url, token: relay.token)
         try mac.connect(relayURL: relay.url, token: relay.token)
         try phone.replace(path, with: "Hello")
@@ -34,7 +38,12 @@ final class SyncTests: XCTestCase {
             }
             return true
         }
-        XCTAssertTrue(shared)
+        guard shared else {
+            let phoneText = (try? phone.text(path)) ?? ""
+            let macText = (try? mac.text(path)) ?? ""
+            XCTFail("the shared Hello never arrived (phone=\(phoneText) mac=\(macText)); later edits would have no common base")
+            return
+        }
         phone.disconnect()
         mac.disconnect()
         try phone.replace(path, with: "Hello PHONE")
@@ -65,8 +74,6 @@ final class SyncTests: XCTestCase {
             }
             XCTAssertTrue(copied)
         }
-        phone.disconnect()
-        mac.disconnect()
     }
 
     func testSameDayNoteCreatedTwice() throws {
@@ -819,8 +826,10 @@ private final class TestRelay {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let done = DispatchSemaphore(value: 0)
         var status = 0
-        let task = URLSession.shared.dataTask(with: request) { _, response, _ in
+        var responseBody = Data()
+        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
             status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if let data { responseBody = data }
             done.signal()
         }
         task.resume()
@@ -832,22 +841,37 @@ private final class TestRelay {
         if status != 200 {
             throw AidanError.io("The test relay did not reset (\(status)).")
         }
-        // A reset that follows a live sync can keep the relay busy for more
-        // than a minute. The next test has to wait until health reports a
-        // new start. A probe that never answers is cancelled so it does not
-        // hold on to the relay's connections.
+        let ticket = Self.integer(Self.jsonObject(responseBody)?["resetGeneration"])
+        // The POST returns before the folder is empty. A new bootedAt can
+        // belong to a reset that was already queued, and this request's
+        // rotate would then wipe a note the test just wrote. Wait until
+        // health reports this request's generation. A probe that never
+        // answers is cancelled so it does not hold the relay's connections.
         let deadline = Date().addingTimeInterval(120)
         while Date() < deadline {
             let probe = URL(string: "http://127.0.0.1:3757/health?n=\(UUID().uuidString)")
-            if let probe, let booted = try? Self.bootedAt(probe), booted != before {
-                return
+            if let probe, let health = try? Self.relayHealth(probe) {
+                if let ticket {
+                    if health.resetGeneration >= ticket { return }
+                } else if health.bootedAt != before {
+                    return
+                }
             }
             Thread.sleep(forTimeInterval: 0.05)
         }
         throw AidanError.io("The test relay did not come back.")
     }
 
+    private struct RelayHealth {
+        var bootedAt: String
+        var resetGeneration: Int
+    }
+
     private static func bootedAt(_ url: URL) throws -> String? {
+        try relayHealth(url)?.bootedAt
+    }
+
+    private static func relayHealth(_ url: URL) throws -> RelayHealth? {
         let done = DispatchSemaphore(value: 0)
         var body = Data()
         var failed = false
@@ -866,8 +890,18 @@ private final class TestRelay {
             return nil
         }
         if failed { return nil }
-        let parsed = try JSONSerialization.jsonObject(with: body) as? [String: Any]
-        return parsed?["bootedAt"] as? String
+        guard let parsed = jsonObject(body), let booted = parsed["bootedAt"] as? String else { return nil }
+        return RelayHealth(bootedAt: booted, resetGeneration: integer(parsed["resetGeneration"]) ?? 0)
+    }
+
+    private static func jsonObject(_ data: Data) -> [String: Any]? {
+        (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private static func integer(_ value: Any?) -> Int? {
+        if let number = value as? Int { return number }
+        if let number = value as? NSNumber { return number.intValue }
+        return nil
     }
     #else
     private init(url: String, token: String, vault: URL, data: URL, port: Int, server: URL, running: RunningRelay) {

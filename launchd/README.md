@@ -8,11 +8,11 @@ Do not bake the Mac vault path into the start script.
 
 ## Paths to edit before load
 
-The plist uses placeholders:
+The plist uses these absolute paths:
 
 - Node binary: /usr/local/bin/node (Homebrew may be /opt/homebrew/bin/node)
-- Slice: /Users/colby/Grok/motorunit/dashboard
-- Vault: /Users/colby/Grok/motorunit
+- Slice: /Users/colbynricker/Grok/motorunit/dashboard
+- Vault: /Users/colbynricker/Grok/motorunit
 
 launchd does not inherit a login PATH, so ProgramArguments must be absolute.
 
@@ -20,7 +20,7 @@ launchd does not inherit a login PATH, so ProgramArguments must be absolute.
 
 ```sh
 mkdir -p ~/Library/Logs/aidanos
-cp /Users/colby/Grok/motorunit/dashboard/launchd/com.aidanos.plist ~/Library/LaunchAgents/com.aidanos.plist
+cp /Users/colbynricker/Grok/motorunit/dashboard/launchd/com.aidanos.plist ~/Library/LaunchAgents/com.aidanos.plist
 launchctl load ~/Library/LaunchAgents/com.aidanos.plist
 ```
 
@@ -39,11 +39,11 @@ On the Linux sit machine, ./start.sh is the keep-alive (setsid or nohup npm star
 Same process, foreground:
 
 ```sh
-cd /Users/colby/Grok/motorunit/dashboard
+cd /Users/colbynricker/Grok/motorunit/dashboard
 node server.mjs
 ```
 
 package.json start script runs that same node process without launchd.
 Honors an existing AIDANOS_VAULT env and otherwise uses the sibling vault folder next to the server.
-On the Mac, the plist sets that env to /Users/colby/Grok/motorunit.
+On the Mac, the plist sets that env to /Users/colbynricker/Grok/motorunit.
 Plist EnvironmentVariables key: AIDANOS_VAULT

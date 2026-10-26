@@ -887,10 +887,7 @@ async function readableTarget(abs, root) {
     if (e.code === "ENOENT") return null;
     throw new Error("bad path");
   }
-  if (!st.isSymbolicLink()) {
-    refuseServedFile(st);
-    return abs;
-  }
+  if (!st.isSymbolicLink()) return abs;
   try {
     await resolveInside(root, abs);
   } catch (e) {
@@ -912,14 +909,6 @@ async function readableTarget(abs, root) {
     throw new Error("bad path");
   }
   if (!contained(real, rootReal) || realPathInGit(real, rootReal)) throw new Error("bad path");
-  let followed;
-  try {
-    followed = await fs.lstat(real);
-  } catch (e) {
-    if (e.code === "ENOENT") return null;
-    throw new Error("bad path");
-  }
-  refuseServedFile(followed);
   return real;
 }
 

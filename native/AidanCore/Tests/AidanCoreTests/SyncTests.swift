@@ -30,7 +30,11 @@ final class SyncTests: XCTestCase {
         try phone.connect(relayURL: relay.url, token: relay.token)
         try mac.connect(relayURL: relay.url, token: relay.token)
         try phone.replace(path, with: "Hello")
-        let shared = try waitUntil(seconds: 8) {
+        // The first index round trip took 9.6s on the simulator in run
+        // 40416129009, and the note reply was still missing 11s after the
+        // request. Eight seconds ends before that reply. This is the same
+        // arrival the other two-device tests already wait 20s for.
+        let shared = try waitUntil(seconds: 24) {
             guard (try? phone.text(path)) == "Hello", (try? mac.text(path)) == "Hello" else { return false }
             if let relayVault = relay.vault {
                 let file = try? String(contentsOf: relayVault.appendingPathComponent(path), encoding: .utf8)
@@ -54,7 +58,9 @@ final class SyncTests: XCTestCase {
         try phone.connect(relayURL: relay.url, token: relay.token)
         try mac.connect(relayURL: relay.url, token: relay.token)
         let allowed = ["Hello PHONE MAC", "Hello MAC PHONE"]
-        let merged = try waitUntil(seconds: 12) {
+        // Same cold round trip as the shared base. Twelve seconds ended
+        // before one reply in run 40416129009.
+        let merged = try waitUntil(seconds: 24) {
             guard let left = try? phone.text(path), let right = try? mac.text(path) else { return false }
             return left == right && allowed.contains(left)
         }

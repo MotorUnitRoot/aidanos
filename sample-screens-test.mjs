@@ -641,23 +641,26 @@ try {
     await evalJs(`showEditorState("loading")`);
     const quiet = await evalJs(`document.getElementById("editor-note").hidden === true && !(document.getElementById("paper").innerText || "").trim()`);
     assert(quiet === true, "loading spoke before a second or kept the note");
-    await sleep(1100);
-    const ready = await evalJs(`(() => {
-      const paper = document.getElementById("paper");
-      const title = document.getElementById("paper-title");
-      const week = document.querySelector(".week-row");
-      const note = document.getElementById("editor-note");
-      const titleBox = title.getBoundingClientRect();
-      const weekBox = week.getBoundingClientRect();
-      return !document.querySelector(".spinner, [aria-busy='true']")
-        && !(paper.innerText || "").trim()
-        && (title.textContent || "").length > 0
-        && week.querySelectorAll(".day-card").length === 7
-        && note.hidden === false
-        && note.textContent === "Opening\u2026"
-        && titleBox.top >= weekBox.bottom - 1;
-    })()`);
-    assert(ready === true, "loading did not show the week, the title, and Opening");
+    // The notice is a one-second timer. A fixed 1100ms sleep raced that timer
+    // on the macOS runner (run 40416128991): Opening had not been drawn yet.
+    await waitFor(async () => {
+      const ready = await evalJs(`(() => {
+        const paper = document.getElementById("paper");
+        const title = document.getElementById("paper-title");
+        const week = document.querySelector(".week-row");
+        const note = document.getElementById("editor-note");
+        const titleBox = title.getBoundingClientRect();
+        const weekBox = week.getBoundingClientRect();
+        return !document.querySelector(".spinner, [aria-busy='true']")
+          && !(paper.innerText || "").trim()
+          && (title.textContent || "").length > 0
+          && week.querySelectorAll(".day-card").length === 7
+          && note.hidden === false
+          && note.textContent === "Opening\u2026"
+          && titleBox.top >= weekBox.bottom - 1;
+      })()`);
+      return ready === true ? true : ready;
+    }, 4000, "loading did not show the week, the title, and Opening");
     const width = await evalJs(`document.documentElement.clientWidth`);
     if (width === 1280 && openedEdge) {
       const loadingEdge = await paperEdge();

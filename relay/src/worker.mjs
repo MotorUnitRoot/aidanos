@@ -1,0 +1,454 @@
+// Sync worker. The accept thread keeps the sockets and the token.
+// This thread owns the repo, the storage adapter, and the markdown mirror.
+import { parentPort, workerData } from "node:worker_threads";
+import { formatWithOptions } from "node:util";
+import * as Automerge from "@automerge/automerge";
+import { next as AutomergeNext } from "@automerge/automerge/slim";
+import { Repo, NetworkAdapter } from "@automerge/automerge-repo";
+import { decode, encode } from "@automerge/automerge-repo/helpers/cbor.js";
+import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
+import { frameToTransfer, writeSlot } from "./channel.mjs";
+import { INDEX_ID } from "./ids.mjs";
+import {
+  beginFrame,
+  beginIndexRequest,
+  finishIndexReply,
+  installIndexTrace,
+  watchRepo,
+  traceStorage,
+} from "./index-trace.mjs";
+import { createMirror } from "./mirror.mjs";
+import { logSafe } from "./redact.mjs";
+import { SafeStorage, refuseSymlinkedStorage, storageFolderFault } from "./storage-safe.mjs";
+
+const INDEX_TYPES = new Set(["request", "sync", "doc-unavailable"]);
+
+function warmSyncEngine() {
+  const local = AutomergeNext.init();
+  const remote = AutomergeNext.init();
+  let localState = AutomergeNext.initSyncState();
+  let remoteState = AutomergeNext.initSyncState();
+  const generated = AutomergeNext.generateSyncMessage(local, localState);
+  localState = generated[0];
+  const request = generated[1];
+  if (!request) return;
+  Automerge.decodeSyncMessage(request);
+  const received = AutomergeNext.receiveSyncMessage(remote, remoteState, request);
+  remoteState = received[1];
+  const reply = AutomergeNext.generateSyncMessage(received[0], remoteState);
+  if (reply[1]) AutomergeNext.receiveSyncMessage(local, localState, reply[1]);
+  AutomergeNext.decodeSyncState(AutomergeNext.encodeSyncState(localState));
+}
+
+function post(message, transfer) {
+  parentPort.postMessage(message, transfer || []);
+}
+
+function savedBinary(doc) {
+  if (!doc) return null;
+  const saved = Automerge.save(doc);
+  return frameToTransfer(saved);
+}
+
+class ParentAdapter extends NetworkAdapter {
+  constructor() {
+    super();
+    this.repo = null;
+    this.byConn = new Map();
+    this.byPeer = new Map();
+    this.#ready = false;
+    this.#readyPromise = new Promise((resolve) => {
+      this.#readyResolver = resolve;
+    });
+  }
+
+  #ready;
+  #readyResolver;
+  #readyPromise;
+
+  isReady() {
+    return this.#ready;
+  }
+
+  whenReady() {
+    return this.#readyPromise;
+  }
+
+  connect(peerId, peerMetadata) {
+    this.peerId = peerId;
+    this.peerMetadata = peerMetadata;
+    if (!this.#ready) {
+      this.#ready = true;
+      this.#readyResolver();
+    }
+  }
+
+  disconnect() {
+    this.emit("close");
+  }
+
+  send(message) {
+    if (!message || message.targetId == null) return;
+    const conn = this.byPeer.get(message.targetId);
+    if (conn == null) return;
+    let encoded;
+    try {
+      encoded = encode(message);
+    } catch {
+      return;
+    }
+    const copy = frameToTransfer(encoded);
+    if (!copy) return;
+    const docId = typeof message.documentId === "string" ? message.documentId : "";
+    if (docId === INDEX_ID && INDEX_TYPES.has(message.type)) finishIndexReply();
+    post({ v: 1, kind: "msg", conn, data: copy }, [copy]);
+  }
+
+  open(conn, peerId, metadata) {
+    if (!peerId) return;
+    const previous = this.byPeer.get(peerId);
+    if (previous != null && previous !== conn) {
+      this.emit("peer-disconnected", { peerId });
+    }
+    this.byConn.set(conn, peerId);
+    this.byPeer.set(peerId, conn);
+    this.emit("peer-candidate", { peerId, peerMetadata: metadata || null });
+  }
+
+  inbound(conn, data) {
+    const peerId = this.byConn.get(conn);
+    if (!peerId) return;
+    let message;
+    try {
+      message = decode(Buffer.from(data));
+    } catch {
+      return;
+    }
+    if (!message || typeof message !== "object") return;
+    if (message.senderId && message.senderId !== peerId) return;
+    const docId = typeof message.documentId === "string" ? message.documentId : "";
+    // A multi-megabyte flood is not decoded as an Automerge sync message here.
+    // The repo catches a bad payload. Heads stay off this path.
+    if (docId) beginFrame(docId);
+    if (docId === INDEX_ID && INDEX_TYPES.has(message.type)) beginIndexRequest(this.repo);
+    this.emit("message", message);
+  }
+
+  closeConn(conn) {
+    const peerId = this.byConn.get(conn);
+    if (!peerId) return;
+    this.byConn.delete(conn);
+    if (this.byPeer.get(peerId) === conn) {
+      this.byPeer.delete(peerId);
+      this.emit("peer-disconnected", { peerId });
+    }
+  }
+}
+
+async function preloadStoredNotes(repo) {
+  const storage = repo.storageSubsystem;
+  if (!storage || typeof storage.loadDoc !== "function") return;
+  const index = await storage.loadDoc(INDEX_ID);
+  if (!index) return;
+  await repo.find(INDEX_ID);
+  const paths = index.paths && typeof index.paths === "object" ? index.paths : {};
+  for (const id of Object.values(paths)) {
+    if (typeof id !== "string" || !id) continue;
+    const stored = await storage.loadDoc(id);
+    if (!stored) continue;
+    await repo.find(id);
+  }
+}
+
+function bytesOf(binary) {
+  if (!binary) return null;
+  if (binary instanceof Uint8Array) return binary;
+  if (binary instanceof ArrayBuffer) return new Uint8Array(binary);
+  if (ArrayBuffer.isView(binary)) return new Uint8Array(binary.buffer, binary.byteOffset, binary.byteLength);
+  return null;
+}
+
+async function run() {
+  const data = workerData || {};
+  const test = process.env.NODE_ENV === "test" && data.test ? data.test : null;
+  const slot = data.slot;
+  const wake = data.wake;
+  let busyUsed = false;
+  let oomUsed = false;
+  let badUsed = false;
+  const queue = [];
+  let draining = false;
+  let stopped = false;
+  let readyForWork = false;
+  // Attach this before anything is posted. The parent can send as soon as it
+  // sees "ready", and a message that arrives earlier must not be dropped.
+  parentPort.on("message", (msg) => {
+    if (msg && msg.kind === "ping") {
+      post({ v: 1, kind: "pong" });
+      return;
+    }
+    queue.push(msg);
+    if (readyForWork) drain();
+  });
+  console.error = (...args) => {
+    const line = formatWithOptions({ colors: false }, ...args);
+    try {
+      post({ v: 1, kind: "log", line });
+    } catch {
+      // The parent is already gone.
+    }
+  };
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("AIDANOS_")) {
+      logSafe([], "worker saw AIDANOS_ env");
+      break;
+    }
+  }
+  await installIndexTrace((line) => logSafe([], line), { thread: "worker" });
+  try {
+    await refuseSymlinkedStorage(data.dataDir);
+    const fault = storageFolderFault(data.dataDir);
+    if (fault) throw new Error("storage folder failed the owner walk");
+  } catch {
+    post({ v: 1, kind: "startup-error", reason: "startup failed" });
+    process.exit(1);
+  }
+  warmSyncEngine();
+  const inner = new NodeFSStorageAdapter(data.dataDir);
+  const storage = traceStorage(new SafeStorage(data.dataDir, inner));
+  const adapter = new ParentAdapter();
+  const repo = new Repo({
+    storage,
+    network: [adapter],
+    sharePolicy: async () => true,
+    peerId: data.peerId || "aidanos-relay",
+  });
+  adapter.repo = repo;
+  watchRepo(repo);
+  const debounce = Number(data.mirrorDebounceMs);
+  const mirror = createMirror({
+    repo,
+    vault: data.vault,
+    debounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
+    secrets: [],
+  });
+  await preloadStoredNotes(repo);
+  await mirror.now();
+  const peerMetadata = await repo.networkSubsystem.peerMetadata;
+  if (!adapter.peerId) throw new Error("The sync engine was not ready.");
+  post({
+    v: 1,
+    kind: "ready",
+    peerId: adapter.peerId,
+    peerMetadata: peerMetadata || null,
+  });
+  readyForWork = true;
+  drain();
+  if (test && test.crashOnBoot) {
+    setTimeout(() => process.exit(1), 40);
+  }
+
+  async function rpc(msg) {
+    const method = msg.method;
+    if (method === "import") {
+      const bytes = bytesOf(msg.binary);
+      if (!bytes || !msg.docId) throw new Error("failed");
+      repo.import(bytes, { docId: msg.docId });
+      return { result: { ok: true }, transfer: [] };
+    }
+    if (method === "find") {
+      const handle = await repo.find(msg.docId);
+      const binary = savedBinary(handle.doc());
+      if (!binary) throw new Error("failed");
+      return { result: { binary }, transfer: [binary] };
+    }
+    if (method === "flush") {
+      await repo.flush();
+      return { result: { ok: true }, transfer: [] };
+    }
+    if (method === "loadDoc") {
+      const loaded = await repo.storageSubsystem.loadDoc(msg.docId);
+      if (!loaded) return { result: { binary: null }, transfer: [] };
+      const binary = savedBinary(loaded);
+      return { result: { binary }, transfer: binary ? [binary] : [] };
+    }
+    if (method === "replace") {
+      const bytes = bytesOf(msg.binary);
+      if (!bytes || !msg.docId) throw new Error("failed");
+      const incoming = Automerge.load(bytes);
+      const handle = repo.handles[msg.docId];
+      if (!handle) repo.import(Automerge.save(incoming), { docId: msg.docId });
+      else handle.update((doc) => Automerge.merge(doc, incoming));
+      return { result: { ok: true }, transfer: [] };
+    }
+    if (method === "mirrorNow") {
+      await mirror.now();
+      const docs = [];
+      const transfer = [];
+      const ids = Array.isArray(msg.ids) ? msg.ids : [];
+      for (const id of ids) {
+        const handle = repo.handles[id];
+        if (!handle) continue;
+        let binary = null;
+        try {
+          binary = savedBinary(handle.doc());
+        } catch {
+          binary = null;
+        }
+        if (!binary) continue;
+        docs.push({ id, binary });
+        transfer.push(binary);
+      }
+      return { result: { docs }, transfer };
+    }
+    if (method === "idle") {
+      await mirror.idle();
+      return { result: { ok: true }, transfer: [] };
+    }
+    if (method === "stop") {
+      mirror.stop();
+      return { result: { ok: true }, transfer: [] };
+    }
+    throw new Error("failed");
+  }
+
+  function holdBusy() {
+    if (!test || !test.busyMs || busyUsed) return false;
+    busyUsed = true;
+    post({ v: 1, kind: "holding" });
+    Atomics.wait(new Int32Array(wake), 0, 0, test.busyMs);
+    post({ v: 1, kind: "holding", done: true });
+    return true;
+  }
+
+  function runOom() {
+    if (!test || !test.oom || oomUsed) return;
+    oomUsed = true;
+    const junk = [];
+    try {
+      for (;;) {
+        const block = [];
+        for (let i = 0; i < 64; i += 1) block.push({ n: i, text: "x".repeat(4096) });
+        junk.push(block);
+      }
+    } catch {
+      process.exit(1);
+    }
+  }
+
+  async function handle(msg) {
+    if (!msg || msg.v !== 1) return;
+    if (msg.kind === "shutdown") {
+      stopped = true;
+      mirror.stop();
+      try {
+        await mirror.idle();
+      } catch {
+        // The mirror already stopped.
+      }
+      try {
+        await repo.flush();
+      } catch {
+        // The folder may already be gone.
+      }
+      process.exit(0);
+    }
+    if (msg.kind === "rpc") {
+      try {
+        const answered = await rpc(msg);
+        post({ v: 1, kind: "rpc", id: msg.id, ok: true, result: answered.result }, answered.transfer);
+      } catch {
+        post({ v: 1, kind: "rpc", id: msg.id, ok: false, error: "failed" });
+      }
+      return;
+    }
+    if (msg.kind === "open") {
+      adapter.open(msg.conn, msg.peerId, msg.peerMetadata);
+      return;
+    }
+    if (msg.kind === "close") {
+      adapter.closeConn(msg.conn);
+      return;
+    }
+    if (msg.kind === "msg") {
+      const docId = documentIdOf(msg.data);
+      writeSlot(slot, msg.conn, docId);
+      if (test && test.badChannel && !badUsed) {
+        badUsed = true;
+        const stray = frameToTransfer(msg.data);
+        if (stray) post({ v: 1, kind: "msg", conn: 987654321, data: stray }, [stray]);
+        post({ v: 1, kind: "close", conn: msg.conn, code: 1003 });
+        post({ v: 1, kind: "not-a-kind" });
+      }
+      if (test && test.echo && msg.data instanceof ArrayBuffer) {
+        const copy = frameToTransfer(msg.data);
+        if (copy) post({ v: 1, kind: "echo", conn: msg.conn, data: copy }, [copy]);
+      }
+      // Leave the slot in place when the thread is about to die. A finally
+      // that cleared it would hide the document from the parent.
+      let keepSlot = false;
+      try {
+        if (test && test.crash && docId) {
+          keepSlot = true;
+          process.exit(1);
+        }
+        if (docId) holdBusy();
+        if (docId) runOom();
+        adapter.inbound(msg.conn, msg.data);
+      } finally {
+        if (!keepSlot) {
+          const size = msg.data instanceof ArrayBuffer ? msg.data.byteLength : 0;
+          post({ v: 1, kind: "ack", conn: msg.conn, bytes: size });
+          writeSlot(slot, msg.conn, "");
+        }
+      }
+    }
+  }
+
+  async function drain() {
+    if (draining) return;
+    draining = true;
+    try {
+      while (queue.length && !stopped) {
+        const next = queue.shift();
+        await handle(next);
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    } finally {
+      draining = false;
+      if (queue.length && !stopped) drain();
+    }
+  }
+
+}
+
+function documentIdOf(data) {
+  if (!(data instanceof ArrayBuffer)) return "";
+  try {
+    const message = decode(Buffer.from(data));
+    if (!message || typeof message !== "object") return "";
+    return typeof message.documentId === "string" ? message.documentId : "";
+  } catch {
+    return "";
+  }
+}
+
+process.on("uncaughtException", () => {
+  try {
+    logSafe([], "worker fatal");
+  } catch {
+    // The parent may already be gone.
+  }
+  process.exit(1);
+});
+
+if (parentPort) {
+  run().catch(() => {
+    try {
+      post({ v: 1, kind: "startup-error", reason: "startup failed" });
+    } catch {
+      // The parent may already be gone.
+    }
+    process.exit(1);
+  });
+}

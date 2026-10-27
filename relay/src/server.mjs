@@ -4,28 +4,28 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import * as Automerge from "@automerge/automerge";
 import { next as AutomergeNext } from "@automerge/automerge/slim";
-import { Repo, isValidDocumentId } from "@automerge/automerge-repo";
-import { decode } from "@automerge/automerge-repo/helpers/cbor.js";
-import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
-import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
+import { isValidDocumentId } from "@automerge/automerge-repo";
+import { decode, encode } from "@automerge/automerge-repo/helpers/cbor.js";
 import { listenHosts } from "./bind.mjs";
+import { planBudget } from "./budget.mjs";
+import {
+  HEALTH_CRASH_LOOP,
+  HEALTH_OK,
+  HEALTH_SILENT,
+  HEALTH_SYNC_DOWN,
+  HEALTH_WARMING,
+  WORKER_SILENT_MS,
+  frameToTransfer,
+} from "./channel.mjs";
 import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
-import {
-  beginFrame,
-  beginIndexRequest,
-  finishIndexReply,
-  installIndexTrace,
-  noteGitWork,
-  traceStorage,
-  watchRepo,
-} from "./index-trace.mjs";
-import { createMirror } from "./mirror.mjs";
-import { installFileLog, logFatal, logSafe, stampLine } from "./redact.mjs";
-import { describeSyncFrame } from "./sync-log.mjs";
+import { installIndexTrace, noteGitWork } from "./index-trace.mjs";
+import { installFileLog, logFatal, logSafe, redact, stampLine } from "./redact.mjs";
+import { refuseSymlinkedStorage, storageFolderFault } from "./storage-safe.mjs";
+import { createWorkerHost } from "./worker-host.mjs";
 
 const DEFAULT_PORT = 3750;
 const MIN_TOKEN_LENGTH = 32;
@@ -178,15 +178,22 @@ export function warmSyncEngine() {
   AutomergeNext.decodeSyncState(AutomergeNext.encodeSyncState(localState));
 }
 
-function health(gitState, bootedAt, syncUp, resetGeneration) {
+function health(gitState, bootedAt, status, resetGeneration) {
+  const syncUp = status === HEALTH_OK;
   return JSON.stringify({
     ok: syncUp,
-    status: syncUp ? "ok" : "sync down",
+    status,
     git: gitState.status === "ok",
     gitStatus: gitState.status,
     bootedAt,
     resetGeneration,
   });
+}
+
+function selectProtocol(versions) {
+  if (versions === undefined) return "1";
+  if (Array.isArray(versions) && versions.includes("1")) return "1";
+  return null;
 }
 
 export function parseArgs(argv) {
@@ -505,9 +512,12 @@ export async function startRelay(options = {}) {
   const gitUrl = String(options.gitUrl ?? env.AIDANOS_RELAY_GIT_URL ?? "").trim();
   const gitToken = String(options.gitToken ?? env.AIDANOS_RELAY_GIT_TOKEN ?? "").trim();
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
-  await installIndexTrace((line) => logSafe(secrets, line));
+  await installIndexTrace((line) => logSafe(secrets, line), { thread: "main" });
   await assertNotClientVault(vault);
+  // A symlink is refused before any marker is written through it.
+  await refuseSymlinkedStorage(dataDir);
   await claimRelayFolders(vault, dataDir);
+  if (storageFolderFault(dataDir)) throw new Error("storage folder failed the owner walk");
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
   const failures = new Map();
@@ -561,115 +571,113 @@ export async function startRelay(options = {}) {
   const allowReset = options.allowReset === true;
   const servers = [];
   let live = null;
+  let everLive = false;
   let resetChain = Promise.resolve();
   let api = null;
+  const sockets = new Map();
+  const peers = new Map();
+  let nextConn = 1;
+  let budgetTimer = null;
+  let keepAliveTimer = null;
 
-  // One adapter must not see the shared server. disconnect() walks
-  // server.clients and terminates every socket, and the "close" listener
-  // runs that for whichever adapter heard it. A timed-out open that finishes
-  // after the retry is live used to emit close on the shared server and
-  // remove its listeners, so sync died while /health still said 200.
-  function sessionSockets(wss) {
-    const connectionListeners = new Map();
-    const closeListeners = new Map();
-    const mine = new Set();
-    let released = false;
-    const view = {
-      on(event, fn) {
-        if (event === "connection") {
-          const wrapped = (socket, request) => {
-            mine.add(socket);
-            socket.once("close", () => mine.delete(socket));
-            fn(socket, request);
-          };
-          connectionListeners.set(fn, wrapped);
-          wss.on("connection", wrapped);
-          return;
-        }
-        if (event === "close") closeListeners.set(fn, fn);
-      },
-      off(event, fn) {
-        if (event === "connection") {
-          const wrapped = connectionListeners.get(fn);
-          if (!wrapped) return;
-          connectionListeners.delete(fn);
-          try { wss.removeListener("connection", wrapped); } catch { /* already gone */ }
-          return;
-        }
-        if (event === "close") closeListeners.delete(fn);
-      },
-      get clients() {
-        return mine;
-      },
-    };
-    function release(keepSockets) {
-      if (released) return;
-      released = true;
-      // The shared sockets belong to the live adapter. Clearing this set
-      // before disconnect() means that call terminates nothing.
-      if (keepSockets) mine.clear();
-      for (const fn of [...closeListeners.values()]) {
-        try { fn(); } catch { /* the adapter clears its timer here */ }
-      }
-      for (const wrapped of connectionListeners.values()) {
-        try { wss.removeListener("connection", wrapped); } catch { /* already gone */ }
-      }
-      connectionListeners.clear();
-      closeListeners.clear();
-      if (!keepSockets) {
-        for (const socket of mine) {
-          try { socket.terminate(); } catch { /* already gone */ }
-        }
-      }
-      mine.clear();
+  function currentHost() {
+    return live && live.host ? live.host : null;
+  }
+
+  function syncStatus() {
+    const host = currentHost();
+    if (host && host.crashLoop) return HEALTH_CRASH_LOOP;
+    if (!live && everLive) return HEALTH_SYNC_DOWN;
+    if (!host || !host.warm) return HEALTH_WARMING;
+    if (!host.lastPong || Date.now() - host.lastPong > WORKER_SILENT_MS) return HEALTH_SILENT;
+    return HEALTH_OK;
+  }
+
+  function closeConn(entry, code) {
+    if (!entry || entry.gone) return;
+    entry.gone = true;
+    sockets.delete(entry.id);
+    if (entry.peerId && peers.get(entry.peerId) === entry.id) peers.delete(entry.peerId);
+    const host = currentHost();
+    if (host) host.post({ v: 1, kind: "close", conn: entry.id });
+    try {
+      if (code) entry.ws.close(code);
+      else entry.ws.terminate();
+    } catch {
+      // The socket is already gone.
     }
-    return { view, release };
+  }
+
+  function closeAll(code) {
+    for (const entry of [...sockets.values()]) closeConn(entry, code);
+  }
+
+  function applyBudget() {
+    const now = Date.now();
+    const plan = planBudget([...sockets.values()], now);
+    const closing = new Set(plan.close);
+    for (const id of plan.close) {
+      const entry = sockets.get(id);
+      if (entry) closeConn(entry, 1008);
+    }
+    for (const id of plan.pause) {
+      const entry = sockets.get(id);
+      if (!entry || entry.gone || closing.has(id) || entry.paused) continue;
+      entry.paused = true;
+      entry.pausedAt = now;
+      try { entry.ws._socket.pause(); } catch { /* the socket is already gone */ }
+    }
+    for (const id of plan.resume) {
+      const entry = sockets.get(id);
+      if (!entry || entry.gone || !entry.paused) continue;
+      entry.paused = false;
+      entry.pausedAt = 0;
+      try { entry.ws._socket.resume(); } catch { /* the socket is already gone */ }
+    }
+  }
+
+  function deliver(msg) {
+    if (!msg || !Number.isInteger(msg.conn)) return;
+    const entry = sockets.get(msg.conn);
+    if (msg.kind === "ack") {
+      if (entry) entry.bytes = Math.max(0, (Number(entry.bytes) || 0) - (Number(msg.bytes) || 0));
+      applyBudget();
+      return;
+    }
+    // A worker frame is written only to the socket that owns this id.
+    if (!entry || entry.gone) return;
+    if (msg.kind === "msg" && msg.data instanceof ArrayBuffer) {
+      try { entry.sendLogged(msg.data); } catch { /* already closed */ }
+      return;
+    }
+    if (msg.kind === "close") closeConn(entry, msg.code);
   }
 
   async function openSession() {
-    const adapters = [];
-    const releases = [];
+    const debounce = Number(options.mirrorDebounceMs ?? env.AIDANOS_MIRROR_DEBOUNCE_MS);
+    const host = createWorkerHost({
+      vault,
+      dataDir,
+      peerId: options.peerId || "aidanos-relay",
+      mirrorDebounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
+      test: options,
+      isOpen(id) {
+        const entry = sockets.get(id);
+        return Boolean(entry && !entry.gone);
+      },
+      onLog(line) {
+        console.error(redact(line, secrets));
+      },
+      onDown() {
+        closeAll(1011);
+      },
+      onSocket: deliver,
+    });
     try {
-      for (const entry of servers) {
-        const attached = sessionSockets(entry.wss);
-        releases.push(attached.release);
-        adapters.push(new NodeWSServerAdapter(attached.view));
-      }
-      const repo = new Repo({
-        storage: traceStorage(new NodeFSStorageAdapter(dataDir)),
-        network: adapters,
-        sharePolicy: async () => true,
-        peerId: options.peerId || "aidanos-relay",
-      });
-      watchRepo(repo);
-      const debounce = Number(options.mirrorDebounceMs ?? process.env.AIDANOS_MIRROR_DEBOUNCE_MS);
-      const mirror = createMirror({
-        repo,
-        vault,
-        debounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
-        secrets,
-      });
-      // Fold a file that changed while this process was stopped before any device
-      // can connect. Doing it later lets that device's offline edit arrive first,
-      // and the file then replaces it.
-      await preloadStoredNotes(repo);
-      await mirror.now();
-      // The socket listener is attached only after the storage id is read.
-      // The port stays closed until that has finished, or the first join is missed.
-      await repo.networkSubsystem.peerMetadata;
-      for (const adapter of adapters) {
-        if (!adapter.peerId) throw new Error("The sync engine was not ready.");
-      }
-      return {
-        repo,
-        mirror,
-        adapters,
-        release(keepSockets) {
-          for (const releaseOne of releases) releaseOne(keepSockets);
-        },
-      };
+      await host.start();
+      return { repo: host.repo, mirror: host.mirror, host, release() {} };
     } catch (error) {
-      for (const releaseOne of releases) releaseOne(true);
+      try { await host.stop(); } catch { /* the start error is the one that surfaces */ }
       throw error;
     }
   }
@@ -678,22 +686,14 @@ export async function startRelay(options = {}) {
     if (!session || session.closed) return;
     session.closed = true;
     const keepSockets = how === "abandon";
+    if (session.host && typeof session.host.wake === "function") session.host.wake();
     session.mirror.stop();
-    // Drop this adapter only. The shared server stays up for the live session.
-    if (typeof session.release === "function") session.release(keepSockets);
-    // The folder is about to be deleted, so do not flush or write it again.
-    // Wait only for a rename that has already started.
+    // The folder is about to be deleted, so do not flush it again.
+    // Wait only for a write that has already started.
     await session.mirror.idle();
-    try {
-      session.repo.networkSubsystem.disconnect();
-    } catch {
-      // The adapter is already detached from the socket server.
-    }
-    try {
-      await session.repo.storageSubsystem?.close();
-    } catch {
-      // Closing storage is best effort. The directory is removed next.
-    }
+    // A timed-out open finishes after the retry is live. Leave those sockets.
+    if (!keepSockets) closeAll(1000);
+    try { await session.host.stop(); } catch { /* already stopped */ }
     if (keepSockets && typeof options.onAbandonedSession === "function") {
       try { options.onAbandonedSession(); } catch { /* the test observes the cleanup */ }
     }
@@ -764,6 +764,7 @@ export async function startRelay(options = {}) {
       if (api) api.repo = session.repo;
       bootedAt = new Date().toISOString();
       live = session;
+      everLive = true;
       published = true;
     } finally {
       if (!published) {
@@ -836,9 +837,9 @@ export async function startRelay(options = {}) {
     const httpServer = http.createServer((req, res) => {
       const pathOnly = String(req.url || "").split("?")[0];
       if (pathOnly === "/health") {
-        const syncUp = live != null;
-        const body = health(gitState, bootedAt, syncUp, resetGeneration);
-        res.writeHead(syncUp ? 200 : 503, {
+        const status = syncStatus();
+        const body = health(gitState, bootedAt, status, resetGeneration);
+        res.writeHead(status === HEALTH_OK ? 200 : 503, {
           "content-type": "application/json",
           "content-length": Buffer.byteLength(body),
           "cache-control": "no-store",
@@ -904,7 +905,8 @@ export async function startRelay(options = {}) {
     const wss = new WebSocketServer({ noServer: true, maxPayload: cap });
     const entry = { httpServer, host, wss };
     httpServer.on("upgrade", (req, socket, head) => {
-      if (!live) {
+      const hostNow = currentHost();
+      if (!live || !hostNow || !hostNow.warm || hostNow.crashLoop) {
         socket.destroy();
         return;
       }
@@ -917,85 +919,166 @@ export async function startRelay(options = {}) {
       }
       failures.delete(ip);
       entry.wss.handleUpgrade(req, socket, head, (ws) => {
-        const addListener = ws.addListener.bind(ws);
-        let rejectedFrame = false;
-        function listen(event, handler) {
-          if (event !== "message" || typeof handler !== "function") return addListener(event, handler);
-          return addListener(event, function guarded(data, ...rest) {
-            let allowed = false;
-            try {
-              allowed = syncFrameAllowed(data);
-            } catch {
-              allowed = false;
-            }
-            if (!allowed) {
-              if (!rejectedFrame) {
-                rejectedFrame = true;
-                logSafe(secrets, "closed a sync connection");
-                ws.terminate();
-              }
-              return;
-            }
-            return handler.call(this, data, ...rest);
-          });
+        const id = nextConn;
+        nextConn += 1;
+        const conn = {
+          id,
+          ws,
+          bytes: 0,
+          paused: false,
+          pausedAt: 0,
+          peerId: "",
+          gone: false,
+          rejected: false,
+          openedAt: Date.now(),
+          joinAnswered: false,
+          indexRequestAt: null,
+        };
+        ws.isAlive = true;
+        ws.on("pong", () => {
+          ws.isAlive = true;
+        });
+        function logFrame(direction, data) {
+          const message = frameMessage(data);
+          if (!message) return null;
+          const type = typeof message.type === "string" ? message.type : "";
+          const docId = typeof message.documentId === "string" ? message.documentId : "";
+          let line = "";
+          if (type === "join") line = "sync " + direction + " join";
+          else if (type === "peer") line = "sync " + direction + " peer";
+          else if (type === "doc-unavailable") line = "sync " + direction + " doc-unavailable doc=" + docId;
+          else if (type === "sync" || type === "request") {
+            line = "sync " + direction + " " + type + " doc=" + docId;
+          }
+          if (line) logSafe(secrets, line);
+          const now = Date.now();
+          if (direction === "out" && type === "peer" && !conn.joinAnswered) {
+            conn.joinAnswered = true;
+            logSafe(secrets, "join answered in " + seconds(now - conn.openedAt));
+          }
+          const indexFrame =
+            docId === INDEX_ID &&
+            (type === "request" || type === "sync" || type === "doc-unavailable");
+          if (indexFrame && direction === "in") {
+            conn.indexRequestAt = now;
+            logSafe(secrets, "index request");
+          } else if (indexFrame && direction === "out" && conn.indexRequestAt != null) {
+            logSafe(secrets, "index reply in " + seconds(now - conn.indexRequestAt));
+            conn.indexRequestAt = null;
+          }
+          return message;
         }
-        ws.on = listen;
-        ws.addListener = listen;
+        conn.sendLogged = (payload) => {
+          logFrame("out", payload);
+          return ws.send(payload);
+        };
+        function handleJoin(message) {
+          const senderId = typeof message.senderId === "string" ? message.senderId : "";
+          if (!senderId) {
+            closeConn(conn, 1008);
+            return;
+          }
+          const previousId = peers.get(senderId);
+          if (previousId != null && previousId !== conn.id) {
+            const previous = sockets.get(previousId);
+            logSafe(secrets, "closed the older sync connection for a duplicate peer id");
+            if (previous) closeConn(previous, 1000);
+          }
+          const host = currentHost();
+          if (!host || !host.warm || host.crashLoop) {
+            closeConn(conn, 1011);
+            return;
+          }
+          conn.peerId = senderId;
+          peers.set(senderId, conn.id);
+          const selected = selectProtocol(message.supportedProtocolVersions);
+          if (selected == null) {
+            try {
+              ws.send(encode({
+                type: "error",
+                senderId: host.peerId,
+                message: "unsupported protocol version",
+                targetId: senderId,
+              }));
+            } catch { /* already closed */ }
+            closeConn(conn, 1008);
+            return;
+          }
+          // Tell the worker about the peer before the peer frame hits the socket,
+          // so the client's first sync cannot overtake "open" on the port.
+          host.post({
+            v: 1,
+            kind: "open",
+            conn: conn.id,
+            peerId: senderId,
+            peerMetadata: message.peerMetadata || null,
+          });
+          conn.sendLogged(encode({
+            type: "peer",
+            senderId: host.peerId,
+            peerMetadata: host.peerMetadata,
+            selectedProtocolVersion: "1",
+            targetId: senderId,
+          }));
+        }
+        function handleDoc(message, raw) {
+          const host = currentHost();
+          if (!host || !host.warm || host.crashLoop) {
+            closeConn(conn, 1011);
+            return;
+          }
+          const docId = typeof message.documentId === "string" ? message.documentId : "";
+          if (docId && host.refused.has(docId)) {
+            logSafe(secrets, "refused document " + docId);
+            closeConn(conn, 1008);
+            return;
+          }
+          const copy = frameToTransfer(raw);
+          if (!copy) {
+            closeConn(conn, 1008);
+            return;
+          }
+          conn.bytes += copy.byteLength;
+          applyBudget();
+          if (conn.gone) return;
+          host.post({ v: 1, kind: "msg", conn: conn.id, data: copy }, [copy]);
+        }
         ws.on("error", (error) => {
           logSafe(secrets, "sync connection closed:", error instanceof Error ? error.message : error);
         });
-        const openedAt = Date.now();
-        let joinAnswered = false;
-        let indexRequestAt = null;
-        function noteFrame(direction, data) {
-          const message = frameMessage(data);
-          const docId = message && typeof message.documentId === "string" ? message.documentId : "";
-          const messageType = message && typeof message.type === "string" ? message.type : "";
-          if (docId) beginFrame(docId);
-          // Open the window before describeSyncFrame decodes the message,
-          // so that decode is part of this request and not the previous one.
-          const indexIn =
-            direction === "in" &&
-            docId === INDEX_ID &&
-            (messageType === "request" || messageType === "sync" || messageType === "doc-unavailable");
-          if (indexIn) beginIndexRequest(live && live.repo);
-          let line = "";
-          try {
-            line = describeSyncFrame(direction, data);
-          } catch {
-            line = "";
-          }
-          if (!line) return;
-          logSafe(secrets, line);
-          const now = Date.now();
-          if (!joinAnswered && line === "sync out peer") {
-            joinAnswered = true;
-            logSafe(secrets, "join answered in " + seconds(now - openedAt));
-          }
-          const indexFrame =
-            line.startsWith("sync " + direction + " request doc=" + INDEX_ID) ||
-            line.startsWith("sync " + direction + " sync doc=" + INDEX_ID) ||
-            line.startsWith("sync " + direction + " doc-unavailable doc=" + INDEX_ID);
-          if (!indexFrame) return;
-          if (direction === "in") {
-            indexRequestAt = now;
-            logSafe(secrets, "index request");
-          } else if (indexRequestAt != null) {
-            logSafe(secrets, "index reply in " + seconds(now - indexRequestAt));
-            finishIndexReply();
-            indexRequestAt = null;
-          }
-        }
-        ws.on("message", (data) => {
-          noteFrame("in", data);
+        ws.on("close", () => {
+          if (conn.gone) return;
+          conn.gone = true;
+          sockets.delete(conn.id);
+          if (conn.peerId && peers.get(conn.peerId) === conn.id) peers.delete(conn.peerId);
+          const host = currentHost();
+          if (host) host.post({ v: 1, kind: "close", conn: conn.id });
+          applyBudget();
         });
-        const send = ws.send;
-        ws.send = function sendLogged(...args) {
-          noteFrame("out", args[0]);
-          return send.apply(ws, args);
-        };
+        ws.on("message", (data, isBinary) => {
+          if (conn.gone) return;
+          let allowed = false;
+          try {
+            allowed = syncFrameAllowed(data);
+          } catch {
+            allowed = false;
+          }
+          if (!allowed) {
+            if (!conn.rejected) {
+              conn.rejected = true;
+              logSafe(secrets, "closed a sync connection");
+              try { ws.terminate(); } catch { /* already gone */ }
+            }
+            return;
+          }
+          const message = logFrame("in", isBinary === false && typeof data === "string" ? data : data);
+          if (!message || conn.gone) return;
+          if (message.type === "join") handleJoin(message);
+          else handleDoc(message, data);
+        });
+        sockets.set(id, conn);
         logSafe(secrets, "accepted a sync connection");
-        entry.wss.emit("connection", ws, req);
+        if (ws.readyState !== WebSocket.OPEN) return;
       });
     });
     servers.push(entry);
@@ -1043,6 +1126,21 @@ export async function startRelay(options = {}) {
     if (gitTimer.unref) gitTimer.unref();
   }
 
+  budgetTimer = setInterval(() => applyBudget(), 1000);
+  if (budgetTimer.unref) budgetTimer.unref();
+  keepAliveTimer = setInterval(() => {
+    for (const entry of [...sockets.values()]) {
+      if (entry.gone) continue;
+      if (entry.ws.isAlive === false) {
+        try { entry.ws.terminate(); } catch { /* already gone */ }
+        continue;
+      }
+      entry.ws.isAlive = false;
+      try { entry.ws.ping(); } catch { /* already gone */ }
+    }
+  }, 5000);
+  if (keepAliveTimer.unref) keepAliveTimer.unref();
+
   api = {
     port: boundPort,
     url: "ws://" + "127.0.0.1:" + boundPort,
@@ -1063,6 +1161,8 @@ export async function startRelay(options = {}) {
       const session = live;
       live = null;
       if (gitTimer) clearInterval(gitTimer);
+      if (budgetTimer) clearInterval(budgetTimer);
+      if (keepAliveTimer) clearInterval(keepAliveTimer);
       if (session) {
         try { await disposeSession(session); } catch { /* shutdown still closes the port */ }
       }
@@ -1083,25 +1183,17 @@ export async function startRelay(options = {}) {
       // already went away can leave that timer running, which holds the
       // process open after the tests have finished.
       for (const entry of servers) entry.wss.emit("close");
-      if (session && typeof session.repo.shutdown === "function") await session.repo.shutdown();
+      if (session && session.repo && typeof session.repo.shutdown === "function") await session.repo.shutdown();
     },
   };
-  return api;
-}
-
-async function preloadStoredNotes(repo) {
-  const storage = repo.storageSubsystem;
-  if (!storage || typeof storage.loadDoc !== "function") return;
-  const index = await storage.loadDoc(INDEX_ID);
-  if (!index) return;
-  await repo.find(INDEX_ID);
-  const paths = index.paths && typeof index.paths === "object" ? index.paths : {};
-  for (const id of Object.values(paths)) {
-    if (typeof id !== "string" || !id) continue;
-    const stored = await storage.loadDoc(id);
-    if (!stored) continue;
-    await repo.find(id);
+  if (env.NODE_ENV === "test") {
+    api.pausedSockets = () =>
+      [...sockets.values()].filter((entry) => entry.paused && !entry.gone).map((entry) => entry.id);
+    api.echoedFrames = () => (live && live.host ? live.host.echoes.map((frame) => Buffer.from(frame)) : []);
+    api.workerHolding = () => Boolean(live && live.host && live.host.holding);
+    api.refusedDocs = () => (live && live.host ? [...live.host.refused] : []);
   }
+  return api;
 }
 
 function portFromEnv(env = process.env) {

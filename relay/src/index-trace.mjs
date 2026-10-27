@@ -6,6 +6,7 @@
 import { performance } from "node:perf_hooks";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { isMainThread } from "node:worker_threads";
 import { next as Automerge } from "@automerge/automerge/slim";
 import { INDEX_ID } from "./ids.mjs";
 
@@ -39,6 +40,11 @@ const METRIC_STEP = {
 };
 
 let write = () => {};
+let threadName = "main";
+
+function emit(line) {
+  write(line + " thread=" + threadName);
+}
 let patching = null;
 let timer = null;
 let expectedTick = 0;
@@ -91,7 +97,7 @@ function keep(entry) {
     queueMicrotask(() => {
       if (entry.logged) return;
       entry.logged = true;
-      write("sync step " + entry.name + " doc=" + entry.docId + " " + entry.ms.toFixed(1) + "ms");
+      emit("sync step " + entry.name + " doc=" + entry.docId + " " + entry.ms.toFixed(1) + "ms");
     });
   }
 }
@@ -264,13 +270,15 @@ function startLagTimer() {
     expectedTick = now + LAG_INTERVAL_MS;
     if (window && late >= LAG_COUNT_MS) window.blocked += late;
     const line = nextLoopLateLine(lateState, late, now);
-    if (line) write(line);
+    if (line) emit(line);
   }, LAG_INTERVAL_MS);
   if (timer.unref) timer.unref();
 }
 
 export async function installIndexTrace(log, options = {}) {
   if (typeof log === "function") write = log;
+  if (options.thread === "worker" || options.thread === "main") threadName = options.thread;
+  else threadName = isMainThread ? "main" : "worker";
   startLagTimer();
   const custom = typeof options.load === "function";
   try {
@@ -428,7 +436,7 @@ export function beginIndexRequest(repo) {
   if (window) finishIndex("unfinished");
   const facts = indexFacts(repo);
   window = { start: performance.now(), entries: [], blocked: 0, facts };
-  write("index doc " + factsText(facts));
+  emit("index doc " + factsText(facts));
 }
 
 function sumName(entries, name, docId) {
@@ -471,7 +479,7 @@ export function finishIndex(kind) {
   parts.push("otherdoc=" + otherDocN + "x/" + otherDocMs.toFixed(1) + "ms");
   parts.push("other=" + seconds(other));
   parts.push("blocked=" + seconds(open.blocked));
-  write(parts.join(" "));
+  emit(parts.join(" "));
 }
 
 export function finishIndexReply() {
@@ -490,7 +498,7 @@ function noteWork(name, ms, docId, slowLine) {
     logged: true,
     bytes: 0,
   });
-  if (elapsed >= SLOW_MS) write(slowLine + " " + elapsed.toFixed(1) + "ms");
+  if (elapsed >= SLOW_MS) emit(slowLine + " " + elapsed.toFixed(1) + "ms");
 }
 
 export function noteMirror(ms) {

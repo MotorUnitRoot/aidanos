@@ -3,9 +3,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import * as Automerge from "@automerge/automerge";
+import { writeNoteText } from "../../editor/note-save.mjs";
 import { noteMirror } from "./index-trace.mjs";
 import { logSafe } from "./redact.mjs";
 import { prepareNoteFile, safeNotePath } from "./paths.mjs";
+
+function yieldNow() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
 
 function plainDoc(doc) {
   try {
@@ -128,9 +133,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
   async function saveHashes() {
     const body = JSON.stringify(records || {});
     await fs.mkdir(path.dirname(recordFile), { recursive: true });
-    const tmp = recordFile + "." + process.pid + ".tmp";
-    await fs.writeFile(tmp, body);
-    await fs.rename(tmp, recordFile);
+    await writeNoteText(recordFile, body, { swapInRequested: false, vaultRoot: vault });
   }
 
   function indexPaths() {
@@ -155,6 +158,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
     const known = await hashes();
     const paths = indexPaths();
     for (const [notePath, docId] of Object.entries(paths)) {
+      await yieldNow();
       const handle = repo.handles[docId];
       if (!handle) continue;
       const file = await prepareNoteFile(vault, notePath);
@@ -209,6 +213,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
       } catch (error) {
         logSafe(secrets, "fold-in failed for", notePath, error instanceof Error ? error.message : error);
       }
+      await yieldNow();
     }
   }
 
@@ -217,6 +222,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
     const paths = indexPaths();
     let changed = false;
     for (const [notePath, docId] of Object.entries(paths)) {
+      await yieldNow();
       const handle = repo.handles[docId];
       if (!handle) continue;
       let text;
@@ -227,7 +233,17 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
       }
       if (text == null) continue;
       const file = await prepareNoteFile(vault, notePath);
-      if (!file) continue;
+      if (!file) {
+        const candidate = path.join(vault, ...notePath.split("/"));
+        try {
+          const info = await fs.lstat(candidate);
+          if (info.isSymbolicLink()) logSafe(secrets, "mirror write refused", notePath);
+        } catch {
+          // A missing file is not a refusal. The path itself was unsafe.
+        }
+        await yieldNow();
+        continue;
+      }
       let existing = null;
       try {
         existing = await fs.readFile(file, "utf8");
@@ -240,14 +256,20 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
           known[notePath] = digest(text);
           changed = true;
         }
+        await yieldNow();
         continue;
       }
-      const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
-      await fs.writeFile(tmp, text);
-      await fs.rename(tmp, file);
+      try {
+        await writeNoteText(file, text, { swapInRequested: false, vaultRoot: vault });
+      } catch {
+        logSafe(secrets, "mirror write refused", notePath);
+        await yieldNow();
+        continue;
+      }
       lastWritten.set(notePath, text);
       known[notePath] = digest(text);
       changed = true;
+      await yieldNow();
     }
     if (changed) await saveHashes();
   }

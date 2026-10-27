@@ -425,7 +425,8 @@ await check("a recovery name is removed only when it is still the created file",
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-unlinkat-"));
   const folder = await openCheckedDirectory(dir);
   try {
-    for (const backend of ["proc", "helper"]) {
+    const backends = process.platform === "linux" ? ["proc", "helper"] : ["helper"];
+    for (const backend of backends) {
       const name = backend + ".recover";
       const created = await createExclusive(folder, name, Buffer.from("old\n"), backend);
       const kept = path.join(dir, name + ".kept");

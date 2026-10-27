@@ -25,6 +25,7 @@ import {
 import { LOG_LINE_CAP } from "../src/redact.mjs";
 import { planBudget } from "../src/budget.mjs";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
+import { indexEntries } from "../src/mirror.mjs";
 import { startRelay } from "../src/server.mjs";
 import { createWorkerHost } from "../src/worker-host.mjs";
 import { writeStorageBytes } from "../src/storage-safe.mjs";
@@ -635,6 +636,17 @@ test("the mirror writes a note whose kind and id are automerge raw strings", asy
   } finally {
     await relay.close();
   }
+});
+
+test("an index id stored as a raw string is still a note id", () => {
+  let index = Automerge.from({ kind: "index", paths: {} });
+  const id = noteId("log/ABC/2026-10-21.md");
+  index = Automerge.change(index, (doc) => {
+    doc.kind = new Automerge.ImmutableString("index");
+    doc.paths["log/ABC/2026-10-21.md"] = new Automerge.ImmutableString(id);
+  });
+  assert.equal(typeof index.paths["log/ABC/2026-10-21.md"], "object");
+  assert.deepEqual(indexEntries(index), { "log/ABC/2026-10-21.md": id });
 });
 
 test("a mirror failure does not kill the worker", async () => {

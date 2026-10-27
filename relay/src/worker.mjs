@@ -19,7 +19,7 @@ import {
   watchRepo,
   traceStorage,
 } from "./index-trace.mjs";
-import { createMirror, discardOpenNoteTemps, rememberVaultRoot, replaceNoteAtomic, saveNoteFile } from "./mirror.mjs";
+import { createMirror, discardOpenNoteTemps, indexEntries, rememberVaultRoot, replaceNoteAtomic, saveNoteFile } from "./mirror.mjs";
 import { logSafe, redact } from "./redact.mjs";
 import { SafeStorage, refuseSymlinkedStorage, storageFolderFault, sweepDeadStorageTemps } from "./storage-safe.mjs";
 
@@ -162,9 +162,7 @@ async function preloadStoredNotes(repo) {
   const index = await storage.loadDoc(INDEX_ID);
   if (!index) return;
   await repo.find(INDEX_ID);
-  const paths = index.paths && typeof index.paths === "object" ? index.paths : {};
-  for (const id of Object.values(paths)) {
-    if (typeof id !== "string" || !id) continue;
+  for (const id of new Set(Object.values(indexEntries(index)))) {
     const stored = await storage.loadDoc(id);
     if (!stored) continue;
     await repo.find(id);

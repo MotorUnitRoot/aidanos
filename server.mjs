@@ -769,7 +769,10 @@ async function processHoldsLock(file, dev, ino) {
 // "held", "free", or "unknown". A holder of index.lock has to be able to
 // write the vault, so a process owned by another user is skipped. pid 1
 // is root and its descriptor directory is unreadable; that is not a failed
-// read of a process we own. A read error on a process we do own stays
+// read of a process we own. ssh-agent and gpg-agent are the same user and
+// refuse a listing of their descriptors. Git does not. Skipping a process
+// we cannot list is the same as another user: a permanent unknown would
+// keep every index.lock. A descriptor we did list and cannot stat stays
 // unknown, and the lock stays.
 // On Linux, deleting index.lock and creating it again can reuse the inode
 // and report the same ctime, birthtime, and size. All four identity fields
@@ -807,6 +810,7 @@ function linuxProcessHolds(dev, ino) {
       fds = fsSync.readdirSync(fdDir);
     } catch (error) {
       if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
+      if (error && (error.code === "EACCES" || error.code === "EPERM")) continue;
       return "unknown";
     }
     for (const fd of fds) {

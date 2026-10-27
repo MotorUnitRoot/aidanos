@@ -25,7 +25,7 @@ function yieldNow() {
 // Swift notes use that for kind and for index ids. JSON.stringify of the
 // whole doc used to coerce them, and it also copied every byte of a large
 // note on the sync thread. Read the one field.
-function plainString(value) {
+export function plainString(value) {
   if (typeof value === "string") return value;
   if (!value || typeof value.toJSON !== "function") return null;
   try {
@@ -34,6 +34,19 @@ function plainString(value) {
   } catch {
     return null;
   }
+}
+
+// Swift stores the index kind and each note id as a raw string. A preload
+// that only accepts a JS string skips those notes, and the first mirror
+// after a restart then treats the old file as a newer outside edit.
+export function indexEntries(doc) {
+  const paths = {};
+  if (!doc || plainString(doc.kind) !== "index" || !doc.paths || typeof doc.paths !== "object") return paths;
+  for (const [notePath, docId] of Object.entries(doc.paths)) {
+    const id = plainString(docId);
+    if (id && safeNotePath(notePath)) paths[notePath] = id;
+  }
+  return paths;
 }
 
 function noteText(doc) {
@@ -1104,11 +1117,7 @@ export function createMirror({
       } catch {
         continue;
       }
-      if (!doc || plainString(doc.kind) !== "index" || !doc.paths || typeof doc.paths !== "object") continue;
-      for (const [notePath, docId] of Object.entries(doc.paths)) {
-        const id = plainString(docId);
-        if (id && safeNotePath(notePath)) paths[notePath] = id;
-      }
+      Object.assign(paths, indexEntries(doc));
     }
     return paths;
   }

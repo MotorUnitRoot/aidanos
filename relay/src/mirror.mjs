@@ -4,24 +4,56 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import * as Automerge from "@automerge/automerge";
+import {
+  createExclusive,
+  directoryBackend,
+  openCheckedDirectory,
+  openDirectoryHelper,
+  renameEntry,
+  statEntry,
+  unlinkIfSame,
+} from "../../editor/dirfd.mjs";
 import { noteMirror } from "./index-trace.mjs";
 import { logSafe } from "./redact.mjs";
 import { prepareNoteFile, safeNotePath } from "./paths.mjs";
 
-function plainDoc(doc) {
+function yieldNow() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+// Automerge's raw string is an object with toJSON, not a JS string. The
+// Swift notes use that for kind and for index ids. JSON.stringify of the
+// whole doc used to coerce them, and it also copied every byte of a large
+// note on the sync thread. Read the one field.
+export function plainString(value) {
+  if (typeof value === "string") return value;
+  if (!value || typeof value.toJSON !== "function") return null;
   try {
-    return JSON.parse(JSON.stringify(doc));
+    const out = value.toJSON();
+    return typeof out === "string" ? out : null;
   } catch {
     return null;
   }
 }
 
+// Swift stores the index kind and each note id as a raw string. A preload
+// that only accepts a JS string skips those notes, and the first mirror
+// after a restart then treats the old file as a newer outside edit.
+export function indexEntries(doc) {
+  const paths = {};
+  if (!doc || plainString(doc.kind) !== "index" || !doc.paths || typeof doc.paths !== "object") return paths;
+  for (const [notePath, docId] of Object.entries(doc.paths)) {
+    const id = plainString(docId);
+    if (id && safeNotePath(notePath)) paths[notePath] = id;
+  }
+  return paths;
+}
+
 function noteText(doc) {
-  const plain = plainDoc(doc);
-  if (!plain || plain.kind !== "note") return null;
-  if (typeof plain.text === "string") return plain.text;
-  if (plain.text == null) return "";
-  return null;
+  if (!doc || plainString(doc.kind) !== "note") return null;
+  if (doc.text == null) return "";
+  const text = plainString(doc.text);
+  return text == null ? null : text;
 }
 
 function changes(before, after) {
@@ -831,30 +863,122 @@ async function dropManifestIfGone(file, meta) {
   await dropManifest(meta.stateDir, meta.rel);
 }
 
-// Note temps are created at 0600. rename keeps that mode on the note.
-// Notes stay 0600. They are not loosened to 0644.
-async function writeSyncedTemp(tmp, text) {
-  const handle = await fs.open(tmp, "w", 0o600);
+function pathError(code) {
+  const error = new Error("bad path");
+  error.code = code || "BAD_PATH";
+  return error;
+}
+
+async function closeQuietDir(handle) {
+  if (!handle) return;
+  try { await handle.close(); } catch { /* already closed */ }
+}
+
+// Temp in the checked folder, fsync, then renameat on that folder's descriptor.
+// A crash before the rename leaves the previous note and a sibling temp.
+// The manifest line is fsynced before the temp exists. The temp is created
+// at 0600 and the note stays that mode.
+export async function replaceNoteAtomic(file, text, options = {}) {
+  const vault = options.vault || "";
+  const stateDir = options.stateDir || "";
+  const tmp = options.tmp || noteTempPath(file);
+  let rel = options.rel || "";
+  if (!rel && options.recordManifest !== false && vault && stateDir) {
+    rel = tempRelative(vault, tmp);
+  }
+  const record = options.recordManifest !== false && Boolean(stateDir && rel);
+  if (record) await appendManifest(stateDir, [rel]);
+  const meta = { rel, stateDir };
+  const trackTemp = options.trackTemp !== false;
+  if (trackTemp) openNoteTemps.set(tmp, meta);
+  const backend = directoryBackend();
+  const tool = await openDirectoryHelper();
+  let dir = null;
+  let created = null;
   try {
-    await handle.writeFile(text);
-    await handle.sync();
+    const dirPath = path.dirname(file);
+    const listed = await fs.lstat(dirPath);
+    if (listed.isSymbolicLink() || !listed.isDirectory()) throw pathError("BAD_PATH");
+    dir = await openCheckedDirectory(dirPath, { dev: listed.dev, ino: listed.ino });
+    const destName = path.basename(file);
+    const tmpName = path.basename(tmp);
+    let destInfo = null;
+    try {
+      destInfo = await fs.lstat(file);
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    if (destInfo) {
+      if (destInfo.isSymbolicLink()) throw pathError("ELOOP");
+      if (!destInfo.isFile() || destInfo.nlink !== 1) throw pathError("BAD_PATH");
+    }
+    const listedEntry = await statEntry(dir, destName, backend, tool);
+    if (listedEntry && (listedEntry.symlink || !listedEntry.regular)) throw pathError("ELOOP");
+    const payload = Buffer.from(String(text), "utf8");
+    if (options.crashMidWrite) {
+      const count = Math.min(8, Math.max(1, payload.length));
+      created = await createExclusive(dir, tmpName, payload.subarray(0, count), backend, { tool });
+      process.kill(process.pid, "SIGKILL");
+      await new Promise(() => {});
+    }
+    created = await createExclusive(dir, tmpName, payload, backend, { tool });
+    if (typeof options.beforeRename === "function") await options.beforeRename();
+    await renameEntry(dir, tmpName, destName, backend, tool);
+    created = null;
+    await dir.sync();
+  } catch (error) {
+    if (trackTemp && created && dir) {
+      try { await unlinkIfSame(dir, path.basename(tmp), created, backend, tool); } catch { /* the sweep removes a temp we could not unlink */ }
+    }
+    throw error;
   } finally {
-    await handle.close();
+    await closeQuietDir(dir);
+    if (tool && tool.handle) await closeQuietDir(tool.handle);
+    if (trackTemp) openNoteTemps.delete(tmp);
+    if (trackTemp && rel && stateDir) {
+      try {
+        await fs.lstat(tmp);
+      } catch (error) {
+        if (error && error.code === "ENOENT") await dropManifest(stateDir, [rel]);
+      }
+    }
   }
 }
 
-// Write each note beside its final name, fsync that temp, then rename it
-// into place. A reader sees the previous file or the whole new file. Every
-// temp path in this batch is recorded before any of those temps exist.
-// One clean note is five fsyncs: the manifest file that records the temp,
-// the state directory after that rename, the note temp before it is renamed
-// onto the note, the manifest file again when that temp line is dropped,
-// and the state directory after the drop. A corrupt manifest adds one more
-// fsync of that directory when the bad file is renamed aside, before those
-// five. Same-account gap: the note's directory is not fsynced after the
-// rename, so a crash can lose the directory entry even though the temp was
-// fsynced and the note stayed mode 0600. A refused manifest still saves
-// the note, logs the doc id, and does not delete the temp it could not record.
+function siblingError(code) {
+  const error = new Error(code === "RECOVER" ? "recovery sibling" : "outside edit unchecked");
+  error.code = code;
+  return error;
+}
+
+// null when the note may be written. An error when a temp or .recover file
+// is sitting next to it, or the directory cannot be listed. A failed check
+// refuses the write: skipping the check and writing the note drops the edit.
+async function noteSiblingFault(file) {
+  const dir = path.dirname(file);
+  const base = path.basename(file);
+  let names;
+  try {
+    names = await fs.readdir(dir);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    return error && error.code ? error : siblingError("EREAD");
+  }
+  for (const name of names) {
+    if (name.startsWith("." + base + ".") && name.endsWith(".tmp")) return siblingError("RECOVER");
+    if (name.startsWith(base + ".") && name.endsWith(".recover")) return siblingError("RECOVER");
+  }
+  return null;
+}
+
+// Write each note beside its final name, then rename it into place through
+// the checked directory. A reader sees the previous file or the whole new
+// file. Every temp path in this batch is recorded before any of those temps
+// exist. That record is two fsyncs: the new manifest file, then the state
+// directory after the rename onto note-temps. A refused manifest still saves
+// the note and logs the doc id. That temp is not tracked, so a later sweep
+// cannot delete a file the manifest does not name. The note directory is
+// fsynced after the rename. The temp is mode 0600 and the note stays that mode.
 export async function saveNoteBatch(entries, options = {}) {
   const vault = options.vault || "";
   const stateDir = options.stateDir || "";
@@ -887,29 +1011,30 @@ export async function saveNoteBatch(entries, options = {}) {
     }
   }
   if (typeof options.afterManifest === "function") await options.afterManifest(prepared);
-  const gone = [];
   for (const entry of prepared) {
-    const meta = { rel: entry.rel, stateDir };
-    const track = recorded && entry.rel;
-    if (track) openNoteTemps.set(entry.tmp, meta);
+    await yieldNow();
+    let release = () => {};
+    if (typeof options.around === "function") {
+      const out = options.around(entry);
+      if (typeof out === "function") release = out;
+    }
+    const tracked = Boolean(recorded && entry.rel);
     try {
-      await writeSyncedTemp(entry.tmp, entry.text);
-      if (typeof entry.beforeRename === "function") await entry.beforeRename();
-      await fs.rename(entry.tmp, entry.file);
+      await replaceNoteAtomic(entry.file, entry.text, {
+        vault,
+        stateDir,
+        tmp: entry.tmp,
+        rel: tracked ? entry.rel : "",
+        recordManifest: false,
+        trackTemp: tracked,
+        beforeRename: entry.beforeRename,
+      });
     } catch (error) {
       errors.push({ error, file: entry.file });
     } finally {
-      if (track) openNoteTemps.delete(entry.tmp);
-      if (recorded && entry.rel) {
-        try {
-          await fs.lstat(entry.tmp);
-        } catch (error) {
-          if (error && error.code === "ENOENT") gone.push(entry.rel);
-        }
-      }
+      release();
     }
   }
-  if (gone.length) await dropManifest(stateDir, gone);
   return errors;
 }
 
@@ -945,12 +1070,26 @@ export function mirrorFailureLine(error) {
   return "mirror failed: " + logCode(error);
 }
 
-export function createMirror({ repo, vault, debounceMs = 400, secrets = [], track = (work) => work(), stateDir = "" }) {
+export function createMirror({
+  repo,
+  vault,
+  debounceMs = 400,
+  secrets = [],
+  track = (work) => work(),
+  stateDir = "",
+  hold = null,
+}) {
+  function held(docId) {
+    if (typeof hold !== "function" || !docId) return () => {};
+    const release = hold(docId);
+    return typeof release === "function" ? release : () => {};
+  }
   const lastWritten = new Map();
   const incorporated = new Map();
   let records = null;
   let timer = null;
   let chain = Promise.resolve();
+  let queued = 0;
   const recordFile = path.join(vault, ".aidanos", "written.json");
 
   async function hashes() {
@@ -967,41 +1106,50 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
   async function saveHashes() {
     const body = JSON.stringify(records || {});
     await fs.mkdir(path.dirname(recordFile), { recursive: true });
-    const tmp = recordFile + "." + process.pid + ".tmp";
-    await fs.writeFile(tmp, body);
-    await fs.rename(tmp, recordFile);
+    await replaceNoteAtomic(recordFile, body, { vault, recordManifest: false });
   }
 
-  function indexPaths() {
+  async function indexPaths() {
     const paths = {};
     for (const handle of Object.values(repo.handles)) {
+      await yieldNow();
       let doc;
       try {
         doc = handle.doc();
       } catch {
         continue;
       }
-      const plain = plainDoc(doc);
-      if (!plain || plain.kind !== "index" || !plain.paths || typeof plain.paths !== "object") continue;
-      for (const [notePath, docId] of Object.entries(plain.paths)) {
-        if (typeof docId === "string" && safeNotePath(notePath)) paths[notePath] = docId;
-      }
+      Object.assign(paths, indexEntries(doc));
     }
     return paths;
   }
 
+  function blockNote(blocked, notePath, docId, error) {
+    blocked.set(notePath, { docId, error });
+    logSafe(secrets, foldInFailureLine(docId, error));
+  }
+
   async function foldOutside() {
+    const blocked = new Map();
     const known = await hashes();
-    const paths = indexPaths();
+    const paths = await indexPaths();
     for (const [notePath, docId] of Object.entries(paths)) {
+      await yieldNow();
       const handle = repo.handles[docId];
       if (!handle) continue;
-      const file = await prepareNoteFile(vault, notePath);
+      const file = await prepareNoteFile(vault, notePath, vaultRoot(vault));
       if (!file) continue;
+      const sibling = await noteSiblingFault(file);
+      if (sibling) {
+        blockNote(blocked, notePath, docId, sibling);
+        continue;
+      }
       let fileText;
       try {
         fileText = await fs.readFile(file, "utf8");
-      } catch {
+      } catch (error) {
+        if (error && error.code === "ENOENT") continue;
+        blockNote(blocked, notePath, docId, error && error.code ? error : siblingError("EREAD"));
         continue;
       }
       const fileHash = digest(fileText);
@@ -1046,17 +1194,20 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
         lastWritten.set(notePath, merged);
         incorporated.set(notePath, fileHash);
       } catch (error) {
-        logSafe(secrets, foldInFailureLine(docId, error));
+        blockNote(blocked, notePath, docId, error && error.code ? error : siblingError("EREAD"));
       }
+      await yieldNow();
     }
+    return blocked;
   }
 
-  async function writeNotes() {
+  async function writeNotes(blocked) {
     const known = await hashes();
-    const paths = indexPaths();
+    const paths = await indexPaths();
     let changed = false;
     const batch = [];
     for (const [notePath, docId] of Object.entries(paths)) {
+      await yieldNow();
       const handle = repo.handles[docId];
       if (!handle) continue;
       let text;
@@ -1066,12 +1217,41 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
         continue;
       }
       if (text == null) continue;
-      const file = await prepareNoteFile(vault, notePath);
-      if (!file) continue;
+      const file = await prepareNoteFile(vault, notePath, vaultRoot(vault));
+      if (blocked && blocked.has(notePath)) {
+        await yieldNow();
+        continue;
+      }
+      if (!file) {
+        const candidate = path.join(vault, ...notePath.split("/"));
+        try {
+          const info = await fs.lstat(candidate);
+          if (info.isSymbolicLink()) {
+            const error = new Error("symlink");
+            error.code = "ELOOP";
+            logSafe(secrets, mirrorNoteFailureLine(docId, error));
+          }
+        } catch {
+          // A missing file is not a refusal. The path itself was unsafe.
+        }
+        await yieldNow();
+        continue;
+      }
+      const sibling = await noteSiblingFault(file);
+      if (sibling) {
+        logSafe(secrets, mirrorNoteFailureLine(docId, sibling));
+        await yieldNow();
+        continue;
+      }
       let existing = null;
       try {
         existing = await fs.readFile(file, "utf8");
-      } catch {
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") {
+          logSafe(secrets, mirrorNoteFailureLine(docId, error && error.code ? error : siblingError("EREAD")));
+          await yieldNow();
+          continue;
+        }
         existing = null;
       }
       if (existing === text) {
@@ -1080,14 +1260,22 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
           known[notePath] = digest(text);
           changed = true;
         }
+        await yieldNow();
         continue;
       }
       batch.push({ file, text, notePath, docId });
     }
     if (batch.length) {
+      batch.sort((a, b) => (a.notePath < b.notePath ? -1 : a.notePath > b.notePath ? 1 : 0));
       let errors;
       try {
-        errors = await saveNoteBatch(batch, { vault, stateDir });
+        errors = await saveNoteBatch(batch, {
+          vault,
+          stateDir,
+          around(entry) {
+            return held(entry.docId);
+          },
+        });
       } catch (error) {
         errors = batch.map((entry) => ({ error, file: entry.file }));
       }
@@ -1110,8 +1298,8 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
     chain = chain.then(() => track(async () => {
       const started = performance.now();
       try {
-        await foldOutside();
-        await writeNotes();
+        const blocked = await foldOutside();
+        await writeNotes(blocked);
       } finally {
         noteMirror(performance.now() - started);
       }
@@ -1121,16 +1309,30 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
     return chain;
   }
 
+  function enqueueSync() {
+    queued += 1;
+    const run = syncDisk();
+    run.finally(() => {
+      queued -= 1;
+    });
+    return run;
+  }
+
   function schedule() {
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
-      syncDisk();
+      if (queued < 1) enqueueSync();
     }, debounceMs);
     if (timer.unref) timer.unref();
   }
 
-  const poll = setInterval(schedule, Math.max(debounceMs, 200));
+  // The interval must start the pass itself. Calling schedule() from it
+  // resets the debounce on every tick, and an idle worker never writes.
+  const poll = setInterval(() => {
+    if (queued >= 1) return;
+    enqueueSync();
+  }, Math.max(debounceMs, 200));
   if (poll.unref) poll.unref();
 
   return {
@@ -1140,7 +1342,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
         clearTimeout(timer);
         timer = null;
       }
-      await syncDisk();
+      await enqueueSync();
     },
     // Wait for a write that has already started. Does not start another one.
     async idle() {

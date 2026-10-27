@@ -27,14 +27,37 @@ jobs:
         run: bash relay/scripts/reject-optional-native.sh
       - run: npm test
         working-directory: relay
-      - name: Relay image omits native CBOR packages
+      - name: Relay image omits native CBOR packages and answers /health
         run: |
           set -euo pipefail
-          docker build -t aidanos-relay relay
+          docker build -f relay/Dockerfile -t aidanos-relay .
           docker run --rm --entrypoint bash aidanos-relay -lc 'bash scripts/reject-optional-native.sh'
           docker run --rm --entrypoint cat aidanos-relay /app/Acknowledgements.txt > "$RUNNER_TEMP/ack-image.txt"
           cmp "$RUNNER_TEMP/ack-image.txt" relay/Acknowledgements.txt
           cmp native/Apps/Shared/Acknowledgements.txt relay/Acknowledgements.txt
+          docker run --rm --entrypoint bash \
+            -e AIDANOS_RELAY_TOKEN=aidanos-test-token-0123456789abcdef \
+            aidanos-relay -lc '
+            set -euo pipefail
+            mkdir -p /tmp/vault /tmp/data
+            node src/server.mjs --vault /tmp/vault --data /tmp/data --port 3750 >/tmp/relay.out 2>/tmp/relay.err &
+            pid=$!
+            ok=0
+            for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+              if node --input-type=module -e "const r = await fetch(\"http://127.0.0.1:3750/health\"); if (!r.ok) process.exit(1)"; then
+                ok=1
+                break
+              fi
+              sleep 1
+            done
+            kill "$pid" || true
+            wait "$pid" || true
+            if [ "$ok" != 1 ]; then
+              echo "relay did not answer /health" >&2
+              cat /tmp/relay.err >&2 || true
+              exit 1
+            fi
+          '
 
   aidan-core-linux:
     runs-on: ubuntu-latest

@@ -1,4 +1,6 @@
 # node:22-bookworm-slim
+# Build from the repo root: docker build -f relay/Dockerfile -t aidanos-relay .
+# relay/src imports ../../editor, which is /editor when the server lives in /app/src.
 FROM node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
 
 RUN apt-get update \
@@ -6,13 +8,24 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY package.json package-lock.json ./
-COPY scripts/reject-optional-native.sh scripts/reject-optional-native.sh
+COPY relay/package.json relay/package-lock.json ./
+COPY relay/scripts/reject-optional-native.sh scripts/reject-optional-native.sh
 RUN npm ci --omit=dev --omit=optional \
   && bash scripts/reject-optional-native.sh \
   && chown -R node:node /app
-COPY --chown=node:node src ./src
-COPY --chown=node:node Acknowledgements.txt ./
+COPY --chown=node:node relay/src ./src
+COPY --chown=node:node relay/Acknowledgements.txt ./
+# The runtime user can read and execute the helper. It cannot replace it.
+# linux-arm64 has no pinned directory helper. Fail the image build instead of
+# shipping a relay that cannot open a checked folder on that platform.
+COPY editor /editor
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ] && [ ! -f /editor/bin/dirfd-tool-linux-arm64 ]; then \
+      echo "linux-arm64 directory helper is not shipped (editor/bin/dirfd-tool-linux-arm64). Refusing to build this image." >&2; \
+      exit 1; \
+    fi \
+    && chown -R root:root /editor \
+    && chmod -R a-w /editor
 
 ENV AIDANOS_RELAY_PORT=3750
 EXPOSE 3750

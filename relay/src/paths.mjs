@@ -26,11 +26,15 @@ async function isSymlink(candidate) {
   }
 }
 
-// Returns the file to write, or null when the path would leave the vault.
-export async function prepareNoteFile(vault, notePath) {
+// knownRoot is the vault path recorded once at claim. A save must not call
+// realpath. On macOS that walk follows /var to /private/var and stalls the
+// worker, so the note never lands in the vault. Each path component is
+// lstat'd and a symlink is refused, which is the escape check realpath was
+// doing on every write.
+export async function prepareNoteFile(vault, notePath, knownRoot = "") {
   const safe = safeNotePath(notePath);
   if (!safe) return null;
-  const root = await fs.realpath(vault);
+  const root = knownRoot || path.resolve(vault);
   const parts = safe.split("/");
   let current = root;
   for (let index = 0; index < parts.length - 1; index += 1) {
@@ -45,9 +49,8 @@ export async function prepareNoteFile(vault, notePath) {
     }
     if (stat.isSymbolicLink() || !stat.isDirectory()) return null;
   }
-  const parent = await fs.realpath(current);
-  if (parent !== root && !parent.startsWith(root + path.sep)) return null;
-  const file = path.join(parent, parts[parts.length - 1]);
+  if (current !== root && !current.startsWith(root + path.sep)) return null;
+  const file = path.join(current, parts[parts.length - 1]);
   if (await isSymlink(file)) return null;
   return file;
 }

@@ -35,6 +35,7 @@ import {
   sweepStaleNoteTemps,
 } from "../src/mirror.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
+import { prepareNoteFile } from "../src/paths.mjs";
 import { FATAL_FALLBACK_NAME, FILE_LOG_CAP, LOG_LINE_CAP, REDACT_INPUT_CAP, flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, redact, restoreShields, stampLine } from "../src/redact.mjs";
 import { INDEX_TRACE_ENTRY_CAP, beginIndexRequest, emptyLateState, finishIndexReply, installIndexTrace, nextLoopLateLine, noteGitWork, noteMirror } from "../src/index-trace.mjs";
 import { cbor } from "@automerge/automerge-repo";
@@ -755,6 +756,8 @@ async function spawnRelay(dir, envExtra = {}) {
     "AIDANOS_RELAY_TEST_SAVE_HOLD_MS",
     "AIDANOS_RELAY_TEST_SAVE_WAIT_MS",
     "AIDANOS_RELAY_TEST_SHUTDOWN_MS",
+    "AIDANOS_RELAY_TEST_HOLD_NOTE_MS",
+    "AIDANOS_RELAY_TEST_CRASH_MID_WRITE",
   ]) {
     if (!Object.prototype.hasOwnProperty.call(envExtra, name)) delete env[name];
   }
@@ -877,6 +880,91 @@ test("a save that outlasts the shutdown bound is logged before close", { timeout
   const names = await fs.readdir(started.vault);
   assert.equal(names.some((name) => name.endsWith(".tmp")), false, names.join(","));
   assert.ok(elapsed < 1500, "waited out the save in " + elapsed + "ms");
+});
+
+test("a worker temp held past the save wait is unlinked and the process exits 1", { timeout: 20000 }, async () => {
+  const dir = await tempDir();
+  const started = await spawnRelay(dir, {
+    NODE_ENV: "test",
+    AIDANOS_RELAY_TEST_HOLD_NOTE_MS: "8000",
+    AIDANOS_RELAY_TEST_SAVE_WAIT_MS: "400",
+    AIDANOS_RELAY_TEST_SHUTDOWN_MS: "4000",
+  });
+  const body = slowSaveNoteBody();
+  try {
+    const deadline = Date.now() + 5000;
+    let found = false;
+    while (Date.now() < deadline) {
+      const names = await fs.readdir(started.vault);
+      if (names.some((name) => name.endsWith(".tmp"))) {
+        found = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (!found) throw new Error("worker temp did not appear");
+  } catch (error) {
+    closeSync(started.fd);
+    started.child.kill("SIGKILL");
+    throw error;
+  }
+  const began = Date.now();
+  started.child.kill("SIGTERM");
+  const [code] = await once(started.child, "exit");
+  const elapsed = Date.now() - began;
+  closeSync(started.fd);
+  const text = await fs.readFile(started.stderr, "utf8");
+  let note = "";
+  try {
+    note = await fs.readFile(path.join(started.vault, "held-note.md"), "utf8");
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  const names = await fs.readdir(started.vault);
+  assert.equal(code, 1, text);
+  assert.match(text, new RegExp(SAVE_WAIT_TIMEOUT_LINE));
+  assert.match(text, /relay log closed/);
+  assert.notEqual(note, body);
+  assert.equal(names.some((name) => name.endsWith(".tmp")), false, names.join(","));
+  assert.ok(elapsed < 6000, "exited in " + elapsed + "ms");
+});
+
+test("a second signal during the save wait exits immediately", { timeout: 20000 }, async () => {
+  const dir = await tempDir();
+  const staged = path.join(dir, "staged");
+  const body = slowSaveNoteBody();
+  const started = await spawnRelay(dir, {
+    NODE_ENV: "test",
+    AIDANOS_RELAY_TEST_SLOW_SAVE: "1",
+    AIDANOS_RELAY_TEST_SAVE_STAGED: staged,
+    AIDANOS_RELAY_TEST_SAVE_HOLD_MS: "8000",
+  });
+  try {
+    await waitForPath(staged);
+  } catch (error) {
+    closeSync(started.fd);
+    started.child.kill("SIGKILL");
+    throw error;
+  }
+  const began = Date.now();
+  started.child.kill("SIGTERM");
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  started.child.kill("SIGINT");
+  const [code] = await once(started.child, "exit");
+  const elapsed = Date.now() - began;
+  closeSync(started.fd);
+  const text = await fs.readFile(started.stderr, "utf8");
+  let note = "";
+  try {
+    note = await fs.readFile(path.join(started.vault, SLOW_SAVE_NOTE_NAME), "utf8");
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  assert.equal(code, 1, text);
+  assert.match(text, new RegExp(SHUTDOWN_TIMEOUT_LINE));
+  assert.equal(text.includes("relay log closed"), false, text);
+  assert.notEqual(note, body);
+  assert.ok(elapsed < 2000, "second signal waited " + elapsed + "ms");
 });
 
 test("an index trace window drops the oldest entries past the cap", async () => {
@@ -1340,9 +1428,19 @@ test("a location scrub is linear on adversarial input", () => {
     }
     return elapsed;
   }
+  // One trial is a few milliseconds, so a single pause makes 4N look
+  // quadratic. The bound stays 6x. The median of several trials is what
+  // has to fit under it.
+  function medianMs(input) {
+    const samples = [];
+    for (let trial = 0; trial < 5; trial += 1) samples.push(elapsedFor(input));
+    samples.sort((a, b) => a - b);
+    return samples[2];
+  }
   redact(smallInput, []);
-  const smallMs = elapsedFor(smallInput);
-  const largeMs = elapsedFor(largeInput);
+  redact(largeInput, []);
+  const smallMs = medianMs(smallInput);
+  const largeMs = medianMs(largeInput);
   assert.ok(largeMs < 1000, "scrubbed in " + largeMs + "ms");
   assert.ok(largeMs < smallMs * 6, "4N/N " + largeMs + " / " + smallMs);
   const cleaned = redact(largeInput, []);
@@ -1365,6 +1463,28 @@ test("a location scrub is linear on adversarial input", () => {
   assert.equal(huge2Cleaned.includes("(a/"), false);
   assert.equal(huge2Cleaned.includes("Secret"), false);
   assert.equal(huge2Cleaned.includes("Users"), false);
+});
+
+test("a note path is prepared from the claimed root, not a fresh realpath", async () => {
+  const source = await fs.readFile(new URL("../src/paths.mjs", import.meta.url), "utf8");
+  assert.equal(/realpath\s*\(/.test(source), false);
+  const dir = await tempDir();
+  const real = path.join(dir, "real");
+  const link = path.join(dir, "link");
+  const elsewhere = path.join(dir, "elsewhere");
+  await fs.mkdir(real);
+  await fs.mkdir(elsewhere);
+  await fs.symlink(real, link);
+  rememberVaultRoot(link);
+  const file = await prepareNoteFile(link, "log/2026-10-21.md", real);
+  assert.equal(file, path.join(real, "log", "2026-10-21.md"));
+  const created = await fs.lstat(path.join(real, "log"));
+  assert.equal(created.isDirectory(), true);
+  assert.equal(created.isSymbolicLink(), false);
+  await fs.symlink(elsewhere, path.join(real, "linked"));
+  assert.equal(await prepareNoteFile(real, "linked/note.md", real), null);
+  await fs.symlink(path.join(real, "log", "2026-10-21.md"), path.join(real, "log", "alias.md"));
+  assert.equal(await prepareNoteFile(real, "log/alias.md", real), null);
 });
 
 test("github tokens that are not listed are masked", () => {
@@ -2662,10 +2782,15 @@ test("reset is off when NODE_ENV is production or unset", { timeout: 40000 }, as
 test("a reset warms the sync engine before devices are told it is ready", async () => {
   warmSyncEngine();
   const source = await fs.readFile(new URL("../src/server.mjs", import.meta.url), "utf8");
+  const workerSource = await fs.readFile(new URL("../src/worker.mjs", import.meta.url), "utf8");
   const activate = source.slice(source.indexOf("async function activateSession"), source.indexOf("async function rotate"));
-  const warm = activate.indexOf("warmSyncEngine()");
   const published = activate.indexOf("live = session");
-  assert.ok(warm > 0 && published > warm);
+  assert.equal(activate.includes("warmSyncEngine()"), false);
+  assert.match(source, /timersOnly:\s*true/);
+  assert.ok(published > 0);
+  const warmAt = workerSource.indexOf("const warmMs = performance.now() - warmStarted");
+  const readyAt = workerSource.indexOf('kind: "ready"');
+  assert.ok(warmAt > 0 && readyAt > warmAt);
   assert.match(activate, /finally/);
   assert.match(activate, /disposeSession\(session\)/);
   assert.match(activate, /sync engine warm in /);
@@ -2682,6 +2807,55 @@ test("a reset warms the sync engine before devices are told it is ready", async 
   assert.match(source, /join answered in /);
   assert.match(source, /index request/);
   assert.match(source, /index reply in /);
+});
+
+test("a crash between a partial note write and rename keeps the note", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  const id = noteId("notes/keep.md");
+  const full = "version-one-" + "abc".repeat(80);
+  const first = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  importDoc(first.repo, INDEX_ID, { kind: "index", paths: { "notes/keep.md": id } });
+  importDoc(first.repo, id, { kind: "note", text: full });
+  await first.mirrorNow();
+  await first.repo.flush();
+  await first.close();
+  const file = path.join(vault, "notes", "keep.md");
+  assert.equal(await fs.readFile(file, "utf8"), full);
+  const started = await spawnRelay(dir, {
+    NODE_ENV: "test",
+    AIDANOS_RELAY_TEST_CRASH_MID_WRITE: "1",
+  });
+  const [code, signal] = await once(started.child, "exit");
+  closeSync(started.fd);
+  assert.equal(signal, "SIGKILL", "code " + code);
+  assert.equal(await fs.readFile(file, "utf8"), full);
+  const names = await fs.readdir(path.join(vault, "notes"));
+  assert.ok(names.some((name) => name.startsWith(".keep.md.") && name.endsWith(".tmp")), names.join(","));
+  const third = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  try {
+    const handle = await third.repo.find(id);
+    assert.equal(handle.doc().text, full);
+    const index = await third.repo.find(INDEX_ID);
+    assert.equal(index.doc().paths["notes/keep.md"], id);
+  } finally {
+    await third.close();
+  }
 });
 
 test("a failed warm-up closes the session", async () => {
@@ -2749,7 +2923,7 @@ test("a warm-up timeout closes the session instead of leaving health down", asyn
   }
 });
 
-test("a reset warm-up timeout keeps the old generation", async () => {
+test("a reset warm-up timeout keeps the old generation", { timeout: 40000 }, async () => {
   const dir = await tempDir();
   let opens = 0;
   const seen = [];
@@ -2765,7 +2939,7 @@ test("a reset warm-up timeout keeps the old generation", async () => {
     port: 0,
     gitUrl: "",
     allowReset: true,
-    sessionTimeoutMs: 200,
+    sessionTimeoutMs: 5000,
     beforeOpenReady() {
       opens += 1;
       if (opens > 1 && opens <= 4) return new Promise(() => {});
@@ -2781,7 +2955,7 @@ test("a reset warm-up timeout keeps the old generation", async () => {
       headers: { Authorization: "Bearer " + TOKEN },
     });
     assert.equal(accepted.status, 200);
-    const deadline = Date.now() + 5000;
+    const deadline = Date.now() + 25000;
     let again = null;
     let status = 0;
     while (Date.now() < deadline) {
@@ -2803,7 +2977,7 @@ test("a reset warm-up timeout keeps the old generation", async () => {
   }
 });
 
-test("a late warm-up disposes only its own session", async () => {
+test("a late warm-up disposes only its own session", { timeout: 30000 }, async () => {
   const dir = await tempDir();
   let opens = 0;
   let releaseLate = null;
@@ -2821,7 +2995,7 @@ test("a late warm-up disposes only its own session", async () => {
     port: 0,
     gitUrl: "",
     allowReset: true,
-    sessionTimeoutMs: 200,
+    sessionTimeoutMs: 5000,
     beforeOpenReady() {
       opens += 1;
       if (opens === 2) return late;
@@ -2841,7 +3015,7 @@ test("a late warm-up disposes only its own session", async () => {
       headers: { Authorization: "Bearer " + TOKEN },
     });
     assert.equal(accepted.status, 200);
-    const deadline = Date.now() + 5000;
+    const deadline = Date.now() + 15000;
     let live = null;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 20));

@@ -1,7 +1,7 @@
-// Open, stat, and unlink one name on a directory descriptor that was already
-// checked. Node has no openat or unlinkat. On Linux, /proc/self/fd/<dirfd>/name
-// is that operation. On macOS a small helper calls openat, fstatat, and
-// unlinkat on the inherited descriptor.
+// Open, stat, unlink, and rename one name on a directory descriptor that was
+// already checked. Node has no openat, unlinkat, or renameat. On Linux,
+// /proc/self/fd/<dirfd>/name is that operation. On macOS a small helper calls
+// openat, fstatat, unlinkat, and renameat on the inherited descriptor.
 //
 // A pure Node walk is weaker than that helper. O_NOFOLLOW applies only to the
 // last component, so opening vault/notes/file follows a parent that was
@@ -41,9 +41,9 @@ const STICKY = 0o1000;
 // rebuilds that file from dirfd-tool.c and fails unless this SHA-256 matches.
 // A rebuilt binary does not run until this constant is updated.
 const HELPER_SHA256 = {
-  "linux-x64": "78bbeec3aa73aeb0526f8cbe0f17ca20d0eeee1c4dd859e0299960b6964da92d",
-  "darwin-arm64": "0822955a14335f1cbd69239c4eaa886f156a81f76384d29992e8b6567ff6fd3c",
-  "darwin-x64": "381a4c24358f62aed38f2377e2e5e084b6eab9cbb66d3b92c5cab2281c336bee",
+  "linux-x64": "a11fa3f5c70468692bcba1bc1fb30a47151c351100cacf98d830e3f621ef7e2c",
+  "darwin-arm64": "605a6f8d353fe2a1f4b0c97de9bb9a942d6f8b00b6ed7d1c0950c521968131e4",
+  "darwin-x64": "7c3d7c2e2fb15e500b6559b26b851a54b2a7c6e9cdb6c634df164458d45b8a31",
 };
 
 function badPath() {
@@ -117,32 +117,52 @@ function selfIds() {
   return { uid, gid };
 }
 
-// filePath is included in the same listing as the directories. A fault on
-// that file is "helper-acl"; a fault on a directory is "ancestor-acl".
-export function ancestorFault(leafDir, uid = typeof process.getuid === "function" ? process.getuid() : null, filePath = "") {
-  if (typeof uid !== "number") return "ancestor";
+function walkToEnd(leafDir, uid) {
+  if (typeof uid !== "number") return { kind: "fault", fault: "ancestor", dirs: [] };
   let abs = path.resolve(String(leafDir || ""));
   const seenLinks = new Set();
   const dirs = [];
   for (let hop = 0; hop <= MAX_ANCESTOR_LINKS; hop++) {
     const step = walkAncestors(abs, uid, seenLinks);
     if (step.dirs) dirs.push(...step.dirs);
-    if (step.fault) {
-      const acl = aclFaultFor(dirs.map((dir) => ({ path: dir.path, uid: dir.uid, file: false })));
-      if (acl) return "ancestor-acl";
-      return step.fault;
-    }
-    if (!step.next) {
-      const entries = dirs.map((dir) => ({ path: dir.path, uid: dir.uid, file: false }));
-      if (filePath) entries.push({ path: path.resolve(String(filePath)), uid, file: true });
-      const acl = aclFaultFor(entries);
-      if (acl === "file") return "helper-acl";
-      if (acl) return "ancestor-acl";
-      return "";
-    }
+    if (step.fault) return { kind: "fault", fault: step.fault, dirs };
+    if (!step.next) return { kind: "done", dirs };
     abs = step.next;
   }
-  return "ancestor";
+  return { kind: "limit", dirs };
+}
+
+function aclEntries(result, filePath, uid) {
+  const entries = result.dirs.map((dir) => ({ path: dir.path, uid: dir.uid, file: false }));
+  if (result.kind === "done" && filePath) {
+    entries.push({ path: path.resolve(String(filePath)), uid, file: true });
+  }
+  return entries;
+}
+
+function applyAncestorAcl(result, acl) {
+  if (result.kind === "limit") return "ancestor";
+  if (result.kind === "fault") {
+    if (acl) return "ancestor-acl";
+    return result.fault;
+  }
+  if (acl === "file") return "helper-acl";
+  if (acl) return "ancestor-acl";
+  return "";
+}
+
+// filePath is included in the same listing as the directories. A fault on
+// that file is "helper-acl"; a fault on a directory is "ancestor-acl".
+export function ancestorFault(leafDir, uid = typeof process.getuid === "function" ? process.getuid() : null, filePath = "") {
+  const result = walkToEnd(leafDir, uid);
+  if (result.kind === "limit") return "ancestor";
+  return applyAncestorAcl(result, aclFaultFor(aclEntries(result, filePath, uid)));
+}
+
+export async function ancestorFaultAsync(leafDir, uid = typeof process.getuid === "function" ? process.getuid() : null, filePath = "") {
+  const result = walkToEnd(leafDir, uid);
+  if (result.kind === "limit") return "ancestor";
+  return applyAncestorAcl(result, await aclFaultForAsync(aclEntries(result, filePath, uid)));
 }
 
 function walkAncestors(abs, uid, seenLinks) {
@@ -405,44 +425,95 @@ function trustedLs() {
 }
 
 // "" is clean. "file" means the helper file's entry. "acl" means a directory.
-function aclFaultFor(entries) {
-  if (process.platform !== "darwin" || !entries.length) return "";
+function aclRequest(entries) {
+  if (process.platform !== "darwin" || !entries.length) return { done: "" };
   const self = selfIds();
-  if (!self || self.gid < 0) return "acl";
+  if (!self || self.gid < 0) return { done: "acl" };
   const ls = trustedLs();
-  if (!ls) return "acl";
+  if (!ls) return { done: "acl" };
   const paths = [];
   const seen = new Set();
   const unique = [];
   for (const entry of entries) {
     const filePath = String(entry.path);
-    if (filePath.includes("\n") || filePath.includes("\r")) return "acl";
+    if (filePath.includes("\n") || filePath.includes("\r")) return { done: "acl" };
     paths.push(filePath);
     if (seen.has(filePath)) continue;
     seen.add(filePath);
     unique.push(filePath);
   }
   unique.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
-  aclSpawns += 1;
-  const listed = spawnSync(ls, ["-lde", "-n", ...unique], {
-    encoding: "utf8",
-    env: { LC_ALL: "C", PATH: "/bin:/usr/bin" },
-    timeout: 5000,
-  });
+  return { self, ls, paths, unique, entries };
+}
+
+function aclFromListing(request, listed) {
   if (!listed || listed.error || listed.status !== 0) return "acl";
-  const blocks = splitAclListing(listed.stdout, paths);
+  const blocks = splitAclListing(listed.stdout, request.paths);
   if (!blocks) return "acl";
-  for (let i = 0; i < entries.length; i += 1) {
-    const ownerUid = typeof entries[i].uid === "number" ? entries[i].uid : self.uid;
+  for (let i = 0; i < request.entries.length; i += 1) {
+    const ownerUid = typeof request.entries[i].uid === "number" ? request.entries[i].uid : request.self.uid;
     if (aclListingFault(blocks[i].join("\n"), ownerUid, "")) {
-      return entries[i].file ? "file" : "acl";
+      return request.entries[i].file ? "file" : "acl";
     }
   }
   return "";
 }
 
-function foreignAcl(filePath, ownerUid) {
-  return aclFaultFor([{ path: filePath, uid: ownerUid, file: true }]) ? "acl" : "";
+function aclFaultFor(entries) {
+  const request = aclRequest(entries);
+  if (request.done !== undefined) return request.done;
+  aclSpawns += 1;
+  const listed = spawnSync(request.ls, ["-lde", "-n", ...request.unique], {
+    encoding: "utf8",
+    env: { LC_ALL: "C", PATH: "/bin:/usr/bin" },
+    timeout: 5000,
+  });
+  return aclFromListing(request, listed);
+}
+
+// Same check as aclFaultFor. spawnSync froze the worker for the whole `ls`,
+// which showed up as a multi-second event-loop gap during a mirror pass.
+// Nothing is cached: the next save lists the paths again.
+function captureSpawn(cmd, args) {
+  return new Promise((resolve) => {
+    let settled = false;
+    function finish(result) {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    }
+    let child;
+    try {
+      child = spawn(cmd, args, {
+        env: { LC_ALL: "C", PATH: "/bin:/usr/bin" },
+        timeout: 5000,
+        killSignal: "SIGKILL",
+      });
+    } catch (error) {
+      finish({ error, status: null, stdout: "" });
+      return;
+    }
+    const out = [];
+    if (child.stdout) child.stdout.on("data", (chunk) => out.push(chunk));
+    if (child.stderr) child.stderr.on("data", () => {});
+    child.on("error", (error) => finish({ error, status: null, stdout: "" }));
+    child.on("close", (status) => {
+      finish({ error: null, status, stdout: Buffer.concat(out).toString("utf8") });
+    });
+  });
+}
+
+async function aclFaultForAsync(entries) {
+  const request = aclRequest(entries);
+  if (request.done !== undefined) return request.done;
+  aclSpawns += 1;
+  const listed = await captureSpawn(request.ls, ["-lde", "-n", ...request.unique]);
+  return aclFromListing(request, listed);
+}
+
+async function foreignAclAsync(filePath, ownerUid) {
+  const fault = await aclFaultForAsync([{ path: filePath, uid: ownerUid, file: true }]);
+  return fault ? "acl" : "";
 }
 
 // A umask 002 checkout leaves the helper group-writable. Saves keep refusing
@@ -517,7 +588,7 @@ async function openTrustedHelper(env = process.env) {
   const base = path.basename(filePath);
   if (!base || base === "." || base === ".." || base.includes("/") || base.includes("\\")) throw helperUnavailable("pin");
   const parentPath = path.dirname(filePath);
-  const fault = ancestorFault(parentPath, uid);
+  const fault = await ancestorFaultAsync(parentPath, uid);
   if (fault) throw helperUnavailable(fault);
   let listed;
   let parentListed;
@@ -564,7 +635,7 @@ async function openTrustedHelper(env = process.env) {
     if (!ownedAndPrivate(again, uid)) throw helperUnavailable("owner");
     if (!ownedByAcceptableParent(parentAgain, uid)) throw helperUnavailable("race");
     if (parentAgain.dev !== parentStat.dev || parentAgain.ino !== parentStat.ino) throw helperUnavailable("race");
-    if (foreignAcl(filePath, again.uid)) throw helperUnavailable("helper-acl");
+    if (await foreignAclAsync(filePath, again.uid)) throw helperUnavailable("helper-acl");
     return { handle: file, path: filePath };
   } catch (error) {
     if (file) await file.close();
@@ -581,22 +652,26 @@ function sameInode(listed, opened) {
 
 function callHelper(dirHandle, args, body, borrowed) {
   const ready = borrowed ? Promise.resolve(borrowed) : openTrustedHelper();
-  return ready.then((tool) => new Promise((resolve, reject) => {
+  return ready.then(async (tool) => {
+    // The same checked descriptor is reused for every call in one save.
+    // The folder walk still runs before each exec: a parent can change
+    // without the open file descriptor changing. The listing is async so
+    // the walk does not freeze the caller while `ls` runs.
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    const fault = await ancestorFaultAsync(path.dirname(tool.path), uid, tool.path);
+    if (fault) {
+      if (!borrowed) {
+        try { await tool.handle.close(); } catch { /* already closed */ }
+      }
+      throw helperUnavailable(fault);
+    }
+    return new Promise((resolve, reject) => {
     function rejectClosed(error) {
       if (borrowed) {
         reject(error);
         return;
       }
       Promise.resolve(tool.handle.close()).then(() => reject(error), () => reject(error));
-    }
-    // The same checked descriptor is reused for every call in one save.
-    // The folder walk still runs before each exec: a parent can change
-    // without the open file descriptor changing.
-    const uid = typeof process.getuid === "function" ? process.getuid() : null;
-    const fault = ancestorFault(path.dirname(tool.path), uid, tool.path);
-    if (fault) {
-      rejectClosed(helperUnavailable(fault));
-      return;
     }
     // macOS will not execute /dev/fd. Recheck the path, then execute that path.
     // Linux executes the descriptor that was hashed, through /proc/self/fd.
@@ -662,7 +737,8 @@ function callHelper(dirHandle, args, body, borrowed) {
     });
     if (body && body.length) child.stdin.write(body);
     child.stdin.end();
-  }));
+    });
+  });
 }
 
 function parseIdentity(text) {
@@ -754,6 +830,41 @@ async function unlinkWithProc(dirHandle, name, id) {
   return true;
 }
 
+async function renameWithHelper(dirHandle, fromName, toName, tool) {
+  const text = await callHelper(
+    dirHandle,
+    ["rename", plainName(fromName), plainName(toName)],
+    null,
+    tool,
+  );
+  if (String(text || "").trim().split("\n")[0] !== "ok") {
+    const error = new Error("EIO");
+    error.code = "EIO";
+    throw error;
+  }
+}
+
+async function renameWithProc(dirHandle, fromName, toName) {
+  const srcPath = procEntry(dirHandle.fd, fromName);
+  const dstPath = procEntry(dirHandle.fd, toName);
+  const src = await fs.lstat(srcPath);
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (src.isSymbolicLink() || !src.isFile() || src.nlink !== 1) throw badPath();
+  if (typeof uid === "number" && src.uid !== uid) throw badPath();
+  let dst = null;
+  try {
+    dst = await fs.lstat(dstPath);
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  if (dst) {
+    if (dst.isSymbolicLink() || !dst.isFile() || dst.nlink !== 1) throw badPath();
+    if (typeof uid === "number" && dst.uid !== uid) throw badPath();
+  }
+  await fs.rename(srcPath, dstPath);
+  await dirHandle.sync();
+}
+
 function procEntry(dirfd, name) {
   return "/proc/self/fd/" + dirfd + "/" + plainName(name);
 }
@@ -809,6 +920,13 @@ export async function statEntry(dirHandle, name, backend = directoryBackend(), t
 export async function unlinkIfSame(dirHandle, name, id, backend = directoryBackend(), tool = null) {
   if (backend === "helper") return unlinkWithHelper(dirHandle, name, id, tool);
   return unlinkWithProc(dirHandle, name, id);
+}
+
+// Atomic replace inside the checked directory. The temp and the destination
+// are both one path component. A symlink or a second hard link is refused.
+export async function renameEntry(dirHandle, fromName, toName, backend = directoryBackend(), tool = null) {
+  if (backend === "helper") return renameWithHelper(dirHandle, fromName, toName, tool);
+  return renameWithProc(dirHandle, fromName, toName);
 }
 
 // A file this call just created may sit outside the vault when a parent was

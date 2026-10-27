@@ -223,6 +223,17 @@ function spawnServer(env) {
   return child;
 }
 
+async function waitBoundPort(child) {
+  const deadline = Date.now() + 12000;
+  while (Date.now() < deadline) {
+    if (child.exitCode != null) throw new Error("server exited " + child.exitCode + " " + child._log());
+    const match = child._log().match(/open:\s+http:\/\/127\.0\.0\.1:(\d+)/);
+    if (match && match[1] !== "0") return match[1];
+    await new Promise((r) => setTimeout(r, 40));
+  }
+  throw new Error("open timeout " + child._log());
+}
+
 async function waitHealth(base, child) {
   const deadline = Date.now() + 12000;
   let last = "";
@@ -1549,9 +1560,9 @@ async function pauseClearsOnlyAfterSuccess() {
   gitQuiet(vault, ["commit", "-m", "init"]);
   gitQuiet(vault, ["remote", "add", "origin", bare]);
   gitQuiet(vault, ["push", "-u", "origin", "HEAD"]);
-  const port = 38800 + Math.floor(Math.random() * 200);
+  const turnFile = path.join(tmp, "git-turn");
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: bare,
@@ -1559,8 +1570,9 @@ async function pauseClearsOnlyAfterSuccess() {
     GITHUB_TOKEN: "",
     AIDANOS_VAULT_GIT_SYNC_MS: "400",
     AIDANOS_VAULT_GIT_DEBOUNCE_MS: "200",
+    AIDANOS_TEST_GIT_TURN: turnFile,
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   const localOnly = "Sync is paused. Notes are saved on this computer only.";
   function showBare(rel) {
     try {
@@ -1570,9 +1582,26 @@ async function pauseClearsOnlyAfterSuccess() {
     }
   }
   async function pauseWithChmod() {
-    const loggedBefore = child._log().length;
-    fs.chmodSync(vault, 0);
     const deadline = Date.now() + 4000;
+    let held = false;
+    while (Date.now() < deadline) {
+      try {
+        const fd = fs.openSync(turnFile, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+        fs.closeSync(fd);
+        held = true;
+        break;
+      } catch (error) {
+        if (!error || error.code !== "EEXIST") throw error;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    }
+    assert(held, "git was still inside the vault");
+    const loggedBefore = child._log().length;
+    try {
+      fs.chmodSync(vault, 0);
+    } finally {
+      try { fs.unlinkSync(turnFile); } catch {}
+    }
     let logged = "";
     while (Date.now() < deadline) {
       logged = child._log().slice(loggedBefore);
@@ -1604,6 +1633,8 @@ async function pauseClearsOnlyAfterSuccess() {
     return { status: res.status, body, text };
   }
   try {
+    const port = await waitBoundPort(child);
+    base = "http://127.0.0.1:" + port;
     await waitHealth(base, child);
     await pauseWithChmod();
     const idle = await postSync();

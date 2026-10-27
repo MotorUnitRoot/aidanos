@@ -446,13 +446,8 @@ async function describeForeign(dir) {
 
 function foreignFolderError(found) {
   const parts = ["This folder is not the relay's own folder."];
-  if (found.notes.length) {
-    parts.push("It contains notes (" + found.notes.slice(0, 3).join(", ") + ").");
-  }
   if (found.gitRemote) parts.push("It has a git remote.");
-  if (!found.notes.length && !found.gitRemote) {
-    parts.push("It already has files, and it has no relay marker.");
-  }
+  else parts.push("It already has files, and it has no relay marker.");
   parts.push("Pass an empty folder, or the folder the relay marked earlier.");
   return parts.join(" ");
 }
@@ -594,10 +589,12 @@ export async function startRelay(options = {}) {
   await installIndexTrace((line) => logSafe(secrets, line), { thread: "main" });
   await assertNotClientVault(vault);
   // A symlink is refused before any marker is written through it.
+  // The temp sweep runs only after the folder is claimed, and only for
+  // paths recorded in the state-folder manifest. There is no tree walk.
   await refuseSymlinkedStorage(dataDir);
-  await sweepStaleNoteTemps(vault);
   await claimRelayFolders(vault, dataDir);
   if (storageFolderFault(dataDir)) throw new Error("storage folder failed the owner walk");
+  await sweepStaleNoteTemps(vault, dataDir);
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
   const failures = new Map();
@@ -1341,7 +1338,7 @@ export async function startRelay(options = {}) {
     trackInflight(() => saveNoteFile(noteFile, body, async () => {
       if (staged) await fs.writeFile(String(staged), body);
       await new Promise((resolve) => setTimeout(resolve, delay));
-    })).catch(() => { /* the shutdown wait still sees this save leave the set */ });
+    }, { vault, stateDir: dataDir })).catch(() => { /* the shutdown wait still sees this save leave the set */ });
   }
   return api;
 }

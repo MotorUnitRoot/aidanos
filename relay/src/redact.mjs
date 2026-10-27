@@ -2,7 +2,15 @@
 // token must never appear in a log line.
 import { closeSync, constants as fsConstants, createWriteStream, fchmodSync, fstatSync, ftruncateSync, lstatSync, openSync, writeSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { formatWithOptions } from "node:util";
+
+// This file lives at relay/src. A stack frame under that tree is shown
+// repo-relative. A vault path that only looks like relay/src is not.
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+const SLASH_ALLOW = new Set(["HTTP/1.1", "KB/s", "MB/s", "application/json", "text/plain"]);
+const NOTE_EXTS = ["markdown", "mdx", "txt", "md"];
 
 export function redact(text, secrets) {
   let out = String(text ?? "");
@@ -21,33 +29,28 @@ export function redact(text, secrets) {
   out = out.replace(/Authorization:\s*Basic\s+\S+/gi, "Authorization: Basic ***");
   out = out.replace(/AIDANOS_(?:RELAY|VAULT_GIT)_TOKEN=\S+/g, "AIDANOS_TOKEN=***");
   out = out.replace(/https?:\/\/[^\s]+/gi, "[url]");
-  out = out.replace(/file:\/\/[^\s]+/gi, "[url]");
   // Same scrub for stderr and fatal.log. A vault path or a note file name
   // must not land in either. Document ids have neither a slash nor a .md suffix.
-  return scrubLocations(out);
+  // Scrub runs before the cut so a path or a spaced note name that crosses
+  // 8 KB is already [path] or [note], not a leftover prefix.
+  const kept = [];
+  out = scrubLocations(out, kept);
+  out = out.replace(/file:\/\/\S+/gi, "[url]");
+  for (let i = 0; i < kept.length; i += 1) {
+    out = out.split("\uE000" + i.toString(16) + "\uE000").join(kept[i]);
+  }
+  return capLocations(out);
 }
 
-// One log line, then the marker. The scanner never sees more than this.
+// One log line, then the marker. The cut is applied to text that is already
+// scrubbed, and the last partial token is dropped so the marker does not
+// keep the start of a path.
 export const LOG_LINE_CAP = 8 * 1024;
 
-function capLine(line) {
-  // A code unit at or below 127 is one UTF-8 byte, so the byte length is the
-  // string length. Wider lines are measured and cut on a code-point boundary.
-  if (line.length <= LOG_LINE_CAP) {
-    let ascii = true;
-    for (let i = 0; i < line.length; i += 1) {
-      if (line.charCodeAt(i) > 127) {
-        ascii = false;
-        break;
-      }
-    }
-    if (ascii) return line;
-  }
-  const buf = Buffer.from(line);
-  if (buf.length <= LOG_LINE_CAP) return line;
-  let end = LOG_LINE_CAP;
-  while (end > 0 && (buf[end] & 0xc0) === 0x80) end -= 1;
-  return buf.toString("utf8", 0, end) + "[truncated]";
+function shield(kept, text) {
+  const token = "\uE000" + kept.length.toString(16) + "\uE000";
+  kept.push(text);
+  return token;
 }
 
 // Token boundaries. A slash stays inside the token so /a/b and a/b are one path.
@@ -57,27 +60,81 @@ function isBreak(code) {
     || code === 93 || code === 96;
 }
 
-// Index lines record a step as 3x/1.2ms. That slash is not a vault path.
-function isDurationCount(token) {
-  let i = 0;
-  const n = token.length;
-  if (n < 6 || token.charCodeAt(0) < 48 || token.charCodeAt(0) > 57) return false;
-  while (i < n && token.charCodeAt(i) >= 48 && token.charCodeAt(i) <= 57) i += 1;
-  if (i + 1 >= n || token.charCodeAt(i) !== 120 || token.charCodeAt(i + 1) !== 47) return false;
-  i += 2;
-  if (i >= n || token.charCodeAt(i) < 48 || token.charCodeAt(i) > 57) return false;
-  while (i < n && token.charCodeAt(i) >= 48 && token.charCodeAt(i) <= 57) i += 1;
-  if (i < n && token.charCodeAt(i) === 46) {
-    i += 1;
-    if (i >= n || token.charCodeAt(i) < 48 || token.charCodeAt(i) > 57) return false;
-    while (i < n && token.charCodeAt(i) >= 48 && token.charCodeAt(i) <= 57) i += 1;
+function isDigit(code) {
+  return code >= 48 && code <= 57;
+}
+
+function isRatio(token) {
+  let slash = -1;
+  for (let i = 0; i < token.length; i += 1) {
+    const code = token.charCodeAt(i);
+    if (code === 47) {
+      if (slash !== -1 || i === 0 || i + 1 === token.length) return false;
+      slash = i;
+      continue;
+    }
+    if (!isDigit(code)) return false;
   }
-  return token.charCodeAt(i) === 109 && token.charCodeAt(i + 1) === 115 && i + 2 === n;
+  return slash !== -1;
+}
+
+// :line:col after a path. Returns the index just past the column, or 0.
+function stackTail(line, i) {
+  const n = line.length;
+  if (i >= n || line.charCodeAt(i) !== 58) return 0;
+  let j = i + 1;
+  if (j >= n || !isDigit(line.charCodeAt(j))) return 0;
+  while (j < n && isDigit(line.charCodeAt(j))) j += 1;
+  if (j >= n || line.charCodeAt(j) !== 58) return 0;
+  j += 1;
+  if (j >= n || !isDigit(line.charCodeAt(j))) return 0;
+  while (j < n && isDigit(line.charCodeAt(j))) j += 1;
+  return j;
+}
+
+function repoFrame(absPath) {
+  if (!absPath || absPath.includes("\0")) return "";
+  const abs = path.resolve(absPath);
+  const root = REPO_ROOT.endsWith(path.sep) ? REPO_ROOT : REPO_ROOT + path.sep;
+  if (!abs.startsWith(root)) return "";
+  const rel = path.relative(REPO_ROOT, abs).split(path.sep).join("/");
+  if (!rel.startsWith("relay/") || rel.split("/").includes("..") || rel.split("/").includes("")) return "";
+  return rel;
+}
+
+function fileUrlFrame(url) {
+  const lower = url.slice(0, 7).toLowerCase();
+  if (lower !== "file://") return "";
+  let body = url.slice(7);
+  const tailAt = body.lastIndexOf(":");
+  if (tailAt <= 0) return "";
+  const lineAt = body.lastIndexOf(":", tailAt - 1);
+  if (lineAt <= 0) return "";
+  const tail = stackTail(body, lineAt);
+  if (tail !== body.length) return "";
+  const abs = body.slice(0, lineAt);
+  const shown = repoFrame(abs);
+  if (!shown) return "";
+  return shown + body.slice(lineAt);
+}
+
+function capScrubbed(line) {
+  const buf = Buffer.from(line);
+  if (buf.length <= LOG_LINE_CAP) return line;
+  let end = LOG_LINE_CAP;
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end -= 1;
+  let head = buf.toString("utf8", 0, end);
+  if (end < buf.length) {
+    let cut = head.length;
+    while (cut > 0 && !isBreak(head.charCodeAt(cut - 1))) cut -= 1;
+    head = head.slice(0, cut);
+  }
+  return head + "[truncated]";
 }
 
 // One forward pass. Each character is copied or skipped once, so a line of
 // '(a/' or 'a/a/a/' cannot blow up the way a nested quantifier did.
-function scrubPaths(line) {
+function scrubPaths(line, kept) {
   const n = line.length;
   const parts = [];
   let i = 0;
@@ -86,37 +143,111 @@ function scrubPaths(line) {
     while (i < n && isBreak(line.charCodeAt(i))) i += 1;
     if (i > start) parts.push(line.slice(start, i));
     if (i >= n) break;
+    if (line.startsWith("file://", i)) {
+      let j = i + 7;
+      while (j < n && line.charCodeAt(j) > 32 && line.charCodeAt(j) !== 41) j += 1;
+      const url = line.slice(i, j);
+      const shown = fileUrlFrame(url);
+      parts.push(shown ? shield(kept, shown) : url);
+      i = j;
+      continue;
+    }
+    if (line.startsWith("node:internal/", i)) {
+      let j = i + "node:internal/".length;
+      let frameEnd = 0;
+      while (j < n) {
+        const code = line.charCodeAt(j);
+        if (code === 58) {
+          const tail = stackTail(line, j);
+          if (tail) {
+            frameEnd = tail;
+            break;
+          }
+        }
+        if (isBreak(code)) break;
+        j += 1;
+      }
+      if (frameEnd) {
+        parts.push(shield(kept, line.slice(i, frameEnd)));
+        i = frameEnd;
+        continue;
+      }
+    }
+    if (driveAt(line, i)) {
+      const tokenStart = i;
+      i += 2;
+      while (i < n && !isBreak(line.charCodeAt(i))) i += 1;
+      parts.push(line.slice(tokenStart, i).length ? "[path]" : "");
+      continue;
+    }
     const tokenStart = i;
     let slash = false;
+    let encoded = false;
     while (i < n && !isBreak(line.charCodeAt(i))) {
-      if (line.charCodeAt(i) === 47) slash = true;
+      const code = line.charCodeAt(i);
+      if (code === 47 || code === 92) slash = true;
+      if (code === 37 && i + 2 < n && line.charCodeAt(i + 1) === 50) {
+        const hex = line.charCodeAt(i + 2);
+        if (hex === 70 || hex === 102) encoded = true;
+      }
       i += 1;
     }
     const token = line.slice(tokenStart, i);
-    parts.push(slash && !isDurationCount(token) ? "[path]" : token);
+    const tail = stackTail(line, i);
+    if (tail && (token.startsWith("/") || token.startsWith("\\"))) {
+      const shown = repoFrame(token);
+      if (shown) {
+        parts.push(shield(kept, shown + line.slice(i, tail)));
+        i = tail;
+        continue;
+      }
+    }
+    if (SLASH_ALLOW.has(token) || isRatio(token)) {
+      parts.push(token);
+      continue;
+    }
+    parts.push(slash || encoded ? "[path]" : token);
   }
   return parts.join("");
 }
 
+function driveAt(line, i) {
+  if (i + 2 >= line.length) return false;
+  const code = line.charCodeAt(i);
+  const letter = (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+  if (!letter || line.charCodeAt(i + 1) !== 58) return false;
+  const sep = line.charCodeAt(i + 2);
+  return sep === 92 || sep === 47;
+}
+
 function matchNoteExt(line, i) {
-  if (i + 3 > line.length || line.charCodeAt(i) !== 46) return 0;
-  const a = line.charCodeAt(i + 1);
-  const b = line.charCodeAt(i + 2);
-  const m = a === 77 || a === 109;
-  const d = b === 68 || b === 100;
-  if (!m || !d) return 0;
-  const after = i + 3;
-  if (after < line.length) {
-    const c = line.charCodeAt(after);
-    const word = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
-    if (word) return 0;
+  if (i >= line.length || line.charCodeAt(i) !== 46) return 0;
+  for (const ext of NOTE_EXTS) {
+    const after = i + 1 + ext.length;
+    if (after > line.length) continue;
+    let ok = true;
+    for (let k = 0; k < ext.length; k += 1) {
+      let code = line.charCodeAt(i + 1 + k);
+      if (code >= 65 && code <= 90) code += 32;
+      if (code !== ext.charCodeAt(k)) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+    if (after < line.length) {
+      const code = line.charCodeAt(after);
+      const word = (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95;
+      if (word) continue;
+    }
+    return after;
   }
-  return after;
+  return 0;
 }
 
 // A note name may contain spaces. The left edge is the line start, a quote,
 // a colon, or a slash. Walking stops at a span already claimed, so the pass
-// stays linear. .md and .MD are the same suffix.
+// stays linear. .md, .txt, .markdown, and .mdx match in either case.
 function scrubNotes(line) {
   const n = line.length;
   const drop = new Uint8Array(n);
@@ -151,13 +282,19 @@ function scrubNotes(line) {
   return parts.join("");
 }
 
-function scrubLine(line) {
-  return scrubNotes(scrubPaths(line));
+function scrubLine(line, kept) {
+  return scrubNotes(scrubPaths(line, kept));
 }
 
-function scrubLocations(text) {
+function scrubLocations(text, kept) {
   const lines = String(text).split("\n");
-  for (let i = 0; i < lines.length; i += 1) lines[i] = scrubLine(capLine(lines[i]));
+  for (let i = 0; i < lines.length; i += 1) lines[i] = scrubLine(lines[i], kept);
+  return lines.join("\n");
+}
+
+function capLocations(text) {
+  const lines = String(text).split("\n");
+  for (let i = 0; i < lines.length; i += 1) lines[i] = capScrubbed(lines[i]);
   return lines.join("\n");
 }
 

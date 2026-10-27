@@ -303,7 +303,7 @@ async function run() {
     const body = "whole-note-line\n".repeat(256);
     trackSave(() => saveNoteFile(noteFile, body, () => new Promise((resolve) => {
       setTimeout(resolve, test.holdNoteMs);
-    })));
+    }), { vault: data.vault, stateDir: data.dataDir }));
   }
   if (test && test.crashOnBoot) {
     setTimeout(() => process.exit(1), 40);

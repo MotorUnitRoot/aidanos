@@ -161,14 +161,38 @@ function normalizeTime(hhmm) {
     String(parseInt(parts[1], 10)).padStart(2, "0");
 }
 
+const SPOKEN_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+function spokenClock(hhmm) {
+  const parts = normalizeTime(hhmm).split(":");
+  let hour = parseInt(parts[0], 10);
+  const minute = parts[1];
+  if (!minute || Number.isNaN(hour)) return String(hhmm || "");
+  const suffix = hour >= 12 ? "pm" : "am";
+  hour = hour % 12;
+  if (hour === 0) hour = 12;
+  return hour + ":" + minute + suffix;
+}
+
+function spokenDateTime(date, hhmm) {
+  const month = parseInt(String(date || "").slice(5, 7), 10);
+  const day = parseInt(String(date || "").slice(8, 10), 10);
+  const name = SPOKEN_MONTHS[month - 1];
+  if (!name || !day) return String(date || "") + " " + spokenClock(hhmm);
+  return name + " " + day + ", " + spokenClock(hhmm);
+}
+
 function stripWhen(line) {
   return String(line || "")
-    .replace(WHEN_RE, "")
-    .replace(/^[-*+]\s*\[[ xX]\]\s*/, "")
-    .replace(/^#{1,6}\s+/, "")
-    .replace(/^[-*+]\s+/, "")
-    .replace(/^\d+[.)]\s+/, "")
-    .replace(/\s+/g, " ")
+    .replace(/@(\d{4}-\d{2}-\d{2})[ T]\d{1,2}:\d{2}\b/, "$1")
+    .replace(/@\d{1,2}:\d{2}\b/g, "")
+    .replace(/@(\d{4}-\d{2}-\d{2})[ T](\d{1,2}:\d{2})\b/g, (_, date, hhmm) => spokenDateTime(date, hhmm))
+    .replace(/^\s*[-*+]\s+\[[^\]]*\]\s*/, "")
+    .replace(/^\s*#{1,6}\s+/, "")
+    .replace(/^\s*[-*+]\s+/, "")
+    .replace(/^\s*\d+[.)]\s+/, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([.,])/g, "$1")
     .trim();
 }
 
@@ -190,7 +214,8 @@ function parseBlocks(text, day) {
     const key = time + "|" + label;
     if (seen.has(key)) continue;
     seen.add(key);
-    blocks.push({ time, text: label, raw: line });
+    const done = /^\s*[-*+]\s+\[[xX]\]/.test(line);
+    blocks.push({ time, text: label, raw: line, done });
   }
   const stop = day && day.hard_stop ? normalizeTime(day.hard_stop) : "";
   if (stop && !blocks.some((b) => b.time === stop && /hard stop/i.test(b.text))) {
@@ -218,9 +243,12 @@ function paintWiki(escaped, showMarks) {
 function paintBold(escaped) {
   return String(escaped || "").replace(/\*\*([^*]+)\*\*/g, '<strong class="md-b">$1</strong>');
 }
+function paintDates(escaped) {
+  return String(escaped || "").replace(/(\d{4}-\d{2}-\d{2})/g, '<span class="md-date">$1</span>');
+}
 function paintInline(s) {
-  return paintWiki(paintBold(escapeHtml(s)
-    .replace(/@(\d{1,2}:\d{2})\b/g, '<span class="md-when">@$1</span>')), false);
+  return paintDates(paintWiki(paintBold(escapeHtml(s)
+    .replace(/@(\d{1,2}:\d{2})\b/g, '<span class="md-when">@$1</span>')), false));
 }
 
 function indentPad(spaces) {
@@ -238,8 +266,27 @@ function paperTaskSrc(indent, mark, on, body) {
 
 function paintTaskBodyHtml(body, asSource) {
   const text = String(body ?? "");
-  const html = asSource ? paintWiki(escapeHtml(text), true) : paintInline(text);
+  const html = asSource ? paintDates(paintWiki(escapeHtml(text), true)) : paintInline(text);
   return html || "<br>";
+}
+
+function markLine(line) {
+  const match = String(line ?? "").match(/^(\s*)([-*+])\s+\[([ xX\->]?)\](.*)$/);
+  if (!match) return null;
+  const box = match[3];
+  if (box === "-") return { form: "cancelled", indent: match[1], body: match[4] };
+  if (box === ">") return { form: "scheduled", indent: match[1], body: match[4] };
+  return { form: "task", done: box.toLowerCase() === "x", indent: match[1], body: match[4] };
+}
+
+function tickTypedBox(line) {
+  const text = String(line ?? "");
+  const task = text.match(/^(\s*[-*+]\s+)\[([ xX]?)\](.*)$/);
+  if (!task) return text;
+  const mark = task[2];
+  if (mark !== "" && mark !== " " && mark.toLowerCase() !== "x") return text;
+  const box = mark.toLowerCase() === "x" ? "[ ]" : "[x]";
+  return task[1] + box + task[3];
 }
 
 function familyQuestionText(n) {
@@ -298,9 +345,26 @@ function formatQuestionLine(line, asSource, hidden) {
     '</span><span class="md-body">' + answer + "</span></div>";
 }
 
+function paintMarkedLine(line, asSource, hidden) {
+  const marked = markLine(line);
+  if (!marked || marked.form === "task") return "";
+  const front = hidden ? " md-front" : "";
+  const src = asSource ? " is-source" : "";
+  const nest = marked.indent ? " nest" : "";
+  const body = paintTaskBodyHtml(marked.body, asSource);
+  const cls = "md-line" + src + front + (marked.form === "cancelled" ? " cancelled" : " scheduled") + nest;
+  const arrow = marked.form === "scheduled"
+    ? '<span class="md-go" contenteditable="false" aria-hidden="true"></span>'
+    : "";
+  return '<div draggable="true" class="' + cls + '" data-kind="' + marked.form + '" data-src="' + attr(line) +
+    '" style="' + indentPad(marked.indent) + '">' + arrow + '<span class="md-body">' + body + "</span></div>";
+}
+
 function formatOneLine(line, asSource, hidden) {
   const questionHtml = formatQuestionLine(line, asSource, hidden);
   if (questionHtml) return questionHtml;
+  const markedHtml = paintMarkedLine(line, asSource, hidden);
+  if (markedHtml) return markedHtml;
   if (asSource) {
     let cls = "md-line is-source";
     if (hidden) cls += " md-front";
@@ -317,11 +381,10 @@ function formatOneLine(line, asSource, hidden) {
     } else if ((m = matchPaperTask(line))) {
       const on = /x/i.test(m[3]);
       const nest = m[1] ? " nest" : "";
-      const src = paperTaskSrc(m[1], m[2], on, m[4]);
       cls += " task" + (on ? " done" : "") + nest;
       kind = "task";
       extra = ' data-indent="' + attr(m[1]) + '" data-mark="' + attr(m[2]) + '"';
-      return '<div draggable="true" class="' + cls + '" data-kind="' + kind + '" data-src="' + attr(src) + '"' + extra +
+      return '<div draggable="true" class="' + cls + '" data-kind="' + kind + '" data-src="' + attr(line) + '"' + extra +
         ' style="' + indentPad(m[1]) + '"><span class="md-box" contenteditable="false" role="checkbox" aria-checked="' +
         (on ? "true" : "false") + '"></span><span class="md-body">' +
         paintTaskBodyHtml(m[4], true) + "</span></div>";
@@ -353,9 +416,8 @@ function formatOneLine(line, asSource, hidden) {
   if ((m = matchPaperTask(line))) {
     const on = /x/i.test(m[3]);
     const nest = m[1] ? " nest" : "";
-    const src = paperTaskSrc(m[1], m[2], on, m[4]);
     return '<div draggable="true" class="md-line' + front + ' task' + (on ? " done" : "") + nest +
-      '" data-kind="task" data-src="' + attr(src) + '" data-indent="' + attr(m[1]) + '" data-mark="' + attr(m[2]) +
+      '" data-kind="task" data-src="' + attr(line) + '" data-indent="' + attr(m[1]) + '" data-mark="' + attr(m[2]) +
       '" style="' + indentPad(m[1]) + '"><span class="md-box" contenteditable="false" role="checkbox" aria-checked="' +
       (on ? "true" : "false") + '"></span><span class="md-body">' +
       paintTaskBodyHtml(m[4], false) + "</span></div>";
@@ -434,6 +496,12 @@ function cleanPaperMarkdown(md) {
   return joinBrokenHyphens(String(md ?? "").split("\n").map((line) => normalizeCheckboxStub(stripAccidentalBulletSpace(line))).join("\n"));
 }
 
+function textAsTyped(markdown) {
+  const editor = globalThis.AidanLiveNote;
+  if (editor && typeof editor.keepTyped === "function") return editor.keepTyped(markdown);
+  return cleanPaperMarkdown(markdown);
+}
+
 function normalizeSeasonPlanMarkdown(md) {
   let s = String(md ?? "").replace(/\r\n/g, "\n");
   // Un-task headings accidentally saved as "- [ ] ## Why"
@@ -477,14 +545,105 @@ function outdentDumpLine(line) {
   return s;
 }
 
+// "1." and "1)" are ordered markers. A four-digit year like "2026." is not.
+function formatBarListMark(line) {
+  const m = String(line ?? "").match(/^(\s*)(\d+)([.)])(\s+)(.*)$/);
+  if (!m) return null;
+  if (m[2].length === 4 && m[3] === ".") return null;
+  return m;
+}
+
+function formatBarBody(line) {
+  const s = String(line ?? "");
+  const task = matchPaperTask(s);
+  if (task) return String(task[4] ?? "");
+  let m;
+  if ((m = s.match(/^(#{1,6})\s+(.*)$/))) return m[2];
+  if ((m = s.match(/^(\s*)([-*+])\s+(.*)$/))) return m[3];
+  const ol = formatBarListMark(s);
+  // Heading keeps a parenthesis number ("1)") in the text. Only "1." is a list.
+  if (ol && ol[3] === ".") return ol[5];
+  if ((m = s.match(/^\s{2,}(\S.*)$/))) return m[1];
+  return s.replace(/^\s+/, "");
+}
+
+function formatBarTaskLine(text) {
+  const line = String(text ?? "");
+  if (/^\s*#{1,6}\s/.test(line)) return line;
+  const task = matchPaperTask(line);
+  if (task) return paperTaskSrc(task[1], task[2], !/x/i.test(task[3]), task[4]);
+  const ul = line.match(/^(\s*)([-*+])\s+(.*)$/);
+  if (ul) return ul[1] + "- [ ] " + ul[3];
+  const ol = formatBarListMark(line);
+  if (ol) return ol[1] + "- [ ] " + ol[5];
+  const nest = line.match(/^(\s{2,})(\S.*)$/);
+  if (nest) return nest[1] + "- [ ] " + nest[2];
+  return "- [ ] " + line.replace(/^\s+/, "");
+}
+
+// Heading toggles level 2 ("## "). A level-2 line, even with leading spaces,
+// returns to its body. Any other line, including another heading level,
+// becomes "## " plus that body. A task line is left unchanged. A year like
+// "2026." is not a list marker, and "1)" stays in the text.
+// List toggles a bullet ("- ").
+function formatBarHeadingLine(text) {
+  const line = String(text ?? "");
+  if (matchPaperTask(line)) return line;
+  const already = line.match(/^\s*(#{1,6})\s+(.*)$/);
+  if (already && already[1] === "##") return already[2];
+  const body = already ? already[2] : formatBarBody(line);
+  return body ? "## " + body : "## ";
+}
+
+function formatBarListLine(text) {
+  const line = String(text ?? "");
+  const task = matchPaperTask(line);
+  if (task) return task[1] + "- " + String(task[4] ?? "");
+  let m;
+  if ((m = line.match(/^(\s*)([-*+])\s+(.*)$/))) return m[1] + m[3];
+  const ol = formatBarListMark(line);
+  if (ol) return ol[1] + ol[5];
+  if ((m = line.match(/^(#{1,6})\s+(.*)$/))) return m[2] ? "- " + m[2] : "- ";
+  if ((m = line.match(/^(\s+)(\S.*)$/))) return m[1] + "- " + m[2].replace(/^#{1,6}\s+/, "");
+  const body = line.replace(/^\s+/, "");
+  return body ? "- " + body : "- ";
+}
+
+function formatBarCaret(before, after, offset) {
+  const prev = String(before ?? "");
+  const next = String(after ?? "");
+  const off = Number(offset);
+  const start = Number.isFinite(off) ? off : 0;
+  const pos = start + next.length - prev.length;
+  if (pos < 0) return 0;
+  if (pos > next.length) return next.length;
+  return pos;
+}
+
+function formatBarApply(markdown, index, action) {
+  const lines = String(markdown ?? "").split("\n");
+  let idx = Number(index);
+  if (!Number.isInteger(idx) || idx < 0) idx = 0;
+  while (lines.length <= idx) lines.push("");
+  const text = lines[idx] != null ? lines[idx] : "";
+  let next = text;
+  if (action === "task") next = formatBarTaskLine(text);
+  else if (action === "heading") next = formatBarHeadingLine(text);
+  else if (action === "list") next = formatBarListLine(text);
+  else if (action === "indent") next = indentDumpLine(text);
+  else if (action === "outdent") next = outdentDumpLine(text);
+  lines[idx] = next;
+  return lines.join("\n");
+}
+
 function emptyListPrefix(line) {
   const s = String(line ?? "");
   const task = s.match(/^(\s*[-*+]\s+\[[ xX]?\]\s*)$/);
   if (task) return task[1];
   const ul = s.match(/^(\s*[-*+]\s+)$/);
   if (ul) return ul[1];
-  const ol = s.match(/^(\s*\d+[.)]\s+)$/);
-  if (ol) return ol[1];
+  const ol = s.match(/^(\s*)(\d+)([.)])(\s+)$/);
+  if (ol && !(ol[2].length === 4 && ol[3] === ".")) return ol[0];
   return "";
 }
 
@@ -695,6 +854,24 @@ function lineIndexOfCaret() {
   return paperLines().indexOf(line);
 }
 
+function keptTaskLine(el, dumpLine) {
+  const original = (el.getAttribute && el.getAttribute("data-src")) || dumpLine || "";
+  const parts = String(original).match(/^(\s*[-*+]\s+\[[^\]]*\]\s*)([\s\S]*)$/);
+  if (!parts) return dumpLine != null ? dumpLine : original;
+  const bodyEl = el.querySelector && el.querySelector(".md-body");
+  const raw = bodyEl
+    ? (bodyEl.innerText != null ? bodyEl.innerText : bodyEl.textContent)
+    : (el.innerText != null ? el.innerText : el.textContent);
+  const body = stripAccidentalBulletSpace(String(raw || "").replace(/\n/g, "").replace(/\u00a0/g, " ").replace(/\u200b/g, ""));
+  let next = body === parts[2] ? original : parts[1] + body;
+  if (el.dataset && el.dataset.kind === "task") {
+    const done = !!(el.classList && el.classList.contains("done"));
+    const was = /\[[xX]\]/.test(parts[1]);
+    if (done !== was) next = tickTypedBox(next);
+  }
+  return next;
+}
+
 function lineMarkdown(el) {
   if (!el) return "";
   const locked = lockedQuestionMarkdown(el);
@@ -711,7 +888,9 @@ function lineMarkdown(el) {
         : String(el.innerText != null ? el.innerText : (el.textContent || "")).replace(/^#+\s*/, "");
       return "#".repeat(level) + " " + stripAccidentalBulletSpace(body.replace(/\n/g, "").replace(/\u00a0/g, " "));
     }
-    if (el.dataset && el.dataset.kind === "task") return sourceTaskMarkdown(el);
+    if (el.dataset && (el.dataset.kind === "task" || el.dataset.kind === "cancelled" || el.dataset.kind === "scheduled")) {
+      return keptTaskLine(el, dumpLine);
+    }
     const raw = (el.innerText != null ? el.innerText : (el.textContent || ""));
     return stripAccidentalBulletSpace(String(raw).replace(/\n/g, "").replace(/\u00a0/g, " "));
   }
@@ -719,8 +898,8 @@ function lineMarkdown(el) {
     if (el.dataset && el.dataset.kind === "task" && matchPaperTask(dumpLine)) {
       const hit = matchPaperTask(dumpLine);
       const on = el.classList.contains("done");
-      const was = /x/i.test(hit[3]);
-      if (on !== was) return paperTaskSrc(hit[1], hit[2], on, hit[4]);
+      const was = String(hit[3] || "").toLowerCase() === "x";
+      if (on !== was) return tickTypedBox(dumpLine);
     }
     return dumpLine;
   }
@@ -768,7 +947,7 @@ function syncDumpFromPaper() {
     const was = /x/i.test(hit[3]);
     if (on !== was) lines[idx] = paperTaskSrc(hit[1], hit[2], on, hit[4]);
   }
-  dump.value = cleanPaperMarkdown(lines.join("\n"));
+  dump.value = textAsTyped(lines.join("\n"));
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
   return dump;
 }
@@ -944,12 +1123,75 @@ function paperFocused() {
   return a && (a.id === "paper" || a.id === "dump" || (a.closest && a.closest("#paper")));
 }
 
+let editorNotice = "";
+
+function paintEditorNote() {
+  const note = $("editor-note");
+  if (!note) return;
+  if (!editorNotice) {
+    note.hidden = true;
+    note.textContent = "";
+    return;
+  }
+  note.hidden = false;
+  note.textContent = editorNotice;
+}
+
 function setStatus(msg, kind = "") {
   const el = $("status");
   if (!el) return;
   el.textContent = msg || "\u00a0";
   el.className = "status" + (kind ? " " + kind : "");
+  if (msg !== "Unsaved") {
+    editorNotice = "";
+    paintEditorNote();
+  }
 }
+
+let openingTimer = null;
+
+function showEditorUnsaved() {
+  setStatus("Unsaved");
+  editorNotice = "This change is kept on this device.";
+  paintEditorNote();
+  const wrap = document.querySelector(".paper-wrap");
+  if (wrap) wrap.scrollTop = 0;
+}
+
+function showEditorState(name) {
+  const stateName = String(name || "");
+  document.body.dataset.editorState = stateName;
+  clearTimeout(openingTimer);
+  openingTimer = null;
+  if (stateName === "error") {
+    showEditorUnsaved();
+    return;
+  }
+  if (stateName === "loading") {
+    const paper = $("paper");
+    if (paper) {
+      paper.innerHTML = "";
+      paper.removeAttribute("data-placeholder");
+    }
+    editorNotice = "";
+    paintEditorNote();
+    setStatus("");
+    openingTimer = setTimeout(() => {
+      if (document.body.dataset.editorState !== "loading") return;
+      editorNotice = "Opening\u2026";
+      paintEditorNote();
+    }, 1000);
+    return;
+  }
+  if (stateName === "normal") {
+    setStatus("Saved", "saved");
+    return;
+  }
+  setStatus("");
+}
+
+globalThis.showEditorState = showEditorState;
+globalThis.openDay = openDay;
 
 async function api(path, opts = {}) {
   const rest = { ...opts };
@@ -1114,6 +1356,10 @@ function renderWeek() {
       "<span class=\"dow\">" + DOW_FULL[i] + "</span>" +
       "<span class=\"dom\">" + d.date.slice(8) + "</span>" +
       "<span class=\"moy\">" + escapeHtml(formatCardMonth(d.date)) + "</span>";
+    const month = $("week-month");
+    if (month && i === 0) {
+      month.textContent = parseDate(d.date).toLocaleDateString("en-US", { month: "long", year: "numeric" });
+    }
     btn.addEventListener("click", () => openDay(d.date));
     daysEl.appendChild(btn);
   });
@@ -1278,7 +1524,7 @@ async function openDay(date, { silent = false, force = false } = {}) {
     clearTimeout(state.saveTimer);
     state.saveTimer = null;
     if (state.day) {
-      const kept = cleanPaperMarkdown(oldMd);
+      const kept = textAsTyped(oldMd);
       state.day.markdown = kept;
       state.day.paper = kept;
       if (dump) dump.value = kept;
@@ -1359,7 +1605,7 @@ function renderDay() {
   $("paper-title").textContent = formatPaperTitle(d.date);
   $("rail-date").textContent = formatRailDate(d.date);
   const dump = $("dump");
-  dump.value = cleanPaperMarkdown(dayMarkdown(d));
+  dump.value = textAsTyped(dayMarkdown(d));
   paintPaper();
   syncJobChrome();
   paintJobSeason();
@@ -1393,7 +1639,7 @@ function renderRail() {
     lane.className = "slot-lane";
     for (const b of (byTime[time] || [])) {
       const block = document.createElement("div");
-      block.className = "block" + (b.bound ? " bound" : "");
+      block.className = "block" + (b.bound ? " bound" : "") + (b.done ? " done" : "");
       block.textContent = b.text;
       if (!b.bound) {
         block.draggable = false;
@@ -1799,9 +2045,9 @@ function ensureDumpMatchesPaper() {
   const nodes = paperLines();
   let rebuilt = "";
   if (nodes.length) {
-    rebuilt = cleanPaperMarkdown(nodes.map(lineMarkdown).join("\n"));
+    rebuilt = textAsTyped(nodes.map(lineMarkdown).join("\n"));
   } else {
-    rebuilt = cleanPaperMarkdown(String(paper.innerText || "").replace(/\u00a0/g, " "));
+    rebuilt = textAsTyped(String(paper.innerText || "").replace(/\u00a0/g, " "));
   }
   const dumpTrim = String(dump.value || "").trim();
   const paperTrim = String(rebuilt || "").trim();
@@ -1849,7 +2095,7 @@ function applyRemoteDay(day) {
   if (state.selectedDate && date && date !== state.selectedDate) return;
   const markdown = typeof day.markdown === "string" ? day.markdown : dayMarkdown(day);
   const dump = $("dump");
-  const cleaned = cleanPaperMarkdown(markdown || "");
+  const cleaned = textAsTyped(markdown || "");
   if (dump) dump.value = cleaned;
   if (state.day && (!date || state.day.date === date)) {
     state.day.markdown = cleaned;
@@ -1996,7 +2242,7 @@ function applyRemoteNote(body) {
   const path = body && body.path ? String(body.path).replace(/\\/g, "/") : state.doc.path;
   if (path && state.doc.path && path !== state.doc.path) return;
   const markdown = typeof (body && body.markdown) === "string" ? body.markdown : "";
-  const cleaned = cleanPaperMarkdown(markdown || "");
+  const cleaned = textAsTyped(markdown || "");
   const dump = $("dump");
   if (dump) dump.value = cleaned;
   state.doc.markdown = cleaned;
@@ -2013,7 +2259,7 @@ function paperSaveSnapshot() {
   ensureDumpMatchesPaper();
   const dump = $("dump");
   if (isNoteDoc()) {
-    let markdown = cleanPaperMarkdown(dump ? dump.value : String(state.doc.markdown || ""));
+    let markdown = textAsTyped(dump ? dump.value : String(state.doc.markdown || ""));
     if (String(state.doc.path || "").replace(/\\/g, "/") === "aidanos/active-horse.md") {
       markdown = normalizeSeasonPlanMarkdown(markdown);
     }
@@ -2033,7 +2279,7 @@ function paperSaveSnapshot() {
     };
   }
   if (state.day) {
-    const markdown = cleanPaperMarkdown(dump ? dump.value : dayMarkdown(state.day));
+    const markdown = textAsTyped(dump ? dump.value : dayMarkdown(state.day));
     if (dump) dump.value = markdown;
     state.day.markdown = markdown;
     const stamp = captureUnsentStamp();
@@ -2131,9 +2377,20 @@ function conflictMineNow() {
   if (document.body.classList.contains("conflict-edit")) {
     ensureDumpMatchesPaper();
     const dump = $("dump");
-    if (dump) return cleanPaperMarkdown(dump.value);
+    if (dump) return textAsTyped(dump.value);
   }
   return paperConflict.mine;
+}
+
+const GIT_LOCK_RECOVERY = "It may be from another app or a crash.";
+const GIT_LOCK_PAUSE_OPEN = "Sync is paused: a lock in this vault is still open. Close it, then sync resumes. If this vault is on an exFAT drive or a network drive, copy the vault onto a drive on this computer, then sync resumes. " + GIT_LOCK_RECOVERY;
+const GIT_LOCK_PAUSE_UNREADABLE = "Sync is paused: a lock in this vault could not be read. Close the other app that uses this vault, then sync resumes. " + GIT_LOCK_RECOVERY;
+const GIT_LOCK_PAUSE_OVERSIZE = "Sync is paused: a lock in this vault is over 1 MB. Wait until the other write is finished, then sync resumes. " + GIT_LOCK_RECOVERY;
+
+function gitLockPauseText(reason) {
+  if (reason === "unreadable") return GIT_LOCK_PAUSE_UNREADABLE;
+  if (reason === "oversize") return GIT_LOCK_PAUSE_OVERSIZE;
+  return GIT_LOCK_PAUSE_OPEN;
 }
 
 async function resolveConflictKeep() {
@@ -2204,8 +2461,12 @@ async function resolveConflictKeep() {
     }
     closePaperConflict();
     if (info.git) {
-      await afterGitChoice(info.kind === "note" ? info.path : ("log/" + info.date + ".md"));
+      const sync = await afterGitChoice(info.kind === "note" ? info.path : ("log/" + info.date + ".md"));
       if (gitJoin) return;
+      if (sync && sync.lockKept) {
+        setStatus(gitLockPauseText(sync && sync.lockReason), "error");
+        return;
+      }
     }
     setStatus("Saved", "saved");
     setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
@@ -2281,7 +2542,8 @@ async function afterGitChoice(path) {
   while (Date.now() < deadline) {
     let data = null;
     try { data = await api("/api/sync"); } catch { data = null; }
-    if (!data || data.enabled === false) return;
+    if (!data || data.enabled === false) return data;
+    if (data.lockKept) return data;
     const conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
     const still = conflicts.some((item) => item && String(item.path || "").replace(/\\/g, "/") === rel);
     if (still) {
@@ -2321,7 +2583,7 @@ function openGitConflict(item) {
   if (state.dirty) {
     ensureDumpMatchesPaper();
     const dump = $("dump");
-    if (dump) mine = cleanPaperMarkdown(dump.value);
+    if (dump) mine = textAsTyped(dump.value);
   }
   if (mine === theirs) return;
   const mtime = Number(item && item.mtime) || 0;
@@ -2500,6 +2762,10 @@ function surfaceGitConflict(data) {
     return;
   }
   if (gitJoin && !data.join) closeGitJoin();
+  if (data.lockKept && !paperConflict && !gitJoin) {
+    setStatus(gitLockPauseText(data.lockReason), "error");
+    return;
+  }
   if (data.error && !paperConflict && !gitJoin && currentView() === "today") {
     setStatus(String(data.error), "error");
     return;
@@ -2592,7 +2858,7 @@ async function saveDay({ keepalive = false, bound = null } = {}) {
         return { ok: true };
       } catch (e) {
         rememberUnsent(snap);
-        if (!keepalive) setStatus(String(e.message), "error");
+        if (!keepalive) showEditorUnsaved();
         return { ok: false, error: String(e.message || e) };
       }
     }
@@ -2640,7 +2906,7 @@ async function saveDay({ keepalive = false, bound = null } = {}) {
       return { ok: true };
     } catch (e) {
       rememberUnsent(snap);
-      if (!keepalive) setStatus(String(e.message), "error");
+      if (!keepalive) showEditorUnsaved();
       return { ok: false, error: String(e.message || e) };
     }
   };
@@ -2839,7 +3105,7 @@ function renderNote() {
   if ($("paper-title")) $("paper-title").textContent = jobDay ? formatPaperTitle(day) : title;
   if ($("rail-date")) $("rail-date").textContent = jobDay ? formatRailDate(day) : title;
   const dump = $("dump");
-  const md = cleanPaperMarkdown(doc.markdown || "");
+  const md = textAsTyped(doc.markdown || "");
   if (dump) dump.value = md;
   paintJobSeason();
   if (isWorkMapPath(path)) {
@@ -2969,7 +3235,7 @@ function renderMap() {
   room.removeAttribute("hidden");
   document.body.classList.add("doc-note", "doc-map");
   document.body.classList.toggle("doc-stage", !!state.mapStageId);
-  if (typeof setFmtBarVisible === "function") setFmtBarVisible(false);
+  if (typeof settleFormatBar === "function") settleFormatBar();
   const title = parsed.title || notePaperTitle(state.doc);
   if ($("map-title")) $("map-title").textContent = title;
   if ($("paper-title")) $("paper-title").textContent = title;
@@ -3974,9 +4240,10 @@ $("paper").addEventListener("click", (e) => {
   const dump = $("dump");
   const lines = dump.value.split("\n");
   if (!lines[idx] || !matchPaperTask(lines[idx])) return;
+  const ticked = tickTypedBox(lines[idx]);
+  if (ticked === lines[idx]) return;
   pushPaperHistory(paperHistory, { markdown: dump.value, line: idx < 0 ? 0 : idx, caret: 0 }, { kind: "box" });
-  const hit = matchPaperTask(lines[idx]);
-  lines[idx] = paperTaskSrc(hit[1], hit[2], !/x/i.test(hit[3]), hit[4]);
+  lines[idx] = ticked;
   dump.value = lines.join("\n");
   if (state.day) { state.day.paper = dump.value; state.day.markdown = dump.value; }
   if (isNoteDoc() && state.doc) state.doc.markdown = dump.value;
@@ -4081,6 +4348,10 @@ $("paper").addEventListener("mouseup", () => {
 });
 $("paper").addEventListener("pointerdown", (e) => {
   if (e.target.closest && e.target.closest(".md-box")) {
+    slotDrag.armed = false;
+    return;
+  }
+  if (e.target.closest && e.target.closest(".md-body")) {
     slotDrag.armed = false;
     return;
   }
@@ -5017,8 +5288,8 @@ async function openPlanNote() {
     const days0 = $("days");
     if (days0) days0.innerHTML = "";
     syncTodayNav();
-    // Do not auto-focus — format capsule stays hidden until the user taps to type
-    setFmtBarVisible(false);
+    // Do not auto-focus — formatting bar stays hidden until the user taps to type
+    settleFormatBar();
     return;
   }
   try { await leaveCurrentPaper(); } catch (e) {}
@@ -5046,8 +5317,8 @@ async function openPlanNote() {
     // Prefer rendered paint on open (phone was flashing raw ## Why in source mode)
     state.activeLine = -1;
   }
-  // Do not auto-focus — format capsule stays hidden until the user taps to type
-  setFmtBarVisible(false);
+  // Do not auto-focus — formatting bar stays hidden until the user taps to type
+  settleFormatBar();
 }
 
 async function openCaptureNote() {
@@ -5102,9 +5373,9 @@ async function openCaptureNote() {
       painting = false;
     }
     syncPaperEmptyClass();
-    // Do not auto-focus — format capsule stays hidden until the user taps to type
+    // Do not auto-focus — formatting bar stays hidden until the user taps to type
   }
-  setFmtBarVisible(false);
+  settleFormatBar();
 }
 
 $("door-skip").addEventListener("click", () => {
@@ -5717,6 +5988,7 @@ document.addEventListener("visibilitychange", () => {
   btn.addEventListener("click", () => {
     handCollapsed = !room.classList.contains("rail-collapsed");
     sync(handCollapsed);
+    syncFmtBarForKeyboard();
   });
 })();
 
@@ -5731,137 +6003,76 @@ function runPaperUndoAction() {
 }
 
 function fmtActiveLineIndex() {
-  let idx = state.activeLine >= 0 ? state.activeLine : lineIndexOfCaret();
-  if (idx < 0) idx = 0;
+  const idx = state.activeLine >= 0 ? state.activeLine : lineIndexOfCaret();
   return idx;
 }
 
-function fmtToggleTaskLine() {
+function fmtApplyActive(action, kind, caretMode) {
   const paper = $("paper");
   const dump = $("dump");
   if (!paper || !dump) return;
-  paper.focus();
   const idx = fmtActiveLineIndex();
+  if (idx < 0) return;
+  paper.focus();
   const el = paperLines()[idx];
+  const off = el ? (() => { try { return caretOffset(el); } catch (e) { return 0; } })() : 0;
   if (el) writeDumpLine(idx, lineMarkdown(el));
   const lines = dump.value.split("\n");
   while (lines.length <= idx) lines.push("");
   const text = lines[idx] != null ? lines[idx] : "";
-  // Headings stay headings — task mark must not produce "- [ ] ## Why"
-  if (/^\s*#{1,6}\s/.test(text)) return;
-  const task = matchPaperTask(text);
-  let next;
-  if (task) {
-    next = paperTaskSrc(task[1], task[2], !/x/i.test(task[3]), task[4]);
-  } else {
-    const ul = text.match(/^(\s*)([-*+])\s+(.*)$/);
-    const ol = text.match(/^(\s*)(\d+[.)])\s+(.*)$/);
-    const nest = text.match(/^(\s{2,})(\S.*)$/);
-    if (ul) next = ul[1] + "- [ ] " + ul[3];
-    else if (ol) next = ol[1] + "- [ ] " + ol[3];
-    else if (nest) next = nest[1] + "- [ ] " + nest[2];
-    else next = "- [ ] " + String(text || "").replace(/^\s+/, "");
-  }
-  pushPaperHistory(paperHistory, { markdown: dump.value, line: idx, caret: 0 }, { kind: "fmt-task" });
+  const next = formatBarApply(text, 0, action);
+  if (next === text) return;
+  pushPaperHistory(paperHistory, { markdown: dump.value, line: idx, caret: off }, { kind: kind });
   writeDumpLine(idx, next);
-  scheduleSave();
-  paintPaperAt(idx, next.length);
-}
-
-function fmtBoldSelectionOrLine() {
-  const paper = $("paper");
-  const dump = $("dump");
-  if (!paper || !dump) return;
-  paper.focus();
-  const idx = fmtActiveLineIndex();
-  const el = paperLines()[idx];
-  if (!el) return;
-  writeDumpLine(idx, lineMarkdown(el));
-  const lines = dump.value.split("\n");
-  while (lines.length <= idx) lines.push("");
-  let text = lines[idx] != null ? lines[idx] : "";
-  const sel = window.getSelection();
-  let start = -1;
-  let end = -1;
-  if (sel && sel.rangeCount && paper.contains(sel.anchorNode) && !sel.isCollapsed) {
-    try {
-      void caretOffset(el);
-      const selected = String(sel.toString() || "");
-      if (selected && text.includes(selected)) {
-        start = text.indexOf(selected);
-        end = start + selected.length;
-      } else {
-        // best-effort: wrap around caret using last selection length
-        const piece = state.lastPaperSelection || selected;
-        if (piece && text.includes(piece)) {
-          start = text.indexOf(piece);
-          end = start + piece.length;
-        }
-      }
-    } catch (err) {}
-  }
-  pushPaperHistory(paperHistory, {
-    markdown: dump.value,
-    line: idx,
-    caret: el ? (() => { try { return caretOffset(el); } catch (e) { return 0; } })() : 0,
-  }, { kind: "fmt-bold" });
-  let caret = text.length;
-  if (start >= 0 && end > start) {
-    const wrapped = text.slice(0, start) + "**" + text.slice(start, end) + "**" + text.slice(end);
-    text = wrapped;
-    caret = end + 4;
-  } else {
-    // wrap whole body after list/task prefix, or wrap empty as ****
-    const m = text.match(/^(\s*(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+|#{1,6}\s+)?)([\s\S]*)$/);
-    const prefix = m ? m[1] : "";
-    const body = m ? m[2] : text;
-    if (!body) {
-      text = prefix + "****";
-      caret = prefix.length + 2;
-    } else if (/^\*\*([\s\S]*)\*\*$/.test(body)) {
-      text = prefix + body.replace(/^\*\*([\s\S]*)\*\*$/, "$1");
-      caret = text.length;
-    } else {
-      text = prefix + "**" + body + "**";
-      caret = text.length;
-    }
-  }
-  writeDumpLine(idx, text);
+  const caret = (caretMode === "indent" && isSourceTask(el)) ? off : formatBarCaret(text, next, off);
   scheduleSave();
   paintPaperAt(idx, caret);
+  revealLineAboveFormatBar();
+}
+
+function fmtToggleTaskLine() {
+  fmtApplyActive("task", "fmt-task", "end");
+}
+
+function fmtHeadingLine() {
+  fmtApplyActive("heading", "fmt-heading", "end");
+}
+
+function fmtListLine() {
+  fmtApplyActive("list", "fmt-list", "end");
 }
 
 function fmtIndentLine() {
-  const paper = $("paper");
-  const dump = $("dump");
-  if (!paper || !dump) return;
-  paper.focus();
-  const idx = fmtActiveLineIndex();
-  const el = paperLines()[idx];
-  const off = el ? (() => { try { return caretOffset(el); } catch (e) { return 0; } })() : 0;
-  if (idx < 0 || !el) return;
-  writeDumpLine(idx, lineMarkdown(el));
-  const lines = dump.value.split("\n");
-  const text = lines[idx] != null ? lines[idx] : "";
-  const next = indentDumpLine(text);
-  if (next === text) return;
-  pushPaperHistory(paperHistory, { markdown: dump.value, line: idx, caret: off }, { kind: "indent" });
-  writeDumpLine(idx, next);
-  const caret = isSourceTask(el) ? off : Math.max(0, off + (next.length - text.length));
-  scheduleSave();
-  paintPaperAt(idx, caret);
+  fmtApplyActive("indent", "indent", "indent");
+}
+
+function fmtOutdentLine() {
+  fmtApplyActive("outdent", "outdent", "indent");
+}
+
+function settleFormatBar() {
+  if (paperEditorFocused()) syncFmtBarForKeyboard();
+  else setFmtBarVisible(false);
 }
 
 function setFmtBarVisible(on) {
-  const bar = $("fmt-bar");
-  if (!bar) return;
-  if (on) {
-    bar.classList.remove("hidden");
-    bar.removeAttribute("hidden");
-  } else {
-    bar.classList.add("hidden");
-    bar.setAttribute("hidden", "");
+  const bar = $("format-bar");
+  const show = !!on && formatBarPhone();
+  if (bar) {
+    if (show) {
+      bar.classList.remove("hidden");
+      bar.removeAttribute("hidden");
+    } else {
+      bar.classList.add("hidden");
+      bar.setAttribute("hidden", "");
+    }
   }
+  document.body.classList.toggle("format-bar-on", show);
+  if (!show) {
+    const paper = $("paper");
+    if (paper) paper.style.paddingBottom = "";
+  }
+  syncFmtBarInset();
 }
 
 function fmtKeyboardInset() {
@@ -5870,9 +6081,8 @@ function fmtKeyboardInset() {
   return Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
 }
 
-function fmtPhoneLike() {
-  return window.matchMedia("(max-width: 640px)").matches
-    || window.matchMedia("(pointer: coarse)").matches;
+function formatBarPhone() {
+  return window.matchMedia("(max-width: 640px)").matches;
 }
 
 function paperEditorFocused() {
@@ -5881,49 +6091,99 @@ function paperEditorFocused() {
   return !!(paper && a && (a === paper || (paper.contains && paper.contains(a))));
 }
 
-function syncFmtBarInset() {
-  const bar = $("fmt-bar");
-  if (!bar) return;
-  const vv = window.visualViewport;
-  if (!vv) {
-    bar.style.bottom = "calc(12px + env(safe-area-inset-bottom, 0px))";
-    return;
-  }
-  bar.style.bottom = (fmtKeyboardInset() + 12) + "px";
+function timelineRailBox() {
+  const room = document.querySelector(".today-room");
+  const rail = document.querySelector(".today-rail");
+  if (!room || !rail || room.classList.contains("rail-collapsed")) return null;
+  if (getComputedStyle(rail).display === "none") return null;
+  const box = rail.getBoundingClientRect();
+  if (box.height < 8 || box.width < 8) return null;
+  return box;
 }
 
-let softKeyboardSeen = false;
-
-function syncFmtBarForKeyboard() {
-  if (!paperEditorFocused()) {
-    setFmtBarVisible(false);
+function syncFmtBarInset() {
+  const bar = $("format-bar");
+  if (!bar) return;
+  const askEl = $("ask-open");
+  const inset = fmtKeyboardInset();
+  let lift = 0;
+  if (inset > 80) {
+    lift = inset;
+  } else if (askEl && askEl.getBoundingClientRect) {
+    const ask = askEl.getBoundingClientRect();
+    if (ask.height > 0) lift = Math.max(0, window.innerHeight - ask.top);
+  }
+  const rail = timelineRailBox();
+  if (rail) lift = Math.max(lift, Math.max(0, window.innerHeight - rail.top));
+  bar.style.bottom = lift + "px";
+  const wrap = document.querySelector(".paper-wrap");
+  const paper = $("paper");
+  if (!wrap || bar.hidden || bar.hasAttribute("hidden")) {
+    if (paper) paper.style.paddingBottom = "";
     return;
   }
-  const phone = fmtPhoneLike();
-  const inset = fmtKeyboardInset();
-  if (phone) {
-    if (inset > 80) softKeyboardSeen = true;
-    if (softKeyboardSeen && inset <= 80) {
-      setFmtBarVisible(false);
-      return;
-    }
-    // Phone: show while focused even before the keyboard lifts
-    setFmtBarVisible(true);
-    syncFmtBarInset();
+  const cover = Math.max(0, wrap.getBoundingClientRect().bottom - bar.getBoundingClientRect().top);
+  if (paper) paper.style.paddingBottom = (cover + 16) + "px";
+}
+
+function revealLineAboveFormatBar() {
+  const bar = $("format-bar");
+  if (!bar || bar.hasAttribute("hidden")) return;
+  const wrap = document.querySelector(".paper-wrap");
+  if (!wrap) return;
+  const idx = fmtActiveLineIndex();
+  const el = paperLines()[idx];
+  if (!el || !el.getBoundingClientRect) return;
+  let rect = el.getBoundingClientRect();
+  const sel = window.getSelection();
+  if (sel && sel.rangeCount && el.contains(sel.anchorNode)) {
+    try {
+      const range = sel.getRangeAt(0).cloneRange();
+      range.collapse(true);
+      const caretRect = range.getClientRects()[0];
+      if (caretRect && caretRect.height) rect = caretRect;
+    } catch (e) {}
+  }
+  const barTop = bar.getBoundingClientRect().top;
+  const gap = 8;
+  if (rect.bottom > barTop - gap) wrap.scrollTop += rect.bottom - (barTop - gap);
+}
+
+function syncFmtBarForKeyboard() {
+  const editing = paperEditorFocused() || fmtKeyboardInset() > 80;
+  if (!formatBarPhone() || !editing) {
+    setFmtBarVisible(false);
     return;
   }
   setFmtBarVisible(true);
   syncFmtBarInset();
+  revealLineAboveFormatBar();
 }
 
-(function wireFmtBar() {
-  const bar = $("fmt-bar");
+function moveCursorToFindLine() {
+  const line = $("ask-open");
+  if (line) {
+    try { line.scrollIntoView({ block: "nearest" }); } catch (e) {}
+  }
+  openAsk();
+}
+
+function hidePhoneKeyboard() {
+  setFmtBarVisible(false);
+  const paper = $("paper");
+  if (paper && paper.blur) paper.blur();
+  const active = document.activeElement;
+  if (active && active !== document.body && active.blur) active.blur();
+}
+
+(function wireFormatBar() {
+  const bar = $("format-bar");
   const paper = $("paper");
   if (!bar || !paper) return;
   let ignoreBlur = false;
 
   const holdFocus = (e) => {
-    // Keep paper focused so bar taps do not blur/hide the strip first
+    // Keep paper focused so a bar tap does not dismiss the keyboard first
     e.preventDefault();
     ignoreBlur = true;
   };
@@ -5937,11 +6197,14 @@ function syncFmtBarForKeyboard() {
     e.preventDefault();
     const act = btn.getAttribute("data-fmt");
     if (act === "task") fmtToggleTaskLine();
-    else if (act === "style") fmtBoldSelectionOrLine();
-    else if (act === "undo") runPaperUndoAction();
+    else if (act === "heading") fmtHeadingLine();
+    else if (act === "list") fmtListLine();
     else if (act === "indent") fmtIndentLine();
-    else if (act === "find" || act === "wand" || act === "command") openAsk();
-    syncFmtBarInset();
+    else if (act === "outdent") fmtOutdentLine();
+    else if (act === "undo") runPaperUndoAction();
+    else if (act === "find") moveCursorToFindLine();
+    else if (act === "hide") hidePhoneKeyboard();
+    if (act !== "hide" && act !== "find") syncFmtBarInset();
   });
 
   paper.addEventListener("focus", () => {
@@ -5955,9 +6218,21 @@ function syncFmtBarForKeyboard() {
         return;
       }
       if (bar.contains(document.activeElement)) return;
-      softKeyboardSeen = false;
       setFmtBarVisible(false);
     }, 0);
+  });
+
+  let revealQueued = false;
+  document.addEventListener("selectionchange", () => {
+    const bar = $("format-bar");
+    if (!bar || bar.hasAttribute("hidden") || !paperEditorFocused()) return;
+    if (revealQueued) return;
+    revealQueued = true;
+    requestAnimationFrame(() => {
+      revealQueued = false;
+      if (!paperEditorFocused()) return;
+      revealLineAboveFormatBar();
+    });
   });
 
   const onVV = () => syncFmtBarForKeyboard();

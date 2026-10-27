@@ -19,6 +19,7 @@ final class RelayLink {
     private weak var host: SyncHost?
     private var ready: (() -> Void)?
     private var failed: ((Error) -> Void)?
+    private var loggedFirstByte = false
 
     func connect(url: String, token: String, peerId: String, storageId: String, host: SyncHost) throws {
         _ = signal(SIGPIPE, SIG_IGN)
@@ -27,6 +28,7 @@ final class RelayLink {
         self.storageId = storageId
         self.host = host
         let fd = try connectTCP(host: parsed.host, port: parsed.port)
+        SyncLog.write("sync socket open")
         socket = fd
         try upgrade(fd: fd, address: parsed, token: token)
         running = true
@@ -41,6 +43,7 @@ final class RelayLink {
             self?.readLoop()
         }
         try send(encodeJoin(senderId: peerId, storageId: storageId))
+        SyncLog.write("sync sent join")
         SyncLog.write("sync out join")
         let wait = joined.wait(timeout: .now() + 15)
         if wait == .timedOut {
@@ -83,12 +86,11 @@ final class RelayLink {
             } catch {
                 return
             }
-            SyncLog.write("sync out \(outgoing.type) doc=\(docId) heads=\(outgoing.heads)")
-            host.noteSent(docId: docId)
+            SyncLog.write("sync out \(outgoing.type) doc=\(SyncLog.escapedId(docId)) heads=\(outgoing.heads)")
             sent += 1
         }
         if sent == 16 {
-            SyncLog.write("sync cap 16 doc=\(docId)")
+            SyncLog.write("sync cap 16 doc=\(SyncLog.escapedId(docId))")
         }
         if sent == 0 {
             host.settled(docId: docId)
@@ -164,11 +166,11 @@ final class RelayLink {
             guard let docId = message["documentId"]?.textValue, let bytes = message["data"]?.bytesValue else { return }
             try host?.applyIncoming(docId: docId, bytes: bytes)
             let heads = host?.syncHeads(docId: docId) ?? ""
-            SyncLog.write("sync in \(type) doc=\(docId) heads=\(heads)")
+            SyncLog.write("sync in \(type) doc=\(SyncLog.escapedId(docId)) heads=\(heads)")
             pump(docId)
         case "doc-unavailable":
             if let docId = message["documentId"]?.textValue {
-                SyncLog.write("sync in doc-unavailable doc=\(docId)")
+                SyncLog.write("sync in doc-unavailable doc=\(SyncLog.escapedId(docId))")
                 host?.markUnavailable(docId: docId)
                 pump(docId)
             }
@@ -230,6 +232,7 @@ final class RelayLink {
             "",
         ].joined(separator: "\r\n")
         try writeAll(Data(request.utf8))
+        SyncLog.write("sync sent upgrade")
         let header = try readHTTPHeader(fd: fd)
         let status = httpStatus(header)
         if status == 401 { throw AidanError.authRejected }
@@ -256,6 +259,10 @@ final class RelayLink {
                     continue
                 }
                 throw AidanError.protocol("The relay closed the connection.")
+            }
+            if !loggedFirstByte {
+                loggedFirstByte = true
+                SyncLog.write("sync first byte")
             }
             data.append(buffer[0])
             if data.count >= 4 {
@@ -290,7 +297,27 @@ final class RelayLink {
         if masked {
             mask = Array(try readExact(4))
         }
-        guard length >= 0, length <= Self.maxFrame else {
+        let limit = host?.maxSyncBytes ?? Self.maxFrame
+        if length > limit {
+            // The relay's sync map stores the note bytes before documentId.
+            // Reading that id, then dropping the frame, names the oversized
+            // note. Throwing here blamed whichever note this device sent last
+            // and reconnected into the same frame.
+            if opcode == 0x2 || opcode == 0x0 {
+                let docId = try oversizedDocumentId(count: length, masked: masked, mask: mask)
+                if let docId, !docId.isEmpty {
+                    SyncLog.write("sync drop oversized doc=\(SyncLog.escapedId(docId))")
+                    host?.noteTooLarge(docId: docId)
+                } else {
+                    SyncLog.write("sync drop oversized")
+                }
+                return nil
+            }
+            try discardExact(length)
+            if opcode == 0x8 { throw AidanError.payloadTooLarge }
+            return nil
+        }
+        guard length >= 0 else {
             throw AidanError.payloadTooLarge
         }
         var payload = try readExact(length)
@@ -307,8 +334,32 @@ final class RelayLink {
         return payload
     }
 
-    /// A frame bigger than this is refused. The relay's cap is the same 32 MB.
+    /// A frame bigger than this is refused. The relay's cap is the same 4 MB.
     private static let maxFrame = SyncLimits.maxMessageBytes
+
+    /// Names the note inside a frame this device will not keep, and consumes the frame.
+    private func oversizedDocumentId(count: Int, masked: Bool, mask: [UInt8]) throws -> String? {
+        let frame = OversizedFrame(count: count, masked: masked, mask: mask) { count in
+            try self.readExact(count)
+        }
+        var docId: String?
+        do {
+            docId = try frame.documentId()
+        } catch let error as AidanError {
+            if case .io = error { throw error }
+        }
+        try frame.discardRemaining()
+        return docId
+    }
+
+    private func discardExact(_ count: Int) throws {
+        var left = count
+        while left > 0 {
+            let chunk = min(left, 16 * 1024)
+            _ = try readExact(chunk)
+            left -= chunk
+        }
+    }
 
     private func closeError(_ payload: Data) -> AidanError {
         var code = 0
@@ -389,7 +440,156 @@ protocol SyncHost: AnyObject {
     func linkClosed()
     func linkFailed(_ error: Error)
     func noteTooLarge(docId: String)
-    func noteSent(docId: String)
+}
+
+/// Walks one CBOR map and keeps only `documentId`. Byte strings are skipped, not stored.
+private final class OversizedFrame {
+    private var remaining: Int
+    private let masked: Bool
+    private let mask: [UInt8]
+    private var maskAt = 0
+    private let readExact: (Int) throws -> Data
+
+    init(count: Int, masked: Bool, mask: [UInt8], readExact: @escaping (Int) throws -> Data) {
+        remaining = count
+        self.masked = masked
+        self.mask = mask
+        self.readExact = readExact
+    }
+
+    func documentId() throws -> String? {
+        let (major, info) = try head()
+        guard major == 5, info != 31 else {
+            try skipBody(major, info, depth: 0)
+            return nil
+        }
+        let pairs = try argument(info)
+        guard pairs <= 64 else { throw AidanError.protocol("The relay sent a huge map.") }
+        var found: String?
+        for _ in 0..<pairs {
+            let key = try readText(limit: 64)
+            if key == "documentId" {
+                found = try readText(limit: 256)
+            } else {
+                try skipValue(depth: 1)
+            }
+        }
+        return found
+    }
+
+    func discardRemaining() throws {
+        if remaining > 0 { try skip(remaining) }
+    }
+
+    private func head() throws -> (UInt8, UInt8) {
+        let byte = try read(1)[0]
+        return (byte >> 5, byte & 0x1F)
+    }
+
+    private func argument(_ info: UInt8) throws -> Int {
+        if info < 24 { return Int(info) }
+        let width: Int
+        switch info {
+        case 24: width = 1
+        case 25: width = 2
+        case 26: width = 4
+        case 27: width = 8
+        default: throw AidanError.protocol("The relay message used an unsupported length.")
+        }
+        var value: UInt64 = 0
+        for byte in try read(width) { value = (value << 8) | UInt64(byte) }
+        guard value <= UInt64(Int.max) else { throw AidanError.protocol("The relay message used an unsupported length.") }
+        return Int(value)
+    }
+
+    private func readText(limit: Int) throws -> String? {
+        let (major, info) = try head()
+        guard major == 3, info != 31 else {
+            try skipBody(major, info, depth: 1)
+            return nil
+        }
+        let count = try argument(info)
+        guard count <= limit else {
+            try skipCount(count)
+            return nil
+        }
+        let data = try readCount(count)
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func skipValue(depth: Int) throws {
+        if depth >= CBORNesting.limit {
+            throw AidanError.protocol("The relay sent a message nested too deep.")
+        }
+        let (major, info) = try head()
+        try skipBody(major, info, depth: depth)
+    }
+
+    private func skipBody(_ major: UInt8, _ info: UInt8, depth: Int) throws {
+        if info == 31 { throw AidanError.protocol("The relay message used an unsupported length.") }
+        switch major {
+        case 0, 1:
+            _ = try argument(info)
+        case 2, 3:
+            try skipCount(try argument(info))
+        case 4:
+            let count = try argument(info)
+            guard count <= 100_000 else { throw AidanError.protocol("The relay sent a huge list.") }
+            for _ in 0..<count { try skipValue(depth: depth + 1) }
+        case 5:
+            let count = try argument(info)
+            guard count <= 100_000 else { throw AidanError.protocol("The relay sent a huge map.") }
+            for _ in 0..<count {
+                try skipValue(depth: depth + 1)
+                try skipValue(depth: depth + 1)
+            }
+        case 6:
+            _ = try argument(info)
+            try skipValue(depth: depth + 1)
+        case 7:
+            if info >= 24 { _ = try argument(info) }
+        default:
+            throw AidanError.protocol("The relay sent a message this app cannot read.")
+        }
+    }
+
+    private func skipCount(_ count: Int) throws {
+        guard count <= remaining else { throw AidanError.protocol("The relay message ended early.") }
+        try skip(count)
+    }
+
+    private func readCount(_ count: Int) throws -> Data {
+        guard count <= remaining else { throw AidanError.protocol("The relay message ended early.") }
+        return try read(count)
+    }
+
+    private func read(_ count: Int) throws -> Data {
+        var data = try take(count)
+        if masked {
+            for index in data.indices {
+                data[index] ^= mask[maskAt % 4]
+                maskAt += 1
+            }
+        }
+        return data
+    }
+
+    private func skip(_ count: Int) throws {
+        var left = count
+        while left > 0 {
+            let chunk = min(left, 16 * 1024)
+            _ = try take(chunk)
+            left -= chunk
+        }
+        if masked { maskAt += count }
+    }
+
+    private func take(_ count: Int) throws -> Data {
+        guard count <= remaining else { throw AidanError.protocol("The relay message ended early.") }
+        let data = try readExact(count)
+        remaining -= count
+        return data
+    }
 }
 
 struct RelayAddress {

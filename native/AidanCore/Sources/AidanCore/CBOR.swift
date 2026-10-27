@@ -1,5 +1,9 @@
 import Foundation
 
+enum CBORNesting {
+    static let limit = 32
+}
+
 enum CBOR: Equatable {
     case unsigned(UInt64)
     case negative(Int64)
@@ -95,7 +99,10 @@ private func writeUnsigned(major: UInt8, value: UInt64, into data: inout Data) {
     }
 }
 
-private func readValue(_ data: Data, _ cursor: inout Int) throws -> CBOR {
+private func readValue(_ data: Data, _ cursor: inout Int, depth: Int = 0) throws -> CBOR {
+    if depth >= CBORNesting.limit {
+        throw AidanError.protocol("The relay sent a message nested too deep.")
+    }
     let (major, info) = try readHead(data, &cursor)
     switch major {
     case 0:
@@ -104,9 +111,9 @@ private func readValue(_ data: Data, _ cursor: inout Int) throws -> CBOR {
         let magnitude = try readLength(info, data, &cursor)
         return .negative(-1 - Int64(bitPattern: magnitude))
     case 2:
-        return .bytes(try readBytes(info, data, &cursor))
+        return .bytes(try readBytes(info, data, &cursor, depth: depth))
     case 3:
-        let bytes = try readBytes(info, data, &cursor)
+        let bytes = try readBytes(info, data, &cursor, depth: depth)
         guard let text = String(data: bytes, encoding: .utf8) else {
             throw AidanError.protocol("The relay sent text that is not UTF-8.")
         }
@@ -115,7 +122,7 @@ private func readValue(_ data: Data, _ cursor: inout Int) throws -> CBOR {
         if info == 31 {
             var values: [CBOR] = []
             while try peek(data, cursor) != 0xFF {
-                values.append(try readValue(data, &cursor))
+                values.append(try readValue(data, &cursor, depth: depth + 1))
             }
             cursor += 1
             return .array(values)
@@ -124,14 +131,14 @@ private func readValue(_ data: Data, _ cursor: inout Int) throws -> CBOR {
         guard count <= 100_000 else { throw AidanError.protocol("The relay sent a huge list.") }
         var values: [CBOR] = []
         values.reserveCapacity(Int(count))
-        for _ in 0..<count { values.append(try readValue(data, &cursor)) }
+        for _ in 0..<count { values.append(try readValue(data, &cursor, depth: depth + 1)) }
         return .array(values)
     case 5:
         var pairs: [String: CBOR] = [:]
         if info == 31 {
             while try peek(data, cursor) != 0xFF {
-                let key = try readValue(data, &cursor)
-                let value = try readValue(data, &cursor)
+                let key = try readValue(data, &cursor, depth: depth + 1)
+                let value = try readValue(data, &cursor, depth: depth + 1)
                 if let text = key.textValue { pairs[text] = value }
             }
             cursor += 1
@@ -140,14 +147,14 @@ private func readValue(_ data: Data, _ cursor: inout Int) throws -> CBOR {
         let count = try readLength(info, data, &cursor)
         guard count <= 100_000 else { throw AidanError.protocol("The relay sent a huge map.") }
         for _ in 0..<count {
-            let key = try readValue(data, &cursor)
-            let value = try readValue(data, &cursor)
+            let key = try readValue(data, &cursor, depth: depth + 1)
+            let value = try readValue(data, &cursor, depth: depth + 1)
             if let text = key.textValue { pairs[text] = value }
         }
         return .map(pairs)
     case 6:
         _ = try readLength(info, data, &cursor)
-        return try readValue(data, &cursor)
+        return try readValue(data, &cursor, depth: depth + 1)
     case 7:
         switch info {
         case 20: return .bool(false)
@@ -187,11 +194,11 @@ private func readLength(_ info: UInt8, _ data: Data, _ cursor: inout Int) throws
     return value
 }
 
-private func readBytes(_ info: UInt8, _ data: Data, _ cursor: inout Int) throws -> Data {
+private func readBytes(_ info: UInt8, _ data: Data, _ cursor: inout Int, depth: Int) throws -> Data {
     if info == 31 {
         var out = Data()
         while try peek(data, cursor) != 0xFF {
-            let chunk = try readValue(data, &cursor)
+            let chunk = try readValue(data, &cursor, depth: depth + 1)
             guard let bytes = chunk.bytesValue else {
                 throw AidanError.protocol("The relay sent a broken byte string.")
             }

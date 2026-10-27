@@ -42,7 +42,7 @@ public final class AidanSession: SyncHost {
     public var onError: ((String) -> Void)?
     /// Fires after a relay message raises or updates a conflict. The screen shows the choice on its next turn.
     public var onConflict: (() -> Void)?
-    /// One sync message larger than this is not sent. Defaults to 32 MB, the relay's cap.
+    /// One sync message larger than this is not sent. Defaults to 4 MB, the relay's cap.
     public var maxSyncBytes: Int {
         get {
             lock.lock()
@@ -77,7 +77,6 @@ public final class AidanSession: SyncHost {
     private var link: RelayLink?
     private var syncByteLimit = SyncLimits.maxMessageBytes
     private var oversized: Set<String> = []
-    private var lastOutbound: String?
     private var watcher: DispatchSourceTimer?
     private let peerId: String
     private let storageId: String
@@ -98,6 +97,7 @@ public final class AidanSession: SyncHost {
         self.vault = vault
         try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: vault.appendingPathComponent(".aidanos"), withIntermediateDirectories: true)
+        Self.reportRecoveryFiles(in: vault)
         self.deviceActor = try AidanSession.loadActor(in: vault)
         self.peerId = "aidanos-" + UUID().uuidString.lowercased()
         self.storageId = try AidanSession.loadStorageId(in: vault)
@@ -122,6 +122,16 @@ public final class AidanSession: SyncHost {
         watcher?.cancel()
         reconnectWork?.cancel()
         link?.close()
+    }
+
+    static var logRecoveryFile: (String) -> Void = { name in
+        fputs("recovery file: \(name)\n", stderr)
+    }
+
+    static func reportRecoveryFiles(in vault: URL) {
+        for rel in VaultPaths.recoveryFiles(in: vault) {
+            logRecoveryFile(rel)
+        }
     }
 
     public static func todayPath(on date: Date = Date(), timeZone: TimeZone = .current) -> String {
@@ -328,7 +338,6 @@ public final class AidanSession: SyncHost {
         lock.lock()
         desiredURL = nil
         desiredToken = nil
-        lastOutbound = nil
         reconnectWork?.cancel()
         let current = link
         link = nil
@@ -513,12 +522,6 @@ public final class AidanSession: SyncHost {
         conflictCallback?()
     }
 
-    func noteSent(docId: String) {
-        lock.lock()
-        lastOutbound = docId
-        lock.unlock()
-    }
-
     /// The note's sync message does not fit. Sync stops for this note only.
     func noteTooLarge(docId: String) {
         lock.lock()
@@ -537,19 +540,11 @@ public final class AidanSession: SyncHost {
 
     func linkFailed(_ error: Error) {
         if case AidanError.payloadTooLarge = error {
-            lock.lock()
-            let docId = lastOutbound
-            lastOutbound = nil
-            if let docId {
-                let inserted = oversized.insert(docId).inserted
-                let message = Self.tooLargeMessage(path: pathLocked(for: docId) ?? docId, limit: syncByteLimit)
-                let callback = inserted ? onError : nil
-                lock.unlock()
-                callback?(message)
-                linkClosed()
-                return
-            }
-            lock.unlock()
+            // The socket is already closing. The note was named when its frame
+            // was dropped. Reconnecting would read that frame again.
+            stopTrying()
+            setConnection(.disconnected)
+            return
         }
         guard Self.isTerminal(error) else {
             linkClosed()
@@ -590,7 +585,6 @@ public final class AidanSession: SyncHost {
             openingGate.unlock()
         }
         lock.lock()
-        lastOutbound = nil
         let next = RelayLink()
         link?.close()
         link = next
@@ -843,8 +837,8 @@ public final class AidanSession: SyncHost {
     }
 
     private func writeFileLocked(_ path: String, _ text: String) throws {
-        let url = try VaultPaths.fileURL(vault: vault, path: path)
-        try AtomicFile.write(Data(text.utf8), to: url)
+        let located = try VaultPaths.locate(vault: vault, path: path)
+        try NoteFolderSave.write(Data(text.utf8), to: located.url, parents: located.parents, vaultRoot: vault)
         lastWritten[path] = text
         writtenHash[path] = Self.sha(text)
         persistWritten()

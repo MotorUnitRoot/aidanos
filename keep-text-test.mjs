@@ -577,7 +577,9 @@ await check("a day switch that cannot reach the server stays on the day", async 
   await tick();
   assert(dump.value === "typed offline", "the failed switch left the page (" + dump.value + ")");
   assert(client.doc.getElementById("conflict-sheet").hidden === true, "a network failure opened the conflict sheet");
-  assert(client.doc.getElementById("status").textContent === "Failed to fetch", "the status line did not use the fetch error");
+  assert(client.doc.getElementById("status").textContent === "Unsaved", "the status line did not say Unsaved");
+  assert(client.doc.getElementById("editor-note").hidden === false, "the quiet line stayed hidden");
+  assert(client.doc.getElementById("editor-note").textContent === "This change is kept on this device.", "the quiet line did not say the change is kept");
   const key = client.storage.keys().find((k) => k.indexOf("log/" + day + ".md") >= 0);
   assert(key, "the failed switch did not keep a local copy");
   assert(JSON.parse(client.storage.getItem(key)).markdown === "typed offline", "the local copy was not the typed text");

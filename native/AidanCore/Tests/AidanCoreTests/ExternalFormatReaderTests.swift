@@ -375,13 +375,28 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertTrue(line.wikiLinks.isEmpty)
     }
 
+    /// A million unclosed brackets stay a linear scan.
+    /// The simulator's wall clock missed 5s on this same linear read
+    /// (run 40423525581 recorded 6.663s). That clock is not the bound there.
+    /// The step count is: twice the brackets stay within 3x.
     func testUnclosedBracketLineStaysWithinTheTimeBound() {
+        let half = String(repeating: "[", count: 500_000)
         let line = String(repeating: "[", count: 1_000_000)
+        let halfWork = scanWork(half)
+        let fullWork = scanWork(line)
+        XCTAssertGreaterThan(halfWork, 0)
+        XCTAssertLessThanOrEqual(
+            fullWork,
+            halfWork * 3,
+            "reading 1,000,000 brackets took \(fullWork) steps after \(halfWork)"
+        )
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing bracket-bound \(elapsed)")
+        #if !targetEnvironment(simulator)
         XCTAssertLessThan(elapsed, 5)
+        #endif
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
@@ -755,24 +770,55 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(characters.tags, line.tags)
     }
 
+    /// A long rejected `[[#` line stays a linear scan.
+    /// The simulator's wall clock missed 5s on this same linear read
+    /// (run 40451323920 recorded 8.383s). That clock is not the bound there.
+    /// The step count is: twice the openers stay within 3x.
     func testRejectedWikiLineStaysWithinTheTimeBound() {
+        let half = String(repeating: "[[#", count: 175_000) + "]]"
         let line = String(repeating: "[[#", count: 350_000) + "]]"
+        let halfWork = scanWork(half)
+        let fullWork = scanWork(line)
+        print("reader-work wiki-bound \(halfWork) \(fullWork)")
+        XCTAssertGreaterThan(halfWork, 0)
+        XCTAssertLessThanOrEqual(
+            fullWork,
+            halfWork * 3,
+            "reading 350,000 rejected wiki openers took \(fullWork) steps after \(halfWork)"
+        )
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing wiki-bound \(elapsed)")
+        #if !targetEnvironment(simulator)
         XCTAssertLessThan(elapsed, 5)
+        #endif
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
     }
 
+    /// A long unclosed `@a(` stays a linear scan.
+    /// The simulator's wall clock missed 5s on this same linear read
+    /// (run 40429234247 recorded 7.199s). That clock is not the bound there.
+    /// The step count is: twice the mentions stay within 3x.
     func testUnclosedMentionParenStaysWithinTheTimeBound() {
+        let half = String(repeating: "@a(", count: 175_000)
         let line = String(repeating: "@a(", count: 350_000)
+        let halfWork = scanWork(half)
+        let fullWork = scanWork(line)
+        XCTAssertGreaterThan(halfWork, 0)
+        XCTAssertLessThanOrEqual(
+            fullWork,
+            halfWork * 3,
+            "reading 350,000 mentions took \(fullWork) steps after \(halfWork)"
+        )
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing mention-bound \(elapsed)")
+        #if !targetEnvironment(simulator)
         XCTAssertLessThan(elapsed, 5)
+        #endif
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }
@@ -790,13 +836,29 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertLessThanOrEqual(twice, once * 3)
     }
 
+    /// A long closed `@a(` line stays a linear scan.
+    /// The simulator's wall clock missed 5s on this same linear read
+    /// (c70a892 recorded 13.062s). That clock is not the bound there.
+    /// The step count is: twice the mentions stay within 3x.
     func testClosedMentionParenStaysWithinTheTimeBound() {
+        let half = String(repeating: "@a(", count: 175_000) + ")"
         let line = String(repeating: "@a(", count: 350_000) + ")"
+        let halfWork = scanWork(half)
+        let fullWork = scanWork(line)
+        print("reader-work mention-closed-bound \(halfWork) \(fullWork)")
+        XCTAssertGreaterThan(halfWork, 0)
+        XCTAssertLessThanOrEqual(
+            fullWork,
+            halfWork * 3,
+            "reading 350,000 closed mentions took \(fullWork) steps after \(halfWork)"
+        )
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing mention-closed-bound \(elapsed)")
+        #if !targetEnvironment(simulator)
         XCTAssertLessThan(elapsed, 5)
+        #endif
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }
@@ -813,13 +875,30 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertLessThanOrEqual(twice, once * 3)
     }
 
+    /// A long closed `[a` line stays a linear scan.
+    /// The simulator's wall clock missed 5s on this same linear read
+    /// (1f2d310 recorded 7.991s). The identical tree was 0.213s on ca876a9.
+    /// That clock is not the bound there.
+    /// The step count is: twice the brackets stay within 3x.
     func testClosedBracketLineStaysWithinTheTimeBound() {
+        let half = String(repeating: "[a", count: 175_000) + "]"
         let line = String(repeating: "[a", count: 350_000) + "]"
+        let halfWork = scanWork(half)
+        let fullWork = scanWork(line)
+        print("reader-work bracket-closed-bound \(halfWork) \(fullWork)")
+        XCTAssertGreaterThan(halfWork, 0)
+        XCTAssertLessThanOrEqual(
+            fullWork,
+            halfWork * 3,
+            "reading 350,000 closed brackets took \(fullWork) steps after \(halfWork)"
+        )
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing bracket-closed-bound \(elapsed)")
+        #if !targetEnvironment(simulator)
         XCTAssertLessThan(elapsed, 5)
+        #endif
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
@@ -874,13 +953,29 @@ final class ExternalFormatReaderTests: XCTestCase {
         return work?.count ?? 0
     }
 
+    /// A long non-English `@a(` line stays a linear scan.
+    /// The step count is: twice the mentions stay within 3x.
     func testNonEnglishLineStaysWithinTheTimeBound() {
+        let half = "é" + String(repeating: "@a(", count: 175_000)
         let line = "é" + String(repeating: "@a(", count: 350_000)
+        let halfWork = scanWork(half)
+        let fullWork = scanWork(line)
+        print("reader-work non-english-bound \(halfWork) \(fullWork)")
+        XCTAssertGreaterThan(halfWork, 0)
+        XCTAssertLessThanOrEqual(
+            fullWork,
+            halfWork * 3,
+            "reading 350,000 non-English mentions took \(fullWork) steps after \(halfWork)"
+        )
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing non-english-bound \(elapsed)")
+        // macOS keeps this 5s wall. The simulator missed it on the same
+        // read (PR 68 run 40494027733 recorded 9.597s; c70a892 recorded 25.577s).
+        #if !targetEnvironment(simulator)
         XCTAssertLessThan(elapsed, 5)
+        #endif
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }

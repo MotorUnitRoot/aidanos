@@ -9,6 +9,23 @@ import Glibc
 
 /// Timestamped sync lines. They go to stderr so a test log can quote them.
 enum SyncLog {
+    /// A document id from the relay is untrusted text. Control bytes and
+    /// backslashes are escaped so one id cannot start a second log line.
+    static func escapedId(_ value: String) -> String {
+        var out = ""
+        out.reserveCapacity(value.utf8.count)
+        for byte in value.utf8 {
+            if byte == UInt8(ascii: "\\") {
+                out.append("\\\\")
+            } else if byte >= 0x20 && byte < 0x7F {
+                out.append(Character(UnicodeScalar(byte)))
+            } else {
+                out.append(String(format: "\\x%02x", byte))
+            }
+        }
+        return out
+    }
+
     static func write(_ message: String, at date: Date = Date()) {
         let line = format(message, at: date)
         line.withCString { pointer in

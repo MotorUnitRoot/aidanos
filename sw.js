@@ -1,5 +1,5 @@
 /* AidanOS shell cache — offline chrome; /api/* network-first */
-const CACHE = "aidanos-shell-v24";
+const CACHE = "aidanos-shell-v25";
 const SHELL = [
   "/",
   "/index.html",
@@ -10,6 +10,7 @@ const SHELL = [
   "/icon-180.png",
   "/icon-192.png",
   "/apple-touch-icon.png",
+  "/editor/live-note.mjs",
 ];
 
 self.addEventListener("install", (event) => {
@@ -43,7 +44,8 @@ self.addEventListener("fetch", (event) => {
     url.pathname === "/app.js" ||
     url.pathname === "/day.css" ||
     url.pathname === "/styles.css" ||
-    url.pathname === "/sw.js";
+    url.pathname === "/sw.js" ||
+    url.pathname === "/editor/live-note.mjs";
 
   if (shellFresh) {
     event.respondWith(

@@ -5,6 +5,8 @@ import path from "node:path";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { WebSocketServer } from "ws";
+import * as Automerge from "@automerge/automerge";
+import { next as AutomergeNext } from "@automerge/automerge/slim";
 import { Repo, isValidDocumentId } from "@automerge/automerge-repo";
 import { decode } from "@automerge/automerge-repo/helpers/cbor.js";
 import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
@@ -12,16 +14,114 @@ import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import { listenHosts } from "./bind.mjs";
 import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
-import { createMirror } from "./mirror.mjs";
-import { logSafe, stampLine } from "./redact.mjs";
-import { logSyncFrame } from "./sync-log.mjs";
+import {
+  beginFrame,
+  beginIndexRequest,
+  finishIndexReply,
+  installIndexTrace,
+  noteGitWork,
+  traceStorage,
+  watchRepo,
+} from "./index-trace.mjs";
+import { createMirror, discardOpenNoteTemps, rememberVaultRoot, saveNoteFile, sweepStaleNoteTemps } from "./mirror.mjs";
+import { flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, setFatalFallbackDir, stampLine } from "./redact.mjs";
+import { describeSyncFrame } from "./sync-log.mjs";
 
 const DEFAULT_PORT = 3750;
 const MIN_TOKEN_LENGTH = 32;
+// openSession loads stored notes before /health can say the engine is up.
+// A hang there used to leave the port open and /health at 503. This bound
+// is separate from the 15s handshake.
+const SESSION_TIMEOUT_MS = 30_000;
+// launchd's stop sends SIGTERM, then SIGKILL if the process is still
+// there. A close() that never finishes used to wait for that SIGKILL,
+// and a second SIGTERM or SIGINT was ignored. The deadline exits first.
+// A second signal exits the same way, without waiting out the deadline.
+export const SHUTDOWN_DEADLINE_MS = 5000;
+export const SHUTDOWN_TIMEOUT_LINE = "relay close timed out";
+// launchd waits about 20s after SIGTERM. Saves get 12s, then close gets 5s.
+export const SAVE_WAIT_MS = 12_000;
+export const SAVE_WAIT_TIMEOUT_LINE = "in-flight saves timed out";
+export const SLOW_SAVE_NOTE_NAME = "held-note.md";
+
+export function slowSaveNoteBody() {
+  return "whole-note-line\n".repeat(256);
+}
+
+const inflightSaves = new Set();
+
+function trackInflight(work) {
+  const run = Promise.resolve().then(work);
+  inflightSaves.add(run);
+  return run.finally(() => inflightSaves.delete(run));
+}
+
+function saveWaitBound(env = process.env) {
+  if (env.NODE_ENV === "test") {
+    const raw = Number(env.AIDANOS_RELAY_TEST_SAVE_WAIT_MS);
+    if (Number.isFinite(raw) && raw >= 50 && raw <= SAVE_WAIT_MS) return raw;
+  }
+  return SAVE_WAIT_MS;
+}
+
+function waitForInflightSaves(ms) {
+  if (inflightSaves.size === 0) return Promise.resolve("settled");
+  return new Promise((resolve) => {
+    const deadline = Date.now() + ms;
+    const check = () => {
+      if (inflightSaves.size === 0) return resolve("settled");
+      const left = deadline - Date.now();
+      if (left <= 0) return resolve("timeout");
+      setTimeout(check, Math.min(20, left));
+    };
+    check();
+  });
+}
+
+function trackStorage(inner) {
+  const wrap = (method) => (...args) => trackInflight(() => inner[method](...args));
+  const api = {
+    load: (...args) => inner.load(...args),
+    loadRange: (...args) => inner.loadRange(...args),
+    save: wrap("save"),
+    remove: wrap("remove"),
+    removeRange: wrap("removeRange"),
+  };
+  if (typeof inner.close === "function") api.close = (...args) => inner.close(...args);
+  if (typeof inner.bytesFor === "function") api.bytesFor = (...args) => inner.bytesFor(...args);
+  return api;
+}
+
+function shutdownDeadline(env = process.env) {
+  if (env.NODE_ENV === "test") {
+    const raw = Number(env.AIDANOS_RELAY_TEST_SHUTDOWN_MS);
+    if (Number.isFinite(raw) && raw >= 50 && raw <= SHUTDOWN_DEADLINE_MS) return raw;
+  }
+  return SHUTDOWN_DEADLINE_MS;
+}
+
+function hangClose(env = process.env) {
+  return env.NODE_ENV === "test" && env.AIDANOS_RELAY_TEST_HANG_CLOSE === "1";
+}
+
+function fatalStateDir(vault, data, env = process.env) {
+  if (data) return path.resolve(String(data));
+  if (env.AIDANOS_RELAY_DATA) return path.resolve(String(env.AIDANOS_RELAY_DATA));
+  const root = vault || env.AIDANOS_RELAY_VAULT || "";
+  if (!String(root).trim()) return "";
+  return path.resolve(String(root), ".aidanos", "relay");
+}
 // A note's first sync is its whole history. 1 MB was small enough to reject that
-// and leave the device retrying forever. The app uses this same 32 MB cap and
-// refuses an oversized note on its own, so the socket stays up for every other note.
-export const MAX_PAYLOAD = 32 * 1024 * 1024;
+// and leave the device retrying forever. Measured with Automerge 3.2.6 on
+// synthetic text, the largest CBOR sync frame was 306,331 bytes for a fresh
+// 2 MB note, 1,191,807 bytes for 2 MB of high-entropy text, 919,964 bytes for
+// 6 MB of note-like text, and 31,575 bytes for an index of 1,000 paths. The
+// relay syncs .md only, so a .txt file is not one of those frames. The largest
+// realistic frame is about 1.19 MB. Twice that is about 2.3 MB, below the
+// 4–8 MB range, so the cap is the bottom of that range. The app uses this
+// same cap and refuses an oversized note on its own, so the socket stays up
+// for every other note.
+export const MAX_PAYLOAD = 4 * 1024 * 1024;
 const FAILURE_CAP = 1024;
 export const LAN_WARNING =
   "WARNING: --lan sends notes across your home network with no encryption. The token is the only protection.";
@@ -101,6 +201,22 @@ export function syncFrameAllowed(value) {
   return true;
 }
 
+function frameMessage(data) {
+  let raw = data;
+  if (raw == null) return null;
+  if (ArrayBuffer.isView(raw)) raw = Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
+  else if (raw instanceof ArrayBuffer) raw = Buffer.from(raw);
+  else if (typeof raw === "string") raw = Buffer.from(raw);
+  else if (!Buffer.isBuffer(raw)) return null;
+  try {
+    const message = decode(raw);
+    if (!message || typeof message !== "object") return null;
+    return message;
+  } catch {
+    return null;
+  }
+}
+
 function rejectUpgrade(socket) {
   const body = "unauthorized";
   socket.write(
@@ -115,13 +231,39 @@ function rejectUpgrade(socket) {
   socket.destroy();
 }
 
-function health(gitState, bootedAt, syncUp) {
+function seconds(millis) {
+  return (millis / 1000).toFixed(3) + "s";
+}
+
+/// The first sync message loads the engine. On a cold simulator that work
+/// blocked the process: run 40425278945 took 48s to accept the other device,
+/// and run 40423525581 took 6.6s for the first index reply. Doing it before
+/// any device is connected keeps that cost off the 15s handshake.
+export function warmSyncEngine() {
+  const local = AutomergeNext.init();
+  const remote = AutomergeNext.init();
+  let localState = AutomergeNext.initSyncState();
+  let remoteState = AutomergeNext.initSyncState();
+  const generated = AutomergeNext.generateSyncMessage(local, localState);
+  localState = generated[0];
+  const request = generated[1];
+  if (!request) return;
+  Automerge.decodeSyncMessage(request);
+  const received = AutomergeNext.receiveSyncMessage(remote, remoteState, request);
+  remoteState = received[1];
+  const reply = AutomergeNext.generateSyncMessage(received[0], remoteState);
+  if (reply[1]) AutomergeNext.receiveSyncMessage(local, localState, reply[1]);
+  AutomergeNext.decodeSyncState(AutomergeNext.encodeSyncState(localState));
+}
+
+function health(gitState, bootedAt, syncUp, resetGeneration) {
   return JSON.stringify({
     ok: syncUp,
     status: syncUp ? "ok" : "sync down",
     git: gitState.status === "ok",
     gitStatus: gitState.status,
     bootedAt,
+    resetGeneration,
   });
 }
 
@@ -301,13 +443,8 @@ async function describeForeign(dir) {
 
 function foreignFolderError(found) {
   const parts = ["This folder is not the relay's own folder."];
-  if (found.notes.length) {
-    parts.push("It contains notes (" + found.notes.slice(0, 3).join(", ") + ").");
-  }
   if (found.gitRemote) parts.push("It has a git remote.");
-  if (!found.notes.length && !found.gitRemote) {
-    parts.push("It already has files, and it has no relay marker.");
-  }
+  else parts.push("It already has files, and it has no relay marker.");
   parts.push("Pass an empty folder, or the folder the relay marked earlier.");
   return parts.join(" ");
 }
@@ -432,6 +569,7 @@ export async function startRelay(options = {}) {
   }
   const vault = path.resolve(String(vaultArg));
   const dataDir = path.resolve(options.data || env.AIDANOS_RELAY_DATA || path.join(vault, ".aidanos", "relay"));
+  setFatalFallbackDir(dataDir);
   const port = options.port == null ? portFromEnv(env) : Number(options.port);
   const { hosts, phone } = listenHosts({
     lan: Boolean(options.lan) || Boolean(options.lanAddress),
@@ -441,8 +579,12 @@ export async function startRelay(options = {}) {
   const gitUrl = String(options.gitUrl ?? env.AIDANOS_RELAY_GIT_URL ?? "").trim();
   const gitToken = String(options.gitToken ?? env.AIDANOS_RELAY_GIT_TOKEN ?? "").trim();
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
+  await installIndexTrace((line) => logSafe(secrets, line));
   await assertNotClientVault(vault);
   await claimRelayFolders(vault, dataDir);
+  // One realpath for the life of this process. A save must not call it again.
+  rememberVaultRoot(vault);
+  await sweepStaleNoteTemps(vault, dataDir);
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
   const failures = new Map();
@@ -489,54 +631,136 @@ export async function startRelay(options = {}) {
   }
 
   let bootedAt = new Date().toISOString();
+  // Finished resets. A caller waits for its own ticket: an earlier queued
+  // reset can change bootedAt before this request's rotate runs.
+  let resetGeneration = 0;
+  let resetQueued = 0;
   const allowReset = options.allowReset === true;
   const servers = [];
   let live = null;
   let resetChain = Promise.resolve();
   let api = null;
+  let accepting = true;
+
+  // One adapter must not see the shared server. disconnect() walks
+  // server.clients and terminates every socket, and the "close" listener
+  // runs that for whichever adapter heard it. A timed-out open that finishes
+  // after the retry is live used to emit close on the shared server and
+  // remove its listeners, so sync died while /health still said 200.
+  function sessionSockets(wss) {
+    const connectionListeners = new Map();
+    const closeListeners = new Map();
+    const mine = new Set();
+    let released = false;
+    const view = {
+      on(event, fn) {
+        if (event === "connection") {
+          const wrapped = (socket, request) => {
+            mine.add(socket);
+            socket.once("close", () => mine.delete(socket));
+            fn(socket, request);
+          };
+          connectionListeners.set(fn, wrapped);
+          wss.on("connection", wrapped);
+          return;
+        }
+        if (event === "close") closeListeners.set(fn, fn);
+      },
+      off(event, fn) {
+        if (event === "connection") {
+          const wrapped = connectionListeners.get(fn);
+          if (!wrapped) return;
+          connectionListeners.delete(fn);
+          try { wss.removeListener("connection", wrapped); } catch { /* already gone */ }
+          return;
+        }
+        if (event === "close") closeListeners.delete(fn);
+      },
+      get clients() {
+        return mine;
+      },
+    };
+    function release(keepSockets) {
+      if (released) return;
+      released = true;
+      // The shared sockets belong to the live adapter. Clearing this set
+      // before disconnect() means that call terminates nothing.
+      if (keepSockets) mine.clear();
+      for (const fn of [...closeListeners.values()]) {
+        try { fn(); } catch { /* the adapter clears its timer here */ }
+      }
+      for (const wrapped of connectionListeners.values()) {
+        try { wss.removeListener("connection", wrapped); } catch { /* already gone */ }
+      }
+      connectionListeners.clear();
+      closeListeners.clear();
+      if (!keepSockets) {
+        for (const socket of mine) {
+          try { socket.terminate(); } catch { /* already gone */ }
+        }
+      }
+      mine.clear();
+    }
+    return { view, release };
+  }
 
   async function openSession() {
     const adapters = [];
-    for (const entry of servers) {
-      adapters.push(new NodeWSServerAdapter(entry.wss));
+    const releases = [];
+    try {
+      for (const entry of servers) {
+        const attached = sessionSockets(entry.wss);
+        releases.push(attached.release);
+        adapters.push(new NodeWSServerAdapter(attached.view));
+      }
+      const repo = new Repo({
+        storage: trackStorage(traceStorage(new NodeFSStorageAdapter(dataDir))),
+        network: adapters,
+        sharePolicy: async () => true,
+        peerId: options.peerId || "aidanos-relay",
+      });
+      watchRepo(repo);
+      const debounce = Number(options.mirrorDebounceMs ?? process.env.AIDANOS_MIRROR_DEBOUNCE_MS);
+      const mirror = createMirror({
+        repo,
+        vault,
+        debounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
+        secrets,
+        track: trackInflight,
+        stateDir: dataDir,
+      });
+      // Fold a file that changed while this process was stopped before any device
+      // can connect. Doing it later lets that device's offline edit arrive first,
+      // and the file then replaces it.
+      await preloadStoredNotes(repo);
+      await mirror.now();
+      // The socket listener is attached only after the storage id is read.
+      // The port stays closed until that has finished, or the first join is missed.
+      await repo.networkSubsystem.peerMetadata;
+      for (const adapter of adapters) {
+        if (!adapter.peerId) throw new Error("The sync engine was not ready.");
+      }
+      return {
+        repo,
+        mirror,
+        adapters,
+        release(keepSockets) {
+          for (const releaseOne of releases) releaseOne(keepSockets);
+        },
+      };
+    } catch (error) {
+      for (const releaseOne of releases) releaseOne(true);
+      throw error;
     }
-    const repo = new Repo({
-      storage: new NodeFSStorageAdapter(dataDir),
-      network: adapters,
-      sharePolicy: async () => true,
-      peerId: options.peerId || "aidanos-relay",
-    });
-    const debounce = Number(options.mirrorDebounceMs ?? process.env.AIDANOS_MIRROR_DEBOUNCE_MS);
-    const mirror = createMirror({
-      repo,
-      vault,
-      debounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
-      secrets,
-    });
-    // Fold a file that changed while this process was stopped before any device
-    // can connect. Doing it later lets that device's offline edit arrive first,
-    // and the file then replaces it.
-    await preloadStoredNotes(repo);
-    await mirror.now();
-    // The socket listener is attached only after the storage id is read.
-    // The port stays closed until that has finished, or the first join is missed.
-    await repo.networkSubsystem.peerMetadata;
-    for (const adapter of adapters) {
-      if (!adapter.peerId) throw new Error("The sync engine was not ready.");
-    }
-    return { repo, mirror, adapters };
   }
 
-  async function disposeSession(session) {
-    if (!session) return;
+  async function disposeSession(session, how) {
+    if (!session || session.closed) return;
+    session.closed = true;
+    const keepSockets = how === "abandon";
     session.mirror.stop();
-    for (const entry of servers) {
-      for (const ws of [...entry.wss.clients]) ws.terminate();
-      // The adapter clears its ping timer on "close". Emitting it here does not
-      // mark the socket server shut, so the next test can still connect.
-      entry.wss.emit("close");
-      entry.wss.removeAllListeners();
-    }
+    // Drop this adapter only. The shared server stays up for the live session.
+    if (typeof session.release === "function") session.release(keepSockets);
     // The folder is about to be deleted, so do not flush or write it again.
     // Wait only for a rename that has already started.
     await session.mirror.idle();
@@ -550,9 +774,79 @@ export async function startRelay(options = {}) {
     } catch {
       // Closing storage is best effort. The directory is removed next.
     }
+    if (keepSockets && typeof options.onAbandonedSession === "function") {
+      try { options.onAbandonedSession(); } catch { /* the test observes the cleanup */ }
+    }
+  }
+
+  function warmTimeout() {
+    const error = new Error("sync warm-up timed out");
+    error.code = "WARM_TIMEOUT";
+    return error;
+  }
+
+  async function openSessionWithinTimeout() {
+    const ms = Number(options.sessionTimeoutMs) > 0 ? Number(options.sessionTimeoutMs) : SESSION_TIMEOUT_MS;
+    let settled = false;
+    let opened = null;
+    let timer;
+    const work = (async () => {
+      if (typeof options.beforeOpenReady === "function") await options.beforeOpenReady();
+      const session = await openSession();
+      opened = session;
+      if (settled) {
+        await disposeSession(session, "abandon");
+        throw warmTimeout();
+      }
+      return session;
+    })();
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        settled = true;
+        reject(warmTimeout());
+      }, ms);
+    });
+    try {
+      return await Promise.race([work, timeout]);
+    } catch (error) {
+      settled = true;
+      if (opened) await disposeSession(opened, "abandon");
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function closeListening() {
+    for (const entry of servers) {
+      for (const ws of [...entry.wss.clients]) ws.terminate();
+      entry.wss.close();
+      if (typeof entry.httpServer.closeAllConnections === "function") entry.httpServer.closeAllConnections();
+    }
+    await Promise.all(servers.map((entry) => whenServerClosed(entry.httpServer)));
+    for (const entry of servers) entry.wss.emit("close");
+  }
+
+  async function activateSession(session) {
+    let published = false;
+    try {
+      const warmStarted = Date.now();
+      if (typeof options.warm === "function") options.warm();
+      else warmSyncEngine();
+      logSafe(secrets, "sync engine warm in " + seconds(Date.now() - warmStarted));
+      if (api) api.repo = session.repo;
+      bootedAt = new Date().toISOString();
+      live = session;
+      published = true;
+    } finally {
+      if (!published) {
+        try { await disposeSession(session); } catch { /* keep the warm error */ }
+      }
+    }
   }
 
   async function rotate() {
+    const started = Date.now();
     const markerId = await ownedMarkerId(vault, dataDir);
     if (!markerId) {
       logSafe(secrets, "reset refused: the folder has no current relay marker");
@@ -574,15 +868,32 @@ export async function startRelay(options = {}) {
         await writeMarkerFile(path.join(vault, ".aidanos", "relay-folder"), marker);
         await writeMarkerFile(path.join(dataDir, "relay-folder"), marker);
         if (typeof options.beforeReopen === "function") await options.beforeReopen();
-        live = await openSession();
-        bootedAt = new Date().toISOString();
-        if (api) api.repo = live.repo;
+        const session = await openSessionWithinTimeout();
+        // The new generation stays hidden until the first sync has run.
+        // A device waiting on /health then connects to an engine that already
+        // answered one index round trip, instead of paying for it while the
+        // other device's handshake sits unread.
+        await activateSession(session);
+        resetGeneration += 1;
         logSafe(secrets, "reset complete");
+        logSafe(secrets, "reset ready in " + seconds(Date.now() - started));
         if (typeof options.onReset === "function") options.onReset();
         return;
       } catch (error) {
         lastError = error;
         logSafe(secrets, "reset attempt failed:", error instanceof Error ? error.message : error);
+      }
+    }
+    logSafe(secrets, "reset failed: kept generation " + resetGeneration);
+    // A timed-out open is closed above. One more open, still on the old
+    // generation, so /health does not stay 503 after the wait has ended.
+    // Any other reset failure leaves sync down.
+    if (lastError && lastError.code === "WARM_TIMEOUT") {
+      try {
+        const session = await openSessionWithinTimeout();
+        await activateSession(session);
+      } catch (error) {
+        logSafe(secrets, "reset failed:", error instanceof Error ? error.message : error);
       }
     }
     throw lastError;
@@ -596,10 +907,15 @@ export async function startRelay(options = {}) {
 
   for (const host of hosts) {
     const httpServer = http.createServer((req, res) => {
+      if (!accepting) {
+        res.writeHead(503, { "content-length": 0 });
+        res.end();
+        return;
+      }
       const pathOnly = String(req.url || "").split("?")[0];
       if (pathOnly === "/health") {
         const syncUp = live != null;
-        const body = health(gitState, bootedAt, syncUp);
+        const body = health(gitState, bootedAt, syncUp, resetGeneration);
         res.writeHead(syncUp ? 200 : 503, {
           "content-type": "application/json",
           "content-length": Buffer.byteLength(body),
@@ -634,7 +950,9 @@ export async function startRelay(options = {}) {
               res.end(refused);
               return;
             }
-            const body = JSON.stringify({ ok: true, resetting: true });
+            resetQueued += 1;
+            const ticket = resetQueued;
+            const body = JSON.stringify({ ok: true, resetting: true, resetGeneration: ticket });
             res.writeHead(200, {
               "content-type": "application/json",
               "content-length": Buffer.byteLength(body),
@@ -663,8 +981,11 @@ export async function startRelay(options = {}) {
     const cap = payloadLimit(rawCap);
     const wss = new WebSocketServer({ noServer: true, maxPayload: cap });
     const entry = { httpServer, host, wss };
+    httpServer.on("connection", (socket) => {
+      if (!accepting) socket.destroy();
+    });
     httpServer.on("upgrade", (req, socket, head) => {
-      if (!live) {
+      if (!accepting || !live) {
         socket.destroy();
         return;
       }
@@ -704,12 +1025,54 @@ export async function startRelay(options = {}) {
         ws.on("error", (error) => {
           logSafe(secrets, "sync connection closed:", error instanceof Error ? error.message : error);
         });
+        const openedAt = Date.now();
+        let joinAnswered = false;
+        let indexRequestAt = null;
+        function noteFrame(direction, data) {
+          const message = frameMessage(data);
+          const docId = message && typeof message.documentId === "string" ? message.documentId : "";
+          const messageType = message && typeof message.type === "string" ? message.type : "";
+          if (docId) beginFrame(docId);
+          // Open the window before describeSyncFrame decodes the message,
+          // so that decode is part of this request and not the previous one.
+          const indexIn =
+            direction === "in" &&
+            docId === INDEX_ID &&
+            (messageType === "request" || messageType === "sync" || messageType === "doc-unavailable");
+          if (indexIn) beginIndexRequest(live && live.repo);
+          let line = "";
+          try {
+            line = describeSyncFrame(direction, data);
+          } catch {
+            line = "";
+          }
+          if (!line) return;
+          logSafe(secrets, line);
+          const now = Date.now();
+          if (!joinAnswered && line === "sync out peer") {
+            joinAnswered = true;
+            logSafe(secrets, "join answered in " + seconds(now - openedAt));
+          }
+          const indexFrame =
+            line.startsWith("sync " + direction + " request doc=" + INDEX_ID) ||
+            line.startsWith("sync " + direction + " sync doc=" + INDEX_ID) ||
+            line.startsWith("sync " + direction + " doc-unavailable doc=" + INDEX_ID);
+          if (!indexFrame) return;
+          if (direction === "in") {
+            indexRequestAt = now;
+            logSafe(secrets, "index request");
+          } else if (indexRequestAt != null) {
+            logSafe(secrets, "index reply in " + seconds(now - indexRequestAt));
+            finishIndexReply();
+            indexRequestAt = null;
+          }
+        }
         ws.on("message", (data) => {
-          logSyncFrame("in", data, secrets);
+          noteFrame("in", data);
         });
         const send = ws.send;
         ws.send = function sendLogged(...args) {
-          logSyncFrame("out", args[0], secrets);
+          noteFrame("out", args[0]);
           return send.apply(ws, args);
         };
         logSafe(secrets, "accepted a sync connection");
@@ -719,21 +1082,34 @@ export async function startRelay(options = {}) {
     servers.push(entry);
   }
 
-  live = await openSession();
-
   let boundPort = port;
   for (const entry of servers) {
     boundPort = await listen(entry.httpServer, entry.host, port);
   }
 
+  // /health stays 503 until this warm-up finishes. The port is already open,
+  // so a start script can wait on it instead of racing a closed socket.
+  let session = null;
+  try {
+    session = await openSessionWithinTimeout();
+    await activateSession(session);
+  } catch (error) {
+    try { await disposeSession(session); } catch { /* the warm error is the one that stops startup */ }
+    await closeListening();
+    throw error;
+  }
+
   const interval = gitInterval(options.gitIntervalMs, env);
   let gitTimer = null;
   async function runBackup() {
+    const started = Date.now();
     try {
       const result = await backupOnce({ vault, gitUrl, gitToken, secrets, env });
+      noteGitWork(Date.now() - started);
       noteGit(result);
       return result;
     } catch (error) {
+      noteGitWork(Date.now() - started);
       gitState.status = "failed";
       throw error;
     }
@@ -764,32 +1140,64 @@ export async function startRelay(options = {}) {
     },
     healthURL: "http://127.0.0.1:" + boundPort + "/health",
     async close() {
+      if (hangClose(env)) await new Promise(() => {});
       await resetChain.catch(() => {});
       const session = live;
       live = null;
-      if (session) session.mirror.stop();
       if (gitTimer) clearInterval(gitTimer);
+      if (session) {
+        try { await disposeSession(session); } catch { /* shutdown still closes the port */ }
+      }
       for (const entry of servers) {
         for (const ws of [...entry.wss.clients]) ws.terminate();
         entry.wss.close();
         if (typeof entry.httpServer.closeAllConnections === "function") entry.httpServer.closeAllConnections();
       }
-      await Promise.all(
-        servers.map(
-          (entry) =>
-            new Promise((resolve) => {
-              entry.httpServer.close(() => resolve());
-            }),
-        ),
-      );
+      await Promise.all(servers.map((entry) => whenServerClosed(entry.httpServer)));
       // The websocket adapter clears its ping timer on "close". A client that
       // already went away can leave that timer running, which holds the
       // process open after the tests have finished.
       for (const entry of servers) entry.wss.emit("close");
       if (session && typeof session.repo.shutdown === "function") await session.repo.shutdown();
     },
+    async stopAcceptingAndDrainSaves() {
+      accepting = false;
+      if (live && live.mirror) live.mirror.stop();
+      for (const entry of servers) {
+        try {
+          if (entry.httpServer.listening) entry.httpServer.close();
+        } catch { /* close() stops the rest */ }
+      }
+      const result = await waitForInflightSaves(saveWaitBound(env));
+      if (result === "timeout") {
+        logSafe(secrets, SAVE_WAIT_TIMEOUT_LINE);
+        await discardOpenNoteTemps();
+      }
+      return result;
+    },
   };
+  if (env.NODE_ENV === "test" && env.AIDANOS_RELAY_TEST_SLOW_SAVE === "1") {
+    const body = slowSaveNoteBody();
+    const noteFile = path.join(vault, SLOW_SAVE_NOTE_NAME);
+    const staged = env.AIDANOS_RELAY_TEST_SAVE_STAGED;
+    const hold = Number(env.AIDANOS_RELAY_TEST_SAVE_HOLD_MS);
+    const delay = Number.isFinite(hold) && hold >= 0 ? hold : 900;
+    trackInflight(() => saveNoteFile(noteFile, body, async () => {
+      if (staged) await fs.writeFile(String(staged), body);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }, { vault, stateDir: dataDir })).catch(() => { /* the shutdown wait still sees this save leave the set */ });
+  }
   return api;
+}
+
+function whenServerClosed(server) {
+  return new Promise((resolve) => {
+    if (!server.listening) {
+      resolve();
+      return;
+    }
+    server.close(() => resolve());
+  });
 }
 
 async function preloadStoredNotes(repo) {
@@ -820,12 +1228,19 @@ function gitInterval(override, env = process.env) {
 }
 
 async function main() {
+  // A terminal stays on the synchronous console. A file or a pipe does
+  // not: Node's file stderr is writeSync, and a full pipe blocks until
+  // the reader drains it. CI and launchd both point this process at a
+  // file. The async stream writes that same fd.
+  if (!process.stderr.isTTY) installFileLog();
+  const args = parseArgs(process.argv.slice(2));
+  const stateDir = fatalStateDir(args.vault, args.data);
+  if (stateDir) setFatalFallbackDir(stateDir);
   const needed = nodeRequirement();
   if (needed) {
-    logSafe([], needed);
+    logFatal([], needed);
     process.exit(1);
   }
-  const args = parseArgs(process.argv.slice(2));
   let relay;
   try {
     relay = await startRelay({
@@ -834,23 +1249,63 @@ async function main() {
       vault: args.vault || undefined,
       data: args.data || undefined,
       port: args.port == null || Number.isNaN(args.port) ? undefined : args.port,
-      allowReset: process.env.AIDANOS_RELAY_ALLOW_RESET === "1",
+      allowReset: process.env.NODE_ENV === "test" && process.env.AIDANOS_RELAY_ALLOW_RESET === "1",
     });
   } catch (error) {
-    logSafe(
+    logFatal(
       [process.env.AIDANOS_RELAY_TOKEN, process.env.AIDANOS_RELAY_GIT_TOKEN],
       error instanceof Error ? error.message : error,
     );
     process.exit(1);
   }
-  for (const line of startupLines({ lan: args.lan || Boolean(args.lanAddress), port: relay.port, phone: relay.phone })) {
-    writeSync(line.startsWith("WARNING") ? 2 : 1, stampLine(line) + "\n");
-  }
+  let closing = false;
+  let settled = false;
+  let deadlineTimer = null;
+  let giveUp = () => {};
   const shutdown = () => {
-    relay.close().then(() => process.exit(0));
+    if (settled) return;
+    if (closing) {
+      giveUp();
+      return;
+    }
+    closing = true;
+    const exitWith = (code, line) => {
+      if (settled) return;
+      settled = true;
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      try {
+        pauseFileLog();
+        logSafe([], line);
+      } catch { /* the flush still runs */ }
+      try {
+        flushFileLog();
+      } catch { /* exit still runs */ }
+      process.exit(code);
+    };
+    let saveWaitTimedOut = false;
+    giveUp = () => exitWith(1, SHUTDOWN_TIMEOUT_LINE);
+    const beginClose = () => {
+      if (settled) return;
+      // The 5s close deadline starts only after in-flight saves settle,
+      // or after the 12s save bound has already been logged. A save wait
+      // that hit that bound still closes, then exits 1.
+      deadlineTimer = setTimeout(() => giveUp(), shutdownDeadline());
+      const code = saveWaitTimedOut ? 1 : 0;
+      Promise.resolve(relay.close()).then(
+        () => exitWith(code, "relay log closed"),
+        () => exitWith(code, "relay log closed"),
+      );
+    };
+    Promise.resolve(relay.stopAcceptingAndDrainSaves()).then((result) => {
+      saveWaitTimedOut = result === "timeout";
+      beginClose();
+    }, beginClose);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  for (const line of startupLines({ lan: args.lan || Boolean(args.lanAddress), port: relay.port, phone: relay.phone })) {
+    writeSync(line.startsWith("WARNING") ? 2 : 1, stampLine(line) + "\n");
+  }
 }
 
 const invoked = process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;

@@ -23,10 +23,18 @@ final class SyncTests: XCTestCase {
         let path = "log/\(UUID().uuidString)/2026-10-21.md"
         let phone = try AidanSession(vault: phoneVault)
         let mac = try AidanSession(vault: macVault)
+        defer {
+            phone.disconnect()
+            mac.disconnect()
+        }
         try phone.connect(relayURL: relay.url, token: relay.token)
         try mac.connect(relayURL: relay.url, token: relay.token)
         try phone.replace(path, with: "Hello")
-        let shared = try waitUntil(seconds: 8) {
+        // The first index round trip took 9.6s on the simulator in run
+        // 40416129009, and the note reply was still missing 11s after the
+        // request. Eight seconds ends before that reply. This is the same
+        // arrival the other two-device tests already wait 20s for.
+        let shared = try waitUntil(seconds: 24, label: "airplane-shared") {
             guard (try? phone.text(path)) == "Hello", (try? mac.text(path)) == "Hello" else { return false }
             if let relayVault = relay.vault {
                 let file = try? String(contentsOf: relayVault.appendingPathComponent(path), encoding: .utf8)
@@ -34,7 +42,12 @@ final class SyncTests: XCTestCase {
             }
             return true
         }
-        XCTAssertTrue(shared)
+        guard shared else {
+            let phoneText = (try? phone.text(path)) ?? ""
+            let macText = (try? mac.text(path)) ?? ""
+            XCTFail("the shared Hello never arrived (phone=\(phoneText) mac=\(macText)); later edits would have no common base")
+            return
+        }
         phone.disconnect()
         mac.disconnect()
         try phone.replace(path, with: "Hello PHONE")
@@ -45,7 +58,9 @@ final class SyncTests: XCTestCase {
         try phone.connect(relayURL: relay.url, token: relay.token)
         try mac.connect(relayURL: relay.url, token: relay.token)
         let allowed = ["Hello PHONE MAC", "Hello MAC PHONE"]
-        let merged = try waitUntil(seconds: 12) {
+        // Same cold round trip as the shared base. Twelve seconds ended
+        // before one reply in run 40416129009.
+        let merged = try waitUntil(seconds: 24, label: "airplane-merged") {
             guard let left = try? phone.text(path), let right = try? mac.text(path) else { return false }
             return left == right && allowed.contains(left)
         }
@@ -59,14 +74,12 @@ final class SyncTests: XCTestCase {
         XCTAssertEqual(phoneFile, phoneText)
         XCTAssertEqual(macFile, macText)
         if let relayVault = relay.vault {
-            let copied = try waitUntil(seconds: 8) {
+            let copied = try waitUntil(seconds: 8, label: "airplane-relay") {
                 let text = try? String(contentsOf: relayVault.appendingPathComponent(path), encoding: .utf8)
                 return text == phoneText
             }
             XCTAssertTrue(copied)
         }
-        phone.disconnect()
-        mac.disconnect()
     }
 
     func testSameDayNoteCreatedTwice() throws {
@@ -91,7 +104,7 @@ final class SyncTests: XCTestCase {
         try left.connect(relayURL: relay.url, token: relay.token)
         try right.connect(relayURL: relay.url, token: relay.token)
         let allowed = ["morning lineevening line", "evening linemorning line"]
-        let merged = try waitUntil(seconds: 12) {
+        let merged = try waitUntil(seconds: 12, label: "same-day-merged") {
             guard let a = try? left.text(path), let b = try? right.text(path) else { return false }
             return a == b && allowed.contains(a)
         }
@@ -135,16 +148,16 @@ final class SyncTests: XCTestCase {
         try phone.connect(relayURL: relay.url, token: relay.token)
         try mac.connect(relayURL: relay.url, token: relay.token)
         try phone.replace(path, with: "Hello")
-        let helloArrived = try waitUntil(seconds: 20) { (try? mac.text(path)) == "Hello" }
+        let helloArrived = try waitUntil(seconds: 20, label: "remote-typing-hello") { (try? mac.text(path)) == "Hello" }
         XCTAssertTrue(helloArrived)
         if !helloArrived { return }
         try mac.replace(path, with: "Hello there")
-        let thereArrived = try waitUntil(seconds: 20) { (try? phone.text(path)) == "Hello there" }
+        let thereArrived = try waitUntil(seconds: 20, label: "remote-typing-there") { (try? phone.text(path)) == "Hello there" }
         XCTAssertTrue(thereArrived)
         if !thereArrived { return }
         let merged = try phone.applyEdit(path, from: "Hello", to: "Hello!")
         XCTAssertEqual(merged, "Hello! there")
-        XCTAssertTrue(try waitUntil(seconds: 20) { (try? mac.text(path)) == "Hello! there" })
+        XCTAssertTrue(try waitUntil(seconds: 20, label: "remote-typing-keystroke") { (try? mac.text(path)) == "Hello! there" })
     }
 
     func testOutsideEditWhileClosedSurvivesLaunch() throws {
@@ -196,12 +209,12 @@ final class SyncTests: XCTestCase {
         try author.replace(path, with: "from the relay")
         let witness = try AidanSession(vault: try temporaryVault())
         try witness.connect(relayURL: relay.url, token: relay.token)
-        let arrived = try waitUntil(seconds: 15) {
+        let arrived = try waitUntil(seconds: 15, label: "rebuild-arrived") {
             (try? witness.text(path)) == "from the relay"
         }
         XCTAssertTrue(arrived)
         if let relayVault = relay.vault {
-            XCTAssertTrue(try waitUntil(seconds: 8) {
+            XCTAssertTrue(try waitUntil(seconds: 8, label: "rebuild-relay") {
                 let text = try? String(contentsOf: relayVault.appendingPathComponent(path), encoding: .utf8)
                 return text == "from the relay"
             })
@@ -214,7 +227,7 @@ final class SyncTests: XCTestCase {
         try "from the file".write(to: fileURL, atomically: true, encoding: .utf8)
         let reader = try AidanSession(vault: fileVault)
         try reader.connect(relayURL: relay.url, token: relay.token)
-        let raised = try waitUntil(seconds: 20) {
+        let raised = try waitUntil(seconds: 20, label: "rebuild-raised") {
             guard let conflict = reader.conflicts().first(where: { $0.path == path }) else { return false }
             return conflict.mine == "from the file" && conflict.theirs == "from the relay"
         }
@@ -286,9 +299,10 @@ final class SyncTests: XCTestCase {
             try? session.connect(relayURL: stall.url, token: testToken)
             blocked.signal()
         }
-        XCTAssertTrue(try waitUntil(seconds: 3) {
-            session.connection == .connecting || session.connection == .reconnecting
-        })
+        // .connecting is set before the TCP handshake. Stop only once the stall
+        // holds the accepted socket, so close wakes the handshake read instead of
+        // racing an unaccepted connect that can sit out this 5s bound.
+        XCTAssertTrue(try waitUntil(seconds: 3) { stall.hasClient() })
         let free = DispatchSemaphore(value: 0)
         let started = Date()
         DispatchQueue.global(qos: .userInitiated).async {
@@ -298,6 +312,32 @@ final class SyncTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 0.5)
         stall.stop()
         XCTAssertEqual(blocked.wait(timeout: .now() + 5), .success)
+    }
+
+    func testCborRejectsDeepNesting() throws {
+        func nested(_ depth: Int) -> Data {
+            var data = Data(repeating: 0x81, count: depth)
+            data.append(0x00)
+            return data
+        }
+        _ = try CBOR.decode(nested(CBORNesting.limit - 1))
+        XCTAssertThrowsError(try CBOR.decode(nested(CBORNesting.limit))) { error in
+            guard case AidanError.protocol(let text) = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+            XCTAssertTrue(text.contains("nested too deep"))
+        }
+    }
+
+    func testRelaySuppliedIdIsEscapedBeforeLogging() {
+        let escaped = SyncLog.escapedId("note\nid\\x")
+        XCTAssertFalse(escaped.contains("\n"))
+        XCTAssertFalse(escaped.contains("\\x") && escaped.contains("\n"))
+        XCTAssertTrue(escaped.contains("\\x0a"))
+        XCTAssertTrue(escaped.contains("\\\\"))
+        let line = SyncLog.format("sync drop oversized doc=\(escaped)", at: Date(timeIntervalSince1970: 1_761_091_323))
+        XCTAssertEqual(line.filter { $0 == "\n" }.count, 1)
+        XCTAssertTrue(line.hasSuffix("\n"))
     }
 
     func testSyncLogNamesHeadsAndTime() {
@@ -315,7 +355,7 @@ final class SyncTests: XCTestCase {
         try author.replace(path, with: "from the relay")
         let witness = try AidanSession(vault: try temporaryVault())
         try witness.connect(relayURL: relay.url, token: relay.token)
-        let arrived = try waitUntil(seconds: 20) { (try? witness.text(path)) == "from the relay" }
+        let arrived = try waitUntil(seconds: 20, label: "rebuilt-before-arrived") { (try? witness.text(path)) == "from the relay" }
         XCTAssertTrue(arrived)
         if !arrived { return }
         witness.disconnect()
@@ -342,7 +382,7 @@ final class SyncTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "Hello!")
 
         try reader.connect(relayURL: relay.url, token: relay.token)
-        let raised = try waitUntil(seconds: 20) {
+        let raised = try waitUntil(seconds: 20, label: "rebuilt-before-raised") {
             guard let conflict = reader.conflicts().first(where: { $0.path == path }) else { return false }
             return conflict.mine == "Hello!" && conflict.theirs == "from the relay"
         }
@@ -364,7 +404,7 @@ final class SyncTests: XCTestCase {
         try author.replace(path, with: "from the relay")
         let witness = try AidanSession(vault: try temporaryVault())
         try witness.connect(relayURL: relay.url, token: relay.token)
-        let arrived = try waitUntil(seconds: 20) { (try? witness.text(path)) == "from the relay" }
+        let arrived = try waitUntil(seconds: 20, label: "conflict-typing-arrived") { (try? witness.text(path)) == "from the relay" }
         XCTAssertTrue(arrived)
         if !arrived { return }
         witness.disconnect()
@@ -377,7 +417,7 @@ final class SyncTests: XCTestCase {
         let reader = try AidanSession(vault: fileVault)
         defer { reader.disconnect() }
         try reader.connect(relayURL: relay.url, token: relay.token)
-        let raised = try waitUntil(seconds: 20) {
+        let raised = try waitUntil(seconds: 20, label: "conflict-typing-raised") {
             guard let conflict = reader.conflicts().first(where: { $0.path == path }) else { return false }
             return conflict.mine == "from the file" && conflict.theirs == "from the relay"
         }
@@ -412,7 +452,7 @@ final class SyncTests: XCTestCase {
         try author.replace(path, with: "from the relay")
         let witness = try AidanSession(vault: try temporaryVault())
         try witness.connect(relayURL: relay.url, token: relay.token)
-        let arrived = try waitUntil(seconds: 20) { (try? witness.text(path)) == "from the relay" }
+        let arrived = try waitUntil(seconds: 20, label: "relay-conflict-arrived") { (try? witness.text(path)) == "from the relay" }
         XCTAssertTrue(arrived)
         if !arrived { return }
         witness.disconnect()
@@ -429,7 +469,7 @@ final class SyncTests: XCTestCase {
         let noticed = Flag()
         reader.onConflict = { noticed.set() }
         try reader.connect(relayURL: relay.url, token: relay.token)
-        let raised = try waitUntil(seconds: 20) {
+        let raised = try waitUntil(seconds: 20, label: "relay-conflict-raised") {
             noticed.get() && reader.conflicts().contains { $0.path == path && $0.theirs == "from the relay" }
         }
         XCTAssertTrue(raised)
@@ -497,7 +537,7 @@ final class SyncTests: XCTestCase {
     }
 
     func testOversizedNoteStopsOnlyThatNote() throws {
-        XCTAssertEqual(SyncLimits.maxMessageBytes, 32 * 1024 * 1024)
+        XCTAssertEqual(SyncLimits.maxMessageBytes, 4 * 1024 * 1024)
         let relay = try TestRelay.start()
         defer { relay.stop() }
         let phone = try AidanSession(vault: try temporaryVault())
@@ -512,7 +552,7 @@ final class SyncTests: XCTestCase {
         let small = "notes/small-\(UUID().uuidString).md"
         let big = "notes/big-\(UUID().uuidString).md"
         try phone.replace(small, with: "Hi")
-        let smallArrived = try waitUntil(seconds: 20) { (try? mac.text(small)) == "Hi" }
+        let smallArrived = try waitUntil(seconds: 20, label: "oversized-small") { (try? mac.text(small)) == "Hi" }
         XCTAssertTrue(smallArrived)
         if !smallArrived { return }
         let reported = Flag()
@@ -521,7 +561,7 @@ final class SyncTests: XCTestCase {
         }
         let bigText = (0..<900).map { String(format: "word-%04d ", $0) }.joined()
         try phone.replace(big, with: bigText)
-        let sawError = try waitUntil(seconds: 20) { reported.get() }
+        let sawError = try waitUntil(seconds: 20, label: "oversized-error") { reported.get() }
         XCTAssertTrue(sawError)
         let reportedText = reported.message()
         XCTAssertTrue(reportedText.contains(big), reportedText)
@@ -531,10 +571,64 @@ final class SyncTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.5)
         XCTAssertNotEqual(try mac.text(big), bigText)
         try phone.applyEdit(small, from: "Hi", to: "Hi!")
-        let edited = try waitUntil(seconds: 20) { (try? mac.text(small)) == "Hi!" }
+        let edited = try waitUntil(seconds: 20, label: "oversized-edited") { (try? mac.text(small)) == "Hi!" }
         XCTAssertTrue(edited)
         XCTAssertEqual(phone.connection, .connected)
         XCTAssertNotEqual(try mac.text(big), bigText)
+    }
+
+    func testOversizedNoteFromTheRelayStopsOnlyThatNote() throws {
+        let relay = try TestRelay.start()
+        defer { relay.stop() }
+        let phone = try AidanSession(vault: try temporaryVault())
+        let mac = try AidanSession(vault: try temporaryVault())
+        phone.maxSyncBytes = 2_000
+        phone.reconnectPause = 0.2
+        let reconnects = Counter()
+        phone.onConnection = { state in
+            if state == .reconnecting { reconnects.add() }
+        }
+        defer {
+            phone.disconnect()
+            mac.disconnect()
+        }
+        try phone.connect(relayURL: relay.url, token: relay.token)
+        try mac.connect(relayURL: relay.url, token: relay.token)
+        let small = "notes/small-\(UUID().uuidString).md"
+        let big = "notes/big-\(UUID().uuidString).md"
+        try mac.replace(small, with: "Hi")
+        let smallArrived = try waitUntil(seconds: 20, label: "oversized-inbound-small") {
+            (try? phone.text(small)) == "Hi"
+        }
+        XCTAssertTrue(smallArrived)
+        if !smallArrived { return }
+        let reported = Flag()
+        phone.onError = { message in
+            reported.set(message)
+        }
+        let bigText = (0..<900).map { String(format: "word-%04d ", $0) }.joined()
+        try mac.replace(big, with: bigText)
+        let sawError = try waitUntil(seconds: 20, label: "oversized-inbound-error") { reported.get() }
+        XCTAssertTrue(sawError)
+        let reportedText = reported.message()
+        let namesBig = reportedText.contains(big) || reportedText.contains(DocumentIds.noteId(big))
+        XCTAssertTrue(namesBig, reportedText)
+        XCTAssertFalse(reportedText.contains(small), reportedText)
+        XCTAssertFalse(reportedText.contains(DocumentIds.noteId(small)), reportedText)
+        XCTAssertTrue(reportedText.contains("Other notes keep syncing"), reportedText)
+        XCTAssertEqual(phone.connection, .connected)
+        XCTAssertEqual(reconnects.get(), 0)
+        Thread.sleep(forTimeInterval: 0.6)
+        XCTAssertEqual(phone.connection, .connected)
+        XCTAssertEqual(reconnects.get(), 0)
+        try mac.applyEdit(small, from: "Hi", to: "Hi!")
+        let edited = try waitUntil(seconds: 20, label: "oversized-inbound-edited") {
+            (try? phone.text(small)) == "Hi!"
+        }
+        XCTAssertTrue(edited)
+        XCTAssertNotEqual(try? phone.text(big), bigText)
+        XCTAssertEqual(phone.connection, .connected)
+        XCTAssertEqual(reconnects.get(), 0)
     }
 
     func testAppRefusesTheRelayFolder() throws {
@@ -575,7 +669,7 @@ final class SyncTests: XCTestCase {
         try right.connect(relayURL: relay.url, token: relay.token)
         let path = uniqueNote("created-after")
         try left.replace(path, with: "created after")
-        XCTAssertTrue(try waitUntil(seconds: 8) { (try? right.text(path)) == "created after" })
+        XCTAssertTrue(try waitUntil(seconds: 8, label: "note-created-after") { (try? right.text(path)) == "created after" })
         left.disconnect()
         right.disconnect()
     }
@@ -669,6 +763,21 @@ private func rebuiltSession(path: String, text: String) throws -> (URL, AidanSes
     return (vault, again)
 }
 
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func add() {
+        lock.lock()
+        value += 1
+        lock.unlock()
+    }
+    func get() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 private final class Flag: @unchecked Sendable {
     private let lock = NSLock()
     private var value = false
@@ -698,13 +807,25 @@ private func temporaryVault() throws -> URL {
     return url
 }
 
-private func waitUntil(seconds: TimeInterval, _ body: () throws -> Bool) throws -> Bool {
-    let deadline = Date().addingTimeInterval(seconds)
+private func waitUntil(seconds: TimeInterval, label: String = "", _ body: () throws -> Bool) throws -> Bool {
+    let started = Date()
+    let deadline = started.addingTimeInterval(seconds)
+    var matched = false
     while Date() < deadline {
-        if try body() { return true }
+        if try body() {
+            matched = true
+            break
+        }
         Thread.sleep(forTimeInterval: 0.05)
     }
-    return try body()
+    if !matched {
+        matched = try body()
+    }
+    if !label.isEmpty {
+        let elapsed = Date().timeIntervalSince(started)
+        print(String(format: "sync-wait %@ %.3f", label, elapsed))
+    }
+    return matched
 }
 
 #if !os(iOS)
@@ -819,8 +940,10 @@ private final class TestRelay {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let done = DispatchSemaphore(value: 0)
         var status = 0
-        let task = URLSession.shared.dataTask(with: request) { _, response, _ in
+        var responseBody = Data()
+        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
             status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if let data { responseBody = data }
             done.signal()
         }
         task.resume()
@@ -832,22 +955,37 @@ private final class TestRelay {
         if status != 200 {
             throw AidanError.io("The test relay did not reset (\(status)).")
         }
-        // A reset that follows a live sync can keep the relay busy for more
-        // than a minute. The next test has to wait until health reports a
-        // new start. A probe that never answers is cancelled so it does not
-        // hold on to the relay's connections.
+        let ticket = Self.integer(Self.jsonObject(responseBody)?["resetGeneration"])
+        // The POST returns before the folder is empty. A new bootedAt can
+        // belong to a reset that was already queued, and this request's
+        // rotate would then wipe a note the test just wrote. Wait until
+        // health reports this request's generation. A probe that never
+        // answers is cancelled so it does not hold the relay's connections.
         let deadline = Date().addingTimeInterval(120)
         while Date() < deadline {
             let probe = URL(string: "http://127.0.0.1:3757/health?n=\(UUID().uuidString)")
-            if let probe, let booted = try? Self.bootedAt(probe), booted != before {
-                return
+            if let probe, let health = try? Self.relayHealth(probe) {
+                if let ticket {
+                    if health.resetGeneration >= ticket { return }
+                } else if health.bootedAt != before {
+                    return
+                }
             }
             Thread.sleep(forTimeInterval: 0.05)
         }
         throw AidanError.io("The test relay did not come back.")
     }
 
+    private struct RelayHealth {
+        var bootedAt: String
+        var resetGeneration: Int
+    }
+
     private static func bootedAt(_ url: URL) throws -> String? {
+        try relayHealth(url)?.bootedAt
+    }
+
+    private static func relayHealth(_ url: URL) throws -> RelayHealth? {
         let done = DispatchSemaphore(value: 0)
         var body = Data()
         var failed = false
@@ -866,8 +1004,18 @@ private final class TestRelay {
             return nil
         }
         if failed { return nil }
-        let parsed = try JSONSerialization.jsonObject(with: body) as? [String: Any]
-        return parsed?["bootedAt"] as? String
+        guard let parsed = jsonObject(body), let booted = parsed["bootedAt"] as? String else { return nil }
+        return RelayHealth(bootedAt: booted, resetGeneration: integer(parsed["resetGeneration"]) ?? 0)
+    }
+
+    private static func jsonObject(_ data: Data) -> [String: Any]? {
+        (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private static func integer(_ value: Any?) -> Int? {
+        if let number = value as? Int { return number }
+        if let number = value as? NSNumber { return number.intValue }
+        return nil
     }
     #else
     private init(url: String, token: String, vault: URL, data: URL, port: Int, server: URL, running: RunningRelay) {
@@ -925,7 +1073,13 @@ private final class TestRelay {
         environment["AIDANOS_RELAY_GIT_URL"] = ""
         process.environment = environment
         process.currentDirectoryURL = server.deletingLastPathComponent().deletingLastPathComponent()
-        let log = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let logDirectory = ProcessInfo.processInfo.environment["AIDANOS_TEST_RELAY_LOG_DIR"]
+            .flatMap { $0.isEmpty ? nil : $0 } ?? NSTemporaryDirectory()
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: logDirectory, isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let log = URL(fileURLWithPath: logDirectory, isDirectory: true)
             .appendingPathComponent("aidanos-relay-\(UUID().uuidString).log")
         FileManager.default.createFile(atPath: log.path, contents: nil)
         let handle = try FileHandle(forWritingTo: log)
@@ -1037,6 +1191,7 @@ private final class StallServer {
     private var listenFd: Int32
     private let lock = NSLock()
     private var clients: [Int32] = []
+    private var stopped = false
 
     init() throws {
         let bound = try Loopback.listen()
@@ -1047,13 +1202,27 @@ private final class StallServer {
         }
     }
 
+    func hasClient() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !clients.isEmpty
+    }
+
     private func acceptLoop() {
         while true {
-            let client = acceptSocket(listenFd)
+            let client = acceptSocket(currentListen())
             if client < 0 { return }
             lock.lock()
-            clients.append(client)
+            // stop() may already have snapshotted clients. Closing only that
+            // snapshot leaves this socket open, and the handshake read waits
+            // out its 15s deadline.
+            let drop = stopped
+            if !drop { clients.append(client) }
             lock.unlock()
+            if drop {
+                _ = closeSocket(client)
+                return
+            }
             DispatchQueue.global().async {
                 var buffer = [UInt8](repeating: 0, count: 1024)
                 while true {
@@ -1067,8 +1236,15 @@ private final class StallServer {
         }
     }
 
+    private func currentListen() -> Int32 {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopped ? -1 : listenFd
+    }
+
     func stop() {
         lock.lock()
+        stopped = true
         let open = clients
         clients = []
         let listen = listenFd

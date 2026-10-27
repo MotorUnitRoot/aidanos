@@ -39,6 +39,11 @@ const REQUIRED_SCREENS = [
   "stage",
   "conflict",
   "conflict-edit",
+  "editor-normal",
+  "editor-empty",
+  "editor-first",
+  "editor-loading",
+  "editor-error",
 ];
 
 function assert(cond, msg) {

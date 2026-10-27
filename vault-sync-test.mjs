@@ -36,7 +36,10 @@ async function waitHealth(base, child) {
   const deadline = Date.now() + 12000;
   let last = "";
   while (Date.now() < deadline) {
-    if (child.exitCode != null) throw new Error("server exited " + child.exitCode + " " + last);
+    if (child.exitCode != null) {
+      const tail = child._log ? child._log().slice(-500) : "";
+      throw new Error("server exited " + child.exitCode + " " + last + " " + tail);
+    }
     try {
       const res = await fetch(base + "/api/health");
       if (res.ok) return res;
@@ -196,6 +199,24 @@ function assertClientSurfacesConflict() {
   const afterChoice = app.slice(app.indexOf("function afterGitChoice("), app.indexOf("function gitConflictForOpenPage("));
   assert(afterChoice.indexOf("conflicts.length") < afterChoice.indexOf("openGitJoin("), "a remaining conflict hides Bring them in");
   assert(keepFn.includes("afterGitChoice(") && takeFn.includes("afterGitChoice("), "a choice looks for changes still waiting");
+  const lockPause = "Sync is paused: a lock in this vault is still open. Close it, then sync resumes.";
+  const lockExfat = "If this vault is on an exFAT drive or a network drive, copy the vault onto a drive on this computer, then sync resumes.";
+  const lockUnreadableStep = "Close the other app that uses this vault, then sync resumes.";
+  const lockOversizeStep = "Wait until the other write is finished, then sync resumes.";
+  const lockRecovery = "It may be from another app or a crash.";
+  assert(app.includes(lockPause), "a kept lock says sync is paused");
+  assert(app.includes(lockRecovery), "the pause includes the recovery hint");
+  assert(app.includes(lockPause + " " + lockExfat + " \" + GIT_LOCK_RECOVERY"), "an open lock includes the drive case and the recovery hint");
+  assert(app.includes("a lock in this vault could not be read. " + lockUnreadableStep + " \" + GIT_LOCK_RECOVERY"), "an unreadable lock has its own pause");
+  assert(app.includes("a lock in this vault is over 1 MB. " + lockOversizeStep + " \" + GIT_LOCK_RECOVERY"), "an over-1 MB lock has its own pause");
+  const unreadLine = app.slice(app.indexOf("GIT_LOCK_PAUSE_UNREADABLE"), app.indexOf("GIT_LOCK_PAUSE_OVERSIZE"));
+  const oversizeLine = app.slice(app.indexOf("GIT_LOCK_PAUSE_OVERSIZE"), app.indexOf("function gitLockPauseText"));
+  assert(unreadLine.includes("could not be read") && unreadLine.includes(lockUnreadableStep) && !unreadLine.includes("still open"), "an unreadable lock says it is still open");
+  assert(oversizeLine.includes("over 1 MB") && oversizeLine.includes(lockOversizeStep) && !oversizeLine.includes("still open"), "an over-1 MB lock says it is still open");
+  assert(keepFn.includes('setStatus(gitLockPauseText(sync && sync.lockReason), "error")'), "the lock pause is an error");
+  assert(keepFn.indexOf("gitLockPauseText") < keepFn.lastIndexOf('setStatus("Saved"'), "Saved waits until the lock check");
+  assert(server.includes("lockKept"), "sync tells the editor when a git lock was kept");
+  assert(server.includes("lockReason"), "sync tells the editor why a git lock was kept");
   assert(app.includes("function afterGitChoice(") && app.slice(app.indexOf("function afterGitChoice("), app.indexOf("function gitConflictForOpenPage(")).includes("openGitJoin("), "a choice opens the other-copy sheet when changes are still waiting");
   assert(app.includes("function resolveGitJoin("), "join waits for the click");
   assert(app.includes('body: JSON.stringify({ join: true })'), "join posts only after the click");

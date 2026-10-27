@@ -1,7 +1,10 @@
 import crypto from "node:crypto";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, realpathSync, unlinkSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import * as Automerge from "@automerge/automerge";
+import { noteMirror } from "./index-trace.mjs";
 import { logSafe } from "./redact.mjs";
 import { prepareNoteFile, safeNotePath } from "./paths.mjs";
 
@@ -104,7 +107,851 @@ function digest(text) {
   return crypto.createHash("sha256").update(String(text), "utf8").digest("hex");
 }
 
-export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
+// `.{note}.md.{pid}.tmp` beside the note. The pid is the relay's, so a later
+// start can tell a crashed write from one this process still holds.
+const NOTE_TEMP_BASENAME = /^\.(.+\.md)\.(\d+)\.tmp$/;
+const RELAY_MARKER_HEADER = "aidanos-relay-folder v2";
+const RELAY_MARKER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export const NOTE_TEMP_MANIFEST = "note-temps";
+export const MANIFEST_REFUSED_LINE = "note temp manifest refused";
+export const MANIFEST_RESET_LINE = "note temp manifest reset";
+export const MANIFEST_ASIDE_LINE = "note temp manifest aside";
+export const MANIFEST_UNRECORDED_LINE = "note temp unrecorded";
+export const NOTE_TEMP_KEPT_LINE = "note temp kept";
+const MANIFEST_CAP = 1024 * 1024;
+const MANIFEST_ASIDE_KEEP = 3;
+const ASIDE_MANIFEST_NAME = /^note-temps\.\d+T\d+\.\d+\.\d+$/;
+const GROUP_OR_OTHER_WRITE = 0o022;
+const STICKY = 0o1000;
+const openNoteTemps = new Map();
+let manifestChain = Promise.resolve();
+const manifestRefusalLogged = new Set();
+const manifestResetLogged = new Set();
+// path.resolve(vault) -> realpath(vault). Filled once at claim. A save must
+// not call realpath again: on macOS that stat walks /var -> /private/var
+// and it blocks the process.
+const vaultRoots = new Map();
+
+export function rememberVaultRoot(vault) {
+  if (!vault) return "";
+  const key = path.resolve(vault);
+  try {
+    const real = realpathSync(key);
+    vaultRoots.set(key, real);
+    return real;
+  } catch {
+    vaultRoots.set(key, key);
+    return key;
+  }
+}
+
+function vaultRoot(vault) {
+  const key = path.resolve(vault);
+  if (vaultRoots.has(key)) return vaultRoots.get(key);
+  return rememberVaultRoot(vault);
+}
+
+function noteTempPath(file, pid = process.pid) {
+  return path.join(path.dirname(file), `.${path.basename(file)}.${pid}.tmp`);
+}
+
+function withManifest(work) {
+  const run = manifestChain.then(work, work);
+  manifestChain = run.then(() => {}, () => {});
+  return run;
+}
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !error || error.code !== "ESRCH";
+  }
+}
+
+async function removeOwnedRegular(file) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (typeof uid !== "number") return;
+  let st;
+  try {
+    st = await fs.lstat(file);
+  } catch {
+    return;
+  }
+  if (st.isSymbolicLink() || !st.isFile() || st.uid !== uid) return;
+  unlinkChecked(file, st, uid, false);
+}
+
+// Temps this process has written and not yet renamed. Called when the save
+// wait gives up, so the whole note does not stay in the vault under a dot name.
+export async function discardOpenNoteTemps() {
+  const pending = [...openNoteTemps.entries()];
+  await Promise.all(pending.map(async ([file, meta]) => {
+    await removeOwnedRegular(file);
+    await dropManifestIfGone(file, meta);
+  }));
+}
+
+function markerTextId(text) {
+  if (typeof text !== "string") return "";
+  const lines = text.split("\n");
+  if (lines.length !== 3 || lines[2] !== "") return "";
+  if (lines[0] !== RELAY_MARKER_HEADER || !RELAY_MARKER_ID.test(lines[1])) return "";
+  return lines[1];
+}
+
+function outsideMarker(vault) {
+  const resolved = path.resolve(vault);
+  return path.join(path.dirname(resolved), "." + path.basename(resolved) + ".aidanos-relay-id");
+}
+
+function readRegularFile(file) {
+  let fd;
+  try {
+    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch {
+    return null;
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > 1024 * 1024) return null;
+    const buf = Buffer.alloc(st.size);
+    let off = 0;
+    while (off < buf.length) {
+      const n = readSync(fd, buf, off, buf.length - off, off);
+      if (n <= 0) break;
+      off += n;
+    }
+    return buf.toString("utf8", 0, off);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+async function markersMatch(vault, stateDir) {
+  if (!vault || !stateDir) return false;
+  const vaultId = markerTextId(readRegularFile(path.join(vault, ".aidanos", "relay-folder")));
+  const dataId = markerTextId(readRegularFile(path.join(stateDir, "relay-folder")));
+  const outsideId = markerTextId(readRegularFile(outsideMarker(vault)));
+  return Boolean(vaultId && vaultId === dataId && vaultId === outsideId);
+}
+
+function parseManifestLine(line) {
+  if (typeof line !== "string" || !line || line.includes("\\") || line.includes("\0")) return null;
+  if (line.startsWith("/") || path.win32.isAbsolute(line)) return null;
+  const parts = line.split("/");
+  if (parts.some((part) => part === "" || part === "." || part === "..")) return null;
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    if (parts[i].startsWith(".")) return null;
+  }
+  const match = NOTE_TEMP_BASENAME.exec(parts[parts.length - 1]);
+  if (!match) return null;
+  const pid = Number(match[2]);
+  if (!Number.isSafeInteger(pid)) return null;
+  return { rel: line, pid };
+}
+
+let beforeOwnedUnlinkForTest = null;
+
+// Closes the checked descriptor, then a test may swap the path. Off unless
+// this process is a test.
+export function setBeforeOwnedUnlinkForTest(fn) {
+  if (process.env.NODE_ENV !== "test") return;
+  beforeOwnedUnlinkForTest = typeof fn === "function" ? fn : null;
+}
+
+function sameFileIdentity(live, recorded) {
+  return live.dev === recorded.dev
+    && live.ino === recorded.ino
+    && live.size === recorded.size
+    && live.ctimeMs === recorded.ctimeMs;
+}
+
+// Open, check, close, then walk the path again. A different file at that
+// path is kept and logged. requireSole refuses a hard link.
+function unlinkChecked(file, recorded, uid, requireSole) {
+  let fd;
+  try {
+    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch {
+    return false;
+  }
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.uid !== uid || !sameFileIdentity(opened, recorded)) return false;
+    if (requireSole && opened.nlink !== 1) return false;
+  } finally {
+    closeSync(fd);
+  }
+  if (process.env.NODE_ENV === "test" && beforeOwnedUnlinkForTest) {
+    const fn = beforeOwnedUnlinkForTest;
+    beforeOwnedUnlinkForTest = null;
+    fn();
+  }
+  let again;
+  try {
+    again = lstatSync(file);
+  } catch {
+    return false;
+  }
+  if (again.isSymbolicLink() || !again.isFile() || again.uid !== uid || !sameFileIdentity(again, recorded)) {
+    logSafe([], NOTE_TEMP_KEPT_LINE);
+    return false;
+  }
+  if (requireSole && again.nlink !== 1) {
+    logSafe([], NOTE_TEMP_KEPT_LINE);
+    return false;
+  }
+  try {
+    unlinkSync(file);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+function unlinkSameFile(file, recorded, uid) {
+  return unlinkChecked(file, recorded, uid, true);
+}
+
+async function unlinkOwnedTemp(vault, rel, uid) {
+  const root = path.resolve(vault);
+  let cursor = root;
+  let rootSt;
+  try {
+    rootSt = await fs.lstat(cursor);
+  } catch {
+    return "keep";
+  }
+  if (rootSt.isSymbolicLink() || !rootSt.isDirectory()) return "keep";
+  const parts = rel.split("/");
+  for (let i = 0; i < parts.length; i += 1) {
+    cursor = path.join(cursor, parts[i]);
+    let st;
+    try {
+      st = await fs.lstat(cursor);
+    } catch (error) {
+      return error && error.code === "ENOENT" ? "drop" : "keep";
+    }
+    // Gone, or not a regular file this user owns alone: forget the line.
+    // Do not unlink it. A stat error that is not "missing" keeps the line.
+    if (st.isSymbolicLink()) return "drop";
+    if (i + 1 < parts.length) {
+      if (!st.isDirectory()) return "drop";
+      continue;
+    }
+    if (!st.isFile() || st.nlink !== 1 || st.uid !== uid) return "drop";
+    return unlinkSameFile(cursor, st, uid) ? "drop" : "keep";
+  }
+  return "keep";
+}
+
+function manifestNoticeKey(stateDir) {
+  return path.resolve(stateDir);
+}
+
+function logManifestNotice(stateDir, kind) {
+  const seen = kind === "reset" ? manifestResetLogged : manifestRefusalLogged;
+  const key = manifestNoticeKey(stateDir);
+  if (seen.has(key)) return;
+  seen.add(key);
+  logSafe([], kind === "reset" ? MANIFEST_RESET_LINE : MANIFEST_REFUSED_LINE);
+}
+
+export function manifestNoticeLogged(stateDir) {
+  const key = manifestNoticeKey(stateDir);
+  return {
+    refused: manifestRefusalLogged.has(key),
+    reset: manifestResetLogged.has(key),
+  };
+}
+
+// Same directory walk fatal.log uses before it opens the state folder.
+// A symlink anywhere on the path is refused. Group or other write is
+// allowed only on a sticky directory owned by root.
+async function recordedStateDir(dir, uid) {
+  if (typeof uid !== "number") return null;
+  const abs = path.resolve(dir);
+  const parts = abs.split(path.sep).filter(Boolean);
+  let cursor = path.parse(abs).root;
+  const check = (st) => {
+    if (!st || st.isSymbolicLink() || !st.isDirectory()) return false;
+    const writable = (st.mode & GROUP_OR_OTHER_WRITE) !== 0;
+    const stickyRoot = (st.mode & STICKY) !== 0 && st.uid === 0;
+    if (writable && !stickyRoot) return false;
+    if (st.uid !== 0 && st.uid !== uid) return false;
+    return true;
+  };
+  let rootStat;
+  try {
+    rootStat = await fs.lstat(cursor);
+  } catch {
+    return null;
+  }
+  if (!check(rootStat)) return null;
+  let recorded = rootStat;
+  for (const part of parts) {
+    cursor = path.join(cursor, part);
+    let st;
+    try {
+      st = await fs.lstat(cursor);
+    } catch {
+      return null;
+    }
+    if (!check(st)) return null;
+    recorded = st;
+  }
+  if (cursor !== abs) return null;
+  return { dev: recorded.dev, ino: recorded.ino };
+}
+
+function manifestAt(dirfd, stateDir, name) {
+  if (process.platform === "linux") return "/proc/self/fd/" + dirfd + "/" + name;
+  return path.join(stateDir, name);
+}
+
+let asideSeq = 0;
+let beforeManifestPathForTest = null;
+let afterManifestRenameForTest = null;
+
+// Original race: the state directory was checked, then note-temps was
+// renamed by path. A swap of that directory in the gap published the
+// manifest into the replacement. The rename is still the act. The held
+// directory handle is compared with a fresh open before the rename and
+// again after it; a mismatch refuses the manifest. A test swaps the
+// state directory in that window. Off unless this process is a test.
+export function setBeforeManifestPathForTest(fn) {
+  if (process.env.NODE_ENV !== "test") return;
+  beforeManifestPathForTest = typeof fn === "function" ? fn : null;
+}
+
+export function setAfterManifestRenameForTest(fn) {
+  if (process.env.NODE_ENV !== "test") return;
+  afterManifestRenameForTest = typeof fn === "function" ? fn : null;
+}
+
+function asideManifestName() {
+  asideSeq += 1;
+  const stamp = new Date().toISOString().replace(/[^0-9T]/g, "");
+  return NOTE_TEMP_MANIFEST + "." + stamp + "." + process.pid + "." + asideSeq;
+}
+
+// Valid lines are kept. A line that does not parse is remembered as bad
+// and left out; the caller sets the original file aside after this returns.
+function parsedManifest(text) {
+  const raw = String(text).split("\n");
+  if (raw.length && raw[raw.length - 1] === "") raw.pop();
+  const lines = [];
+  let bad = false;
+  for (const line of raw) {
+    if (!parseManifestLine(line)) {
+      bad = true;
+      continue;
+    }
+    lines.push(line);
+  }
+  return { lines, bad };
+}
+
+async function readHandleText(handle, size) {
+  if (!size) return "";
+  const buf = Buffer.alloc(size);
+  let off = 0;
+  while (off < buf.length) {
+    const { bytesRead } = await handle.read(buf, off, buf.length - off, off);
+    if (!bytesRead) break;
+    off += bytesRead;
+  }
+  return buf.toString("utf8", 0, off);
+}
+
+async function closeQuiet(handle) {
+  if (!handle) return;
+  try {
+    await handle.close();
+  } catch { /* already closed */ }
+}
+
+async function syncDirectory(dirHandle) {
+  await dirHandle.sync();
+}
+
+async function openStateDirectory(stateDir) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const nofollow = fsConstants.O_NOFOLLOW;
+  const directory = fsConstants.O_DIRECTORY;
+  if (typeof nofollow !== "number" || typeof directory !== "number" || typeof uid !== "number") {
+    logManifestNotice(stateDir, "refused");
+    return null;
+  }
+  const recorded = await recordedStateDir(stateDir, uid);
+  if (!recorded) {
+    logManifestNotice(stateDir, "refused");
+    return null;
+  }
+  let dirHandle;
+  try {
+    dirHandle = await fs.open(stateDir, fsConstants.O_RDONLY | directory | nofollow);
+  } catch {
+    logManifestNotice(stateDir, "refused");
+    return null;
+  }
+  try {
+    const openedDir = await dirHandle.stat();
+    if (
+      !openedDir.isDirectory() ||
+      openedDir.isSymbolicLink() ||
+      openedDir.dev !== recorded.dev ||
+      openedDir.ino !== recorded.ino
+    ) {
+      logManifestNotice(stateDir, "refused");
+      await dirHandle.close();
+      return null;
+    }
+    return { dirHandle, uid };
+  } catch {
+    logManifestNotice(stateDir, "refused");
+    await closeQuiet(dirHandle);
+    return null;
+  }
+}
+
+async function stateDirStillHeld(dirHandle, stateDir) {
+  const nofollow = fsConstants.O_NOFOLLOW;
+  const directory = fsConstants.O_DIRECTORY;
+  if (typeof nofollow !== "number" || typeof directory !== "number") return false;
+  let again;
+  try {
+    again = await fs.open(stateDir, fsConstants.O_RDONLY | directory | nofollow);
+  } catch {
+    return false;
+  }
+  try {
+    const opened = await again.stat();
+    const held = await dirHandle.stat();
+    return opened.isDirectory()
+      && !opened.isSymbolicLink()
+      && opened.dev === held.dev
+      && opened.ino === held.ino;
+  } catch {
+    return false;
+  } finally {
+    await closeQuiet(again);
+  }
+}
+
+function refuseManifestDir() {
+  const error = new Error(MANIFEST_REFUSED_LINE);
+  error.code = "EPERM";
+  throw error;
+}
+
+async function beforeManifestPath(dirHandle, stateDir) {
+  if (process.env.NODE_ENV === "test" && beforeManifestPathForTest) {
+    const fn = beforeManifestPathForTest;
+    beforeManifestPathForTest = null;
+    await fn();
+  }
+  if (!(await stateDirStillHeld(dirHandle, stateDir))) refuseManifestDir();
+}
+
+async function afterManifestRename(dirHandle, stateDir) {
+  if (process.env.NODE_ENV === "test" && afterManifestRenameForTest) {
+    const fn = afterManifestRenameForTest;
+    afterManifestRenameForTest = null;
+    await fn();
+  }
+  if (!(await stateDirStillHeld(dirHandle, stateDir))) refuseManifestDir();
+}
+
+function unlinkMatchedAside(file, identity, uid) {
+  return unlinkChecked(file, identity, uid, true);
+}
+
+// The newest three set-asides stay. Older ones go only when they are a
+// regular file this user owns alone. The count removed is logged.
+async function pruneAsideManifests(dirHandle, stateDir, uid) {
+  if (!(await stateDirStillHeld(dirHandle, stateDir))) {
+    logManifestNotice(stateDir, "refused");
+    return;
+  }
+  const dirfd = dirHandle.fd;
+  const listAt = process.platform === "linux" ? "/proc/self/fd/" + dirfd : stateDir;
+  let names;
+  try {
+    names = await fs.readdir(listAt);
+  } catch {
+    return;
+  }
+  const found = [];
+  for (const name of names) {
+    if (!ASIDE_MANIFEST_NAME.test(name)) continue;
+    let st;
+    try {
+      st = await fs.lstat(manifestAt(dirfd, stateDir, name));
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isFile()) continue;
+    const seqMatch = /\.(\d+)$/.exec(name);
+    found.push({
+      name,
+      dev: st.dev,
+      ino: st.ino,
+      size: st.size,
+      ctimeMs: st.ctimeMs,
+      mtimeMs: st.mtimeMs,
+      seq: seqMatch ? Number(seqMatch[1]) : 0,
+    });
+  }
+  found.sort((a, b) => (b.mtimeMs - a.mtimeMs) || (b.seq - a.seq) || (a.name < b.name ? 1 : a.name > b.name ? -1 : 0));
+  let removed = 0;
+  for (const item of found.slice(MANIFEST_ASIDE_KEEP)) {
+    if (!(await stateDirStillHeld(dirHandle, stateDir))) {
+      logManifestNotice(stateDir, "refused");
+      break;
+    }
+    const filePath = manifestAt(dirfd, stateDir, item.name);
+    let st;
+    try {
+      st = await fs.lstat(filePath);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isFile() || st.nlink !== 1 || st.uid !== uid) continue;
+    if (st.dev !== item.dev || st.ino !== item.ino || st.size !== item.size || st.ctimeMs !== item.ctimeMs) continue;
+    if (unlinkMatchedAside(filePath, item, uid)) removed += 1;
+  }
+  if (removed > 0) logSafe([], MANIFEST_ASIDE_LINE + " " + removed);
+}
+
+async function quarantineManifest(dirHandle, stateDir, uid) {
+  await beforeManifestPath(dirHandle, stateDir);
+  const dirfd = dirHandle.fd;
+  const aside = asideManifestName();
+  await fs.rename(
+    manifestAt(dirfd, stateDir, NOTE_TEMP_MANIFEST),
+    manifestAt(dirfd, stateDir, aside),
+  );
+  await afterManifestRename(dirHandle, stateDir);
+  await syncDirectory(dirHandle);
+  logManifestNotice(stateDir, "reset");
+  await pruneAsideManifests(dirHandle, stateDir, uid);
+}
+
+// Read note-temps through the state directory descriptor. Original race:
+// a hard link to this inode was rewritten along with the manifest, so a
+// note that shared the inode changed. A hard link or a symlink is refused
+// before any rename or chmod, and that note is left byte for byte. An
+// oversized file is renamed aside. A file with a bad line keeps the lines
+// that parse, then the original is renamed aside and the directory is fsynced.
+async function readManifest(dirHandle, stateDir, uid) {
+  const filePath = manifestAt(dirHandle.fd, stateDir, NOTE_TEMP_MANIFEST);
+  let handle;
+  try {
+    handle = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return { missing: true, lines: [] };
+    logManifestNotice(stateDir, "refused");
+    return { refused: true, lines: [] };
+  }
+  try {
+    const st = await handle.stat();
+    if (!st.isFile() || st.isSymbolicLink() || st.uid !== uid || st.nlink !== 1) {
+      logManifestNotice(stateDir, "refused");
+      return { refused: true, lines: [] };
+    }
+    if (st.size > MANIFEST_CAP) {
+      await handle.close();
+      handle = null;
+      await quarantineManifest(dirHandle, stateDir, uid);
+      return { reset: true, lines: [] };
+    }
+    const parsed = parsedManifest(await readHandleText(handle, st.size));
+    if (parsed.bad) {
+      await handle.close();
+      handle = null;
+      await quarantineManifest(dirHandle, stateDir, uid);
+      return { reset: true, lines: parsed.lines };
+    }
+    return { lines: parsed.lines };
+  } finally {
+    await closeQuiet(handle);
+  }
+}
+
+// A new file, created O_EXCL at 0600, fsynced, then renamed over note-temps.
+// The state directory is fsynced after that rename. The old file is never
+// truncated in place.
+async function publishManifest(dirHandle, stateDir, uid, lines) {
+  await beforeManifestPath(dirHandle, stateDir);
+  const dirfd = dirHandle.fd;
+  asideSeq += 1;
+  const tmpName = NOTE_TEMP_MANIFEST + ".new." + process.pid + "." + asideSeq;
+  const tmpPath = manifestAt(dirfd, stateDir, tmpName);
+  const flags = fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
+  const handle = await fs.open(tmpPath, flags, 0o600);
+  try {
+    const st = await handle.stat();
+    if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1 || st.uid !== uid) {
+      const error = new Error("manifest temp refused");
+      error.code = "EPERM";
+      throw error;
+    }
+    await handle.chmod(0o600);
+    const body = lines.length ? lines.join("\n") + "\n" : "";
+    if (body) await writeAllAt(handle, body);
+    await handle.sync();
+  } catch (error) {
+    await closeQuiet(handle);
+    try { await fs.unlink(tmpPath); } catch { /* the next open reports it */ }
+    throw error;
+  }
+  await handle.close();
+  await beforeManifestPath(dirHandle, stateDir);
+  await fs.rename(tmpPath, manifestAt(dirfd, stateDir, NOTE_TEMP_MANIFEST));
+  await afterManifestRename(dirHandle, stateDir);
+  await syncDirectory(dirHandle);
+}
+
+async function writeAllAt(handle, text) {
+  const buf = Buffer.from(text);
+  let off = 0;
+  while (off < buf.length) {
+    const { bytesWritten } = await handle.write(buf, off, buf.length - off, off);
+    if (!bytesWritten) break;
+    off += bytesWritten;
+  }
+  if (off !== buf.length) {
+    const error = new Error("manifest write was short");
+    error.code = "EIO";
+    throw error;
+  }
+}
+
+function sameLines(left, right) {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
+}
+
+// One rewrite for this batch, two fsyncs: the new manifest file, then the
+// state directory after the rename. A refusal writes nothing. The save
+// still stores the note. True only when the lines are in the manifest.
+async function updateManifest(stateDir, create, mutate) {
+  let recorded = false;
+  await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
+  await withManifest(async () => {
+    const opened = await openStateDirectory(stateDir);
+    if (!opened) return;
+    try {
+      const current = await readManifest(opened.dirHandle, stateDir, opened.uid);
+      if (current.refused) return;
+      if (current.missing && !create) return;
+      const next = await mutate(current.lines);
+      if (!next) return;
+      if (!current.reset && !current.missing && sameLines(next, current.lines)) {
+        recorded = true;
+        return;
+      }
+      await publishManifest(opened.dirHandle, stateDir, opened.uid, next);
+      recorded = true;
+    } catch {
+      logManifestNotice(stateDir, "refused");
+    } finally {
+      await closeQuiet(opened.dirHandle);
+    }
+  });
+  return recorded;
+}
+
+// Only paths this relay recorded, and only after the folder markers match.
+// A dead pid's line is dropped when that temp is gone or is not a regular
+// file this user owns alone. The file is removed only in that owned case.
+// A live pid stays. There is no directory walk.
+export async function sweepStaleNoteTemps(vault, stateDir) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (typeof uid !== "number") return;
+  if (!(await markersMatch(vault, stateDir))) return;
+  await updateManifest(stateDir, false, async (lines) => {
+    const kept = [];
+    for (const line of lines) {
+      const parsed = parseManifestLine(line);
+      if (!parsed || pidAlive(parsed.pid)) {
+        kept.push(line);
+        continue;
+      }
+      const action = await unlinkOwnedTemp(vault, parsed.rel, uid);
+      if (action !== "drop") kept.push(line);
+    }
+    return kept;
+  });
+}
+
+function relativeInside(root, file) {
+  const rel = path.relative(root, file);
+  if (!rel || rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) return "";
+  return rel.split(path.sep).join("/");
+}
+
+// The note file is under realpath(vault). On macOS that can be /private/var
+// while the configured vault is /var, and path.relative then looks like ../.
+// The real path is the one remembered at claim, not a stat on this save.
+function tempRelative(vault, file) {
+  const abs = path.resolve(file);
+  let posix = relativeInside(path.resolve(vault), abs);
+  if (!posix) posix = relativeInside(vaultRoot(vault), abs);
+  if (!posix || !parseManifestLine(posix)) {
+    const error = new Error("note temp is outside the vault");
+    error.code = "EINVAL";
+    throw error;
+  }
+  return posix;
+}
+
+async function appendManifest(stateDir, rels) {
+  const lines = (Array.isArray(rels) ? rels : [rels]).filter(Boolean);
+  if (!lines.length || !stateDir) return false;
+  return updateManifest(stateDir, true, async (existing) => existing.concat(lines));
+}
+
+async function dropManifest(stateDir, rels) {
+  if (!stateDir) return;
+  const drop = new Set(Array.isArray(rels) ? rels : [rels]);
+  await updateManifest(stateDir, false, async (existing) => existing.filter((line) => !drop.has(line)));
+}
+
+async function dropManifestIfGone(file, meta) {
+  if (!meta || !meta.rel || !meta.stateDir) return;
+  try {
+    await fs.lstat(file);
+    return;
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") return;
+  }
+  await dropManifest(meta.stateDir, meta.rel);
+}
+
+// Note temps are created at 0600. rename keeps that mode on the note.
+// Notes stay 0600. They are not loosened to 0644.
+async function writeSyncedTemp(tmp, text) {
+  const handle = await fs.open(tmp, "w", 0o600);
+  try {
+    await handle.writeFile(text);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+// Write each note beside its final name, fsync that temp, then rename it
+// into place. A reader sees the previous file or the whole new file. Every
+// temp path in this batch is recorded before any of those temps exist.
+// One clean note is five fsyncs: the manifest file that records the temp,
+// the state directory after that rename, the note temp before it is renamed
+// onto the note, the manifest file again when that temp line is dropped,
+// and the state directory after the drop. A corrupt manifest adds one more
+// fsync of that directory when the bad file is renamed aside, before those
+// five. Original race: the note's directory is not fsynced after the
+// rename. A crash can lose the directory entry even though the temp was
+// fsynced and the note stayed mode 0600. Same-account gap. A refused
+// manifest still saves the note, logs the doc id, and does not delete
+// the temp it could not record.
+export async function saveNoteBatch(entries, options = {}) {
+  const vault = options.vault || "";
+  const stateDir = options.stateDir || "";
+  const prepared = [];
+  const errors = [];
+  for (const entry of entries) {
+    const tmp = noteTempPath(entry.file);
+    try {
+      const rel = vault && stateDir ? tempRelative(vault, tmp) : "";
+      prepared.push({
+        file: entry.file,
+        text: entry.text,
+        beforeRename: entry.beforeRename,
+        tmp,
+        rel,
+        docId: entry.docId,
+      });
+    } catch (error) {
+      errors.push({ error, file: entry.file });
+    }
+  }
+  let recorded = true;
+  if (stateDir && prepared.some((entry) => entry.rel)) {
+    recorded = await appendManifest(stateDir, prepared.map((entry) => entry.rel));
+    if (!recorded) {
+      for (const entry of prepared) {
+        if (!entry.rel) continue;
+        logSafe([], MANIFEST_UNRECORDED_LINE + " " + logToken(entry.docId || ""));
+      }
+    }
+  }
+  if (typeof options.afterManifest === "function") await options.afterManifest(prepared);
+  const gone = [];
+  for (const entry of prepared) {
+    const meta = { rel: entry.rel, stateDir };
+    const track = recorded && entry.rel;
+    if (track) openNoteTemps.set(entry.tmp, meta);
+    try {
+      await writeSyncedTemp(entry.tmp, entry.text);
+      if (typeof entry.beforeRename === "function") await entry.beforeRename();
+      await fs.rename(entry.tmp, entry.file);
+    } catch (error) {
+      errors.push({ error, file: entry.file });
+    } finally {
+      if (track) openNoteTemps.delete(entry.tmp);
+      if (recorded && entry.rel) {
+        try {
+          await fs.lstat(entry.tmp);
+        } catch (error) {
+          if (error && error.code === "ENOENT") gone.push(entry.rel);
+        }
+      }
+    }
+  }
+  if (gone.length) await dropManifest(stateDir, gone);
+  return errors;
+}
+
+export async function saveNoteFile(file, text, beforeRename, options = {}) {
+  const errors = await saveNoteBatch([{ file, text, beforeRename }], options);
+  if (errors.length) throw errors[0].error;
+}
+
+// A note name in these lines is what a later scrub would have to guess at.
+// The id is already a token, or a short hash when it is not.
+export function logToken(value) {
+  const text = String(value ?? "");
+  if (!text) return "no-doc-id";
+  if (/^[A-Za-z0-9]{6,80}$/.test(text)) return text;
+  return crypto.createHash("sha256").update(text).digest("hex").slice(0, 12);
+}
+
+export function logCode(error) {
+  const code = error && error.code ? String(error.code) : "";
+  if (/^[A-Za-z0-9_]+$/.test(code)) return code;
+  return "ERROR";
+}
+
+export function foldInFailureLine(docId, error) {
+  return "fold-in failed for " + logToken(docId) + " " + logCode(error);
+}
+
+export function mirrorNoteFailureLine(docId, error) {
+  return "mirror failed for " + logToken(docId) + " " + logCode(error);
+}
+
+export function mirrorFailureLine(error) {
+  return "mirror failed: " + logCode(error);
+}
+
+export function createMirror({ repo, vault, debounceMs = 400, secrets = [], track = (work) => work(), stateDir = "" }) {
   const lastWritten = new Map();
   const incorporated = new Map();
   let records = null;
@@ -205,7 +1052,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
         lastWritten.set(notePath, merged);
         incorporated.set(notePath, fileHash);
       } catch (error) {
-        logSafe(secrets, "fold-in failed for", notePath, error instanceof Error ? error.message : error);
+        logSafe(secrets, foldInFailureLine(docId, error));
       }
     }
   }
@@ -214,6 +1061,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
     const known = await hashes();
     const paths = indexPaths();
     let changed = false;
+    const batch = [];
     for (const [notePath, docId] of Object.entries(paths)) {
       const handle = repo.handles[docId];
       if (!handle) continue;
@@ -240,22 +1088,41 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
         }
         continue;
       }
-      const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
-      await fs.writeFile(tmp, text);
-      await fs.rename(tmp, file);
-      lastWritten.set(notePath, text);
-      known[notePath] = digest(text);
-      changed = true;
+      batch.push({ file, text, notePath, docId });
+    }
+    if (batch.length) {
+      let errors;
+      try {
+        errors = await saveNoteBatch(batch, { vault, stateDir });
+      } catch (error) {
+        errors = batch.map((entry) => ({ error, file: entry.file }));
+      }
+      const failed = new Set(errors.map((item) => item.file));
+      for (const item of errors) {
+        const entry = batch.find((row) => row.file === item.file);
+        logSafe(secrets, mirrorNoteFailureLine(entry ? entry.docId : "", item.error));
+      }
+      for (const entry of batch) {
+        if (failed.has(entry.file)) continue;
+        lastWritten.set(entry.notePath, entry.text);
+        known[entry.notePath] = digest(entry.text);
+        changed = true;
+      }
     }
     if (changed) await saveHashes();
   }
 
   async function syncDisk() {
-    chain = chain.then(async () => {
-      await foldOutside();
-      await writeNotes();
-    }).catch((error) => {
-      logSafe(secrets, "mirror failed:", error instanceof Error ? error.message : error);
+    chain = chain.then(() => track(async () => {
+      const started = performance.now();
+      try {
+        await foldOutside();
+        await writeNotes();
+      } finally {
+        noteMirror(performance.now() - started);
+      }
+    })).catch((error) => {
+      logSafe(secrets, mirrorFailureLine(error));
     });
     return chain;
   }

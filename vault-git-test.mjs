@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { authenticatedGitUrl, redactSecrets, sanitizeGitError, seedBundledVault } from "./server.mjs";
+import { authenticatedGitUrl, acquireGitTurn, GIT_LOCK_KEPT_LINE, gitLockBlocksVault, gitLockPauseReason, redactSecrets, releaseGitTurn, releaseRememberedGitLock, rememberUnlinkLock, sanitizeGitError, seedBundledVault, setGitLockBeforeMoveForTest, setGitLockBeforeUnlinkForTest, setGitLockHoldersForTest, sweepAbandonedGitLocks } from "./server.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
@@ -222,6 +222,18 @@ function authUrlShaping() {
     const both = redactSecrets(long, { token, url, vault: "/tmp/vault" });
     assert(!both.includes(token), "AIDANOS token redacted");
     assert(!both.includes(other), "GITHUB_TOKEN redacted even when it differs");
+    const bare = "ghp_" + "a".repeat(36);
+    const bareClean = redactSecrets("token " + bare, { token, url, vault: "/tmp/vault" });
+    assert(!bareClean.includes(bare), "an unlisted ghp_ token is masked");
+    assert(!bareClean.includes("ghp_"), "an unlisted ghp_ prefix is masked");
+    const longer = "ghs_" + "b".repeat(40);
+    const glued = "xx" + "ghu_" + "c".repeat(36) + "yy";
+    const pat = "github_pat_" + "d".repeat(82);
+    const shaped = redactSecrets("see " + longer + " " + glued + " " + pat, { token, url, vault: "/tmp/vault" });
+    assert(!shaped.includes(longer), "a long ghs_ token is masked");
+    assert(!shaped.includes("ghu_"), "a glued ghu_ token is masked");
+    assert(!shaped.includes(pat), "a long github_pat_ is masked");
+    assert(!shaped.includes("github_pat_"), "a github_pat_ prefix is masked");
     assert(both.length > 180, "log redaction is not capped at the client hint length");
     assert(sanitizeGitError(long, { token, url, vault: "/tmp/vault" }).length <= 180, "client git hint stays compact");
   } finally {
@@ -267,6 +279,39 @@ async function authOriginIsEmbedded() {
   } finally {
     await stop(child);
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+async function seedSkipsPlantedLinks() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-seed-link-"));
+  const dest = path.join(tmp, "dest");
+  const outside = path.join(tmp, "outside");
+  fs.mkdirSync(dest);
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(dest, "maps"));
+  fs.mkdirSync(path.join(dest, "aidanos"));
+  const broken = path.join(outside, "not-created.md");
+  fs.symlinkSync(broken, path.join(dest, "aidanos", "active-horse.md"));
+  try {
+    const seeded = await seedBundledVault(dest, path.join(root, "vault"));
+    assert(seeded === true, "seed still copies around a planted link");
+    assert(fs.readdirSync(outside).length === 0, "seed wrote through a destination link");
+    assert(!fs.existsSync(broken), "broken link created a file outside the vault");
+    assert(fs.lstatSync(path.join(dest, "maps")).isSymbolicLink(), "folder link was replaced");
+    assert(
+      fs.lstatSync(path.join(dest, "aidanos", "active-horse.md")).isSymbolicLink(),
+      "file link was replaced",
+    );
+    assert(
+      fs.readFileSync(path.join(dest, "README.md"), "utf8").includes("this folder is the disk"),
+      "seed skipped a normal file",
+    );
+    assert(
+      fs.existsSync(path.join(dest, "family-room-to-office", "map.md")),
+      "seed skipped a normal folder",
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
 
@@ -412,14 +457,605 @@ function historyNames(cwd) {
   }
 }
 
+function gitLockMessage(file) {
+  return "fatal: unable to unlink '" + file + "': Permission denied";
+}
+
+function lockTmp() {
+  return fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "aidanos-lock-"));
+}
+
+function openFdCount() {
+  const dir = fs.existsSync("/proc/self/fd") ? "/proc/self/fd" : "/dev/fd";
+  return fs.readdirSync(dir).length;
+}
+
+// A same-uid process with an unreadable descriptor directory keeps a
+// recorded lock. The no-holder case re-enters as root in a private /proc,
+// where every same-uid process can be inspected and none holds the lock.
+function runLockCase(name) {
+  if (process.env.AIDANOS_TEST_ALLOW_SUDO !== "1") {
+    console.log("skip " + name + ": AIDANOS_TEST_ALLOW_SUDO is not 1, so npm test does not run sudo");
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const child = spawn("sudo", [
+      "-n",
+      "--preserve-env=PATH",
+      "env",
+      "AIDANOS_LOCK_CASE=" + name,
+      "NODE_ENV=" + (process.env.NODE_ENV || ""),
+      "unshare",
+      "--pid",
+      "--mount",
+      "--fork",
+      "--mount-proc",
+      process.execPath,
+      fileURLToPath(import.meta.url),
+    ], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let err = "";
+    child.stderr.on("data", (chunk) => { err += chunk; });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(name + " failed " + code + " " + err.slice(-500)));
+    });
+  });
+}
+
+async function captureErrors(fn) {
+  const lines = [];
+  const prev = console.error;
+  console.error = (...args) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await fn();
+    return lines;
+  } finally {
+    console.error = prev;
+    setGitLockHoldersForTest(null);
+    setGitLockBeforeUnlinkForTest(null);
+    setGitLockBeforeMoveForTest(null);
+  }
+}
+
+async function gitLockIgnoresASymlinkedGit() {
+  const tmp = lockTmp();
+  try {
+    const real = path.join(tmp, "real");
+    const vault = path.join(real, "vault");
+    fs.mkdirSync(real, { recursive: true });
+    git(["init", "-q", "-b", "main", vault]);
+    const jump = path.join(tmp, "jump");
+    fs.symlinkSync(real, jump);
+    const via = path.join(jump, "vault");
+    const lock = path.join(vault, ".git", "index.lock");
+    fs.writeFileSync(lock, "held\n");
+    rememberUnlinkLock(gitLockMessage(path.join(via, ".git", "index.lock")), via);
+    await releaseRememberedGitLock(via);
+    assert(fs.existsSync(lock), "a symlinked git path deleted index.lock");
+    assert(fs.readFileSync(lock, "utf8") === "held\n", "a symlinked git path changed the lock");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitLockKeepsALiveGitProcess() {
+  const tmp = lockTmp();
+  const vault = path.join(tmp, "vault");
+  fs.mkdirSync(vault);
+  git(["init", "-q", "-b", "main", vault]);
+  const child = spawn("git", ["-C", vault, "update-index", "--index-info"], { stdio: ["pipe", "pipe", "pipe"] });
+  const lock = path.join(vault, ".git", "index.lock");
+  const deadline = Date.now() + 2000;
+  while (!fs.existsSync(lock) && child.exitCode == null && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  try {
+    assert(fs.existsSync(lock), "git did not hold index.lock");
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    await releaseRememberedGitLock(vault);
+    assert(fs.existsSync(lock), "a live git process's lock was removed");
+    assert(gitLockBlocksVault(vault), "a held lock did not block sync");
+  } finally {
+    try { child.stdin.end(); } catch { /* already closed */ }
+    await new Promise((resolve) => child.on("close", resolve));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitLockIgnoresPathsOutsideGit() {
+  const tmp = lockTmp();
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const outside = path.join(tmp, "index.lock");
+    const named = path.join(vault, "index.lock");
+    const configLock = path.join(vault, ".git", "config.lock");
+    fs.writeFileSync(outside, "out\n");
+    fs.writeFileSync(named, "note\n");
+    fs.writeFileSync(configLock, "cfg\n");
+    const young = path.join(vault, ".git", "index.lock");
+    fs.writeFileSync(young, "young\n");
+    rememberUnlinkLock(
+      [gitLockMessage(outside), gitLockMessage(named), gitLockMessage(configLock)].join("\n"),
+      vault,
+    );
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(outside, "utf8") === "out\n", "a lock outside the vault was removed");
+    assert(fs.readFileSync(named, "utf8") === "note\n", "a lock outside .git was removed");
+    assert(fs.readFileSync(configLock, "utf8") === "cfg\n", "a lock other than index.lock was removed");
+    assert(fs.readFileSync(young, "utf8") === "young\n", "an unrecorded index.lock was removed");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "an unproven index.lock was removed without a message");
+    assert(!kept.some((line) => line.includes(tmp) || line.includes("index.lock")), "the kept message named a path");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitLockRemovesOnlyARecordedLock() {
+  if (process.platform === "linux" && process.env.AIDANOS_LOCK_CASE !== "recorded-free") {
+    await runLockCase("recorded-free");
+    return;
+  }
+  const tmp = lockTmp();
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    fs.writeFileSync(lock, "first\n");
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    const aside = path.join(vault, ".git", "index.lock.aside");
+    fs.renameSync(lock, aside);
+    fs.writeFileSync(lock, "second\n");
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(lock, "utf8") === "second\n", "a replaced lock inode was removed");
+    assert(fs.readFileSync(aside, "utf8") === "first\n", "the recorded inode was unlinked");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "an unproven index.lock was removed without a message");
+    fs.unlinkSync(aside);
+    fs.unlinkSync(lock);
+    fs.writeFileSync(lock, "recorded\n");
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    // Real /proc scan. The test hook is not set.
+    await releaseRememberedGitLock(vault);
+    assert(!fs.existsSync(lock), "the recorded index.lock was kept");
+    assert(!gitLockBlocksVault(vault), "a removed lock still blocks sync");
+    fs.writeFileSync(lock, "old\n");
+    const old = (Date.now() - 15 * 60 * 1000 - 5000) / 1000;
+    fs.utimesSync(lock, old, old);
+    const staleKept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(lock, "utf8") === "old\n", "an unrecorded stale index.lock was removed");
+    assert(staleKept.includes(GIT_LOCK_KEPT_LINE), "an unrecorded stale index.lock was removed without a message");
+    assert(gitLockBlocksVault(vault), "a kept lock did not block sync");
+    assert(!staleKept.some((line) => line.includes(tmp) || line.includes("index.lock")), "the kept message named a path");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+function waitChild(child, ms) {
+  return new Promise((resolve) => {
+    if (child.exitCode != null || child.signalCode != null) return resolve();
+    const timer = setTimeout(resolve, ms);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+async function gitLockOverOneMegabyteDoesNotLeakFds() {
+  const tmp = lockTmp();
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    fs.writeFileSync(lock, Buffer.alloc(1024 * 1024 + 1, 0x61));
+    const before = openFdCount();
+    for (let i = 0; i < 300; i += 1) rememberUnlinkLock(gitLockMessage(lock), vault);
+    const after = openFdCount();
+    assert(after <= before, "an over-1 MB index.lock grew open fds from " + before + " to " + after);
+    assert(fs.existsSync(lock), "an over-1 MB index.lock was removed");
+    assert(fs.statSync(lock).size > 1024 * 1024, "the over-1 MB index.lock was truncated");
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.existsSync(lock), "an over-1 MB index.lock was removed on release");
+    assert(fs.statSync(lock).size > 1024 * 1024, "release truncated the over-1 MB index.lock");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "an over-1 MB index.lock was removed without a message");
+    assert(gitLockPauseReason(vault) === "oversize", "an over-1 MB lock paused as " + gitLockPauseReason(vault));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitLockKeepsSameUidScanError() {
+  if (process.platform !== "linux") return;
+  const tmp = lockTmp();
+  // The python we spawn stays the parent and wait()s. A second fork would
+  // orphan the sleeper. The hosted image runs node as pid 1, and pid 1
+  // here does not reap. A non-dumpable zombie still answers EACCES for
+  // its descriptor directory, so the next test would skip.
+  const sleeper = spawn("python3", ["-c", [
+    "import ctypes, os, time",
+    "pid = os.fork()",
+    "if pid == 0:",
+    "    os.setsid()",
+    "    ctypes.CDLL(None).prctl(4, 0)",
+    "    print(os.getpid(), flush=True)",
+    "    time.sleep(60)",
+    "    raise SystemExit(0)",
+    "os.waitpid(pid, 0)",
+  ].join("\n")], { stdio: ["ignore", "pipe", "pipe"] });
+  let deniedPid = 0;
+  let unreaped = false;
+  try {
+    const line = await new Promise((resolve, reject) => {
+      let buf = "";
+      const timer = setTimeout(() => reject(new Error("the same-uid sleeper did not start")), 4000);
+      sleeper.stdout.on("data", (chunk) => {
+        buf += chunk;
+        if (buf.includes("\n")) {
+          clearTimeout(timer);
+          resolve(buf.trim().split(/\s+/).pop());
+        }
+      });
+    });
+    deniedPid = Number(line);
+    const proc = "/proc/" + deniedPid;
+    assert(fs.statSync(proc).uid === process.getuid(), "the unreadable process is not our uid");
+    let denied = false;
+    try {
+      fs.readdirSync(proc + "/fd");
+    } catch (error) {
+      denied = error && (error.code === "EACCES" || error.code === "EPERM");
+    }
+    assert(denied, "a same-uid descriptor directory was readable");
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    fs.writeFileSync(lock, "recorded\n");
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(lock, "utf8") === "recorded\n", "a same-uid scan error removed the lock");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "a same-uid scan error was removed without a message");
+    assert(gitLockBlocksVault(vault), "a scan error did not block sync");
+    assert(gitLockPauseReason(vault) === "unreadable", "a scan error paused as " + gitLockPauseReason(vault));
+  } finally {
+    if (deniedPid) {
+      try { process.kill(deniedPid, "SIGKILL"); } catch { /* already gone */ }
+      await waitChild(sleeper, 4000);
+    }
+    if (sleeper.exitCode == null && sleeper.signalCode == null) {
+      try { sleeper.kill("SIGKILL"); } catch { /* already exited */ }
+      await waitChild(sleeper, 4000);
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
+    if (deniedPid) {
+      let gone = false;
+      try {
+        fs.statSync("/proc/" + deniedPid);
+      } catch {
+        gone = true;
+      }
+      unreaped = !gone;
+    }
+  }
+  if (unreaped) throw new Error("the non-dumpable process was not reaped");
+}
+
+function linuxSameUidDescriptorsReadable() {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (typeof uid !== "number") return false;
+  let pids;
+  try {
+    pids = fs.readdirSync("/proc");
+  } catch {
+    return false;
+  }
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
+    const procDir = "/proc/" + pid;
+    let st;
+    try {
+      st = fs.statSync(procDir);
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
+      return false;
+    }
+    if (st.uid !== uid) continue;
+    let fds;
+    try {
+      fds = fs.readdirSync(procDir + "/fd");
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
+      return false;
+    }
+    for (const fd of fds) {
+      try {
+        fs.statSync(procDir + "/fd/" + fd);
+      } catch (error) {
+        if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
+        if (error && (error.code === "EACCES" || error.code === "EPERM")) return false;
+      }
+    }
+  }
+  return true;
+}
+
+async function gitLockNormalUserRemovesOwnRecordedLock() {
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    console.log("skip normal-user lock removal: this process is root");
+    return;
+  }
+  if (process.platform !== "linux" && process.platform !== "darwin") {
+    console.log("skip normal-user lock removal: no holder scan on " + process.platform);
+    return;
+  }
+  if (process.platform === "linux" && !linuxSameUidDescriptorsReadable()) {
+    console.log("skip normal-user lock removal: a same-uid process descriptor directory is not readable");
+    return;
+  }
+  const tmp = lockTmp();
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    fs.writeFileSync(lock, "recorded\n");
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    await releaseRememberedGitLock(vault);
+    assert(!fs.existsSync(lock), "a normal user kept its own recorded index.lock");
+    assert(!gitLockBlocksVault(vault), "a normal user's removed lock still blocks sync");
+    fs.writeFileSync(lock, "unrecorded\n");
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(lock, "utf8") === "unrecorded\n", "a normal user removed an unrecorded index.lock");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "a normal user's unrecorded lock was removed without a message");
+    assert(gitLockBlocksVault(vault), "a normal user's kept lock did not block sync");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitLockKeepsSameSizeRecreate() {
+  const tmp = lockTmp();
+  const prev = process.env.NODE_ENV;
+  process.env.NODE_ENV = "test";
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    const first = "same-size\n";
+    const fresh = "same-size\n";
+    assert(first === fresh, "the same-size fixture bytes differ");
+    assert(Buffer.byteLength(first) === Buffer.byteLength(fresh), "the same-size fixture lengths differ");
+    fs.writeFileSync(lock, first);
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    fs.unlinkSync(lock);
+    fs.writeFileSync(lock, fresh);
+    setGitLockHoldersForTest(() => false);
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(lock, "utf8") === fresh, "a same-size recreate was removed");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "a same-size recreate was removed without a message");
+    assert(!kept.some((line) => line.includes(tmp) || line.includes("index.lock")), "the kept message named a path");
+  } finally {
+    setGitLockHoldersForTest(null);
+    if (prev == null) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prev;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitLockKeepsAReusedInode() {
+  const tmp = lockTmp();
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    fs.writeFileSync(lock, "first\n");
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    fs.unlinkSync(lock);
+    fs.writeFileSync(lock, "fresh-lock\n");
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(lock, "utf8") === "fresh-lock\n", "a reused inode was removed");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "a reused inode was removed without a message");
+    assert(!kept.some((line) => line.includes(tmp) || line.includes("index.lock")), "the kept message named a path");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitLockKeepsALockSwappedBeforeUnlink() {
+  if (process.platform === "linux" && process.env.AIDANOS_LOCK_CASE !== "swapped") {
+    await runLockCase("swapped");
+    return;
+  }
+  const tmp = lockTmp();
+  const prev = process.env.NODE_ENV;
+  process.env.NODE_ENV = "test";
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    fs.writeFileSync(lock, "recorded\n");
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    setGitLockBeforeUnlinkForTest(() => {
+      fs.unlinkSync(lock);
+      fs.writeFileSync(lock, "swapped\n");
+    });
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(lock, "utf8") === "swapped\n", "a lock swapped before unlink was removed");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "a swapped lock was removed without a message");
+    assert(!kept.some((line) => line.includes(tmp) || line.includes("index.lock")), "the kept message named a path");
+  } finally {
+    setGitLockBeforeUnlinkForTest(null);
+    if (prev == null) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prev;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitLockKeepsSameBytesDuringMove() {
+  const tmp = lockTmp();
+  const prev = process.env.NODE_ENV;
+  process.env.NODE_ENV = "test";
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    const bytes = "same-bytes\n";
+    fs.writeFileSync(lock, bytes);
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    setGitLockHoldersForTest(() => false);
+    setGitLockBeforeMoveForTest(() => {
+      fs.unlinkSync(lock);
+      fs.writeFileSync(lock, bytes);
+    });
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(lock, "utf8") === bytes, "a same-bytes recreate in the move window was removed");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "a same-bytes recreate was removed without a message");
+    assert(!kept.some((line) => line.includes(tmp) || line.includes("index.lock")), "the kept message named a path");
+  } finally {
+    setGitLockBeforeMoveForTest(null);
+    if (prev == null) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prev;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitLockKeepsALockCreatedDuringQuarantine() {
+  const tmp = lockTmp();
+  const prev = process.env.NODE_ENV;
+  process.env.NODE_ENV = "test";
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    const original = "recorded\n";
+    const fresh = "fresh-lock\n";
+    fs.writeFileSync(lock, original);
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    let seen = 0;
+    setGitLockHoldersForTest(() => {
+      seen += 1;
+      if (seen === 1) return false;
+      fs.writeFileSync(lock, fresh);
+      return "unknown";
+    });
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(lock, "utf8") === fresh, "a lock created during quarantine was overwritten");
+    const left = fs.readdirSync(path.join(vault, ".git")).filter((name) => name.startsWith(".aidanos-lock-"));
+    assert(left.length === 1, "the quarantined lock was not kept");
+    assert(fs.readFileSync(path.join(vault, ".git", left[0]), "utf8") === original, "the quarantined bytes were replaced");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "a lock created during quarantine was removed without a message");
+    assert(gitLockBlocksVault(vault), "a lock created during quarantine did not pause sync");
+    assert(!kept.some((line) => line.includes(tmp) || line.includes("index.lock") || line.includes(".aidanos-lock-")), "the kept message named a path");
+  } finally {
+    setGitLockHoldersForTest(null);
+    if (prev == null) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prev;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitLockSweepsAnAbandonedQuarantine() {
+  const tmp = lockTmp();
+  const prev = process.env.NODE_ENV;
+  process.env.NODE_ENV = "test";
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const gitDir = path.join(vault, ".git");
+    const lock = path.join(gitDir, "index.lock");
+    const abandoned = path.join(gitDir, ".aidanos-lock-0123456789abcdef");
+    const other = path.join(gitDir, ".aidanos-lock-not-a-quarantine");
+    fs.writeFileSync(lock, "live\n");
+    fs.writeFileSync(abandoned, "stale\n");
+    fs.writeFileSync(other, "keep\n");
+    setGitLockHoldersForTest(() => false);
+    await sweepAbandonedGitLocks(vault);
+    assert(!fs.existsSync(abandoned), "an abandoned quarantine with no holder was kept");
+    assert(fs.readFileSync(lock, "utf8") === "live\n", "a sweep removed index.lock");
+    assert(fs.readFileSync(other, "utf8") === "keep\n", "a sweep removed a file that is not a quarantine");
+    fs.writeFileSync(abandoned, "held\n");
+    setGitLockHoldersForTest(() => "unknown");
+    const kept = await captureErrors(() => sweepAbandonedGitLocks(vault));
+    assert(fs.readFileSync(abandoned, "utf8") === "held\n", "a sweep removed a quarantine whose holder is unknown");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "an unknown holder was removed without a message");
+    assert(!kept.some((line) => line.includes(tmp) || line.includes(".aidanos-lock-")), "the kept message named a path");
+  } finally {
+    setGitLockHoldersForTest(null);
+    if (prev == null) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prev;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitTurnStaysOffOutsideTests() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-turn-"));
+  const turn = path.join(tmp, "turn");
+  const prevEnv = process.env.NODE_ENV;
+  const prevTurn = process.env.AIDANOS_TEST_GIT_TURN;
+  try {
+    process.env.NODE_ENV = "production";
+    process.env.AIDANOS_TEST_GIT_TURN = turn;
+    const held = await acquireGitTurn();
+    assert(held === "", "the git turn was held outside tests");
+    assert(!fs.existsSync(turn), "the git turn file was created outside tests");
+    process.env.NODE_ENV = "test";
+    const on = await acquireGitTurn();
+    assert(on === turn, "the git turn was not held in tests");
+    assert(fs.existsSync(turn), "the git turn file is missing");
+    releaseGitTurn(on);
+    assert(!fs.existsSync(turn), "the git turn file was left behind");
+  } finally {
+    if (prevEnv == null) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prevEnv;
+    if (prevTurn == null) delete process.env.AIDANOS_TEST_GIT_TURN;
+    else process.env.AIDANOS_TEST_GIT_TURN = prevTurn;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 try {
+  const only = process.env.AIDANOS_LOCK_CASE || "";
+  if (only === "recorded-free") {
+    await gitLockRemovesOnlyARecordedLock();
+  } else if (only === "swapped") {
+    await gitLockKeepsALockSwappedBeforeUnlink();
+  } else {
+  await gitLockIgnoresASymlinkedGit();
+  await gitLockKeepsALiveGitProcess();
+  await gitLockIgnoresPathsOutsideGit();
+  await gitLockRemovesOnlyARecordedLock();
+  await gitLockOverOneMegabyteDoesNotLeakFds();
+  await gitLockKeepsSameUidScanError();
+  await gitLockNormalUserRemovesOwnRecordedLock();
+  await gitLockKeepsSameSizeRecreate();
+  await gitLockKeepsSameBytesDuringMove();
+  await gitLockKeepsALockCreatedDuringQuarantine();
+  await gitLockSweepsAnAbandonedQuarantine();
+  await gitLockKeepsAReusedInode();
+  await gitLockKeepsALockSwappedBeforeUnlink();
+  await gitTurnStaysOffOutsideTests();
   authUrlShaping();
   await seedDoesNotOverwrite();
+  await seedSkipsPlantedLinks();
   await liveGitSync();
   await authOriginIsEmbedded();
   await bundledSeedWhenCloneFails();
   await seededNotesStayUntracked();
   console.log("vault-git-test ok");
+  }
 } catch (err) {
   console.error("FAIL  vault-git-test  " + err.message);
   process.exit(1);

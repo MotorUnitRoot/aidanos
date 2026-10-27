@@ -106,10 +106,10 @@ check("source task uses md-box + md-body, not raw - [ ] string", () => {
   assert(html.includes('data-src="- [ ] buy milk"'), "data-src should be normalized: " + html);
 });
 
-check("source [] stub normalizes data-src to [ ]", () => {
+check("source [] stub keeps the typed line and still draws a box", () => {
   const html = formatOneLine("- [] buy milk", true);
   assert(html.includes("md-box"), "pretty chrome for [] stub");
-  assert(html.includes('data-src="- [ ] buy milk"'), "[] should normalize to [ ]: " + html);
+  assert(html.includes('data-src="- [] buy milk"'), "[] must stay typed: " + html);
   assert(/<span class="md-body">buy milk<\/span>/.test(html), "body only");
 });
 
@@ -135,6 +135,20 @@ check("other source lines stay raw", () => {
   assert(html.includes("plain note"), "raw text present");
   assert(!html.includes("md-box"), "plain line is not a task");
   assert(!html.includes('data-kind="task"'), "plain is not task");
+});
+
+check("open, done, cancelled, and scheduled draw the same way", () => {
+  const open = formatOneLine("- [ ] Oil the latch", false);
+  const lower = formatOneLine("- [x] Sweep", false);
+  const upper = formatOneLine("- [X] Count the spare bulbs", false);
+  const cancelled = formatOneLine("- [-] cancelled words", false);
+  const scheduled = formatOneLine("- [>] scheduled words", false);
+  assert(open.includes("md-box") && open.includes('aria-checked="false"'), "open box: " + open);
+  assert(lower.includes("md-box") && lower.includes(" done"), "lower x: " + lower);
+  assert(upper.includes("md-box") && upper.includes(" done") && upper.includes('data-src="- [X] Count the spare bulbs"'), "upper X stays typed: " + upper);
+  assert(cancelled.includes("cancelled") && !cancelled.includes("md-box") && cancelled.includes('data-src="- [-] cancelled words"'), "cancelled: " + cancelled);
+  assert(scheduled.includes("md-go") && scheduled.includes("scheduled") && !scheduled.includes("md-box"), "scheduled: " + scheduled);
+  assert(src.includes("return keptTaskLine(el, dumpLine)"), "a task click must keep the typed line");
 });
 
 check("inactive task still pretty", () => {
@@ -181,7 +195,7 @@ check("empty source task keeps md-box and a caret host in md-body", () => {
     assert(html.includes('contenteditable="false"'), "box stays non-editable");
     assert(/<span class="md-body">(<br>|​|\u200b)<\/span>/.test(html), "empty md-body has br or zwsp: " + html);
     assert(!/>\s*- \[\]/.test(html) && !/>\s*- \[ \]/.test(html), "must not dump raw checkbox: " + html);
-    assert(/data-src="- \[ \] ?/.test(html), "data-src normalized: " + html);
+    assert(html.includes('data-src="' + line + '"'), "data-src keeps the typed line: " + html);
   }
   assert(paintTaskBodyHtml("", true) === "<br>", paintTaskBodyHtml("", true));
   assert(paintTaskBodyHtml("x", true) === "x", paintTaskBodyHtml("x", true));

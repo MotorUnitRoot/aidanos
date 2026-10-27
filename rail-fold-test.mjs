@@ -61,7 +61,11 @@ function boot(matches) {
       return mq;
     },
   };
-  const context = vm.createContext({ window, document });
+  const context = vm.createContext({
+    window,
+    document,
+    syncFmtBarForKeyboard() {},
+  });
   vm.runInContext("const $ = (id) => document.getElementById(id);\n" + iife, context);
   return {
     collapsed: () => room.collapsed,

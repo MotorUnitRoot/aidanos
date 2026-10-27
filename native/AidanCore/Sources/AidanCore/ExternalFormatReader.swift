@@ -376,7 +376,7 @@ private struct FoundClock {
 extension ExternalFormatReader {
     /// `\r\n` is one Swift character, so a split on `"\n"` leaves that pair intact.
     /// Walk the scalars and break on `\n`, `\r\n`, and a lone `\r`.
-    fileprivate static func splitLines(_ text: String) -> [String] {
+    static func splitLines(_ text: String) -> [String] {
         if text.isEmpty { return [] }
         // UTF-8 never hides a CR or LF inside another scalar. A note with no
         // line break is already one line, so do not copy its scalars.

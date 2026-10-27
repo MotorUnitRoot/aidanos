@@ -13,8 +13,10 @@ jobs:
   relay:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           cache: npm
@@ -37,14 +39,16 @@ jobs:
   aidan-core-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
       - uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
         with:
           swift-version: "6.2"
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.99.1"
       - name: C++ headers Swift's clang can see
@@ -64,9 +68,13 @@ jobs:
 
   apple:
     runs-on: macos-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
       - run: npm ci --omit=optional
@@ -79,25 +87,38 @@ jobs:
           vault="$RUNNER_TEMP/aidanos-vault"
           data="$RUNNER_TEMP/aidanos-data"
           log="$RUNNER_TEMP/relay-ios.log"
+          cpu="$RUNNER_TEMP/relay-cpu"
           : > "$log"
+          mkdir -p "$cpu"
           # The simulator cannot start its own relay, so every iOS test shares
           # this process. POST /reset empties the folder in that process.
           # Starting Node again while the simulator is up is too slow.
+          # Reset stays off unless NODE_ENV=test as well as the allow flag.
           # This loop only starts a new process if the current one dies.
+          # --cpu-prof writes the profile when this process exits. The stop
+          # step SIGTERMs it; a kill -9 would leave the profile empty.
+          # stdout and stderr are the log file, not this step's pipe.
+          # The harness used to own that pipe, and a slow drain blocked
+          # Node inside console.error. The file is printed in a later step.
           (
             set +e
+            echo "$BASHPID" > "$RUNNER_TEMP/relay-ios.loop.pid"
             while true; do
               rm -rf "$vault" "$data"
-              mkdir -p "$vault" "$data"
+              mkdir -p "$vault" "$data" "$cpu"
               AIDANOS_RELAY_TOKEN=aidanos-test-token-0123456789abcdef \
+                NODE_ENV=test \
                 AIDANOS_RELAY_ALLOW_RESET=1 \
-                node src/server.mjs --port 3757 \
-                --vault "$vault" --data "$data" >> "$log" 2>&1
+                node --cpu-prof --cpu-prof-dir "$cpu" src/server.mjs --port 3757 \
+                --vault "$vault" --data "$data" >> "$log" 2>&1 < /dev/null &
+              echo $! > "$RUNNER_TEMP/relay-ios.pid"
+              wait $!
               code=$?
               echo "relay stopped ($code)" >> "$log"
               sleep 0.2
             done
           ) &
+          disown || true
           for _ in $(seq 1 50); do
             curl -sf http://127.0.0.1:3757/health && exit 0
             sleep 0.2
@@ -107,7 +128,22 @@ jobs:
           exit 1
       - name: AidanCore tests on macOS
         working-directory: native/AidanCore
-        run: swift test --force-resolved-versions
+        env:
+          AIDANOS_TEST_RELAY_LOG_DIR: ${{ runner.temp }}/relay-macos
+        run: |
+          mkdir -p "$RUNNER_TEMP/relay-macos"
+          swift test --force-resolved-versions
+      - name: macOS relay log
+        if: always()
+        run: |
+          echo "---- relay-macos.log ----"
+          dir="$RUNNER_TEMP/relay-macos"
+          if [ -d "$dir" ]; then
+            find "$dir" -type f -name 'aidanos-relay-*.log' | sort | while IFS= read -r file; do
+              echo "---- $(basename "$file") ----"
+              cat "$file"
+            done
+          fi
       - name: Build the Mac app
         run: >
           xcodebuild build
@@ -154,22 +190,57 @@ jobs:
           test -n "$sim_id"
           curl -sf http://127.0.0.1:3757/health
           set +e
-          xcodebuild test -scheme AidanCore -destination "id=${sim_id}" -onlyUsePackageVersionsFromResolvedFile CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          # One relay is shared by every iOS test. Parallel workers would reset it under each other.
+          xcodebuild test -scheme AidanCore -destination "id=${sim_id}" -parallel-testing-enabled NO -onlyUsePackageVersionsFromResolvedFile CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
           status=$?
           set -e
-          if [ "$status" != 0 ]; then
-            echo "---- relay log ----"
-            cat "$RUNNER_TEMP/relay-ios.log" || true
-          fi
           exit "$status"
+      - name: Stop the iOS relay so the CPU profile flushes
+        if: always()
+        run: |
+          set +e
+          node_pid=""
+          loop_pid=""
+          if [ -f "$RUNNER_TEMP/relay-ios.pid" ]; then node_pid=$(cat "$RUNNER_TEMP/relay-ios.pid"); fi
+          if [ -f "$RUNNER_TEMP/relay-ios.loop.pid" ]; then loop_pid=$(cat "$RUNNER_TEMP/relay-ios.loop.pid"); fi
+          if [ -n "$node_pid" ]; then kill -TERM "$node_pid" 2>/dev/null || true; fi
+          for _ in $(seq 1 20); do
+            if ls "$RUNNER_TEMP/relay-cpu/"*.cpuprofile >/dev/null 2>&1; then break; fi
+            sleep 0.5
+          done
+          if [ -n "$loop_pid" ]; then kill -KILL "$loop_pid" 2>/dev/null || true; fi
+          sleep 0.3
+          if [ -f "$RUNNER_TEMP/relay-ios.pid" ]; then
+            kill -TERM "$(cat "$RUNNER_TEMP/relay-ios.pid")" 2>/dev/null || true
+          fi
+          sleep 1
+          pkill -TERM -f 'src/server.mjs --port 3757' || true
+          sleep 0.5
+          pkill -KILL -f 'src/server.mjs --port 3757' || true
+          mkdir -p "$GITHUB_WORKSPACE/relay-ios-profile"
+          cp -f "$RUNNER_TEMP/relay-ios.log" "$GITHUB_WORKSPACE/relay-ios-profile/" 2>/dev/null || true
+          cp -f "$RUNNER_TEMP/relay-cpu/"*.cpuprofile "$GITHUB_WORKSPACE/relay-ios-profile/" 2>/dev/null || true
+          ls -l "$GITHUB_WORKSPACE/relay-ios-profile" || true
+      - name: iOS relay log
+        if: always()
+        run: |
+          echo "---- relay-ios.log ----"
+          cat "$RUNNER_TEMP/relay-ios.log" || true
+      - name: Upload the iOS relay profile
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: relay-ios-profile
+          path: relay-ios-profile/
+          retention-days: 7
 
   sample-notes:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
       - name: Chrome for the sample screenshots
@@ -180,6 +251,8 @@ jobs:
           fi
       - name: Sample notes and screenshots
         run: node sample-notes-test.mjs && node --test external-format-cases-test.mjs && node sample-screens-test.mjs
+      - name: Sample screens in the second order
+        run: node sample-screens-test.mjs --order second
       - name: A screenshot run with no pictures is a failure
         if: always()
         run: |

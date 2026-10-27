@@ -55,11 +55,14 @@ final class TodayModel: ObservableObject {
     @Published var address: String
     @Published var token: String
     @Published var status = "Not connected"
+    @Published var notice = ""
     @Published var conflict: NoteConflict?
     @Published var draftingConflict = false
+    @Published var context: ExternalNoteContext = .project
 
     private var session: AidanSession?
     private var surface: NoteSurface?
+    private var editor = LiveNoteEditor()
     private var path: String
     private var applyingRemote = false
     private var dayTimer: Timer?
@@ -77,10 +80,12 @@ final class TodayModel: ObservableObject {
             token = stored
         }
         path = AidanSession.todayPath()
+        context = EditorNoteContext.forPath(path)
         do {
             let session = try AidanSession(vault: TodayModel.vaultURL())
             self.session = session
             text = try session.open(path)
+            editor = LiveNoteEditor(text: text, context: context)
             let surface = NoteSurface(session: session, path: path, text: text)
             self.surface = surface
             conflict = surface.conflict
@@ -89,7 +94,10 @@ final class TodayModel: ObservableObject {
                     guard let self, notePath == self.path, !self.draftingConflict else { return }
                     self.applyingRemote = true
                     self.text = value
+                    self.editor.reset(value)
+                    self.editor.context = self.context
                     self.surface?.replaceText(value)
+                    self.notice = ""
                     self.applyingRemote = false
                     self.publishConflict()
                 }
@@ -121,11 +129,14 @@ final class TodayModel: ObservableObject {
     func considerDay(now: Date = Date()) {
         guard let next = AidanSession.changedDay(from: path, now: now) else { return }
         path = next
+        context = EditorNoteContext.forPath(next)
         draftingConflict = false
+        notice = ""
         guard let session else { return }
         applyingRemote = true
         let opened = (try? session.open(next)) ?? ""
         text = opened
+        editor = LiveNoteEditor(text: opened, context: context)
         surface?.focus(path: next, text: opened)
         applyingRemote = false
         publishConflict()
@@ -137,15 +148,26 @@ final class TodayModel: ObservableObject {
             text = edited
             return
         }
-        let merged = surface.userEdited(base: base, edited: edited)
+        if editor.text != base { editor.reset(base) }
+        editor.context = context
+        let kept = editor.type(edited)
+        let merged = surface.userEdited(base: base, edited: kept)
+        if merged != kept {
+            editor.reset(merged)
+            editor.context = context
+        }
         applyingRemote = true
         text = merged
         applyingRemote = false
         conflict = surface.conflict
         draftingConflict = surface.draftingConflict
-        if let message = surface.statusMessage {
-            status = message
+        if surface.statusMessage != nil {
+            status = "Unsaved"
+            notice = "This change is kept on this device."
             surface.clearStatus()
+        } else if merged == kept {
+            notice = ""
+            if status == "Unsaved" { status = "Saved" }
         }
     }
 

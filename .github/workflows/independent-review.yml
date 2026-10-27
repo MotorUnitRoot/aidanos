@@ -26,15 +26,13 @@ jobs:
       issues: read
     steps:
       - name: Checkout
-        # v5.1.0
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Set up Node.js
-        # v6.5.0
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: "22"
+          node-version-file: ".nvmrc"
       - name: Self-test
         run: node .github/independent-review.mjs --self-test
       - name: Require a review comment for this head
@@ -56,16 +54,14 @@ jobs:
       statuses: write
     steps:
       - name: Checkout default branch
-        # v5.1.0
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Set up Node.js
-        # v6.5.0
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: "22"
+          node-version-file: ".nvmrc"
       - name: Self-test
         run: node .github/independent-review.mjs --self-test
       - name: Publish the review result on the PR head

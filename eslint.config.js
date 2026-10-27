@@ -49,7 +49,7 @@ export default [
     },
   },
   {
-    files: ["server.mjs", "*-test.mjs", "eslint.config.js", ".github/**/*.mjs", "relay/**/*.mjs"],
+    files: ["server.mjs", "*-test.mjs", "eslint.config.js", ".github/**/*.mjs", "relay/**/*.mjs", "editor/**/*.mjs"],
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",

@@ -831,6 +831,8 @@ async function dropManifestIfGone(file, meta) {
   await dropManifest(meta.stateDir, meta.rel);
 }
 
+// Note temps are created at 0600. rename keeps that mode on the note.
+// Notes stay 0600. They are not loosened to 0644.
 async function writeSyncedTemp(tmp, text) {
   const handle = await fs.open(tmp, "w", 0o600);
   try {
@@ -843,13 +845,16 @@ async function writeSyncedTemp(tmp, text) {
 
 // Write each note beside its final name, fsync that temp, then rename it
 // into place. A reader sees the previous file or the whole new file. Every
-// temp path in this batch is recorded before any of those temps exist. That
-// record is two fsyncs: the new manifest file, then the state directory
-// after the rename onto note-temps. Each note adds one fsync of its temp
-// before the rename, so one clean note is three fsyncs. A corrupt manifest
-// adds one more fsync of that directory after it is renamed aside, which
-// makes the same note four. A refused manifest still saves the note, logs
-// the doc id, and does not delete the temp it could not record.
+// temp path in this batch is recorded before any of those temps exist.
+// One clean note is five fsyncs: the manifest file that records the temp,
+// the state directory after that rename, the note temp before it is renamed
+// onto the note, the manifest file again when that temp line is dropped,
+// and the state directory after the drop. A corrupt manifest adds one more
+// fsync of that directory when the bad file is renamed aside, before those
+// five. Same-account gap: the note's directory is not fsynced after the
+// rename, so a crash can lose the directory entry even though the temp was
+// fsynced and the note stayed mode 0600. A refused manifest still saves
+// the note, logs the doc id, and does not delete the temp it could not record.
 export async function saveNoteBatch(entries, options = {}) {
   const vault = options.vault || "";
   const stateDir = options.stateDir || "";

@@ -21,22 +21,77 @@ export const REDACT_INPUT_CAP = 64 * 1024;
 const REDACT_CHUNK = 64 * 1024;
 // How far a cut walks back to finish a token. A line with no break in this
 // window keeps the character boundary instead of collapsing to the marker.
+// 256 or more non-break characters before a secret used to keep the
+// secret's head. The whole text is masked before this cut, and any
+// trailing piece that still begins a listed secret is then dropped.
 const CAP_BREAK_WINDOW = 256;
-// A Node stack frame we may show. Only node:internal/... and a Node builtin
-// module. The path is lowercase with no `..` and no note suffix.
+// Adversarial scrub of the '(a/' path piece, one run, this host:
+// 1 MB 24.9 ms, 2 MB 41.2 ms. Both stay under the 100 ms test bound.
+// A Node stack frame we may show. A builtin module, or a node:internal
+// path whose characters are only [a-z_/] with an optional .js suffix and
+// whose first segment is a known Node prefix. Not every string that
+// starts with node:internal/.
 const NODE_FRAME = /^node:[a-z0-9_./]+(?:\.js)?:\d+:\d+$/;
+const NODE_INTERNAL_FRAME = /^node:internal\/[a-z_/]+(?:\.js)?:\d+:\d+$/;
+const NODE_INTERNAL_PREFIXES = new Set([
+  "assert", "async_hooks", "blob", "bootstrap", "buffer", "child_process",
+  "cluster", "console", "constants", "crypto", "data_url", "debugger",
+  "deps", "dgram", "dns", "encoding", "errors", "event_target", "events",
+  "fixed_queue", "fs", "http", "inspector", "inspector_async_hook",
+  "linkedlist", "main", "mime", "modules", "net", "options", "perf",
+  "priority_queue", "process", "querystring", "readline", "repl",
+  "source_map", "streams", "test", "timers", "tls", "trace_events", "tty",
+  "url", "util", "v8", "validators", "vm", "wasi", "watch_mode", "webidl",
+  "webstreams", "worker",
+]);
 const NODE_BUILTINS = new Set(builtinModules.map((name) => name.startsWith("node:") ? name.slice(5) : name));
 
-function cutAtBreak(text, cap) {
-  const buf = Buffer.from(text);
-  if (buf.length <= cap) return text;
-  let end = cap;
-  while (end > 0 && (buf[end] & 0xc0) === 0x80) end -= 1;
-  let head = buf.toString("utf8", 0, end);
+// Byte length without a Buffer. The cut stays on a code point, same as
+// walking a UTF-8 continuation byte back to its lead.
+function utf8PrefixEnd(text, cap) {
+  if (Buffer.byteLength(text) <= cap) return text.length;
+  let bytes = 0;
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const code = text.codePointAt(i);
+    const width = code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+    if (bytes + width > cap) return i;
+    bytes += width;
+    i += code > 0xffff ? 2 : 1;
+  }
+  return i;
+}
+
+// After a cut, a suffix that is only the start of a listed secret is the
+// head the 256-character window used to keep. Drop that piece. A full
+// secret is already masked, so only a proper prefix is removed.
+function dropSecretTail(text, secrets) {
+  if (!text || !secrets || !secrets.length) return text;
+  let drop = 0;
+  for (let s = 0; s < secrets.length; s += 1) {
+    const secret = secrets[s];
+    if (!secret || secret.length < 2) continue;
+    const max = Math.min(text.length, secret.length - 1);
+    for (let len = max; len > drop; len -= 1) {
+      if (text.endsWith(secret.slice(0, len))) {
+        drop = len;
+        break;
+      }
+    }
+  }
+  return drop ? text.slice(0, -drop) : text;
+}
+
+function cutAtBreak(text, cap, secrets) {
+  const end = utf8PrefixEnd(text, cap);
+  if (end >= text.length) return text;
+  let head = text.slice(0, end);
   const floor = Math.max(0, head.length - CAP_BREAK_WINDOW);
   let cut = head.length;
   while (cut > floor && !isBreak(head.charCodeAt(cut - 1))) cut -= 1;
   if (cut > floor && cut < head.length) head = head.slice(0, cut);
+  head = dropSecretTail(head, secrets);
   return head.replace(/\[+$/, "");
 }
 
@@ -96,10 +151,15 @@ export function redact(text, secrets) {
     const value = String(secret || "").trim();
     if (value && !list.includes(value)) list.push(value);
   }
+  const tails = [];
   for (const secret of list) {
     out = maskLiteral(out, secret, "***");
+    tails.push(secret);
     const encoded = encodeURIComponent(secret);
-    if (encoded !== secret) out = maskLiteral(out, encoded, "***");
+    if (encoded !== secret) {
+      out = maskLiteral(out, encoded, "***");
+      tails.push(encoded);
+    }
   }
   out = out.replace(/x-access-token:[^@\s]+/gi, "x-access-token:***");
   out = out.replace(/Bearer\s+\S+/gi, "Bearer ***");
@@ -114,8 +174,8 @@ export function redact(text, secrets) {
   out = scrubLocations(out, kept);
   out = out.replace(/file:\/\/\S+/gi, "[url]");
   out = restoreShields(out, kept);
-  out = cutAtBreak(out, REDACT_INPUT_CAP);
-  return capLocations(out);
+  out = cutAtBreak(out, REDACT_INPUT_CAP, tails);
+  return capLocations(out, tails);
 }
 
 // One log line, then the marker. The cut is applied to text that is already
@@ -194,20 +254,18 @@ function fileUrlFrame(url) {
   return shown + body.slice(lineAt);
 }
 
-function capScrubbed(line) {
-  const buf = Buffer.from(line);
-  if (buf.length <= LOG_LINE_CAP) return line;
-  let end = LOG_LINE_CAP;
-  while (end > 0 && (buf[end] & 0xc0) === 0x80) end -= 1;
-  let head = buf.toString("utf8", 0, end);
-  if (end < buf.length) {
-    const floor = Math.max(0, head.length - CAP_BREAK_WINDOW);
-    let cut = head.length;
-    while (cut > floor && !isBreak(head.charCodeAt(cut - 1))) cut -= 1;
-    // A break in the last 256 bytes ends the line on that token, which drops
-    // a partial path. No break: keep the character-boundary cut, about 8 KB.
-    if (cut > floor) head = head.slice(0, cut);
-  }
+function capScrubbed(line, secrets) {
+  const end = utf8PrefixEnd(line, LOG_LINE_CAP);
+  if (end >= line.length) return line;
+  let head = line.slice(0, end);
+  const floor = Math.max(0, head.length - CAP_BREAK_WINDOW);
+  let cut = head.length;
+  while (cut > floor && !isBreak(head.charCodeAt(cut - 1))) cut -= 1;
+  // A break in the last 256 bytes ends the line on that token, which drops
+  // a partial path. No break: keep the character-boundary cut, about 8 KB,
+  // then drop a trailing piece that still begins a listed secret.
+  if (cut > floor) head = head.slice(0, cut);
+  head = dropSecretTail(head, secrets);
   // '[' is a break, so a cut inside [[path]] keeps the brackets and the
   // marker would read [[truncated]. Drop every leftover bracket.
   head = head.replace(/\[+$/, "");
@@ -243,7 +301,14 @@ function nodeBuiltinFrame(frame) {
   for (const ext of NOTE_EXTS) {
     if (pathPart.endsWith("." + ext) || pathPart.includes("." + ext + "/")) return false;
   }
-  if (pathPart === "internal" || pathPart.startsWith("internal/")) return true;
+  if (pathPart === "internal" || pathPart.startsWith("internal/")) {
+    if (!NODE_INTERNAL_FRAME.test(frame)) return false;
+    const rest = pathPart.slice("internal/".length).replace(/\.js$/, "");
+    if (!/^[a-z_]+(?:\/[a-z_]+)*$/.test(rest)) return false;
+    const slash = rest.indexOf("/");
+    const prefix = slash === -1 ? rest : rest.slice(0, slash);
+    return NODE_INTERNAL_PREFIXES.has(prefix);
+  }
   return NODE_BUILTINS.has(pathPart);
 }
 
@@ -392,9 +457,9 @@ function scrubLocations(text, kept) {
   return lines.join("\n");
 }
 
-function capLocations(text) {
+function capLocations(text, secrets) {
   const lines = String(text).split("\n");
-  for (let i = 0; i < lines.length; i += 1) lines[i] = capScrubbed(lines[i]);
+  for (let i = 0; i < lines.length; i += 1) lines[i] = capScrubbed(lines[i], secrets);
   return lines.join("\n");
 }
 
@@ -443,16 +508,25 @@ function chunkBytes(item) {
   return Buffer.from(String(item.chunk), item.encoding || "utf8");
 }
 
-function rememberPending(bytes) {
-  fileLogPending.push(bytes);
-  fileLogPendingBytes += bytes.length;
+function pendingSize(item) {
+  if (!item) return 0;
+  if (typeof item.size === "number") return item.size;
+  if (typeof item.length === "number") return item.length;
+  return 0;
 }
 
-function forgetPending(bytes) {
-  const index = fileLogPending.indexOf(bytes);
+// The hot path keeps the string and its byte length. A Buffer is built
+// only if a fatal flush has to write the line itself.
+function rememberPending(item) {
+  fileLogPending.push(item);
+  fileLogPendingBytes += pendingSize(item);
+}
+
+function forgetPending(item) {
+  const index = fileLogPending.indexOf(item);
   if (index === -1) return;
   fileLogPending.splice(index, 1);
-  fileLogPendingBytes -= bytes.length;
+  fileLogPendingBytes -= pendingSize(item);
   if (fileLogPendingBytes < 0) fileLogPendingBytes = 0;
 }
 
@@ -477,6 +551,12 @@ function writeSyncSome(fd, buffer) {
   }
 }
 
+function itemBytes(item) {
+  if (Buffer.isBuffer(item)) return item;
+  if (item && typeof item.text === "string") return Buffer.from(item.text);
+  return chunkBytes(item);
+}
+
 function writeBounded(fd, parts, maxBytes, asStreamItem) {
   const kept = [];
   const done = [];
@@ -484,7 +564,7 @@ function writeBounded(fd, parts, maxBytes, asStreamItem) {
   let budget = Number(maxBytes) > 0 ? Number(maxBytes) : FILE_LOG_CAP;
   let stopped = false;
   for (const item of parts) {
-    const bytes = Buffer.isBuffer(item) ? item : chunkBytes(item);
+    const bytes = itemBytes(item);
     if (stopped || budget <= 0) {
       kept.push(asStreamItem ? item : bytes);
       length += bytes.length;
@@ -753,11 +833,12 @@ export function installFileLog(fd = process.stderr.fd, options = {}) {
   function announce() {
     if (announced || dropped === 0) return;
     const text = noticeText();
-    const bytes = Buffer.from(text);
-    if (heldLogBytes(stream) + bytes.length > cap) return;
+    const size = Buffer.byteLength(text);
+    if (heldLogBytes(stream) + size > cap) return;
     announced = true;
-    rememberPending(bytes);
-    stream.write(text, () => forgetPending(bytes));
+    const line = { text, size };
+    rememberPending(line);
+    stream.write(text, () => forgetPending(line));
   }
 
   // A fatal exit cannot wait for drain. The notice is written after the
@@ -783,9 +864,9 @@ export function installFileLog(fd = process.stderr.fd, options = {}) {
       dropped += 1;
       return;
     }
-    const bytes = Buffer.from(text);
-    rememberPending(bytes);
-    stream.write(text, () => forgetPending(bytes));
+    const line = { text, size };
+    rememberPending(line);
+    stream.write(text, () => forgetPending(line));
   };
 
   return {

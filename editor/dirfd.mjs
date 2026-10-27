@@ -25,10 +25,11 @@ const CREATE_FLAGS = fsConstants.O_WRONLY
 const READ_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
 const GROUP_OR_OTHER_WRITE = 0o022;
 
-// Content pin for the helper shipped in editor/bin. A rebuilt binary does not
-// run until this constant is updated to its SHA-256.
+// Content pin for the helper shipped in editor/bin. editor/check-dirfd.sh
+// rebuilds that file from dirfd-tool.c and fails unless this SHA-256 matches.
+// A rebuilt binary does not run until this constant is updated.
 const HELPER_SHA256 = {
-  "linux-x64": "3b83002b3b4aa2ac91d5bc0622e95c470631050e1074ccf4024a96fcaeacd294",
+  "linux-x64": "78bbeec3aa73aeb0526f8cbe0f17ca20d0eeee1c4dd859e0299960b6964da92d",
   "darwin-arm64": "44d21f908defa2a055e7fcfbafdcd4caf4c7bb7d7ebf0eed9ce8015f4b686342",
 };
 
@@ -160,16 +161,7 @@ async function openTrustedHelper(env = process.env) {
   }
 }
 
-function helperEnv(options) {
-  const env = { ...process.env };
-  delete env.AIDANOS_DIRFD_FAIL_AFTER;
-  if (options && Number.isInteger(options.failAfterBytes) && options.failAfterBytes >= 0) {
-    env.AIDANOS_DIRFD_FAIL_AFTER = String(options.failAfterBytes);
-  }
-  return env;
-}
-
-function callHelper(dirHandle, args, body, options) {
+function callHelper(dirHandle, args, body) {
   return openTrustedHelper().then((tool) => new Promise((resolve, reject) => {
     const execPath = process.platform === "darwin" ? "/dev/fd/4" : "/proc/self/fd/4";
     let settled = false;
@@ -182,7 +174,7 @@ function callHelper(dirHandle, args, body, options) {
     try {
       child = spawn(execPath, args, {
         stdio: ["pipe", "pipe", "pipe", dirHandle.fd, tool.fd],
-        env: helperEnv(options),
+        env: {},
       });
     } catch {
       finish(() => reject(helperUnavailable()));
@@ -233,7 +225,11 @@ function parseIdentity(text) {
 }
 
 async function createWithHelper(dirHandle, name, payload, options) {
-  const id = parseIdentity(await callHelper(dirHandle, ["creat", plainName(name)], payload, options));
+  const args = ["creat", plainName(name)];
+  if (options && Number.isInteger(options.failAfterBytes) && options.failAfterBytes >= 0) {
+    args.push(String(options.failAfterBytes));
+  }
+  const id = parseIdentity(await callHelper(dirHandle, args, payload));
   if (!id || !id.regular) throw badPath();
   return { dev: id.dev, ino: id.ino };
 }

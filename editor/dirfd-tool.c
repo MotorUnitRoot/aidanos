@@ -1,6 +1,7 @@
 /* Directory-relative create, stat, and unlink.
    The checked directory is inherited as file descriptor 3.
    A name is one path component: a swapped parent path cannot redirect it.
+   This program reads no environment variables. A limit is an argument.
 */
 #if defined(__APPLE__)
 #define _DARWIN_C_SOURCE
@@ -77,9 +78,8 @@ static void drop_created(int fd, const char *name) {
   unlinkat(DIR_FD, name, 0);
 }
 
-/* Test hook. The Node side sets this only for a deliberate partial write. */
-static int fail_after(long *limit) {
-  const char *text = getenv("AIDANOS_DIRFD_FAIL_AFTER");
+/* A negative limit means write the whole input. The value comes from argv. */
+static int parse_limit(const char *text, long *limit) {
   if (text == NULL || text[0] == '\0') return 0;
   errno = 0;
   char *end = NULL;
@@ -89,7 +89,7 @@ static int fail_after(long *limit) {
   return 1;
 }
 
-static int creat_file(const char *name) {
+static int creat_file(const char *name, long limit) {
   int flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW;
 #ifdef O_NONBLOCK
   flags |= O_NONBLOCK;
@@ -99,8 +99,7 @@ static int creat_file(const char *name) {
     fail(errno);
     return 1;
   }
-  long limit = 0;
-  int limited = fail_after(&limit);
+  int limited = limit >= 0;
   long written = 0;
   char buf[8192];
   for (;;) {
@@ -251,11 +250,23 @@ int main(int argc, char **argv) {
   const char *cmd = argv[1];
   const char *name = argv[2];
   if (!valid_name(name)) return 2;
-  if (strcmp(cmd, "unlink-self") == 0 && strcmp(name, "-") == 0) return unlink_self();
-  if (strcmp(cmd, "creat") == 0) return creat_file(name);
-  if (strcmp(cmd, "stat") == 0) return stat_file(name);
+  if (strcmp(cmd, "unlink-self") == 0) {
+    if (argc != 3 || strcmp(name, "-") != 0) return 2;
+    return unlink_self();
+  }
+  if (strcmp(cmd, "creat") == 0) {
+    if (argc == 3) return creat_file(name, -1);
+    if (argc != 4) return 2;
+    long limit = 0;
+    if (!parse_limit(argv[3], &limit)) return 2;
+    return creat_file(name, limit);
+  }
+  if (strcmp(cmd, "stat") == 0) {
+    if (argc != 3) return 2;
+    return stat_file(name);
+  }
   if (strcmp(cmd, "unlink") == 0) {
-    if (argc < 5) return 2;
+    if (argc != 5) return 2;
     return unlink_file(name, argv[3], argv[4]);
   }
   return 2;

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // The note writer refuses a link. Nothing is written through it.
 // These checks call the writer directly, in both save modes.
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -615,6 +615,28 @@ await check("the directory helper is pinned and is not built at runtime", async 
   assert(src.includes(digest), "the source pin does not match the shipped helper");
   const mode = fs.statSync(shipped).mode & 0o777;
   assert((mode & 0o022) === 0, "the shipped helper is group or world writable");
+});
+
+await check("the directory helper reads no environment and only its arguments", async () => {
+  const c = fs.readFileSync(path.join(root, "editor", "dirfd-tool.c"), "utf8");
+  assert(!/\bgetenv\b/.test(c), "the helper calls getenv");
+  assert(!/\benviron\b/.test(c), "the helper reads environ");
+  const js = fs.readFileSync(path.join(root, "editor", "dirfd.mjs"), "utf8");
+  assert(js.includes("env: {}"), "the helper inherits the process environment");
+  const shipped = shippedHelper();
+  const symbols = execFileSync("nm", ["-u", shipped], { encoding: "utf8" });
+  assert(!symbols.includes("getenv"), "the shipped helper references getenv");
+  assert(!/\benviron\b/.test(symbols), "the shipped helper references environ");
+  function status(args) {
+    return spawnSync(shipped, args, { encoding: "utf8" }).status;
+  }
+  assert(status(["creat"]) === 2, "a short command ran");
+  assert(status(["creat", "name", "0", "extra"]) === 2, "creat accepted an extra argument");
+  assert(status(["creat", "name", "-1"]) === 2, "creat accepted a negative limit");
+  assert(status(["stat", "name", "extra"]) === 2, "stat accepted an extra argument");
+  assert(status(["unlink", "name", "1", "2", "extra"]) === 2, "unlink accepted an extra argument");
+  assert(status(["unlink-self", "name"]) === 2, "unlink-self accepted a name");
+  assert(status(["nope", "name"]) === 2, "an unknown command ran");
 });
 
 await check("a planted, replaced, or writable helper is refused", async () => {

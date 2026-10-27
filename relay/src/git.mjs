@@ -96,12 +96,10 @@ async function ensureGitignore(vault) {
   const raw = text.split(/\r?\n/);
   const kept = [];
   for (let i = 0; i < raw.length; i += 1) {
-    // A user's own `.*.tmp` line stays. Only the pair this relay wrote,
-    // the comment and the rule under it, is removed.
-    if (raw[i].trim() === OLD_WIDE_TEMP_COMMENT && raw[i + 1] && raw[i + 1].trim() === ".*.tmp") {
-      i += 1;
-      continue;
-    }
+    // 938d78a appended a bare `.*.tmp`. The comment is the marker added
+    // with that cleanup. Both go. A different temp rule stays.
+    const trimmed = raw[i].trim();
+    if (trimmed === OLD_WIDE_TEMP_COMMENT || trimmed === ".*.tmp") continue;
     kept.push(raw[i]);
   }
   while (kept.length && kept[kept.length - 1] === "") kept.pop();

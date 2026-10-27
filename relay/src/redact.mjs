@@ -1,6 +1,7 @@
 // Scrub secrets before anything is printed. The git token and the relay
 // token must never appear in a log line.
 import { closeSync, constants as fsConstants, createWriteStream, fchmodSync, fstatSync, ftruncateSync, lstatSync, openSync, writeSync } from "node:fs";
+import { builtinModules } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatWithOptions } from "node:util";
@@ -12,22 +13,32 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 const SLASH_ALLOW = new Set(["HTTP/1.1", "KB/s", "MB/s", "application/json", "text/plain"]);
 const NOTE_EXTS = ["markdown", "mdx", "txt", "md"];
 const SHIELD = "\uE000";
-// A log line is scrubbed only up to this size. Anything past it is dropped
-// before the path scan, so a huge line cannot make the scrub quadratic.
+// After a full scrub, anything past this size is dropped. A secret that
+// straddles the cut is masked first, so its head is not left behind.
 export const REDACT_INPUT_CAP = 64 * 1024;
+// Past this size the full scrub is no longer cheap. The text is cut at the
+// last break before 64 KB, and the trailing partial token is dropped, before
+// the mask runs. 1 MB still takes the full scrub (measured around 4 ms).
+const REDACT_CHEAP_BYTES = 2 * 1024 * 1024;
 // How far a cut walks back to finish a token. A line with no break in this
-// window keeps the 8 KB character boundary instead of collapsing to the marker.
+// window keeps the character boundary instead of collapsing to the marker.
 const CAP_BREAK_WINDOW = 256;
-// A Node stack frame we may show. The path is lowercase with no `..`, no
-// note suffix, and no uppercase segment. `.js` is the only dotted piece.
-const NODE_FRAME = /^node:[a-z_/]+(?:\.js)?:\d+:\d+$/;
+// A Node stack frame we may show. Only node:internal/... and a Node builtin
+// module. The path is lowercase with no `..` and no note suffix.
+const NODE_FRAME = /^node:[a-z0-9_./]+(?:\.js)?:\d+:\d+$/;
+const NODE_BUILTINS = new Set(builtinModules.map((name) => name.startsWith("node:") ? name.slice(5) : name));
 
-function capBytes(text, cap) {
+function cutAtBreak(text, cap) {
   const buf = Buffer.from(text);
   if (buf.length <= cap) return text;
   let end = cap;
   while (end > 0 && (buf[end] & 0xc0) === 0x80) end -= 1;
-  return buf.toString("utf8", 0, end);
+  let head = buf.toString("utf8", 0, end);
+  const floor = Math.max(0, head.length - CAP_BREAK_WINDOW);
+  let cut = head.length;
+  while (cut > floor && !isBreak(head.charCodeAt(cut - 1))) cut -= 1;
+  if (cut > floor && cut < head.length) head = head.slice(0, cut);
+  return head.replace(/\[+$/, "");
 }
 
 // One pass. The marker is a private-use character that the input no longer
@@ -41,8 +52,12 @@ export function restoreShields(text, kept) {
 
 export function redact(text, secrets) {
   // Strip the shield marker before any scrubbing so a log line cannot forge
-  // a kept frame, then drop the tail past 64 KB before the scans run.
-  let out = capBytes(String(text ?? "").replace(/\uE000/g, ""), REDACT_INPUT_CAP);
+  // a kept frame. Mask the whole text, then cap. A text too large to mask
+  // cheaply is cut at the last break before 64 KB first, which drops the
+  // partial token sitting on that cut.
+  let out = String(text ?? "").replace(/\uE000/g, "");
+  const cheap = Buffer.byteLength(out) <= REDACT_CHEAP_BYTES;
+  if (!cheap) out = cutAtBreak(out, REDACT_INPUT_CAP);
   const list = [];
   for (const secret of secrets || []) {
     const value = String(secret || "").trim();
@@ -65,7 +80,9 @@ export function redact(text, secrets) {
   const kept = [];
   out = scrubLocations(out, kept);
   out = out.replace(/file:\/\/\S+/gi, "[url]");
-  return capLocations(restoreShields(out, kept));
+  out = restoreShields(out, kept);
+  if (cheap) out = cutAtBreak(out, REDACT_INPUT_CAP);
+  return capLocations(out);
 }
 
 // One log line, then the marker. The cut is applied to text that is already
@@ -158,9 +175,9 @@ function capScrubbed(line) {
     // a partial path. No break: keep the character-boundary cut, about 8 KB.
     if (cut > floor) head = head.slice(0, cut);
   }
-  // '[' is a break, so a cut inside [path] keeps the bracket and the marker
-  // would read [[truncated]. Drop that leftover bracket.
-  if (head.endsWith("[")) head = head.slice(0, -1);
+  // '[' is a break, so a cut inside [[path]] keeps the brackets and the
+  // marker would read [[truncated]. Drop every leftover bracket.
+  head = head.replace(/\[+$/, "");
   return head + "[truncated]";
 }
 
@@ -182,13 +199,19 @@ function nodeFrameEnd(line, i) {
   }
   if (!end) return 0;
   const frame = line.slice(i, end);
-  if (!NODE_FRAME.test(frame) || frame.includes("..")) return 0;
-  const pathPart = frame.slice(5).replace(/(?:\.js)?:\d+:\d+$/, "");
-  if (pathPart !== pathPart.toLowerCase()) return 0;
-  for (const ext of NOTE_EXTS) {
-    if (pathPart.endsWith("." + ext) || pathPart.includes("." + ext + "/")) return 0;
-  }
+  if (!nodeBuiltinFrame(frame)) return 0;
   return end;
+}
+
+function nodeBuiltinFrame(frame) {
+  if (!NODE_FRAME.test(frame) || frame.includes("..")) return false;
+  const pathPart = frame.slice(5).replace(/(?:\.js)?:\d+:\d+$/, "");
+  if (pathPart !== pathPart.toLowerCase()) return false;
+  for (const ext of NOTE_EXTS) {
+    if (pathPart.endsWith("." + ext) || pathPart.includes("." + ext + "/")) return false;
+  }
+  if (pathPart === "internal" || pathPart.startsWith("internal/")) return true;
+  return NODE_BUILTINS.has(pathPart);
 }
 
 // One forward pass. Each character is copied or skipped once, so a line of

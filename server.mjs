@@ -633,18 +633,51 @@ function enqueueVaultWork(fn) {
 
 // Only this file, inside the vault's real .git. No other lock name is removed.
 const GIT_INDEX_LOCK = "index.lock";
-// A lock we did not record is removed only when it is at least this old and
-// no live process still has it open.
-export const GIT_LOCK_STALE_MS = 15 * 60 * 1000;
-// Printed once per vault when index.lock is still there and we cannot prove
-// it is the inode our git recorded or that it is old and unused. No path.
+// Printed once per vault when index.lock is still there and we will not
+// remove it. No path. An old lock this relay did not record stays, and is
+// logged with this line.
 export const GIT_LOCK_KEPT_LINE = "git index lock kept";
-const MAX_GIT_DIR_LINKS = 8;
 const GIT_DIR_GROUP_WRITE = 0o022;
 const GIT_DIR_STICKY = 0o1000;
-// vault path -> { dev, ino } of the index.lock our own git failed to unlink.
+// vault path -> identity of the index.lock our own git failed to unlink.
+// dev, ino, size, ctime, and birthtime when the platform reports one.
 const staleGitLocks = new Map();
 const gitLockKeptLogged = new Set();
+let gitLockBeforeUnlinkForTest = null;
+
+function lockIdentity(st) {
+  const birth = st.birthtimeMs;
+  return {
+    dev: st.dev,
+    ino: st.ino,
+    size: st.size,
+    ctimeMs: st.ctimeMs,
+    birthtimeMs: typeof birth === "number" && birth > 0 ? birth : null,
+  };
+}
+
+function sameLock(recorded, live) {
+  if (!recorded || !live) return false;
+  if (recorded.dev !== live.dev || recorded.ino !== live.ino) return false;
+  if (recorded.size !== live.size || recorded.ctimeMs !== live.ctimeMs) return false;
+  if (recorded.birthtimeMs != null && live.birthtimeMs != null && recorded.birthtimeMs !== live.birthtimeMs) return false;
+  return true;
+}
+
+// The holder check can take the whole lsof wait. A test uses this to swap
+// index.lock in that window. Off unless this process is a test.
+export function setGitLockBeforeUnlinkForTest(fn) {
+  if (process.env.NODE_ENV !== "test") return;
+  gitLockBeforeUnlinkForTest = typeof fn === "function" ? fn : null;
+}
+
+// Tests that prove an unlink need a finished holder scan. Production never
+// sets this. Off unless this process is a test.
+let gitLockHoldersForTest = null;
+export function setGitLockHoldersForTest(fn) {
+  if (process.env.NODE_ENV !== "test") return;
+  gitLockHoldersForTest = typeof fn === "function" ? fn : null;
+}
 
 function reportGitLockKept(key) {
   if (gitLockKeptLogged.has(key)) return;
@@ -660,23 +693,14 @@ function vaultKey(vault) {
   return path.resolve(String(vault || ""));
 }
 
-// Walk vault/.git. A root-owned symlink (macOS /var, /tmp) is followed.
-// Any other symlink, including .git itself, is refused.
+// Walk vault/.git. Every symlink is refused, including one owned by root.
 function resolveGitDir(vault) {
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   if (typeof uid !== "number") return null;
-  let abs = path.resolve(vault, ".git");
-  const seen = new Set();
-  for (let hop = 0; hop <= MAX_GIT_DIR_LINKS; hop += 1) {
-    const step = walkGitDir(abs, uid, seen);
-    if (!step) return null;
-    if (step.done) return step.done;
-    abs = step.next;
-  }
-  return null;
+  return walkGitDir(path.resolve(vault, ".git"), uid);
 }
 
-function walkGitDir(abs, uid, seen) {
+function walkGitDir(abs, uid) {
   const chain = [];
   let cursor = abs;
   for (;;) {
@@ -694,22 +718,7 @@ function walkGitDir(abs, uid, seen) {
     } catch {
       return null;
     }
-    if (st.isSymbolicLink()) {
-      if (st.uid !== 0 || seen.has(dir)) return null;
-      seen.add(dir);
-      let target;
-      try {
-        target = fsSync.readlinkSync(dir);
-      } catch {
-        return null;
-      }
-      const linked = path.resolve(path.dirname(dir), target);
-      const rest = path.relative(dir, abs);
-      const next = !rest || rest.startsWith("..") || path.isAbsolute(rest)
-        ? linked
-        : path.resolve(linked, rest);
-      return { next };
-    }
+    if (st.isSymbolicLink()) return null;
     if (!st.isDirectory()) return null;
     const writable = (st.mode & GIT_DIR_GROUP_WRITE) !== 0;
     const stickyRoot = (st.mode & GIT_DIR_STICKY) !== 0 && st.uid === 0;
@@ -718,7 +727,7 @@ function walkGitDir(abs, uid, seen) {
     stat = st;
   }
   if (!stat) return null;
-  return { done: { dir: abs, dev: stat.dev, ino: stat.ino } };
+  return { dir: abs, dev: stat.dev, ino: stat.ino };
 }
 
 function namedIndexLock(named, vault) {
@@ -735,17 +744,24 @@ function namedIndexLock(named, vault) {
   return ownGit;
 }
 
-function processHoldsLock(file, dev, ino) {
+async function processHoldsLock(file, dev, ino) {
+  if (process.env.NODE_ENV === "test" && gitLockHoldersForTest) {
+    const forced = gitLockHoldersForTest(file, dev, ino);
+    if (forced === "unknown") return "unknown";
+    return forced ? "held" : "free";
+  }
   if (process.platform === "linux") return linuxProcessHolds(dev, ino);
   return lsofHolds(file);
 }
 
+// "held", "free", or "unknown". Another user's descriptor directory that we
+// cannot read is unknown: the lock stays.
 function linuxProcessHolds(dev, ino) {
   let pids;
   try {
     pids = fsSync.readdirSync("/proc");
   } catch {
-    return true;
+    return "unknown";
   }
   for (const pid of pids) {
     if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
@@ -753,47 +769,111 @@ function linuxProcessHolds(dev, ino) {
     let fds;
     try {
       fds = fsSync.readdirSync(fdDir);
-    } catch {
-      continue;
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
+      return "unknown";
     }
     for (const fd of fds) {
       try {
         const st = fsSync.statSync(path.join(fdDir, fd));
-        if (st.dev === dev && st.ino === ino) return true;
-      } catch { /* the descriptor closed */ }
+        if (st.dev === dev && st.ino === ino) return "held";
+      } catch (error) {
+        if (error && (error.code === "EACCES" || error.code === "EPERM")) return "unknown";
+      }
     }
   }
-  return false;
+  return "free";
 }
 
 function lsofHolds(file) {
-  const result = spawnSync("lsof", ["-t", "--", file], { encoding: "utf8", timeout: 2000 });
-  if (result.error || result.status == null) return true;
-  if (result.status !== 0 && result.status !== 1) return true;
-  return String(result.stdout || "")
-    .split(/\s+/)
-    .some((pid) => pid && Number(pid) !== process.pid);
+  return new Promise((resolve) => {
+    let out = "";
+    let settled = false;
+    let timer;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const child = spawn("lsof", ["-t", "--", file], { stdio: ["ignore", "pipe", "ignore"] });
+    timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish("unknown");
+    }, 2000);
+    child.stdout.on("data", (chunk) => { out += chunk; });
+    child.on("error", () => finish("unknown"));
+    child.on("close", (code) => {
+      if (settled) return;
+      if (code == null || (code !== 0 && code !== 1)) {
+        finish("unknown");
+        return;
+      }
+      const held = String(out).split(/\s+/).some((pid) => pid && Number(pid) !== process.pid);
+      finish(held ? "held" : "free");
+    });
+  });
 }
 
-function unlinkRecordedLock(lockPath, dev, ino) {
+// True when the lock is gone or this call removed it. False leaves it in place.
+// The walk is repeated immediately before the path unlink: the open above it
+// can sit behind a long holder check, and the inode may have been reused.
+function unlinkRecordedLock(vault, identity) {
+  if (process.env.NODE_ENV === "test" && gitLockBeforeUnlinkForTest) {
+    const fn = gitLockBeforeUnlinkForTest;
+    gitLockBeforeUnlinkForTest = null;
+    fn();
+  }
+  const git = resolveGitDir(vault);
+  if (!git) return false;
+  const lockPath = path.join(git.dir, GIT_INDEX_LOCK);
+  let st;
+  try {
+    st = fsSync.lstatSync(lockPath);
+  } catch (error) {
+    return Boolean(error && error.code === "ENOENT");
+  }
+  if (st.isSymbolicLink() || !st.isFile() || !sameLock(identity, lockIdentity(st))) return false;
+  let parent;
+  try {
+    parent = fsSync.lstatSync(git.dir);
+  } catch {
+    return false;
+  }
+  if (parent.isSymbolicLink() || !parent.isDirectory() || parent.dev !== git.dev || parent.ino !== git.ino) return false;
   let fd = -1;
   try {
     fd = fsSync.openSync(lockPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
     const opened = fsSync.fstatSync(fd);
-    if (!opened.isFile() || opened.isSymbolicLink() || opened.dev !== dev || opened.ino !== ino) return;
+    if (!opened.isFile() || !sameLock(identity, lockIdentity(opened))) return false;
   } catch {
-    return;
+    return false;
   } finally {
     if (fd >= 0) {
       try { fsSync.closeSync(fd); } catch { /* the unlink still decides */ }
     }
   }
-  try { fsSync.unlinkSync(lockPath); } catch { /* the next git reports the lock */ }
+  const againGit = resolveGitDir(vault);
+  if (!againGit || againGit.dev !== git.dev || againGit.ino !== git.ino || againGit.dir !== git.dir) return false;
+  const againPath = path.join(againGit.dir, GIT_INDEX_LOCK);
+  let again;
+  try {
+    again = fsSync.lstatSync(againPath);
+  } catch (error) {
+    return Boolean(error && error.code === "ENOENT");
+  }
+  if (again.isSymbolicLink() || !again.isFile() || !sameLock(identity, lockIdentity(again))) return false;
+  try {
+    fsSync.unlinkSync(againPath);
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 // Git's "unable to unlink" text is not a path we may delete. The only
 // accepted file is <walked real .git>/index.lock, and only when that walk
-// refused every symlink that this user owns.
+// refused every symlink, including one owned by root.
 export function rememberUnlinkLock(errText, vault = VAULT) {
   const key = vaultKey(vault);
   const re = /unable to unlink '([^']+)'/g;
@@ -817,17 +897,19 @@ export function rememberUnlinkLock(errText, vault = VAULT) {
       continue;
     }
     if (parent.isSymbolicLink() || !parent.isDirectory() || parent.dev !== git.dev || parent.ino !== git.ino) continue;
-    recorded = { dev: st.dev, ino: st.ino };
+    recorded = lockIdentity(st);
   }
   if (recorded) staleGitLocks.set(key, recorded);
 }
 
-// Drop index.lock only when it is still the inode our failed git recorded,
-// or it is old and no live process has it open. A symlink on the way to
-// .git, a lock outside .git, and a lock a live git still holds stay put.
-// A lock that is neither ours nor stale is left in place, and that fact is
-// logged once per vault with no path.
-export function releaseRememberedGitLock(vault = VAULT) {
+// Drop index.lock only when it is still the file our failed git recorded
+// (device, inode, size, ctime, and birthtime where both sides have one)
+// and no live process has it open. That identity is required again, from
+// a fresh walk of .git, immediately before unlink. A lock this relay did
+// not record stays, however old it is. A symlink on the way to .git, a
+// lock outside .git, and a lock a live git still holds stay put. A lock
+// we leave in place is logged once per vault with no path.
+export async function releaseRememberedGitLock(vault = VAULT) {
   const key = vaultKey(vault);
   const recorded = staleGitLocks.get(key) || null;
   const git = resolveGitDir(vault);
@@ -863,19 +945,28 @@ export function releaseRememberedGitLock(vault = VAULT) {
     clearGitLockKept(key);
     return;
   }
-  const same = recorded && recorded.dev === st.dev && recorded.ino === st.ino;
-  const stale = Date.now() - st.mtimeMs >= GIT_LOCK_STALE_MS;
-  if (processHoldsLock(lockPath, st.dev, st.ino)) {
-    if (!same && !stale) reportGitLockKept(key);
+  const current = lockIdentity(st);
+  const same = sameLock(recorded, current);
+  const holders = await processHoldsLock(lockPath, st.dev, st.ino);
+  if (holders === "unknown") {
+    reportGitLockKept(key);
+    return;
+  }
+  if (holders === "held") {
+    if (!same) reportGitLockKept(key);
+    return;
+  }
+  if (!same) {
+    staleGitLocks.delete(key);
+    reportGitLockKept(key);
     return;
   }
   staleGitLocks.delete(key);
-  if (!same && !stale) {
+  if (!unlinkRecordedLock(vault, current)) {
     reportGitLockKept(key);
     return;
   }
   clearGitLockKept(key);
-  unlinkRecordedLock(lockPath, st.dev, st.ino);
 }
 
 // Tests set AIDANOS_TEST_GIT_TURN to a file outside the vault. Git work holds
@@ -2178,7 +2269,7 @@ async function syncVault(commitPaths, resolvePaths) {
   if (vaultGit.syncPaused) return;
   try {
     await assertVaultOpen();
-    releaseRememberedGitLock();
+    await releaseRememberedGitLock();
     await syncVaultBody();
   } catch (e) {
     if (e && e.aidanosStop) {
@@ -3347,7 +3438,7 @@ const server = http.createServer(async (req, res) => {
       try {
         await enqueueVaultGit(async () => {
           await assertVaultOpen();
-          releaseRememberedGitLock();
+          await releaseRememberedGitLock();
           const result = await joinVault();
           await noteUnrelated().catch(() => {});
           status = result.status;

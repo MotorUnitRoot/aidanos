@@ -1278,8 +1278,12 @@ test("a worker that stops answering pings is restarted", async () => {
     testHang: true,
   });
   try {
-    await waitFor(() => seen.some((line) => line.includes("worker heartbeat")), 20_000, "heartbeat did not restart the worker");
-    assert.equal(seen.some((line) => /worker exited code=\d+, restart in \d+ms/.test(line)), true, seen.join("\n"));
+    await waitFor(
+      () => seen.some((line) => /worker exited code=\d+, restart in \d+ms/.test(line)),
+      20_000,
+      "heartbeat did not restart the worker",
+    );
+    assert.equal(seen.some((line) => line.includes("worker heartbeat")), true);
   } finally {
     console.error = write;
     await relay.close();

@@ -42,7 +42,7 @@ const STICKY = 0o1000;
 // A rebuilt binary does not run until this constant is updated.
 const HELPER_SHA256 = {
   "linux-x64": "a11fa3f5c70468692bcba1bc1fb30a47151c351100cacf98d830e3f621ef7e2c",
-  "darwin-arm64": "0822955a14335f1cbd69239c4eaa886f156a81f76384d29992e8b6567ff6fd3c",
+  "darwin-arm64": "605a6f8d353fe2a1f4b0c97de9bb9a942d6f8b00b6ed7d1c0950c521968131e4",
   "darwin-x64": "381a4c24358f62aed38f2377e2e5e084b6eab9cbb66d3b92c5cab2281c336bee",
 };
 

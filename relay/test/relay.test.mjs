@@ -856,6 +856,44 @@ test("a save that outlasts the shutdown bound is logged before close", { timeout
   assert.ok(elapsed < 1500, "waited out the save in " + elapsed + "ms");
 });
 
+test("a second signal during the save wait exits immediately", { timeout: 20000 }, async () => {
+  const dir = await tempDir();
+  const staged = path.join(dir, "staged");
+  const body = slowSaveNoteBody();
+  const started = await spawnRelay(dir, {
+    NODE_ENV: "test",
+    AIDANOS_RELAY_TEST_SLOW_SAVE: "1",
+    AIDANOS_RELAY_TEST_SAVE_STAGED: staged,
+    AIDANOS_RELAY_TEST_SAVE_HOLD_MS: "8000",
+  });
+  try {
+    await waitForPath(staged);
+  } catch (error) {
+    closeSync(started.fd);
+    started.child.kill("SIGKILL");
+    throw error;
+  }
+  const began = Date.now();
+  started.child.kill("SIGTERM");
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  started.child.kill("SIGINT");
+  const [code] = await once(started.child, "exit");
+  const elapsed = Date.now() - began;
+  closeSync(started.fd);
+  const text = await fs.readFile(started.stderr, "utf8");
+  let note = "";
+  try {
+    note = await fs.readFile(path.join(started.vault, SLOW_SAVE_NOTE_NAME), "utf8");
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  assert.equal(code, 1, text);
+  assert.match(text, new RegExp(SHUTDOWN_TIMEOUT_LINE));
+  assert.equal(text.includes("relay log closed"), false, text);
+  assert.notEqual(note, body);
+  assert.ok(elapsed < 2000, "second signal waited " + elapsed + "ms");
+});
+
 test("index trace turns off when automerge internals are missing", async () => {
   const lines = [];
   await installIndexTrace((line) => lines.push(line), {

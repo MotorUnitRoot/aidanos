@@ -661,6 +661,7 @@ async function gitLockKeepsSameUidScanError() {
     "os.waitpid(pid, 0)",
   ].join("\n")], { stdio: ["ignore", "pipe", "pipe"] });
   let deniedPid = 0;
+  let unreaped = false;
   try {
     const line = await new Promise((resolve, reject) => {
       let buf = "";
@@ -710,9 +711,10 @@ async function gitLockKeepsSameUidScanError() {
       } catch {
         gone = true;
       }
-      if (!gone) throw new Error("the non-dumpable process was not reaped");
+      unreaped = !gone;
     }
   }
+  if (unreaped) throw new Error("the non-dumpable process was not reaped");
 }
 
 function linuxSameUidDescriptorsReadable() {

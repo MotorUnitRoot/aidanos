@@ -1163,7 +1163,7 @@ await check("a write ACL for another principal is refused", async () => {
   fs.chmodSync(dir, 0o755);
   const before = ancestorFault(bin);
   assert(before === "", "the temp path was already refused: " + before);
-  const added = spawnSync("chmod", ["+a", "user:0 allow write,append,delete,delete_child", dir], { encoding: "utf8" });
+  const added = spawnSync("chmod", ["+a", "user:root allow write,append,delete,delete_child", dir], { encoding: "utf8" });
   assert(added.status === 0, "chmod +a failed: " + (added.stderr || added.error));
   try {
     assert(ancestorFault(bin) === "ancestor-acl", ancestorFault(bin) || "a write ACL for another principal was allowed");

@@ -16,11 +16,10 @@
 #   MACOSX_DEPLOYMENT_TARGET=12.0
 #   cc -O2 -fno-ident -ffile-prefix-map=$ROOT=srcroot -frandom-seed=aidanos-dirfd \
 #       -o OUT editor/dirfd-tool.c
-# -Wl,-no_uuid produced two identical binaries, and macOS abort-trapped both
-# before main. -Wl,-no_adhoc_codesign did the same. The check tries the
-# default link and a fixed -Wl,-uuid. It accepts the first candidate whose
-# two builds match and which exits 2 on a short command. If none does, the
-# check fails. It does not hash only part of the file.
+# The default UUID is a content hash on this linker, so two builds match.
+# -Wl,-no_uuid also matched, then macOS abort-trapped the binary before main,
+# so that flag is not used. -Wl,-no_adhoc_codesign abort-trapped as well.
+# Executing /dev/fd returns EACCES. The server executes the checked path.
 #
 # CFLAGS, CXXFLAGS, CPPFLAGS, LDFLAGS, and CC are ignored. The helper source
 # must not call getenv, and the rebuild must not reference getenv or environ.
@@ -88,7 +87,7 @@ if [ ! -f "$pinned" ]; then
 fi
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"; rm -f "$root/editor/bin/.dirfd-exec-probe"' EXIT
+trap 'rm -rf "$work"' EXIT
 
 hash_file() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -98,112 +97,23 @@ hash_file() {
   fi
 }
 
-# Build twice to the same path. A timestamp or UUID that the flags do not
-# fix makes the two hashes differ.
-# Returns 0 when the two builds match and a short command exits 2.
-# The hash is written to $work/$name/hash.
-build_pair() {
-  name=$1
-  extra=$2
-  dir="$work/$name"
-  mkdir -p "$dir"
-  echo "candidate $name"
-  echo "candidate-flags $flags $extra"
-  set +e
-  # shellcheck disable=SC2086
-  "$compiler" $flags $extra -o "$dir/tool" "$root/editor/dirfd-tool.c" >"$dir/build.err" 2>&1
-  status=$?
-  set -e
-  if [ "$status" -ne 0 ]; then
-    echo "candidate $name compile failed" >&2
-    cat "$dir/build.err" >&2
-    return 1
-  fi
-  cp "$dir/tool" "$dir/first"
-  rm -f "$dir/tool"
-  set +e
-  # shellcheck disable=SC2086
-  "$compiler" $flags $extra -o "$dir/tool" "$root/editor/dirfd-tool.c" >"$dir/build.err" 2>&1
-  status=$?
-  set -e
-  if [ "$status" -ne 0 ]; then
-    echo "candidate $name second compile failed" >&2
-    cat "$dir/build.err" >&2
-    return 1
-  fi
-  one=$(hash_file "$dir/first")
-  two=$(hash_file "$dir/tool")
-  echo "candidate $name rebuild-1 $one"
-  echo "candidate $name rebuild-2 $two"
-  if [ "$one" != "$two" ]; then
-    echo "candidate $name not reproducible" >&2
-    return 1
-  fi
-  if command -v otool >/dev/null 2>&1; then
-    otool -l "$dir/tool" | awk '/LC_UUID/{show=1} show && /uuid /{print "candidate '"$name"' " $0; exit}' || true
-  fi
-  if command -v codesign >/dev/null 2>&1; then
-    codesign -dv "$dir/tool" 2>&1 | awk -v n="$name" '{print "candidate " n " codesign " $0}' || true
-  fi
-  set +e
-  "$dir/tool" creat >"$dir/out" 2>"$dir/err"
-  status=$?
-  set -e
-  echo "candidate $name exec-status $status"
-  echo "candidate $name exec-stderr $(tr '\n' ' ' < "$dir/err")"
-  cp "$dir/tool" "$root/editor/bin/.dirfd-exec-probe"
-  chmod 755 "$root/editor/bin/.dirfd-exec-probe"
-  set +e
-  "$root/editor/bin/.dirfd-exec-probe" creat >"$dir/out2" 2>"$dir/err2"
-  status2=$?
-  set -e
-  rm -f "$root/editor/bin/.dirfd-exec-probe"
-  echo "candidate $name exec-in-tree-status $status2"
-  echo "candidate $name exec-in-tree-stderr $(tr '\n' ' ' < "$dir/err2")"
-  if [ "$status" -ne 2 ] || [ "$status2" -ne 2 ]; then
-    echo "candidate $name does not run" >&2
-    return 1
-  fi
-  hash_file "$dir/tool" > "$dir/hash"
-  return 0
-}
+# Same output path both times, so a path embedded by the linker is not a
+# difference. A timestamp or UUID that survives the flags above still is.
+# shellcheck disable=SC2086
+"$compiler" $flags -o "$work/tool" "$root/editor/dirfd-tool.c"
+cp "$work/tool" "$work/first"
+rm -f "$work/tool"
+# shellcheck disable=SC2086
+"$compiler" $flags -o "$work/tool" "$root/editor/dirfd-tool.c"
 
-official=""
-if [ "$osname" = linux ]; then
-  if ! build_pair linux ""; then
-    echo "not reproducible" >&2
-    exit 1
-  fi
-  official=$(cat "$work/linux/hash")
-  cp "$work/linux/tool" "$work/tool"
-  echo "official linux $official"
-else
-  # Default link first. A fixed UUID is the fallback that still puts LC_UUID
-  # in the file. -no_uuid is recorded and is not accepted: that binary
-  # abort-traps. The first candidate that matches itself and runs wins.
-  for spec in "default|" "fixed-uuid|-Wl,-uuid,00112233445566778899aabbccddeeff" "no-uuid|-Wl,-no_uuid"; do
-    name=${spec%%|*}
-    extra=${spec#*|}
-    if build_pair "$name" "$extra"; then
-      if [ "$name" = "no-uuid" ]; then
-        echo "candidate no-uuid ran; refusing it because this OS abort-trapped that flag before and a running copy is unexpected" >&2
-        continue
-      fi
-      official=$(cat "$work/$name/hash")
-      cp "$work/$name/tool" "$work/tool"
-      echo "official $name $official"
-      break
-    fi
-  done
-fi
-if [ -z "$official" ] || [ ! -f "$work/tool" ]; then
+first=$(hash_file "$work/first")
+second=$(hash_file "$work/tool")
+echo "rebuild-1 $first"
+echo "rebuild-2 $second"
+if [ "$first" != "$second" ]; then
   echo "not reproducible" >&2
   exit 1
 fi
-first=$official
-second=$official
-echo "rebuild-1 $first"
-echo "rebuild-2 $second"
 
 if ! command -v nm >/dev/null 2>&1; then
   echo "nm is required to check that the helper does not reference the environment" >&2
@@ -218,11 +128,12 @@ expect_status() {
   expected=$1
   shift
   set +e
-  "$work/tool" "$@" >/dev/null 2>&1
+  "$work/tool" "$@" >/dev/null 2>"$work/err"
   status=$?
   set -e
   if [ "$status" -ne "$expected" ]; then
     echo "helper $* exited $status, expected $expected" >&2
+    echo "stderr: $(tr '\n' ' ' < "$work/err")" >&2
     exit 1
   fi
 }
@@ -236,7 +147,7 @@ expect_status 2 unlink-self name
 expect_status 2 nope name
 
 # The rebuilt binary must perform a directory-fd stat. On macOS this also
-# prints whether /dev/fd can be executed. The server does not use that path.
+# prints whether /dev/fd can be executed. The server executes the path.
 node --input-type=module - "$work/tool" << 'EOF'
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";

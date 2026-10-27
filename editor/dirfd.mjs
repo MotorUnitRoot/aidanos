@@ -33,7 +33,7 @@ const GROUP_OR_OTHER_WRITE = 0o022;
 // A rebuilt binary does not run until this constant is updated.
 const HELPER_SHA256 = {
   "linux-x64": "78bbeec3aa73aeb0526f8cbe0f17ca20d0eeee1c4dd859e0299960b6964da92d",
-  "darwin-arm64": "44d21f908defa2a055e7fcfbafdcd4caf4c7bb7d7ebf0eed9ce8015f4b686342",
+  "darwin-arm64": "0822955a14335f1cbd69239c4eaa886f156a81f76384d29992e8b6567ff6fd3c",
 };
 
 function badPath() {

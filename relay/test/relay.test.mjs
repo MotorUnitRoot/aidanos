@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { closeSync, openSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, openSync, readSync, writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import net from "node:net";
 import { once } from "node:events";
@@ -14,13 +14,15 @@ import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
-import { installFileLog, logFatal, logSafe, redact, stampLine } from "../src/redact.mjs";
+import { FATAL_FALLBACK_NAME, flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, redact, stampLine } from "../src/redact.mjs";
 import { emptyLateState, installIndexTrace, nextLoopLateLine } from "../src/index-trace.mjs";
 import { cbor } from "@automerge/automerge-repo";
 import { describeSyncFrame, logSyncFrame } from "../src/sync-log.mjs";
 import {
   LAN_WARNING,
   MAX_PAYLOAD,
+  SHUTDOWN_DEADLINE_MS,
+  SHUTDOWN_TIMEOUT_LINE,
   loadToken,
   nodeRequirement,
   parseArgs,
@@ -190,37 +192,189 @@ test("a fatal log writes queued lines first", async () => {
   assert.match(lines[2], /fatal-line$/);
 });
 
-test("a full pipe does not throw out of a fatal log", async () => {
-  const server = net.createServer();
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const port = server.address().port;
-  const accepted = new Promise((resolve) => server.once("connection", resolve));
-  const writer = net.connect(port, "127.0.0.1");
-  const reader = await accepted;
-  await once(writer, "connect");
-  reader.pause();
-  reader.on("error", () => {});
-  writer.on("error", () => {});
-  const fd = writer._handle.fd;
-  const chunk = Buffer.alloc(64 * 1024, 0x61);
-  let blocked = false;
+function fullFifo(dir) {
+  const fifo = path.join(dir, "stderr.pipe");
+  execFileSync("mkfifo", [fifo]);
+  const reader = openSync(fifo, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+  const fd = openSync(fifo, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK);
+  return {
+    fd,
+    // Nothing is polling the read end, so a full pipe stays full while the
+    // fatal write retries.
+    fill() {
+      const chunk = Buffer.alloc(64 * 1024, 0x61);
+      let blocked = false;
+      try {
+        for (;;) writeSync(fd, chunk);
+      } catch (error) {
+        assert.equal(error.code, "EAGAIN");
+        blocked = true;
+      }
+      assert.equal(blocked, true);
+      try {
+        writeSync(fd, Buffer.from("x"));
+        assert.fail("the pipe accepted another byte");
+      } catch (error) {
+        assert.equal(error.code, "EAGAIN");
+      }
+    },
+    read() {
+      const chunks = [];
+      const buf = Buffer.alloc(64 * 1024);
+      for (;;) {
+        let n = 0;
+        try {
+          n = readSync(reader, buf, 0, buf.length, null);
+        } catch (error) {
+          if (error.code === "EAGAIN") break;
+          throw error;
+        }
+        if (!n) break;
+        chunks.push(Buffer.from(buf.subarray(0, n)));
+      }
+      return Buffer.concat(chunks).toString("utf8");
+    },
+    close() {
+      closeSync(fd);
+      closeSync(reader);
+    },
+  };
+}
+
+test("a flush writes the queued lines", async () => {
+  const dir = await tempDir();
+  const file = path.join(dir, "stderr.log");
+  const fd = openSync(file, "w");
+  const installed = installFileLog(fd);
   try {
-    for (;;) writeSync(fd, chunk);
-  } catch (error) {
-    assert.equal(error.code, "EAGAIN");
-    blocked = true;
-  }
-  assert.equal(blocked, true);
-  const installed = installFileLog(fd, { cap: 32 * 1024 });
-  try {
-    logSafe([], "queued before fatal");
-    assert.doesNotThrow(() => logFatal([], "fatal on a full pipe"));
+    pauseFileLog();
+    logSafe([], "queued-alpha");
+    logSafe([], "queued-beta");
+    assert.equal((await fs.readFile(file, "utf8")).includes("queued-alpha"), false);
+    flushFileLog();
+    const text = await fs.readFile(file, "utf8");
+    const alpha = text.indexOf("queued-alpha");
+    const beta = text.indexOf("queued-beta");
+    assert.ok(alpha !== -1 && beta !== -1 && alpha < beta, text);
   } finally {
     installed.restore();
-    reader.destroy();
-    writer.destroy();
-    server.close();
+    closeSync(fd);
   }
+});
+
+test("a flush writes the queued lines when the stream hides its buffer", async () => {
+  const dir = await tempDir();
+  const file = path.join(dir, "stderr.log");
+  const fd = openSync(file, "w");
+  const installed = installFileLog(fd);
+  try {
+    pauseFileLog();
+    logSafe([], "hidden-alpha");
+    logSafe([], "hidden-beta");
+    assert.equal((await fs.readFile(file, "utf8")).includes("hidden-alpha"), false);
+    // Assigning null goes through Node's setter and leaves an empty array,
+    // which is still "there". Shadow the getter so the flush has no queue.
+    const state = installed.stream._writableState;
+    Object.defineProperty(state, "buffered", {
+      configurable: true,
+      get() {
+        return undefined;
+      },
+    });
+    assert.equal(Array.isArray(state.buffered), false);
+    flushFileLog();
+    delete state.buffered;
+    const text = await fs.readFile(file, "utf8");
+    const alpha = text.indexOf("hidden-alpha");
+    const beta = text.indexOf("hidden-beta");
+    assert.ok(alpha !== -1 && beta !== -1 && alpha < beta, text);
+  } finally {
+    installed.restore();
+    closeSync(fd);
+  }
+});
+
+test("a fatal log writes the drop notice before the fatal line", async () => {
+  const dir = await tempDir();
+  const file = path.join(dir, "stderr.log");
+  const fd = openSync(file, "w");
+  const installed = installFileLog(fd, { cap: 1024 });
+  try {
+    const line = "x".repeat(200);
+    for (let i = 0; i < 100 && installed.dropped === 0; i += 1) logSafe([], line);
+    assert.ok(installed.dropped > 0, "the cap was never hit");
+    logFatal([], "fatal-after-drop");
+    const text = await fs.readFile(file, "utf8");
+    const noticeAt = text.indexOf(installed.dropped + " lines dropped");
+    const fatalAt = text.indexOf("fatal-after-drop");
+    assert.ok(noticeAt !== -1, text.slice(-500));
+    assert.ok(fatalAt !== -1 && noticeAt < fatalAt, text.slice(-500));
+  } finally {
+    installed.restore();
+    closeSync(fd);
+  }
+});
+
+test("a fatal line on a full pipe lands in the pipe or the fallback file", async () => {
+  const dir = await tempDir();
+  const pipe = fullFifo(dir);
+  const marker = "fatal-on-a-full-pipe";
+  const installed = installFileLog(pipe.fd, { cap: 32 * 1024, fallbackDir: dir });
+  let elapsed = 0;
+  try {
+    pauseFileLog();
+    logSafe([], "queued before fatal");
+    pipe.fill();
+    const started = Date.now();
+    assert.doesNotThrow(() => logFatal([], marker));
+    elapsed = Date.now() - started;
+  } finally {
+    installed.restore();
+  }
+  assert.ok(elapsed < 500, "fatal write took " + elapsed + "ms");
+  const piped = pipe.read();
+  pipe.close();
+  const fallbackFile = path.join(dir, FATAL_FALLBACK_NAME);
+  let fallback = "";
+  try {
+    const st = await fs.lstat(fallbackFile);
+    assert.equal(st.isSymbolicLink(), false);
+    assert.equal(st.isFile(), true);
+    assert.equal(st.mode & 0o777, 0o600);
+    fallback = await fs.readFile(fallbackFile, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const inPipe = piped.includes(marker);
+  const inFile = fallback.includes(marker);
+  assert.ok(inPipe || inFile, "fatal line missing from the pipe and " + fallbackFile);
+  if (!inPipe) assert.ok(elapsed >= 50, "gave up on EAGAIN in " + elapsed + "ms");
+});
+
+test("a fatal fallback does not follow a symlink", async () => {
+  const dir = await tempDir();
+  const target = path.join(dir, "target.log");
+  await fs.writeFile(target, "untouched\n");
+  const linkDir = path.join(dir, "state");
+  await fs.mkdir(linkDir);
+  await fs.symlink(target, path.join(linkDir, FATAL_FALLBACK_NAME));
+  const pipe = fullFifo(dir);
+  const marker = "fatal-skipped-symlink";
+  const installed = installFileLog(pipe.fd, { cap: 32 * 1024, fallbackDir: linkDir });
+  try {
+    pipe.fill();
+    const started = Date.now();
+    assert.doesNotThrow(() => logFatal([], marker));
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 500, "symlink fallback took " + elapsed + "ms");
+    assert.ok(elapsed >= 70, "symlink fallback skipped the retry in " + elapsed + "ms");
+  } finally {
+    installed.restore();
+    pipe.close();
+  }
+  const linkStat = await fs.lstat(path.join(linkDir, FATAL_FALLBACK_NAME));
+  assert.equal(linkStat.isSymbolicLink(), true);
+  assert.equal(await fs.readFile(target, "utf8"), "untouched\n");
 });
 
 async function signalFlushesLastLine(signal) {
@@ -236,6 +390,8 @@ async function signalFlushesLastLine(signal) {
   delete env.AIDANOS_RELAY_TOKEN_FILE;
   delete env.AIDANOS_RELAY_GIT_URL;
   delete env.AIDANOS_RELAY_GIT_TOKEN;
+  delete env.AIDANOS_RELAY_TEST_HANG_CLOSE;
+  delete env.AIDANOS_RELAY_TEST_SHUTDOWN_MS;
   const child = spawn(process.execPath, [server, "--vault", vault, "--data", data, "--port", "0"], {
     env,
     stdio: ["ignore", "pipe", fd],
@@ -277,6 +433,78 @@ test("a SIGTERM flushes the last log line", async () => {
 
 test("a SIGINT flushes the last log line", async () => {
   await signalFlushesLastLine("SIGINT");
+});
+
+async function hungCloseExits(first, second, deadlineMs) {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await fs.mkdir(vault);
+  await fs.mkdir(data);
+  const file = path.join(dir, "stderr.log");
+  const fd = openSync(file, "w");
+  const server = fileURLToPath(new URL("../src/server.mjs", import.meta.url));
+  const env = { ...process.env, NODE_ENV: "test", AIDANOS_RELAY_TOKEN: TOKEN, AIDANOS_RELAY_TEST_HANG_CLOSE: "1" };
+  delete env.AIDANOS_RELAY_TOKEN_FILE;
+  delete env.AIDANOS_RELAY_GIT_URL;
+  delete env.AIDANOS_RELAY_GIT_TOKEN;
+  delete env.AIDANOS_RELAY_TEST_SHUTDOWN_MS;
+  if (deadlineMs) env.AIDANOS_RELAY_TEST_SHUTDOWN_MS = String(deadlineMs);
+  const child = spawn(process.execPath, [server, "--vault", vault, "--data", data, "--port", "0"], {
+    env,
+    stdio: ["ignore", "pipe", fd],
+  });
+  let stdout = "";
+  const ready = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("no LISTENING\n" + stdout)), 20000);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (!stdout.includes("LISTENING")) return;
+      clearTimeout(timer);
+      resolve();
+    });
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error("exited " + code + " before LISTENING\n" + stdout));
+    });
+  });
+  try {
+    await ready;
+  } catch (error) {
+    closeSync(fd);
+    child.kill("SIGKILL");
+    throw error;
+  }
+  const started = Date.now();
+  child.kill(first);
+  if (second) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    child.kill(second);
+  }
+  const [code, delivered] = await once(child, "exit");
+  const elapsed = Date.now() - started;
+  closeSync(fd);
+  const text = await fs.readFile(file, "utf8");
+  const lines = text.split("\n").filter((entry) => entry.trim() !== "");
+  return { code, delivered, elapsed, last: lines[lines.length - 1] || "", text };
+}
+
+test("a hung close exits after the shutdown deadline", { timeout: 20000 }, async () => {
+  assert.equal(SHUTDOWN_DEADLINE_MS, 5000);
+  const result = await hungCloseExits("SIGTERM", "", 400);
+  assert.equal(result.delivered, null);
+  assert.equal(result.code, 1, result.text);
+  assert.match(result.last, new RegExp(SHUTDOWN_TIMEOUT_LINE + "$"));
+  assert.ok(result.elapsed >= 300, "exited in " + result.elapsed + "ms");
+  assert.ok(result.elapsed < 2500, "exited in " + result.elapsed + "ms");
+});
+
+test("a second signal exits a hung close", { timeout: 20000 }, async () => {
+  const result = await hungCloseExits("SIGTERM", "SIGINT", 0);
+  assert.equal(result.delivered, null);
+  assert.equal(result.code, 1, result.text);
+  assert.match(result.last, new RegExp(SHUTDOWN_TIMEOUT_LINE + "$"));
+  assert.ok(result.elapsed < 3000, "second signal waited " + result.elapsed + "ms");
 });
 
 test("index trace turns off when automerge internals are missing", async () => {

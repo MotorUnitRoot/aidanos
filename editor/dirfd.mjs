@@ -529,6 +529,8 @@ async function openTrustedHelper(env = process.env) {
   }
   if (listed.isSymbolicLink() || parentListed.isSymbolicLink() || !parentListed.isDirectory()) throw helperUnavailable("symlink");
   if (!ownedByAcceptableParent(parentListed, uid)) throw helperUnavailable("parent-owner");
+  // This listing is the parent-owner refusal. A mode or owner change after
+  // the directory is open is a race, checked again below.
 
   let parent;
   try {
@@ -542,7 +544,7 @@ async function openTrustedHelper(env = process.env) {
     if (!parentStat.isDirectory() || parentStat.dev !== parentListed.dev || parentStat.ino !== parentListed.ino) {
       throw helperUnavailable("race");
     }
-    if (!ownedByAcceptableParent(parentStat, uid)) throw helperUnavailable("parent-owner");
+    if (!ownedByAcceptableParent(parentStat, uid)) throw helperUnavailable("race");
     const openedPath = process.platform === "linux"
       ? "/proc/self/fd/" + parent.fd + "/" + base
       : filePath;
@@ -560,7 +562,7 @@ async function openTrustedHelper(env = process.env) {
     const parentAgain = await parent.stat();
     if (again.dev !== st.dev || again.ino !== st.ino) throw helperUnavailable("race");
     if (!ownedAndPrivate(again, uid)) throw helperUnavailable("owner");
-    if (!ownedByAcceptableParent(parentAgain, uid)) throw helperUnavailable("parent-owner");
+    if (!ownedByAcceptableParent(parentAgain, uid)) throw helperUnavailable("race");
     if (parentAgain.dev !== parentStat.dev || parentAgain.ino !== parentStat.ino) throw helperUnavailable("race");
     if (foreignAcl(filePath, again.uid)) throw helperUnavailable("helper-acl");
     return { handle: file, path: filePath };

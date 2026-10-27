@@ -224,6 +224,7 @@ jobs:
         with:
           name: relay-ios-profile
           path: relay-ios-profile/
+          retention-days: 7
 
   sample-notes:
     runs-on: ubuntu-latest

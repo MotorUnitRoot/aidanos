@@ -1428,6 +1428,56 @@ await check("a folder owned by another user is refused", async () => {
   }
 });
 
+function realStickyRoot() {
+  const candidates = [os.tmpdir(), "/tmp", "/private/tmp"];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    let dir = candidate;
+    try {
+      const listed = fs.lstatSync(candidate);
+      if (listed.isSymbolicLink()) dir = fs.realpathSync(candidate);
+    } catch {
+      continue;
+    }
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    let st;
+    try {
+      st = fs.lstatSync(dir);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) continue;
+    if (st.uid !== 0 || (st.mode & 0o1000) === 0 || (st.mode & 0o022) === 0) continue;
+    if (ancestorFault(dir) !== "") continue;
+    return dir;
+  }
+  return "";
+}
+
+await check("a helper in a sticky other-writable directory is refused for its parent", async () => {
+  const parent = realStickyRoot();
+  assert(parent, "no sticky root directory for the parent-owner check");
+  const st = fs.lstatSync(parent);
+  assert(!st.isSymbolicLink() && st.isDirectory(), "the parent is not a real directory");
+  assert(st.uid === 0 && (st.mode & 0o1000) !== 0 && (st.mode & 0o022) !== 0, "the parent is not sticky and other-writable");
+  assert(ancestorFault(parent) === "", ancestorFault(parent) || "the ancestor walk refused the sticky parent");
+  const tool = path.join(parent, "aidanos-dirfd-parent-" + process.pid);
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-parent-owner-"));
+  const note = path.join(vault, "day.md");
+  fs.copyFileSync(shippedHelper(), tool);
+  fs.chmodSync(tool, 0o755);
+  try {
+    const error = await withHelperEnv({ AIDANOS_DIRFD_TOOL: tool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => writeNoteText(note, "NEW\n", { swapInRequested: false })));
+    assert(error.code === "DIRFD" && error.reason === "parent-owner", error.reason || error.code);
+    assert(!fs.existsSync(note), "an other-writable parent left a note");
+  } finally {
+    fs.rmSync(tool, { force: true });
+    fs.rmSync(vault, { recursive: true, force: true });
+  }
+});
+
 await check("a root-owned helper file is refused for its own owner", async () => {
   const file = rootOwnedHelper();
   assert(file, "no root-owned helper candidate on this machine");

@@ -34,6 +34,7 @@ import {
   sweepStaleNoteTemps,
 } from "../src/mirror.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
+import { prepareNoteFile } from "../src/paths.mjs";
 import { FATAL_FALLBACK_NAME, FILE_LOG_CAP, LOG_LINE_CAP, REDACT_INPUT_CAP, flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, redact, restoreShields, stampLine } from "../src/redact.mjs";
 import { INDEX_TRACE_ENTRY_CAP, beginIndexRequest, emptyLateState, finishIndexReply, installIndexTrace, nextLoopLateLine, noteGitWork, noteMirror } from "../src/index-trace.mjs";
 import { cbor } from "@automerge/automerge-repo";
@@ -1361,9 +1362,19 @@ test("a location scrub is linear on adversarial input", () => {
     }
     return elapsed;
   }
+  // One trial is a few milliseconds, so a single pause makes 4N look
+  // quadratic. The bound stays 6x. The median of several trials is what
+  // has to fit under it.
+  function medianMs(input) {
+    const samples = [];
+    for (let trial = 0; trial < 5; trial += 1) samples.push(elapsedFor(input));
+    samples.sort((a, b) => a - b);
+    return samples[2];
+  }
   redact(smallInput, []);
-  const smallMs = elapsedFor(smallInput);
-  const largeMs = elapsedFor(largeInput);
+  redact(largeInput, []);
+  const smallMs = medianMs(smallInput);
+  const largeMs = medianMs(largeInput);
   assert.ok(largeMs < 1000, "scrubbed in " + largeMs + "ms");
   assert.ok(largeMs < smallMs * 6, "4N/N " + largeMs + " / " + smallMs);
   const cleaned = redact(largeInput, []);
@@ -1379,6 +1390,28 @@ test("a location scrub is linear on adversarial input", () => {
   assert.ok(performance.now() - hugeStarted < 100, "1 MB scrub");
   assert.equal(hugeCleaned.includes("TAILTOKEN-99999"), false);
   assert.equal(hugeCleaned.includes("Secret"), false);
+});
+
+test("a note path is prepared from the claimed root, not a fresh realpath", async () => {
+  const source = await fs.readFile(new URL("../src/paths.mjs", import.meta.url), "utf8");
+  assert.equal(/realpath\s*\(/.test(source), false);
+  const dir = await tempDir();
+  const real = path.join(dir, "real");
+  const link = path.join(dir, "link");
+  const elsewhere = path.join(dir, "elsewhere");
+  await fs.mkdir(real);
+  await fs.mkdir(elsewhere);
+  await fs.symlink(real, link);
+  rememberVaultRoot(link);
+  const file = await prepareNoteFile(link, "log/2026-10-21.md", real);
+  assert.equal(file, path.join(real, "log", "2026-10-21.md"));
+  const created = await fs.lstat(path.join(real, "log"));
+  assert.equal(created.isDirectory(), true);
+  assert.equal(created.isSymbolicLink(), false);
+  await fs.symlink(elsewhere, path.join(real, "linked"));
+  assert.equal(await prepareNoteFile(real, "linked/note.md", real), null);
+  await fs.symlink(path.join(real, "log", "2026-10-21.md"), path.join(real, "log", "alias.md"));
+  assert.equal(await prepareNoteFile(real, "log/alias.md", real), null);
 });
 
 test("relay rejects a bad token and accepts the real one", async () => {

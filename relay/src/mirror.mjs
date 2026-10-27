@@ -1109,7 +1109,7 @@ export function createMirror({
       await yieldNow();
       const handle = repo.handles[docId];
       if (!handle) continue;
-      const file = await prepareNoteFile(vault, notePath);
+      const file = await prepareNoteFile(vault, notePath, vaultRoot(vault));
       if (!file) continue;
       const sibling = await noteSiblingFault(file);
       if (sibling) {
@@ -1189,7 +1189,7 @@ export function createMirror({
         continue;
       }
       if (text == null) continue;
-      const file = await prepareNoteFile(vault, notePath);
+      const file = await prepareNoteFile(vault, notePath, vaultRoot(vault));
       if (blocked && blocked.has(notePath)) {
         await yieldNow();
         continue;

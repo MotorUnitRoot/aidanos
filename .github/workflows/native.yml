@@ -218,6 +218,13 @@ jobs:
         run: |
           echo "---- relay-ios.log ----"
           cat "$RUNNER_TEMP/relay-ios.log" || true
+      - name: Upload the iOS relay profile
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: relay-ios-profile
+          path: relay-ios-profile/
+          retention-days: 7
 
   sample-notes:
     runs-on: ubuntu-latest

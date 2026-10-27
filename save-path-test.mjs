@@ -1217,7 +1217,10 @@ await check("a write ACL for another principal is refused", async () => {
     "drwxr-xr-x  2 501  20  64 Oct 27 03:00 /tmp/a/b",
     "drwxr-xr-x  2 501  20  64 Oct 27 03:00 /tmp/a",
   ].join("\n");
-  assert(splitAclListing(swapped, ["/tmp/a", "/tmp/a/b"]) === null, "a reordered listing was accepted");
+  const reordered = splitAclListing(swapped, ["/tmp/a", "/tmp/a/b"]);
+  assert(reordered && reordered.length === 2, "a reordered listing was refused");
+  assert(reordered[0][0].endsWith(" 03:00 /tmp/a") && reordered[1][0].endsWith(" 03:00 /tmp/a/b"), "a reordered listing was paired by position");
+  assert(splitAclListing("drwxr-xr-x  2 501  20  64 Oct 27 03:00 /not /tmp/safe", ["/tmp/safe"]) === null, "a suffix of another path matched");
   assert(splitAclListing(ordered + "\ndrwxr-xr-x  2 501  20  64 Oct 27 03:00 /tmp/extra", ["/tmp/a", "/tmp/a/b"]) === null, "an extra listing was accepted");
   assert(installFaultText("ancestor-acl") === "an ACL grants write to someone other than the owner", installFaultText("ancestor-acl"));
   if (process.platform !== "darwin") {
@@ -1241,6 +1244,258 @@ await check("a write ACL for another principal is refused", async () => {
   } finally {
     spawnSync("chmod", ["-N", dir], { encoding: "utf8" });
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function aclLine(name) {
+  return "drwxr-xr-x  2 0  0  64 Oct 27 03:00 " + name;
+}
+
+await check("a newline in an acl name is refused", async () => {
+  const one = aclLine("/tmp/a");
+  const forged = one + "\ndrwxr-xr-x  2 0  0  64 Oct 27 03:00 /tmp/b";
+  assert(splitAclListing(forged, ["/tmp/a\ndrwxr-xr-x  2 0  0  64 Oct 27 03:00 /tmp/b"]) === null, "a newline in a name was accepted");
+  assert(splitAclListing(forged, ["/tmp/a"]) === null, "a forged extra header was accepted");
+  assert(splitAclListing(one + "\n" + one, ["/tmp/a"]) === null, "a duplicate header was accepted");
+  assert(splitAclListing(one, ["/tmp/a", "/tmp/missing"]) === null, "a missing header was accepted");
+  assert(splitAclListing("drwxr-xr-x  2 0  0  64 Oct 27 03:00 /tmp/a\r", ["/tmp/a\r"]) === null, "a carriage return in a name was accepted");
+});
+
+await check("a root-owned symlink ancestor that sorts earlier keeps its own acl", async () => {
+  // A walk through /var/lock -> /run/lock collects /, /var, then /, /run, /run/lock.
+  // ls sorts the arguments, so /run is printed before /var. The write grant
+  // has to stay on /run.
+  const walk = ["/", "/var", "/", "/run", "/run/lock"];
+  const listing = [
+    aclLine("/"),
+    "drwxr-xr-x+ 2 0  0  64 Oct 27 03:00 /run",
+    " 0: user:501 allow write,delete",
+    aclLine("/run/lock"),
+    aclLine("/var"),
+  ].join("\n");
+  const blocks = splitAclListing(listing, walk);
+  assert(blocks && blocks.length === walk.length, "a sorted symlink walk was refused");
+  assert(blocks[1][0].endsWith(" 03:00 /var"), blocks[1][0]);
+  assert(blocks[3][0].endsWith(" 03:00 /run"), blocks[3][0]);
+  assert(blocks[0][0] === blocks[2][0], "the repeated root was listed twice");
+  assert(aclListingFault(blocks[1].join("\n"), 0) === "", "/var took the write ACL from /run");
+  assert(aclListingFault(blocks[3].join("\n"), 0) === "acl", "/run lost its write ACL");
+  const clean = [aclLine("/"), aclLine("/run"), aclLine("/run/lock"), aclLine("/var")].join("\n");
+  const cleanBlocks = splitAclListing(clean, walk);
+  assert(cleanBlocks && cleanBlocks.length === walk.length, "a clean sorted symlink walk was refused");
+  assert(cleanBlocks.every((block) => aclListingFault(block.join("\n"), 0) === ""), "a clean symlink ancestor was refused");
+});
+
+await check("a group-writable ancestor is refused on its own", async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-group-anc-"));
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-group-anc-vault-"));
+  const folder = await openCheckedDirectory(vault);
+  const writable = path.join(base, "group");
+  const bin = path.join(writable, "bin");
+  fs.mkdirSync(bin, { recursive: true });
+  const tool = path.join(bin, "dirfd-tool");
+  fs.copyFileSync(shippedHelper(), tool);
+  fs.chmodSync(tool, 0o755);
+  fs.chmodSync(bin, 0o755);
+  fs.chmodSync(writable, 0o775);
+  try {
+    assert(ancestorFault(writable) === "ancestor-writable", ancestorFault(writable) || "a group-writable ancestor was allowed");
+    const error = await withHelperEnv({ AIDANOS_DIRFD_TOOL: tool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => createExclusive(folder, "group.recover", Buffer.from("x\n"), "helper")));
+    assert(error.code === "DIRFD" && error.reason === "ancestor-writable", error.reason || error.code);
+    assert(!fs.existsSync(path.join(vault, "group.recover")), "a group-writable ancestor ran the helper");
+  } finally {
+    await folder.close();
+    fs.chmodSync(writable, 0o755);
+    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(vault, { recursive: true, force: true });
+  }
+});
+
+await check("an other-writable ancestor is refused on its own", async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-other-anc-"));
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-other-anc-vault-"));
+  const folder = await openCheckedDirectory(vault);
+  const writable = path.join(base, "other");
+  const bin = path.join(writable, "bin");
+  fs.mkdirSync(bin, { recursive: true });
+  const tool = path.join(bin, "dirfd-tool");
+  fs.copyFileSync(shippedHelper(), tool);
+  fs.chmodSync(tool, 0o755);
+  fs.chmodSync(bin, 0o755);
+  fs.chmodSync(writable, 0o707);
+  try {
+    assert(ancestorFault(writable) === "ancestor-writable", ancestorFault(writable) || "an other-writable ancestor was allowed");
+    const error = await withHelperEnv({ AIDANOS_DIRFD_TOOL: tool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => createExclusive(folder, "other.recover", Buffer.from("x\n"), "helper")));
+    assert(error.code === "DIRFD" && error.reason === "ancestor-writable", error.reason || error.code);
+    assert(!fs.existsSync(path.join(vault, "other.recover")), "an other-writable ancestor ran the helper");
+  } finally {
+    await folder.close();
+    fs.chmodSync(writable, 0o755);
+    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(vault, { recursive: true, force: true });
+  }
+});
+
+await check("an ancestor owned by another user is refused", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-other-uid-"));
+  fs.chmodSync(dir, 0o755);
+  try {
+    const uid = process.getuid();
+    assert(typeof uid === "number", "this platform has no uid");
+    const fault = ancestorFault(dir, uid + 1);
+    assert(fault === "ancestor-owner", fault || "another uid was allowed");
+    assert(installFaultText(fault) === "ancestor owned by another user", installFaultText(fault));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function otherUserDirectory() {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (typeof uid !== "number") return null;
+  const seeds = [];
+  try {
+    for (const line of fs.readFileSync("/etc/passwd", "utf8").split("\n")) {
+      const home = line.split(":")[5];
+      if (home && home.startsWith("/")) seeds.push(home);
+    }
+  } catch {
+    // macOS may have no readable passwd. The directory walk still runs.
+  }
+  seeds.push(
+    "/var/cache/man",
+    "/var/cache/apt",
+    "/private/var/spool/cups",
+    "/private/var/spool/postfix",
+    "/var",
+    "/private/var",
+    "/usr/local",
+    "/Library",
+    "/Users",
+    "/home",
+  );
+  const skip = new Set(["proc", "sys", "dev", "run"]);
+  const seen = new Set();
+  const queue = seeds.map((dir) => ({ dir, depth: 0 }));
+  let visited = 0;
+  while (queue.length && visited < 2500) {
+    const { dir, depth } = queue.shift();
+    if (!dir || seen.has(dir)) continue;
+    seen.add(dir);
+    let st;
+    try {
+      st = fs.lstatSync(dir);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) continue;
+    visited += 1;
+    if (st.uid !== 0 && st.uid !== uid && (st.mode & 0o022) === 0 && ancestorFault(dir, uid) === "ancestor-owner") {
+      return { path: dir, uid: st.uid };
+    }
+    if (depth >= 3) continue;
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    if (names.length > 80) names = names.slice(0, 80);
+    for (const name of names) {
+      if (skip.has(name)) continue;
+      queue.push({ dir: path.join(dir, name), depth: depth + 1 });
+    }
+  }
+  return null;
+}
+
+await check("a folder owned by another user is refused", async () => {
+  const found = otherUserDirectory();
+  assert(found, "no directory owned by another user was found");
+  console.log("other-user directory " + found.path + " uid " + found.uid);
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-foreign-note-"));
+  const note = path.join(vault, "day.md");
+  const tool = path.join(found.path, "aidanos-dirfd-tool");
+  try {
+    const error = await withHelperEnv({ AIDANOS_DIRFD_TOOL: tool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => writeNoteText(note, "NEW\n", { swapInRequested: false })));
+    assert(error.code === "DIRFD" && error.reason === "ancestor-owner", error.reason || error.code);
+    assert(!fs.existsSync(note), "a folder owned by another user left a note");
+  } finally {
+    fs.rmSync(vault, { recursive: true, force: true });
+  }
+});
+
+function realStickyRoot() {
+  const candidates = [os.tmpdir(), "/tmp", "/private/tmp"];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    let dir = candidate;
+    try {
+      const listed = fs.lstatSync(candidate);
+      if (listed.isSymbolicLink()) dir = fs.realpathSync(candidate);
+    } catch {
+      continue;
+    }
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    let st;
+    try {
+      st = fs.lstatSync(dir);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) continue;
+    if (st.uid !== 0 || (st.mode & 0o1000) === 0 || (st.mode & 0o022) === 0) continue;
+    if (ancestorFault(dir) !== "") continue;
+    return dir;
+  }
+  return "";
+}
+
+await check("a helper in a sticky other-writable directory is refused for its parent", async () => {
+  const parent = realStickyRoot();
+  assert(parent, "no sticky root directory for the parent-owner check");
+  const st = fs.lstatSync(parent);
+  assert(!st.isSymbolicLink() && st.isDirectory(), "the parent is not a real directory");
+  assert(st.uid === 0 && (st.mode & 0o1000) !== 0 && (st.mode & 0o022) !== 0, "the parent is not sticky and other-writable");
+  assert(ancestorFault(parent) === "", ancestorFault(parent) || "the ancestor walk refused the sticky parent");
+  const tool = path.join(parent, "aidanos-dirfd-parent-" + process.pid);
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-parent-owner-"));
+  const note = path.join(vault, "day.md");
+  fs.copyFileSync(shippedHelper(), tool);
+  fs.chmodSync(tool, 0o755);
+  try {
+    const error = await withHelperEnv({ AIDANOS_DIRFD_TOOL: tool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => writeNoteText(note, "NEW\n", { swapInRequested: false })));
+    assert(error.code === "DIRFD" && error.reason === "parent-owner", error.reason || error.code);
+    assert(!fs.existsSync(note), "an other-writable parent left a note");
+  } finally {
+    fs.rmSync(tool, { force: true });
+    fs.rmSync(vault, { recursive: true, force: true });
+  }
+});
+
+await check("a root-owned helper file is refused for its own owner", async () => {
+  const file = rootOwnedHelper();
+  assert(file, "no root-owned helper candidate on this machine");
+  const parent = fs.lstatSync(path.dirname(file));
+  const st = fs.lstatSync(file);
+  assert(!parent.isSymbolicLink() && parent.isDirectory(), "the helper parent is not a directory");
+  assert(parent.uid === 0 || parent.uid === process.getuid(), "the helper parent is not an acceptable owner");
+  assert((parent.mode & 0o022) === 0, "the helper parent is group or other writable");
+  assert(st.uid === 0 && st.isFile() && !st.isSymbolicLink(), "the helper file is not a root-owned file");
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-root-file-"));
+  const note = path.join(vault, "day.md");
+  try {
+    const error = await withHelperEnv({ AIDANOS_DIRFD_TOOL: file, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => writeNoteText(note, "NEW\n", { swapInRequested: false })));
+    assert(error.code === "DIRFD" && error.reason === "owner", error.reason || error.code);
+    assert(!fs.existsSync(note), "a root-owned helper left a note");
+  } finally {
+    fs.rmSync(vault, { recursive: true, force: true });
   }
 });
 

@@ -23,7 +23,16 @@ import {
 import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import { installIndexTrace, noteGitWork } from "./index-trace.mjs";
-import { installFileLog, logFatal, logSafe, redact, stampLine } from "./redact.mjs";
+import {
+  flushFileLog,
+  installFileLog,
+  logFatal,
+  logSafe,
+  pauseFileLog,
+  redact,
+  setFatalFallbackDir,
+  stampLine,
+} from "./redact.mjs";
 import { refuseSymlinkedStorage, storageFolderFault } from "./storage-safe.mjs";
 import { createWorkerHost } from "./worker-host.mjs";
 
@@ -33,6 +42,32 @@ const MIN_TOKEN_LENGTH = 32;
 // A hang there used to leave the port open and /health at 503. This bound
 // is separate from the 15s handshake.
 const SESSION_TIMEOUT_MS = 30_000;
+// launchd's stop sends SIGTERM, then SIGKILL if the process is still
+// there. A close() that never finishes used to wait for that SIGKILL,
+// and a second SIGTERM or SIGINT was ignored. The deadline exits first.
+// A second signal exits the same way, without waiting out the deadline.
+export const SHUTDOWN_DEADLINE_MS = 5000;
+export const SHUTDOWN_TIMEOUT_LINE = "relay close timed out";
+
+function shutdownDeadline(env = process.env) {
+  if (env.NODE_ENV === "test") {
+    const raw = Number(env.AIDANOS_RELAY_TEST_SHUTDOWN_MS);
+    if (Number.isFinite(raw) && raw >= 50 && raw <= SHUTDOWN_DEADLINE_MS) return raw;
+  }
+  return SHUTDOWN_DEADLINE_MS;
+}
+
+function hangClose(env = process.env) {
+  return env.NODE_ENV === "test" && env.AIDANOS_RELAY_TEST_HANG_CLOSE === "1";
+}
+
+function fatalStateDir(vault, data, env = process.env) {
+  if (data) return path.resolve(String(data));
+  if (env.AIDANOS_RELAY_DATA) return path.resolve(String(env.AIDANOS_RELAY_DATA));
+  const root = vault || env.AIDANOS_RELAY_VAULT || "";
+  if (!String(root).trim()) return "";
+  return path.resolve(String(root), ".aidanos", "relay");
+}
 // A note's first sync is its whole history. 1 MB was small enough to reject that
 // and leave the device retrying forever. Measured with Automerge 3.2.6 on
 // synthetic text, the largest CBOR sync frame was 306,331 bytes for a fresh
@@ -503,6 +538,7 @@ export async function startRelay(options = {}) {
   }
   const vault = path.resolve(String(vaultArg));
   const dataDir = path.resolve(options.data || env.AIDANOS_RELAY_DATA || path.join(vault, ".aidanos", "relay"));
+  setFatalFallbackDir(dataDir);
   const port = options.port == null ? portFromEnv(env) : Number(options.port);
   const { hosts, phone } = listenHosts({
     lan: Boolean(options.lan) || Boolean(options.lanAddress),
@@ -1157,6 +1193,7 @@ export async function startRelay(options = {}) {
     },
     healthURL: "http://127.0.0.1:" + boundPort + "/health",
     async close() {
+      if (hangClose(env)) await new Promise(() => {});
       await resetChain.catch(() => {});
       const session = live;
       live = null;
@@ -1214,12 +1251,14 @@ async function main() {
   // the reader drains it. CI and launchd both point this process at a
   // file. The async stream writes that same fd.
   if (!process.stderr.isTTY) installFileLog();
+  const args = parseArgs(process.argv.slice(2));
+  const stateDir = fatalStateDir(args.vault, args.data);
+  if (stateDir) setFatalFallbackDir(stateDir);
   const needed = nodeRequirement();
   if (needed) {
     logFatal([], needed);
     process.exit(1);
   }
-  const args = parseArgs(process.argv.slice(2));
   let relay;
   try {
     relay = await startRelay({
@@ -1237,14 +1276,41 @@ async function main() {
     );
     process.exit(1);
   }
-  for (const line of startupLines({ lan: args.lan || Boolean(args.lanAddress), port: relay.port, phone: relay.phone })) {
-    writeSync(line.startsWith("WARNING") ? 2 : 1, stampLine(line) + "\n");
-  }
+  let closing = false;
+  let settled = false;
+  let giveUp = () => {};
   const shutdown = () => {
-    relay.close().then(() => process.exit(0));
+    if (settled) return;
+    if (closing) {
+      giveUp();
+      return;
+    }
+    closing = true;
+    const timer = setTimeout(() => giveUp(), shutdownDeadline());
+    const exitWith = (code, line) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        pauseFileLog();
+        logSafe([], line);
+      } catch { /* the flush still runs */ }
+      try {
+        flushFileLog();
+      } catch { /* exit still runs */ }
+      process.exit(code);
+    };
+    giveUp = () => exitWith(1, SHUTDOWN_TIMEOUT_LINE);
+    Promise.resolve(relay.close()).then(
+      () => exitWith(0, "relay log closed"),
+      () => exitWith(0, "relay log closed"),
+    );
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  for (const line of startupLines({ lan: args.lan || Boolean(args.lanAddress), port: relay.port, phone: relay.phone })) {
+    writeSync(line.startsWith("WARNING") ? 2 : 1, stampLine(line) + "\n");
+  }
 }
 
 const invoked = process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;

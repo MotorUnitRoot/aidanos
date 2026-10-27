@@ -1642,7 +1642,9 @@ async function pauseClearsOnlyAfterSuccess() {
     while (showBare("notes/queued.md") !== "queued note\n" && Date.now() < queuedDeadline) {
       await new Promise((r) => setTimeout(r, 50));
     }
-    assert(showBare("notes/queued.md") === "queued note\n", "queued note did not sync after resume");
+    let queuedGit = "";
+    try { queuedGit = gitQuiet(vault, ["status", "--short"]) + " | " + gitQuiet(vault, ["log", "-1", "--oneline"]); } catch (error) { queuedGit = String(error && error.message || error); }
+    assert(showBare("notes/queued.md") === "queued note\n", "queued note did not sync after resume\n" + queuedGit + "\n" + child._log().slice(-1200));
     const open = await fetch(base + "/api/health");
     const openBody = await open.json();
     assert(!openBody.git.paused && openBody.git.error !== "sync paused", "resume left the pause on");

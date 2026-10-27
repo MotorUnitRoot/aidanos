@@ -15,8 +15,9 @@
 // writable unless it is sticky and owned by root. A root-owned symlink,
 // such as macOS /tmp or /var, is followed. Any other symlink is refused.
 // On macOS the same walk reads each folder's ACL, and the helper file's ACL,
-// with one /bin/ls -lde -n of every path. The process uid and gid come from
-// getuid and getgid. A write grant for anyone but the owner is refused.
+// with one /bin/ls -lde -n. ls sorts the paths it is given, so each entry is
+// matched by its full path. The process uid and gid come from getuid and
+// getgid. A write grant for anyone but the owner is refused.
 // The helper does not do that check: it would be reporting on itself.
 
 import { spawn, spawnSync } from "node:child_process";
@@ -308,19 +309,40 @@ function isAclHeader(line) {
   return /^[-dlcbps]/.test(mode) && mode.length >= 10;
 }
 
-function headerEndsWithPath(header, filePath) {
-  if (!filePath || !header.endsWith(filePath) || header.length === filePath.length) return false;
-  return isAclSpace(header.charCodeAt(header.length - filePath.length - 1));
+// The pathname is whatever remains after the mode and the seven fields
+// `ls -l -n` prints before it: nlink, uid, gid, size, month, day, and
+// HH:MM or YYYY. A suffix of that text is not a path.
+function headerPathname(header) {
+  let i = 0;
+  const n = header.length;
+  for (let field = 0; field < 8; field += 1) {
+    while (i < n && isAclSpace(header.charCodeAt(i))) i += 1;
+    const start = i;
+    while (i < n && !isAclSpace(header.charCodeAt(i))) i += 1;
+    if (i === start) return null;
+  }
+  while (i < n && isAclSpace(header.charCodeAt(i))) i += 1;
+  if (i >= n) return null;
+  return header.slice(i);
 }
 
-// One block per path, in the order asked. A missing, extra, or reordered
-// entry is a fault: the caller cannot tell which path was listed.
+// One block per requested path, in the order asked. ls prints those paths
+// in its own order, so the pathname on each header has to be that path.
+// A missing, extra, duplicate, or unreadable entry is refused, including a
+// newline in a name, which would otherwise invent another header.
 export function splitAclListing(text, paths) {
+  const wanted = [];
+  for (const filePath of paths) {
+    const name = String(filePath);
+    if (name.includes("\n") || name.includes("\r")) return null;
+    wanted.push(name);
+  }
   const lines = String(text || "").split(/\n/);
   while (lines.length && lines[lines.length - 1] === "") lines.pop();
   const blocks = [];
   let current = null;
-  for (const line of lines) {
+  for (const raw of lines) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
     if (!line) {
       if (current) blocks.push(current);
       current = null;
@@ -335,11 +357,25 @@ export function splitAclListing(text, paths) {
     current.push(line);
   }
   if (current) blocks.push(current);
-  if (blocks.length !== paths.length) return null;
-  for (let i = 0; i < paths.length; i += 1) {
-    if (!headerEndsWithPath(blocks[i][0], paths[i])) return null;
+  const byPath = new Map();
+  for (const block of blocks) {
+    const name = headerPathname(block[0]);
+    if (name == null || name.includes("\n") || name.includes("\r")) return null;
+    if (byPath.has(name)) return null;
+    byPath.set(name, block);
   }
-  return blocks;
+  const unique = new Set(wanted);
+  if (byPath.size !== unique.size) return null;
+  for (const name of byPath.keys()) {
+    if (!unique.has(name)) return null;
+  }
+  const ordered = [];
+  for (const name of wanted) {
+    const block = byPath.get(name);
+    if (!block) return null;
+    ordered.push(block);
+  }
+  return ordered;
 }
 
 function trustedLs() {
@@ -375,9 +411,20 @@ function aclFaultFor(entries) {
   if (!self || self.gid < 0) return "acl";
   const ls = trustedLs();
   if (!ls) return "acl";
-  const paths = entries.map((entry) => entry.path);
+  const paths = [];
+  const seen = new Set();
+  const unique = [];
+  for (const entry of entries) {
+    const filePath = String(entry.path);
+    if (filePath.includes("\n") || filePath.includes("\r")) return "acl";
+    paths.push(filePath);
+    if (seen.has(filePath)) continue;
+    seen.add(filePath);
+    unique.push(filePath);
+  }
+  unique.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
   aclSpawns += 1;
-  const listed = spawnSync(ls, ["-lde", "-n", ...paths], {
+  const listed = spawnSync(ls, ["-lde", "-n", ...unique], {
     encoding: "utf8",
     env: { LC_ALL: "C", PATH: "/bin:/usr/bin" },
     timeout: 5000,
@@ -451,6 +498,13 @@ function ownedAndPrivate(st, uid) {
   return !!st && st.uid === uid && (st.mode & GROUP_OR_OTHER_WRITE) === 0;
 }
 
+// The folder that contains the helper may be root's. The ancestor walk
+// already allows that. Group and other write stay refused. The helper file
+// itself still has to belong to this user.
+function ownedByAcceptableParent(st, uid) {
+  return !!st && (st.uid === uid || st.uid === 0) && (st.mode & GROUP_OR_OTHER_WRITE) === 0;
+}
+
 // Check the helper again on every call. Nothing here is cached: a rejected
 // check must not make the next save fail without looking.
 async function openTrustedHelper(env = process.env) {
@@ -474,7 +528,9 @@ async function openTrustedHelper(env = process.env) {
     throw helperUnavailable("stat");
   }
   if (listed.isSymbolicLink() || parentListed.isSymbolicLink() || !parentListed.isDirectory()) throw helperUnavailable("symlink");
-  if (!ownedAndPrivate(parentListed, uid)) throw helperUnavailable("owner");
+  if (!ownedByAcceptableParent(parentListed, uid)) throw helperUnavailable("parent-owner");
+  // This listing is the parent-owner refusal. A mode or owner change after
+  // the directory is open is a race, checked again below.
 
   let parent;
   try {
@@ -488,7 +544,7 @@ async function openTrustedHelper(env = process.env) {
     if (!parentStat.isDirectory() || parentStat.dev !== parentListed.dev || parentStat.ino !== parentListed.ino) {
       throw helperUnavailable("race");
     }
-    if (!ownedAndPrivate(parentStat, uid)) throw helperUnavailable("owner");
+    if (!ownedByAcceptableParent(parentStat, uid)) throw helperUnavailable("race");
     const openedPath = process.platform === "linux"
       ? "/proc/self/fd/" + parent.fd + "/" + base
       : filePath;
@@ -505,7 +561,8 @@ async function openTrustedHelper(env = process.env) {
     const again = await file.stat();
     const parentAgain = await parent.stat();
     if (again.dev !== st.dev || again.ino !== st.ino) throw helperUnavailable("race");
-    if (!ownedAndPrivate(again, uid) || !ownedAndPrivate(parentAgain, uid)) throw helperUnavailable("owner");
+    if (!ownedAndPrivate(again, uid)) throw helperUnavailable("owner");
+    if (!ownedByAcceptableParent(parentAgain, uid)) throw helperUnavailable("race");
     if (parentAgain.dev !== parentStat.dev || parentAgain.ino !== parentStat.ino) throw helperUnavailable("race");
     if (foreignAcl(filePath, again.uid)) throw helperUnavailable("helper-acl");
     return { handle: file, path: filePath };

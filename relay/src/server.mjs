@@ -24,7 +24,7 @@ import {
   watchRepo,
 } from "./index-trace.mjs";
 import { createMirror } from "./mirror.mjs";
-import { installFileLog, logSafe, stampLine } from "./redact.mjs";
+import { installFileLog, logFatal, logSafe, stampLine } from "./redact.mjs";
 import { describeSyncFrame } from "./sync-log.mjs";
 
 const DEFAULT_PORT = 3750;
@@ -1124,7 +1124,7 @@ async function main() {
   if (!process.stderr.isTTY) installFileLog();
   const needed = nodeRequirement();
   if (needed) {
-    logSafe([], needed);
+    logFatal([], needed);
     process.exit(1);
   }
   const args = parseArgs(process.argv.slice(2));
@@ -1139,7 +1139,7 @@ async function main() {
       allowReset: process.env.AIDANOS_RELAY_ALLOW_RESET === "1",
     });
   } catch (error) {
-    logSafe(
+    logFatal(
       [process.env.AIDANOS_RELAY_TOKEN, process.env.AIDANOS_RELAY_GIT_TOKEN],
       error instanceof Error ? error.message : error,
     );

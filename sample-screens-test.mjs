@@ -461,7 +461,16 @@ try {
       await evalJs(`document.getElementById("conflict-sheet").scrollIntoView({ block: "center" })`);
       return;
     }
-    await prepareToday();
+    await showToday();
+    // A flash left by the today step is not this step's. Wait it out, then
+    // open the latch hit so this step sees its own flash. The step does not
+    // depend on running after stage.
+    await waitFor(async () => {
+      const flashing = await evalJs(`!!document.querySelector("#paper .is-flash")`);
+      return flashing === false ? true : "flashing";
+    }, 2000, "latch flash idle");
+    await openAsk(LATCH);
+    await clickHit(LATCH);
     // The latch hit flashes its line after the day text is already visible.
     // That flash repaints the paper and scrolls. One click, after the flash
     // class is gone and this line is still under the pointer.
@@ -812,7 +821,13 @@ try {
   }
 
   fs.mkdirSync(shotDir, { recursive: true });
+  let previous = null;
   for (const state of screens.states) {
+    // The conflict sheet stays up for the edit that follows it. Any other
+    // next step starts from the restored sample, so this shot can sit
+    // immediately after today.
+    if (previous === "conflict" && state !== "conflict-edit") await reloadSample();
+    previous = state;
     for (const width of screens.widths) {
       await setWidth(width);
       await openers[state]();

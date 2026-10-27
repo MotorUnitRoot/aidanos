@@ -5,6 +5,7 @@ import { builtinModules } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatWithOptions } from "node:util";
+import { GH_APP_TOKEN_BYTES, GH_APP_TOKEN_SOURCE, GH_PAT_TOKEN_SOURCE } from "./github-tokens.mjs";
 
 // This file lives at relay/src. A stack frame under that tree is shown
 // repo-relative. A vault path that only looks like relay/src is not.
@@ -13,29 +14,23 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 const SLASH_ALLOW = new Set(["HTTP/1.1", "KB/s", "MB/s", "application/json", "text/plain"]);
 const NOTE_EXTS = ["markdown", "mdx", "txt", "md"];
 const SHIELD = "\uE000";
-// After a full scrub, anything past this size is dropped. The line is
-// clipped to this size plus the longest secret before that scrub, and a
-// secret that straddles the cut is still inside the window, so its head
-// is not left behind.
+// After secrets are masked, the line is cut here, then paths are scrubbed.
+// The cut is the raw byte offset. Measuring it after [path] replacement
+// skips the cut when a path collapses, and a secret sliced at the first
+// edge stays in plain text.
 export const REDACT_INPUT_CAP = 64 * 1024;
-// github_pat_ is 11 + 22 + 1 + 59. A token that crosses the 64 KB cut is
-// inside the pre-mask window, then replaced, then the cut drops the tail.
-const GITHUB_TOKEN_SPAN = 93;
-// How much of a listed secret is read with each chunk. The overlap is the
-// whole pattern, so a match on the join is replaced before the next chunk.
-const REDACT_CHUNK = 64 * 1024;
 // How far a cut walks back to finish a token. A line with no break in this
 // window keeps the character boundary instead of collapsing to the marker.
 // 256 or more non-break characters before a secret used to keep the
 // secret's head. The whole text is masked before this cut, and any
 // trailing piece that still begins a listed secret is then dropped.
 const CAP_BREAK_WINDOW = 256;
-// The line is clipped to 64 KB plus the longest secret before this scrub.
-// A 30 MB adversarial line is one pass over that window, under 100 ms.
+// The mask window is 64 KB plus a margin measured in UTF-8 bytes, not
+// UTF-16 units. A 30 MB adversarial line is one pass over that window,
+// under 100 ms. The tail past the window is never read.
 // A Node stack frame we may show. A builtin module, or a node:internal
-// path whose characters are only [a-z_/] with an optional .js suffix and
-// whose first segment is a known Node prefix. Not every string that
-// starts with node:internal/.
+// path whose every segment is a known Node name. A user directory under
+// a known prefix, such as node:internal/fs/users/colby, is not a frame.
 const NODE_FRAME = /^node:[a-z0-9_./]+(?:\.js)?:\d+:\d+$/;
 const NODE_INTERNAL_FRAME = /^node:internal\/[a-z_/]+(?:\.js)?:\d+:\d+$/;
 const NODE_INTERNAL_PREFIXES = new Set([
@@ -48,6 +43,15 @@ const NODE_INTERNAL_PREFIXES = new Set([
   "source_map", "streams", "test", "timers", "tls", "trace_events", "tty",
   "url", "util", "v8", "validators", "vm", "wasi", "watch_mode", "webidl",
   "webstreams", "worker",
+]);
+// Segments that follow a known prefix. The first segment still has to be
+// a prefix: cjs alone is not a Node entry point. modules/cjs/loader is.
+const NODE_INTERNAL_SEGMENTS = new Set([
+  ...NODE_INTERNAL_PREFIXES,
+  "cjs", "esm", "loader", "utils", "promises", "module_job", "translators",
+  "run_main", "run_main_module", "get_format", "hooks", "load", "resolve",
+  "formats", "module_map", "helpers", "package_json_reader",
+  "customization_hooks", "shared_constants", "create_dynamic_module",
 ]);
 const NODE_BUILTINS = new Set(builtinModules.map((name) => name.startsWith("node:") ? name.slice(5) : name));
 
@@ -70,20 +74,33 @@ function utf8PrefixEnd(text, cap) {
   return i;
 }
 
-function maskSpan(secrets) {
-  let span = GITHUB_TOKEN_SPAN;
-  for (let i = 0; i < secrets.length; i += 1) {
-    const secret = secrets[i];
-    if (secret.length > span) span = secret.length;
-    const encoded = encodeURIComponent(secret);
-    if (encoded.length > span) span = encoded.length;
+function utf8ByteLength(text) {
+  let bytes = 0;
+  for (let i = 0; i < text.length;) {
+    const code = text.codePointAt(i);
+    bytes += code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+    i += code > 0xffff ? 2 : 1;
   }
-  return span;
+  return bytes;
 }
 
-function clipBeforeMask(text, span) {
-  const end = utf8PrefixEnd(text, REDACT_INPUT_CAP + span);
-  return end >= text.length ? text : text.slice(0, end);
+// Bytes, not UTF-16 code units. A listed secret and its encoded form are
+// both counted, and so is the longest gh[pousr]_ token. A github_pat_
+// longer than that still matches inside this window: the pattern has no
+// upper bound, and the raw cut drops whatever remains past 64 KB.
+function maskMarginBytes(secrets) {
+  let span = GH_APP_TOKEN_BYTES;
+  for (let i = 0; i < secrets.length; i += 1) {
+    const secret = secrets[i];
+    const bytes = utf8ByteLength(secret);
+    if (bytes > span) span = bytes;
+    const encoded = encodeURIComponent(secret);
+    if (encoded !== secret) {
+      const encodedBytes = utf8ByteLength(encoded);
+      if (encodedBytes > span) span = encodedBytes;
+    }
+  }
+  return span;
 }
 
 // After a cut, a suffix that is only the start of a listed secret is the
@@ -106,16 +123,50 @@ function dropSecretTail(text, secrets) {
   return drop ? text.slice(0, -drop) : text;
 }
 
-function cutAtBreak(text, cap, secrets) {
-  const end = utf8PrefixEnd(text, cap);
-  if (end >= text.length) return text;
-  let head = text.slice(0, end);
-  const floor = Math.max(0, head.length - CAP_BREAK_WINDOW);
-  let cut = head.length;
-  while (cut > floor && !isBreak(head.charCodeAt(cut - 1))) cut -= 1;
-  if (cut > floor && cut < head.length) head = head.slice(0, cut);
-  head = dropSecretTail(head, secrets);
-  return head.replace(/\[+$/, "");
+// A replacement before the raw cut shifts the cut. A match that straddles
+// the cut is kept whole, as ***, because the secret began inside the line
+// we keep. A match that starts at the cut or after it is discarded with
+// the tail.
+function replaceTracked(text, re, replacement, cutAt) {
+  let out = "";
+  let last = 0;
+  let mapped = cutAt;
+  re.lastIndex = 0;
+  let match;
+  while ((match = re.exec(text))) {
+    const start = match.index;
+    const end = start + match[0].length;
+    out += text.slice(last, start) + replacement;
+    if (end <= cutAt) mapped += replacement.length - (end - start);
+    else if (start < cutAt) mapped = out.length;
+    last = end;
+    if (match[0].length === 0) {
+      re.lastIndex += 1;
+      if (re.lastIndex > text.length) break;
+    }
+  }
+  out += text.slice(last);
+  return { text: out, cutAt: mapped };
+}
+
+function maskLiteralTracked(text, needle, replacement, cutAt) {
+  if (!needle) return { text, cutAt };
+  let out = "";
+  let last = 0;
+  let mapped = cutAt;
+  let from = 0;
+  while (from < text.length) {
+    const at = text.indexOf(needle, from);
+    if (at === -1) break;
+    const end = at + needle.length;
+    out += text.slice(last, at) + replacement;
+    if (end <= cutAt) mapped += replacement.length - needle.length;
+    else if (at < cutAt) mapped = out.length;
+    last = end;
+    from = end;
+  }
+  out += text.slice(last);
+  return { text: out, cutAt: mapped };
 }
 
 // One pass. The marker is a private-use character that the input no longer
@@ -127,80 +178,61 @@ export function restoreShields(text, kept) {
   });
 }
 
-// Replace needle in chunks. The unsent tail is one shorter than the needle,
-// so a match that straddles two chunks is still whole when it is replaced.
-function maskLiteral(text, needle, replacement) {
-  if (!needle) return text;
-  const n = needle.length;
-  const step = Math.max(REDACT_CHUNK, n);
-  let pending = "";
-  let out = "";
-  const take = (final) => {
-    const hold = final ? 0 : n - 1;
-    let commit = pending.length - hold;
-    if (commit <= 0) return;
-    let i = 0;
-    let piece = "";
-    while (i < commit) {
-      const at = pending.indexOf(needle, i);
-      if (at === -1 || at >= commit) {
-        piece += pending.slice(i, commit);
-        i = commit;
-        break;
-      }
-      piece += pending.slice(i, at) + replacement;
-      i = at + n;
-      if (i > commit) commit = i;
-    }
-    out += piece;
-    pending = pending.slice(commit);
-  };
-  for (let i = 0; i < text.length; i += step) {
-    pending += text.slice(i, Math.min(text.length, i + step));
-    take(false);
-  }
-  take(true);
-  return out;
-}
-
 export function redact(text, secrets) {
   // Strip the shield marker before any scrubbing so a log line cannot forge
-  // a kept frame. Clip to 64 KB plus the longest secret first, then mask.
-  // A listed secret that crosses the cut is fully inside that window, so a
-  // space or a line break on the boundary cannot leave the head behind.
+  // a kept frame. Mask first, on a window of 64 KB plus a byte margin, so a
+  // secret that straddles the cut is whole when it is replaced. Then cut at
+  // the raw 64 KB point and drop a listed prefix the cut still sliced.
+  // Paths are scrubbed after that cut. Collapsing a path to [path] must not
+  // pull a sliced secret back under 64 KB and skip the cut.
   const list = [];
   for (const secret of secrets || []) {
     const value = String(secret || "").trim();
     if (value && !list.includes(value)) list.push(value);
   }
-  let out = clipBeforeMask(String(text ?? ""), maskSpan(list)).replace(/\uE000/g, "");
-  const tails = [];
+  const raw = String(text ?? "").replace(/\uE000/g, "");
+  const margin = maskMarginBytes(list);
+  const cut = utf8PrefixEnd(raw, REDACT_INPUT_CAP);
+  const windowEnd = utf8PrefixEnd(raw, REDACT_INPUT_CAP + margin);
+  const state = {
+    text: windowEnd >= raw.length ? raw : raw.slice(0, windowEnd),
+    cutAt: cut,
+    tails: [],
+  };
+  const maskNeedle = (needle) => {
+    const next = maskLiteralTracked(state.text, needle, "***", state.cutAt);
+    state.text = next.text;
+    state.cutAt = next.cutAt;
+    state.tails.push(needle);
+  };
   for (const secret of list) {
-    out = maskLiteral(out, secret, "***");
-    tails.push(secret);
+    maskNeedle(secret);
     const encoded = encodeURIComponent(secret);
-    if (encoded !== secret) {
-      out = maskLiteral(out, encoded, "***");
-      tails.push(encoded);
-    }
+    if (encoded !== secret) maskNeedle(encoded);
   }
-  out = out.replace(/x-access-token:[^@\s]+/gi, "x-access-token:***");
-  out = out.replace(/(?:ghp|gho)_[A-Za-z0-9]{36}(?![A-Za-z0-9])/g, "***");
-  out = out.replace(/github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}(?![A-Za-z0-9])/g, "***");
-  out = out.replace(/Bearer\s+\S+/gi, "Bearer ***");
-  out = out.replace(/Authorization:\s*Basic\s+\S+/gi, "Authorization: Basic ***");
-  out = out.replace(/AIDANOS_(?:RELAY|VAULT_GIT)_TOKEN=\S+/g, "AIDANOS_TOKEN=***");
-  out = out.replace(/https?:\/\/[^\s]+/gi, "[url]");
+  const maskPattern = (source, flags, replacement) => {
+    const next = replaceTracked(state.text, new RegExp(source, flags), replacement, state.cutAt);
+    state.text = next.text;
+    state.cutAt = next.cutAt;
+  };
+  maskPattern("x-access-token:[^@\\s]+", "gi", "x-access-token:***");
+  maskPattern(GH_APP_TOKEN_SOURCE, "g", "***");
+  maskPattern(GH_PAT_TOKEN_SOURCE, "g", "***");
+  maskPattern("Bearer\\s+\\S+", "gi", "Bearer ***");
+  maskPattern("Authorization:\\s*Basic\\s+\\S+", "gi", "Authorization: Basic ***");
+  maskPattern("AIDANOS_(?:RELAY|VAULT_GIT)_TOKEN=\\S+", "g", "AIDANOS_TOKEN=***");
+  maskPattern("https?:\\/\\/[^\\s]+", "gi", "[url]");
+  let out = state.text.slice(0, state.cutAt);
+  if (cut < raw.length) out = dropSecretTail(out, state.tails);
   // Same scrub for stderr and fatal.log. A vault path or a note file name
   // must not land in either. Document ids have neither a slash nor a .md suffix.
-  // Scrub runs before the cut so a path or a spaced note name that crosses
-  // 8 KB is already [path] or [note], not a leftover prefix.
+  // The 8 KB cap still runs after the scrub, so a path or a spaced note name
+  // that crosses 8 KB is already [path] or [note], not a leftover prefix.
   const kept = [];
   out = scrubLocations(out, kept);
   out = out.replace(/file:\/\/\S+/gi, "[url]");
   out = restoreShields(out, kept);
-  out = cutAtBreak(out, REDACT_INPUT_CAP, tails);
-  return capLocations(out, tails);
+  return capLocations(out, state.tails);
 }
 
 // One log line, then the marker. The cut is applied to text that is already
@@ -330,9 +362,12 @@ function nodeBuiltinFrame(frame) {
     if (!NODE_INTERNAL_FRAME.test(frame)) return false;
     const rest = pathPart.slice("internal/".length).replace(/\.js$/, "");
     if (!/^[a-z_]+(?:\/[a-z_]+)*$/.test(rest)) return false;
-    const slash = rest.indexOf("/");
-    const prefix = slash === -1 ? rest : rest.slice(0, slash);
-    return NODE_INTERNAL_PREFIXES.has(prefix);
+    const segments = rest.split("/");
+    if (!NODE_INTERNAL_PREFIXES.has(segments[0])) return false;
+    for (let i = 0; i < segments.length; i += 1) {
+      if (!NODE_INTERNAL_SEGMENTS.has(segments[i])) return false;
+    }
+    return true;
   }
   return NODE_BUILTINS.has(pathPart);
 }

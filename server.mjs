@@ -30,6 +30,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { noteSaveStyle, reportRecoveryFiles, writeNoteText } from "./editor/note-save.mjs";
 import { ancestorFault, groupWritableHelperMessage, installFaultText } from "./editor/dirfd.mjs";
 import { ensureRecoverExcluded, isRecoverPath } from "./editor/vault-exclude.mjs";
+import { maskGitHubTokens } from "./relay/src/github-tokens.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GIT_URL = String(process.env.AIDANOS_VAULT_GIT_URL || "").trim();
@@ -160,8 +161,7 @@ export function redactSecrets(msg, secrets) {
     if (auth && auth !== url) s = s.split(auth).join("[url]");
   }
   s = s.replace(/x-access-token:[^@\s]+/gi, "x-access-token:***");
-  s = s.replace(/(?:ghp|gho)_[A-Za-z0-9]{36}(?![A-Za-z0-9])/g, "***");
-  s = s.replace(/github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}(?![A-Za-z0-9])/g, "***");
+  s = maskGitHubTokens(s);
   s = s.replace(/https?:\/\/[^\s]+/gi, "[url]");
   s = s.replace(/file:\/\/[^\s]+/gi, "[url]");
   return s;
@@ -644,12 +644,16 @@ const GIT_DIR_GROUP_WRITE = 0o022;
 const GIT_DIR_STICKY = 0o1000;
 // vault path -> identity of the index.lock our own git failed to unlink.
 // dev, ino, size, ctime, and birthtime when the platform reports one.
+// The matching fd stays open until that decision, so the inode cannot be
+// reused by a same-bytes recreate in the same tick.
 const staleGitLocks = new Map();
+const staleGitLockFds = new Map();
 const gitLockKeptLogged = new Set();
 // Vaults whose index.lock we left in place. Sync status reports this so
 // the editor does not say Saved while git is stuck.
 const gitLockBlocked = new Set();
 let gitLockBeforeUnlinkForTest = null;
+let gitLockBeforeMoveForTest = null;
 
 function lockIdentity(st, hash) {
   const birth = st.birthtimeMs;
@@ -686,33 +690,75 @@ function sameMovedLock(recorded, live) {
   return true;
 }
 
-// A planted lock bigger than this is not hashed and therefore not deleted.
+// m4. An index.lock bigger than this is not hashed and is never recorded.
+// Release then sees an empty hash, leaves the file in place, and pauses
+// sync. Fail closed: a lock we cannot identify is not deleted.
 const LOCK_HASH_MAX = 1024 * 1024;
+const QUARANTINE_NAME = /^\.aidanos-lock-[0-9a-f]{16}$/;
 
-function readLockFile(lockPath) {
+function closeFd(fd) {
+  if (typeof fd !== "number" || fd < 0) return;
+  try { fsSync.closeSync(fd); } catch { /* the caller still decides */ }
+}
+
+function hashOpenLock(fd, size) {
+  const hash = createHash("sha256");
+  if (size === 0) return hash.digest("hex");
+  const buf = Buffer.alloc(Math.min(64 * 1024, size));
+  let left = size;
+  let pos = 0;
+  while (left > 0) {
+    const n = fsSync.readSync(fd, buf, 0, Math.min(buf.length, left), pos);
+    if (n <= 0) return "";
+    hash.update(buf.subarray(0, n));
+    left -= n;
+    pos += n;
+  }
+  return hash.digest("hex");
+}
+
+// The fd stays open. The caller closes it. O_NOFOLLOW refuses a symlink.
+function openLockFd(lockPath) {
   let fd = -1;
   try {
     fd = fsSync.openSync(lockPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
     const st = fsSync.fstatSync(fd);
-    if (!st.isFile()) return null;
-    if (st.size > LOCK_HASH_MAX) return { st, hash: "" };
-    const hash = createHash("sha256");
-    const buf = Buffer.alloc(Math.min(64 * 1024, Math.max(1, st.size)));
-    let left = st.size;
-    while (left > 0) {
-      const n = fsSync.readSync(fd, buf, 0, Math.min(buf.length, left));
-      if (n <= 0) return null;
-      hash.update(buf.subarray(0, n));
-      left -= n;
+    if (!st.isFile()) {
+      closeFd(fd);
+      return null;
     }
-    return { st, hash: hash.digest("hex") };
+    if (st.size > LOCK_HASH_MAX) return { fd, st, hash: "" };
+    const hash = hashOpenLock(fd, st.size);
+    if (!hash && st.size > 0) {
+      closeFd(fd);
+      return null;
+    }
+    return { fd, st, hash };
   } catch {
+    closeFd(fd);
     return null;
-  } finally {
-    if (fd >= 0) {
-      try { fsSync.closeSync(fd); } catch { /* the caller still decides */ }
-    }
   }
+}
+
+function readLockFile(lockPath) {
+  const opened = openLockFd(lockPath);
+  if (!opened) return null;
+  closeFd(opened.fd);
+  return { st: opened.st, hash: opened.hash };
+}
+
+function rememberLockFd(key, fd) {
+  const prev = staleGitLockFds.get(key);
+  if (prev != null && prev !== fd) closeFd(prev);
+  staleGitLockFds.set(key, fd);
+}
+
+function forgetRecordedLock(key) {
+  staleGitLocks.delete(key);
+  const fd = staleGitLockFds.get(key);
+  if (fd == null) return;
+  staleGitLockFds.delete(key);
+  closeFd(fd);
 }
 
 // The holder check can take the whole lsof wait. A test uses this to swap
@@ -720,6 +766,13 @@ function readLockFile(lockPath) {
 export function setGitLockBeforeUnlinkForTest(fn) {
   if (process.env.NODE_ENV !== "test") return;
   gitLockBeforeUnlinkForTest = typeof fn === "function" ? fn : null;
+}
+
+// Fires after the recorded fd still matches index.lock and before the
+// quarantine name is created. Off unless this process is a test.
+export function setGitLockBeforeMoveForTest(fn) {
+  if (process.env.NODE_ENV !== "test") return;
+  gitLockBeforeMoveForTest = typeof fn === "function" ? fn : null;
 }
 
 // Tests that prove an unlink need a finished holder scan. Production never
@@ -826,16 +879,18 @@ function procDenied(error) {
 // on the event loop. A holder has to be able to write the vault, so a
 // process owned by another uid is skipped. pid 1 is root. Its descriptor
 // directory is not a failed read of a process we own.
-// EACCES or EPERM while reading a same-uid process is unknown, and the
-// lock is kept. It is not "no holder". A recorded lock is deleted only
-// when every same-uid process was inspected and none has the inode open.
-// The recorded identity includes a sha256 of the bytes. A same-size file
-// created again does not match that hash, so it is kept. Removal renames
-// the lock to a unique quarantine name, then checks the inode, the hash,
-// and the holder on that renamed file before unlink. rename updates
-// ctime, so that check allows ctime to move forward and rejects a ctime
-// that goes backwards. A failed re-check renames it back, or leaves it
-// and reports the pause.
+// m6. EACCES or EPERM while reading a same-uid process is unknown, and
+// the lock is kept. On Linux that is a non-dumpable process (dumpable 0):
+// its descriptor directory is unreadable even when it does not hold the
+// lock. Fail closed. It is not "no holder". A recorded lock is deleted
+// only when every same-uid process was inspected and none has the inode open.
+// The recorded identity includes a sha256 of the bytes. The fd from that
+// record stays open, so a same-bytes recreate in the same tick gets a new
+// inode and is kept. Removal links the lock to a unique quarantine name
+// created exclusively, then compares fstat of the recorded fd with stat
+// of that name. ctime may move forward. A failed re-check links the
+// quarantine back only when index.lock is absent. EEXIST keeps the
+// quarantine and reports the pause.
 // Same-account gap: an unreadable same-uid process keeps the lock even
 // when it does not hold it.
 async function linuxProcessHolds(dev, ino) {
@@ -936,20 +991,56 @@ function lsofHolds(file) {
   });
 }
 
+// link fails with EEXIST when index.lock is already there. The quarantine
+// name stays, and the caller pauses. A successful link drops the extra name.
 function restoreQuarantine(quarantine, lockPath) {
   try {
-    fsSync.renameSync(quarantine, lockPath);
-    return true;
+    fsSync.linkSync(quarantine, lockPath);
   } catch {
     return false;
   }
+  try {
+    fsSync.unlinkSync(quarantine);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+function linkExclusiveQuarantine(lockPath, dir) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const quarantine = path.join(dir, ".aidanos-lock-" + randomBytes(8).toString("hex"));
+    try {
+      fsSync.linkSync(lockPath, quarantine);
+      return quarantine;
+    } catch (error) {
+      if (error && error.code === "EEXIST") continue;
+      return "";
+    }
+  }
+  return "";
+}
+
+function sameDevice(fd, file) {
+  let held;
+  let link;
+  let named;
+  try {
+    held = fsSync.fstatSync(fd);
+    link = fsSync.lstatSync(file);
+    named = fsSync.statSync(file);
+  } catch {
+    return false;
+  }
+  if (link.isSymbolicLink() || !named.isFile()) return false;
+  return held.dev === named.dev && held.ino === named.ino;
 }
 
 // True when this call removed the recorded lock. False leaves a lock in place.
-// The file is renamed to a unique quarantine name first. The renamed file
-// must still be that inode and hash, with ctime equal or newer, and no
-// holder. A failed re-check renames it back when index.lock is free, and
-// otherwise leaves the quarantine file. Neither path prints the file name.
+// The recorded fd stays open. The quarantine name is a hard link, so an
+// existing name is left alone. fstat of that fd must match stat of the
+// quarantine file. A failed re-check links it back only when index.lock
+// is absent. Neither path prints the file name.
 async function quarantineRecordedLock(vault, identity) {
   if (process.env.NODE_ENV === "test" && gitLockBeforeUnlinkForTest) {
     const fn = gitLockBeforeUnlinkForTest;
@@ -966,19 +1057,42 @@ async function quarantineRecordedLock(vault, identity) {
     return false;
   }
   if (parent.isSymbolicLink() || !parent.isDirectory() || parent.dev !== git.dev || parent.ino !== git.ino) return false;
+  const key = vaultKey(vault);
+  const recordedFd = staleGitLockFds.get(key);
+  if (typeof recordedFd !== "number" || !sameDevice(recordedFd, lockPath)) return false;
+  let held;
+  try {
+    held = fsSync.fstatSync(recordedFd);
+  } catch {
+    return false;
+  }
+  if (held.dev !== identity.dev || held.ino !== identity.ino) return false;
   const opened = readLockFile(lockPath);
   if (!opened || !sameLock(identity, lockIdentity(opened.st, opened.hash))) return false;
   const againGit = resolveGitDir(vault);
   if (!againGit || againGit.dev !== git.dev || againGit.ino !== git.ino || againGit.dir !== git.dir) return false;
-  const quarantine = path.join(againGit.dir, ".aidanos-lock-" + randomBytes(8).toString("hex"));
-  try {
-    fsSync.renameSync(lockPath, quarantine);
-  } catch {
+  if (process.env.NODE_ENV === "test" && gitLockBeforeMoveForTest) {
+    const fn = gitLockBeforeMoveForTest;
+    gitLockBeforeMoveForTest = null;
+    fn();
+  }
+  const quarantine = linkExclusiveQuarantine(lockPath, againGit.dir);
+  if (!quarantine) return false;
+  if (!sameDevice(recordedFd, quarantine)) {
+    try { fsSync.unlinkSync(quarantine); } catch { /* the new lock keeps its own name */ }
     return false;
+  }
+  try {
+    const dirEnt = fsSync.lstatSync(lockPath);
+    if (!dirEnt.isSymbolicLink() && dirEnt.isFile() && dirEnt.dev === held.dev && dirEnt.ino === held.ino) {
+      fsSync.unlinkSync(lockPath);
+    }
+  } catch {
+    /* index.lock is already gone, or it is a new file */
   }
   const moved = readLockFile(quarantine);
   const movedIdentity = moved ? lockIdentity(moved.st, moved.hash) : null;
-  const stillSame = Boolean(movedIdentity && sameMovedLock(identity, movedIdentity));
+  const stillSame = Boolean(movedIdentity && sameMovedLock(identity, movedIdentity) && sameDevice(recordedFd, quarantine));
   const holders = stillSame ? await processHoldsLock(quarantine, moved.st.dev, moved.st.ino) : "unknown";
   if (stillSame && holders === "free") {
     try {
@@ -1001,6 +1115,7 @@ export function rememberUnlinkLock(errText, vault = VAULT) {
   const re = /unable to unlink '([^']+)'/g;
   let match;
   let recorded = null;
+  let recordedFd = -1;
   while ((match = re.exec(String(errText || "")))) {
     const git = namedIndexLock(match[1], vault);
     if (!git) continue;
@@ -1019,19 +1134,27 @@ export function rememberUnlinkLock(errText, vault = VAULT) {
       continue;
     }
     if (parent.isSymbolicLink() || !parent.isDirectory() || parent.dev !== git.dev || parent.ino !== git.ino) continue;
-    const opened = readLockFile(lockPath);
+    // m4. Over 1 MB the hash is empty, so this lock is never recorded.
+    const opened = openLockFd(lockPath);
     if (!opened || !opened.hash) continue;
+    if (recordedFd >= 0) closeFd(recordedFd);
     recorded = lockIdentity(opened.st, opened.hash);
+    recordedFd = opened.fd;
   }
-  if (recorded) staleGitLocks.set(key, recorded);
+  if (recorded && recordedFd >= 0) {
+    staleGitLocks.set(key, recorded);
+    rememberLockFd(key, recordedFd);
+  } else {
+    closeFd(recordedFd);
+  }
 }
 
 // Drop index.lock only when it is still the file our failed git recorded
 // (device, inode, size, ctime, birthtime where both sides have one, and
-// the sha256 of the bytes) and no live process has it open. Removal
-// renames that file aside. The renamed file must still be that inode and
-// hash, with ctime equal or newer, and a free holder, before unlink. A
-// lock this relay did
+// the sha256 of the bytes) and no live process has it open. The fd from
+// that record stays open through the quarantine link. fstat of that fd
+// must match stat of the quarantine file, and ctime may only move
+// forward, before unlink. A lock this relay did
 // not record stays, however old it is. A symlink on the way to .git, a
 // lock outside .git, and a lock a live git still holds stay put. A lock
 // we leave in place is logged once per vault with no path.
@@ -1040,7 +1163,7 @@ export async function releaseRememberedGitLock(vault = VAULT) {
   const recorded = staleGitLocks.get(key) || null;
   const git = resolveGitDir(vault);
   if (!git) {
-    staleGitLocks.delete(key);
+    forgetRecordedLock(key);
     clearGitLockKept(key);
     return;
   }
@@ -1049,12 +1172,12 @@ export async function releaseRememberedGitLock(vault = VAULT) {
   try {
     st = fsSync.lstatSync(lockPath);
   } catch {
-    staleGitLocks.delete(key);
+    forgetRecordedLock(key);
     clearGitLockKept(key);
     return;
   }
   if (st.isSymbolicLink() || !st.isFile()) {
-    staleGitLocks.delete(key);
+    forgetRecordedLock(key);
     clearGitLockKept(key);
     return;
   }
@@ -1062,15 +1185,17 @@ export async function releaseRememberedGitLock(vault = VAULT) {
   try {
     parent = fsSync.lstatSync(git.dir);
   } catch {
-    staleGitLocks.delete(key);
+    forgetRecordedLock(key);
     clearGitLockKept(key);
     return;
   }
   if (parent.isSymbolicLink() || !parent.isDirectory() || parent.dev !== git.dev || parent.ino !== git.ino) {
-    staleGitLocks.delete(key);
+    forgetRecordedLock(key);
     clearGitLockKept(key);
     return;
   }
+  // m4. No hash means the lock was over 1 MB or could not be read.
+  // It was never recorded. Leave it and pause sync. Fail closed.
   const opened = readLockFile(lockPath);
   if (!opened || !opened.hash) {
     markGitLockBlocked(key);
@@ -1091,18 +1216,93 @@ export async function releaseRememberedGitLock(vault = VAULT) {
     return;
   }
   if (!same) {
-    staleGitLocks.delete(key);
+    forgetRecordedLock(key);
     markGitLockBlocked(key);
     reportGitLockKept(key);
     return;
   }
   staleGitLocks.delete(key);
-  if (!await quarantineRecordedLock(vault, current)) {
+  let removed = false;
+  try {
+    removed = await quarantineRecordedLock(vault, current);
+  } finally {
+    forgetRecordedLock(key);
+  }
+  if (!removed) {
     markGitLockBlocked(key);
     reportGitLockKept(key);
     return;
   }
   clearGitLockKept(key);
+}
+
+// A crash can leave .aidanos-lock-* behind. At start, delete one only when
+// it is still the regular file we opened, fstat matches stat, and no
+// same-uid process holds it. A holder, or a file that changes, stays.
+export async function sweepAbandonedGitLocks(vault = VAULT) {
+  const git = resolveGitDir(vault);
+  if (!git) return;
+  const key = vaultKey(vault);
+  let names;
+  try {
+    names = fsSync.readdirSync(git.dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!QUARANTINE_NAME.test(name)) continue;
+    const file = path.join(git.dir, name);
+    let parent;
+    try {
+      parent = fsSync.lstatSync(git.dir);
+    } catch {
+      return;
+    }
+    if (parent.isSymbolicLink() || !parent.isDirectory() || parent.dev !== git.dev || parent.ino !== git.ino) return;
+    const opened = openLockFd(file);
+    if (!opened || !opened.hash) {
+      closeFd(opened && opened.fd);
+      markGitLockBlocked(key);
+      reportGitLockKept(key);
+      continue;
+    }
+    try {
+      const identity = lockIdentity(opened.st, opened.hash);
+      const holders = await processHoldsLock(file, opened.st.dev, opened.st.ino);
+      if (holders !== "free" || !sameDevice(opened.fd, file)) {
+        markGitLockBlocked(key);
+        reportGitLockKept(key);
+        continue;
+      }
+      const againHash = hashOpenLock(opened.fd, opened.st.size);
+      let named;
+      try {
+        named = fsSync.fstatSync(opened.fd);
+      } catch {
+        markGitLockBlocked(key);
+        reportGitLockKept(key);
+        continue;
+      }
+      if (!againHash || againHash !== identity.hash || named.dev !== identity.dev || named.ino !== identity.ino) {
+        markGitLockBlocked(key);
+        reportGitLockKept(key);
+        continue;
+      }
+      if (!sameDevice(opened.fd, file)) {
+        markGitLockBlocked(key);
+        reportGitLockKept(key);
+        continue;
+      }
+      try {
+        fsSync.unlinkSync(file);
+      } catch {
+        markGitLockBlocked(key);
+        reportGitLockKept(key);
+      }
+    } finally {
+      closeFd(opened.fd);
+    }
+  }
 }
 
 // Tests set AIDANOS_TEST_GIT_TURN to a file outside the vault. Git work holds
@@ -4257,6 +4457,7 @@ async function boot() {
   }
   await reportRecoveryFiles(VAULT);
   await initVaultGit();
+  await sweepAbandonedGitLocks(VAULT);
   await ensureRecoverExcluded(VAULT);
   startLogWatch();
   startVaultSyncLoop();

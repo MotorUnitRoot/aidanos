@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
@@ -41,6 +43,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
@@ -57,3 +61,25 @@ jobs:
         env:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: npm test
+
+  hosted-image:
+    name: hosted image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Build the hosted image and run vault-git-test as node
+        run: |
+          set -eu
+          docker build -t aidanos-hosted .
+          log=$(docker run --rm --user node -e NODE_ENV=test \
+            -v "$PWD/vault-git-test.mjs:/app/vault-git-test.mjs:ro" \
+            aidanos-hosted node vault-git-test.mjs)
+          printf '%s\n' "$log"
+          printf '%s\n' "$log" | grep -q "vault-git-test ok"
+          if printf '%s\n' "$log" | grep -q "skip normal-user lock removal"; then
+            echo "the normal-user lock path did not run in the hosted image"
+            exit 1
+          fi

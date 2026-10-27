@@ -875,13 +875,30 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertLessThanOrEqual(twice, once * 3)
     }
 
+    /// A long closed `[a` line stays a linear scan.
+    /// The simulator's wall clock missed 5s on this same linear read
+    /// (1f2d310 recorded 7.991s). The identical tree was 0.213s on ca876a9.
+    /// That clock is not the bound there.
+    /// The step count is: twice the brackets stay within 3x.
     func testClosedBracketLineStaysWithinTheTimeBound() {
+        let half = String(repeating: "[a", count: 175_000) + "]"
         let line = String(repeating: "[a", count: 350_000) + "]"
+        let halfWork = scanWork(half)
+        let fullWork = scanWork(line)
+        print("reader-work bracket-closed-bound \(halfWork) \(fullWork)")
+        XCTAssertGreaterThan(halfWork, 0)
+        XCTAssertLessThanOrEqual(
+            fullWork,
+            halfWork * 3,
+            "reading 350,000 closed brackets took \(fullWork) steps after \(halfWork)"
+        )
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing bracket-closed-bound \(elapsed)")
+        #if !targetEnvironment(simulator)
         XCTAssertLessThan(elapsed, 5)
+        #endif
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].markdownLinks.isEmpty)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)

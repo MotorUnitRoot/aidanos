@@ -73,10 +73,12 @@ jobs:
       - name: Build the hosted image and run vault-git-test as node
         run: |
           set -eu
-          docker build -t aidanos-hosted .
+          docker build --target production -t aidanos-hosted .
+          docker build --target test -t aidanos-hosted-test .
+          docker run --rm --entrypoint sh aidanos-hosted -c 'if command -v python3 >/dev/null 2>&1; then echo "production image contains python3"; exit 1; fi'
           log=$(docker run --rm --user node -e NODE_ENV=test \
             -v "$PWD/vault-git-test.mjs:/app/vault-git-test.mjs:ro" \
-            aidanos-hosted node vault-git-test.mjs)
+            aidanos-hosted-test node vault-git-test.mjs)
           printf '%s\n' "$log"
           printf '%s\n' "$log" | grep -q "vault-git-test ok"
           if printf '%s\n' "$log" | grep -q "skip normal-user lock removal"; then

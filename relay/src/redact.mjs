@@ -14,10 +14,13 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 const SLASH_ALLOW = new Set(["HTTP/1.1", "KB/s", "MB/s", "application/json", "text/plain"]);
 const NOTE_EXTS = ["markdown", "mdx", "txt", "md"];
 const SHIELD = "\uE000";
-// After secrets are masked, the line is cut here, then paths are scrubbed.
-// The cut is the raw byte offset. Measuring it after [path] replacement
-// skips the cut when a path collapses, and a secret sliced at the first
-// edge stays in plain text.
+// After secrets are masked, paths and note names are scrubbed on that
+// window, then the line is cut here. The cut is the raw byte offset.
+// Measuring it after [path] replacement skips the cut when a path
+// collapses, and a secret sliced at the first edge stays in plain text.
+// Scrubbing after the cut leaves a spaced note name that crossed 64 KB
+// as a fragment. A partial token still on the cut is trimmed back to
+// the last break, and the kept text is scrubbed again.
 export const REDACT_INPUT_CAP = 64 * 1024;
 // How far a cut walks back to finish a token. A line with no break in this
 // window keeps the character boundary instead of collapsing to the marker.
@@ -181,10 +184,12 @@ export function restoreShields(text, kept) {
 export function redact(text, secrets) {
   // Strip the shield marker before any scrubbing so a log line cannot forge
   // a kept frame. Mask first, on a window of 64 KB plus a byte margin, so a
-  // secret that straddles the cut is whole when it is replaced. Then cut at
-  // the raw 64 KB point and drop a listed prefix the cut still sliced.
-  // Paths are scrubbed after that cut. Collapsing a path to [path] must not
-  // pull a sliced secret back under 64 KB and skip the cut.
+  // secret that straddles the cut is whole when it is replaced. Then scrub
+  // paths and note names on that window. Then cut at the raw 64 KB point
+  // and drop a listed prefix the cut still sliced. Collapsing a path to
+  // [path] must not pull a sliced secret back under 64 KB and skip the cut.
+  // The kept text is scrubbed again, and a partial token on the cut is
+  // trimmed back to the last break.
   const list = [];
   for (const secret of secrets || []) {
     const value = String(secret || "").trim();
@@ -222,17 +227,51 @@ export function redact(text, secrets) {
   maskPattern("Authorization:\\s*Basic\\s+\\S+", "gi", "Authorization: Basic ***");
   maskPattern("AIDANOS_(?:RELAY|VAULT_GIT)_TOKEN=\\S+", "g", "AIDANOS_TOKEN=***");
   maskPattern("https?:\\/\\/[^\\s]+", "gi", "[url]");
+  const kept = [];
+  const scrubbed = scrubWindowTracked(state.text, state.cutAt, kept);
+  state.text = scrubbed.text;
+  state.cutAt = scrubbed.cutAt;
   let out = state.text.slice(0, state.cutAt);
-  if (cut < raw.length) out = dropSecretTail(out, state.tails);
+  if (cut < raw.length) {
+    // The window scrub already replaced a name whose extension was in
+    // the margin. This pass catches a name that is whole in the kept
+    // text, then drops a sliced token the raw cut still ends on.
+    out = scrubLocations(out, kept);
+    out = trimPartialLocation(out);
+    out = dropSecretTail(out, state.tails);
+  }
   // Same scrub for stderr and fatal.log. A vault path or a note file name
   // must not land in either. Document ids have neither a slash nor a .md suffix.
   // The 8 KB cap still runs after the scrub, so a path or a spaced note name
   // that crosses 8 KB is already [path] or [note], not a leftover prefix.
-  const kept = [];
-  out = scrubLocations(out, kept);
   out = out.replace(/file:\/\/\S+/gi, "[url]");
   out = restoreShields(out, kept);
   return capLocations(out, state.tails);
+}
+
+// A replacement before the raw cut shifts the cut. A path or note name
+// that straddles the cut is kept whole, as [path] or [note]. Plain text
+// that straddles is cut at the raw point. A match that starts at the cut
+// or after it is discarded with the tail.
+function trackPiece(state, start, end, replacement, keepWhole) {
+  state.parts.push(replacement);
+  const before = state.outLen;
+  state.outLen += replacement.length;
+  if (end <= state.cutAt) state.mapped += replacement.length - (end - start);
+  else if (start < state.cutAt) state.mapped = keepWhole ? state.outLen : before + (state.cutAt - start);
+}
+
+// The raw cut can end in the middle of a token. Drop that token back to
+// the last break so a sliced path or note name does not keep a fragment.
+// No break in the last 256 bytes keeps the character boundary. A trailing
+// *** is a masked secret and stays.
+function trimPartialLocation(text) {
+  let end = text.length;
+  const floor = Math.max(0, end - CAP_BREAK_WINDOW);
+  while (end > floor && !isBreak(text.charCodeAt(end - 1))) end -= 1;
+  if (end === text.length || end <= floor) return text;
+  if (text.slice(end).includes("*")) return text;
+  return text.slice(0, end);
 }
 
 // One log line, then the marker. The cut is applied to text that is already
@@ -374,27 +413,29 @@ function nodeBuiltinFrame(frame) {
 
 // One forward pass. Each character is copied or skipped once, so a line of
 // '(a/' or 'a/a/a/' cannot blow up the way a nested quantifier did.
-function scrubPaths(line, kept) {
+// cutAt is an index in this line. The returned cutAt is where that same
+// raw point lands after replacements.
+function scrubPathsTracked(line, cutAt, kept) {
   const n = line.length;
-  const parts = [];
+  const state = { parts: [], outLen: 0, mapped: cutAt, cutAt };
   let i = 0;
   while (i < n) {
     const start = i;
     while (i < n && isBreak(line.charCodeAt(i))) i += 1;
-    if (i > start) parts.push(line.slice(start, i));
+    if (i > start) trackPiece(state, start, i, line.slice(start, i), false);
     if (i >= n) break;
     if (line.startsWith("file://", i)) {
       let j = i + 7;
       while (j < n && line.charCodeAt(j) > 32 && line.charCodeAt(j) !== 41) j += 1;
       const url = line.slice(i, j);
       const shown = fileUrlFrame(url);
-      parts.push(shown ? shield(kept, shown) : url);
+      trackPiece(state, i, j, shown ? shield(kept, shown) : url, true);
       i = j;
       continue;
     }
     const nodeEnd = nodeFrameEnd(line, i);
     if (nodeEnd) {
-      parts.push(shield(kept, line.slice(i, nodeEnd)));
+      trackPiece(state, i, nodeEnd, shield(kept, line.slice(i, nodeEnd)), true);
       i = nodeEnd;
       continue;
     }
@@ -402,7 +443,8 @@ function scrubPaths(line, kept) {
       const tokenStart = i;
       i += 2;
       while (i < n && !isBreak(line.charCodeAt(i))) i += 1;
-      parts.push(line.slice(tokenStart, i).length ? "[path]" : "");
+      const token = line.slice(tokenStart, i);
+      trackPiece(state, tokenStart, i, token.length ? "[path]" : "", true);
       continue;
     }
     const tokenStart = i;
@@ -422,18 +464,22 @@ function scrubPaths(line, kept) {
     if (tail && (token.startsWith("/") || token.startsWith("\\"))) {
       const shown = repoFrame(token);
       if (shown) {
-        parts.push(shield(kept, shown + line.slice(i, tail)));
+        trackPiece(state, tokenStart, tail, shield(kept, shown + line.slice(i, tail)), true);
         i = tail;
         continue;
       }
     }
     if (SLASH_ALLOW.has(token) || isRatio(token)) {
-      parts.push(token);
+      trackPiece(state, tokenStart, i, token, false);
       continue;
     }
-    parts.push(slash || encoded ? "[path]" : token);
+    trackPiece(state, tokenStart, i, slash || encoded ? "[path]" : token, Boolean(slash || encoded));
   }
-  return parts.join("");
+  return { text: state.parts.join(""), cutAt: state.mapped };
+}
+
+function scrubPaths(line, kept) {
+  return scrubPathsTracked(line, line.length, kept).text;
 }
 
 function driveAt(line, i) {
@@ -473,7 +519,7 @@ function matchNoteExt(line, i) {
 // A note name may contain spaces. The left edge is the line start, a quote,
 // a colon, or a slash. Walking stops at a span already claimed, so the pass
 // stays linear. .md, .txt, .markdown, and .mdx match in either case.
-function scrubNotes(line) {
+function scrubNotesTracked(line, cutAt) {
   const n = line.length;
   const drop = new Uint8Array(n);
   let i = 0;
@@ -492,19 +538,60 @@ function scrubNotes(line) {
     for (let k = start; k < ext; k += 1) drop[k] = 1;
     i = ext;
   }
-  const parts = [];
+  const state = { parts: [], outLen: 0, mapped: cutAt, cutAt };
   let k = 0;
   while (k < n) {
     if (!drop[k]) {
       const start = k;
       while (k < n && !drop[k]) k += 1;
-      parts.push(line.slice(start, k));
+      trackPiece(state, start, k, line.slice(start, k), false);
       continue;
     }
+    const start = k;
     while (k < n && drop[k]) k += 1;
-    parts.push("[note]");
+    trackPiece(state, start, k, "[note]", true);
   }
-  return parts.join("");
+  return { text: state.parts.join(""), cutAt: state.mapped };
+}
+
+function scrubNotes(line) {
+  return scrubNotesTracked(line, line.length).text;
+}
+
+// Paths and note names on the masked window. cutAt is the raw 64 KB point
+// in that window. Lines after the cut are still scrubbed so a name whose
+// extension sits in the margin is whole before the slice.
+function scrubWindowTracked(text, cutAt, kept) {
+  const lines = String(text).split("\n");
+  const outLines = [];
+  let src = 0;
+  let mapped = 0;
+  let placed = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const localCut = cutAt - src;
+    const paths = scrubPathsTracked(line, localCut, kept);
+    const notes = scrubNotesTracked(paths.text, paths.cutAt);
+    outLines.push(notes.text);
+    if (!placed) {
+      if (localCut <= 0) placed = true;
+      else if (localCut < line.length) {
+        mapped += notes.cutAt;
+        placed = true;
+      } else mapped += notes.text.length;
+    }
+    src += line.length;
+    if (i + 1 < lines.length) {
+      if (!placed) {
+        if (cutAt > src) mapped += 1;
+        else placed = true;
+      }
+      src += 1;
+    }
+  }
+  const joined = outLines.join("\n");
+  if (!placed) mapped = joined.length;
+  return replaceTracked(joined, /file:\/\/\S+/gi, "[url]", mapped);
 }
 
 function scrubLine(line, kept) {

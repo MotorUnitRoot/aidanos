@@ -1135,8 +1135,12 @@ export function rememberUnlinkLock(errText, vault = VAULT) {
     }
     if (parent.isSymbolicLink() || !parent.isDirectory() || parent.dev !== git.dev || parent.ino !== git.ino) continue;
     // m4. Over 1 MB the hash is empty, so this lock is never recorded.
+    // Close the fd before continuing. An empty hash does not keep it.
     const opened = openLockFd(lockPath);
-    if (!opened || !opened.hash) continue;
+    if (!opened || !opened.hash) {
+      closeFd(opened && opened.fd);
+      continue;
+    }
     if (recordedFd >= 0) closeFd(recordedFd);
     recorded = lockIdentity(opened.st, opened.hash);
     recordedFd = opened.fd;

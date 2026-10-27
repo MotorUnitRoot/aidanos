@@ -1416,13 +1416,21 @@ test("secrets swept across the 64 KB cut leak no characters", () => {
   const relay = "9" + "f".repeat(63);
   const pat = "github_pat_" + "C".repeat(71);
   const jwt = "eyJ" + "Q".repeat(366);
+  const note = "My Therapy Notes about the long Tuesday afternoon session with Jordan.md";
+  const userPath = "/Users/colby/notes/medical/private/therapy-folder/session-notes";
   assert.equal(relay.length, 64);
   assert.equal(pat.length, 82);
   assert.equal(jwt.length, 369);
+  assert.ok(note.length > 50, "the spaced note name does not cross a -50 offset");
+  assert.ok(userPath.length > 50, "the user path does not cross a -50 offset");
+  assert.ok(note.length + 50 < 200, "the spaced note name does not fit in the mask margin");
+  assert.ok(userPath.length + 50 < 200, "the user path does not fit in the mask margin");
   const cases = [
     { name: "relay", secret: relay, listed: true },
     { name: "pat", secret: pat, listed: false },
     { name: "jwt", secret: jwt, listed: true },
+    { name: "note", secret: note, listed: false },
+    { name: "user-path", secret: userPath, listed: false },
   ];
   for (const item of cases) {
     for (const shorten of [true, false]) {

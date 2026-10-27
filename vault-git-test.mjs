@@ -465,6 +465,11 @@ function lockTmp() {
   return fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "aidanos-lock-"));
 }
 
+function openFdCount() {
+  const dir = fs.existsSync("/proc/self/fd") ? "/proc/self/fd" : "/dev/fd";
+  return fs.readdirSync(dir).length;
+}
+
 // A same-uid process with an unreadable descriptor directory keeps a
 // recorded lock. The no-holder case re-enters as root in a private /proc,
 // where every same-uid process can be inspected and none holds the lock.
@@ -640,6 +645,25 @@ function waitChild(child, ms) {
       resolve();
     });
   });
+}
+
+async function gitLockOverOneMegabyteDoesNotLeakFds() {
+  const tmp = lockTmp();
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    fs.writeFileSync(lock, Buffer.alloc(1024 * 1024 + 1, 0x61));
+    const before = openFdCount();
+    for (let i = 0; i < 300; i += 1) rememberUnlinkLock(gitLockMessage(lock), vault);
+    const after = openFdCount();
+    assert(after <= before, "an over-1 MB index.lock grew open fds from " + before + " to " + after);
+    assert(fs.existsSync(lock), "an over-1 MB index.lock was removed");
+    assert(fs.statSync(lock).size > 1024 * 1024, "the over-1 MB index.lock was truncated");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 async function gitLockKeepsSameUidScanError() {
@@ -1007,6 +1031,7 @@ try {
   await gitLockKeepsALiveGitProcess();
   await gitLockIgnoresPathsOutsideGit();
   await gitLockRemovesOnlyARecordedLock();
+  await gitLockOverOneMegabyteDoesNotLeakFds();
   await gitLockKeepsSameUidScanError();
   await gitLockNormalUserRemovesOwnRecordedLock();
   await gitLockKeepsSameSizeRecreate();

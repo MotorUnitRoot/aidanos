@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { closeSync, constants as fsConstants, fstatSync, fsyncSync, openSync, readSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, fsyncSync, openSync, readSync, realpathSync, unlinkSync, writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -320,15 +320,29 @@ export async function sweepStaleNoteTemps(vault, stateDir) {
   });
 }
 
+function relativeInside(root, file) {
+  const rel = path.relative(root, file);
+  if (!rel || rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) return "";
+  return rel.split(path.sep).join("/");
+}
+
+// The note file is under realpath(vault). On macOS that can be /private/var
+// while the configured vault is /var, and path.relative then looks like ../.
 function tempRelative(vault, file) {
-  const root = path.resolve(vault);
   const abs = path.resolve(file);
-  const rel = path.relative(root, abs);
-  if (!rel || rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) {
-    throw new Error("note temp is outside the vault");
+  let posix = relativeInside(path.resolve(vault), abs);
+  if (!posix) {
+    try {
+      posix = relativeInside(realpathSync(vault), abs);
+    } catch {
+      posix = "";
+    }
   }
-  const posix = rel.split(path.sep).join("/");
-  if (!parseManifestLine(posix)) throw new Error("note temp is outside the vault");
+  if (!posix || !parseManifestLine(posix)) {
+    const error = new Error("note temp is outside the vault");
+    error.code = "EINVAL";
+    throw error;
+  }
   return posix;
 }
 

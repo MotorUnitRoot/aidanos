@@ -83,6 +83,8 @@ function runGit(args, cwd, secrets, timeoutMs = 20000, extraEnv = {}) {
   });
 }
 
+const OLD_WIDE_TEMP_COMMENT = "# aidanos: drop the old wide temp rule";
+
 async function ensureGitignore(vault) {
   const file = path.join(vault, ".gitignore");
   let text = "";
@@ -91,17 +93,22 @@ async function ensureGitignore(vault) {
   } catch {
     text = "";
   }
+  const raw = text.split(/\r?\n/);
   const kept = [];
-  for (const line of text.split(/\r?\n/)) {
-    if (line.trim() === ".*.tmp") continue;
-    kept.push(line);
+  for (let i = 0; i < raw.length; i += 1) {
+    // A user's own `.*.tmp` line stays. Only the pair this relay wrote,
+    // the comment and the rule under it, is removed.
+    if (raw[i].trim() === OLD_WIDE_TEMP_COMMENT && raw[i + 1] && raw[i + 1].trim() === ".*.tmp") {
+      i += 1;
+      continue;
+    }
+    kept.push(raw[i]);
   }
   while (kept.length && kept[kept.length - 1] === "") kept.pop();
   const present = new Set(kept.map((line) => line.trim()));
   if (!present.has(".aidanos/")) kept.push(".aidanos/");
   if (!present.has("*.recover")) kept.push("*.recover");
-  // Note temps are `.{name}.md.{pid}.tmp`. A wider `.*.tmp` rule would hide
-  // a file the user named themselves, so an exact copy of that older line goes too.
+  // Note temps are `.{name}.md.{pid}.tmp`. That shape is the rule we add.
   if (!present.has(".*.md.*.tmp")) kept.push(".*.md.*.tmp");
   const next = kept.join("\n") + "\n";
   if (next !== text) await fs.writeFile(file, next);

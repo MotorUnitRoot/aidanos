@@ -14,8 +14,11 @@ import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import {
+  MANIFEST_REFUSED_LINE,
+  MANIFEST_RESET_LINE,
   NOTE_TEMP_MANIFEST,
   foldInFailureLine,
+  manifestNoticeLogged,
   mirrorFailureLine,
   mirrorNoteFailureLine,
   rememberVaultRoot,
@@ -24,7 +27,7 @@ import {
   sweepStaleNoteTemps,
 } from "../src/mirror.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
-import { FATAL_FALLBACK_NAME, FILE_LOG_CAP, LOG_LINE_CAP, flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, redact, stampLine } from "../src/redact.mjs";
+import { FATAL_FALLBACK_NAME, FILE_LOG_CAP, LOG_LINE_CAP, REDACT_INPUT_CAP, flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, redact, restoreShields, stampLine } from "../src/redact.mjs";
 import { INDEX_TRACE_ENTRY_CAP, beginIndexRequest, emptyLateState, finishIndexReply, installIndexTrace, nextLoopLateLine, noteGitWork, noteMirror } from "../src/index-trace.mjs";
 import { cbor } from "@automerge/automerge-repo";
 import { describeSyncFrame, logSyncFrame } from "../src/sync-log.mjs";
@@ -1138,23 +1141,109 @@ test("fold-in, mirror, and foreign-folder lines keep their wording", () => {
   assert.equal(oldWrote.includes("Secret"), false, oldWrote);
 });
 
+test("a long line with no break keeps the first 8 KB", () => {
+  const line = "a".repeat(LOG_LINE_CAP + 100);
+  const capped = redact(line, []);
+  assert.equal(capped.endsWith("[truncated]"), true, capped.slice(-20));
+  assert.notEqual(capped, "[truncated]");
+  const body = capped.slice(0, -"[truncated]".length);
+  assert.equal(body, "a".repeat(body.length));
+  assert.ok(Buffer.byteLength(body) > LOG_LINE_CAP - 256, String(Buffer.byteLength(body)));
+  assert.ok(Buffer.byteLength(body) <= LOG_LINE_CAP);
+});
+
+test("a node frame is kept only when it stays inside node", () => {
+  const kept = "node:internal/modules/cjs/loader:198:15";
+  assert.equal(redact("at " + kept, []), "at " + kept);
+  const escaped = "node:internal/../../Users/colby/vault/diary.md:1:2";
+  const scrubbed = redact("at " + escaped, []);
+  assert.notEqual(scrubbed, "at " + escaped);
+  assert.equal(scrubbed.includes("Users"), false, scrubbed);
+  assert.equal(scrubbed.includes("colby"), false, scrubbed);
+  assert.equal(scrubbed.includes("diary"), false, scrubbed);
+  assert.equal(scrubbed.includes("vault"), false, scrubbed);
+  assert.equal(scrubbed.includes(".."), false, scrubbed);
+});
+
+test("a log line does not glue a cut bracket to the truncation mark", () => {
+  const line = "a".repeat(LOG_LINE_CAP - 1) + "[secret]";
+  const capped = redact(line, []);
+  assert.equal(capped.includes("[[truncated]"), false, capped.slice(-24));
+  assert.equal(capped.endsWith("[truncated]"), true, capped.slice(-24));
+  assert.equal(capped.includes("secret"), false, capped.slice(-24));
+});
+
+test("twenty thousand stack frames restore in one pass", () => {
+  const frame = "at node:internal/modules/cjs/loader:1:1\n";
+  const input = frame.repeat(20000) + "at node:internal/modules/cjs/loader:99999:1\n";
+  assert.ok(Buffer.byteLength(input) > REDACT_INPUT_CAP);
+  const started = performance.now();
+  const cleaned = redact(input, []);
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 1000, "redacted in " + elapsed + "ms");
+  assert.equal(cleaned.includes("\uE000"), false, cleaned.slice(0, 80));
+  assert.equal(cleaned.includes("node:internal/modules/cjs/loader:1:1"), true);
+  assert.equal(cleaned.includes("99999"), false, cleaned.slice(-80));
+  const forged = redact("\uE0000\uE000 " + frame, []);
+  assert.equal(forged.includes("\uE000"), false, forged);
+  assert.equal(forged.split("loader:1:1").length - 1, 1, forged);
+
+  const kept = [];
+  let shielded = "";
+  for (let i = 0; i < 20000; i += 1) {
+    kept.push("node:internal/modules/cjs/loader:" + i + ":1");
+    shielded += "\uE000" + i.toString(16) + "\uE000 ";
+  }
+  const restoreStarted = performance.now();
+  const restored = restoreShields(shielded, kept);
+  const restoreElapsed = performance.now() - restoreStarted;
+  assert.ok(restoreElapsed < 1000, "restored in " + restoreElapsed + "ms");
+  assert.equal(restored.includes("\uE000"), false);
+  assert.equal(restored.includes("node:internal/modules/cjs/loader:0:1"), true);
+  assert.equal(restored.includes("node:internal/modules/cjs/loader:19999:1"), true);
+  assert.equal(restoreShields("\uE00063\uE000", ["only"]), "");
+});
+
 test("a location scrub is linear on adversarial input", () => {
   const piece = "(a/".repeat(200) + "a/a/a/".repeat(100) + " Secret Plan.txt Name.markdown Name.mdx "
     + "C:\\Users\\ada\\plan.md \\\\server\\share\\notes notes%2Fplan.md " + " ".repeat(800);
   assert.ok(piece.length < LOG_LINE_CAP, piece.length);
-  let input = "";
-  while (Buffer.byteLength(input) < 1024 * 1024) input += piece + "\n";
-  assert.ok(Buffer.byteLength(input) >= 1024 * 1024);
-  const started = performance.now();
-  const cleaned = redact(input, []);
-  const elapsed = performance.now() - started;
-  assert.ok(elapsed < 100, "scrubbed in " + elapsed + "ms");
+  function fill(bytes) {
+    let input = "";
+    while (Buffer.byteLength(input) < bytes) input += piece + "\n";
+    return input;
+  }
+  const smallInput = fill(12 * 1024);
+  const largeInput = fill(48 * 1024);
+  assert.ok(Buffer.byteLength(largeInput) <= REDACT_INPUT_CAP);
+  assert.ok(Buffer.byteLength(largeInput) >= Buffer.byteLength(smallInput) * 4);
+  function elapsedFor(input) {
+    let elapsed = 0;
+    for (let i = 0; i < 8; i += 1) {
+      const started = performance.now();
+      redact(input, []);
+      elapsed += performance.now() - started;
+    }
+    return elapsed;
+  }
+  redact(smallInput, []);
+  const smallMs = elapsedFor(smallInput);
+  const largeMs = elapsedFor(largeInput);
+  assert.ok(largeMs < 1000, "scrubbed in " + largeMs + "ms");
+  assert.ok(largeMs < smallMs * 6, "4N/N " + largeMs + " / " + smallMs);
+  const cleaned = redact(largeInput, []);
   assert.equal(cleaned.includes("(a/"), false);
   assert.equal(cleaned.includes("a/a/a/"), false);
   assert.equal(cleaned.includes("Secret"), false);
   assert.equal(cleaned.includes("Users"), false);
   assert.equal(cleaned.includes("server"), false);
   assert.equal(cleaned.includes("%2F"), false);
+  const huge = fill(1024 * 1024) + "TAILTOKEN-99999\n";
+  const hugeStarted = performance.now();
+  const hugeCleaned = redact(huge, []);
+  assert.ok(performance.now() - hugeStarted < 1000, "1 MB scrub");
+  assert.equal(hugeCleaned.includes("TAILTOKEN-99999"), false);
+  assert.equal(hugeCleaned.includes("Secret"), false);
 });
 
 test("relay rejects a bad token and accepts the real one", async () => {
@@ -1291,7 +1380,10 @@ test("a fresh backup pushes to an empty repo", async () => {
     gitIntervalMs: 0,
   });
   try {
-    await fs.writeFile(path.join(vault, ".gitignore"), "# keep\n.*.tmp\nuser.tmp\n");
+    await fs.writeFile(
+      path.join(vault, ".gitignore"),
+      "# keep\n.*.tmp\nuser.tmp\n# aidanos: drop the old wide temp rule\n.*.tmp\n",
+    );
     await fs.writeFile(path.join(vault, "day.md"), "today\n");
     await fs.writeFile(path.join(vault, "day.md.leftover.recover"), "secret\n");
     await fs.writeFile(path.join(vault, ".day.md.99999.tmp"), "secret-temp\n");
@@ -1306,13 +1398,14 @@ test("a fresh backup pushes to an empty repo", async () => {
     assert.match(ignore, /^# keep$/m);
     assert.match(ignore, /^user\.tmp$/m);
     assert.match(ignore, /^\.\*\.md\.\*\.tmp$/m);
-    assert.doesNotMatch(ignore, /^\.\*\.tmp$/m);
+    assert.equal(ignore.split(/\r?\n/).filter((line) => line.trim() === ".*.tmp").length, 1);
+    assert.doesNotMatch(ignore, /aidanos: drop the old wide temp rule/);
     const exclude = await fs.readFile(path.join(vault, ".git", "info", "exclude"), "utf8");
     assert.match(exclude, /^\*\.recover$/m);
     const tree = await git(["--git-dir", bare, "ls-tree", "-r", "--name-only", "main"]);
     assert.doesNotMatch(tree.stdout, /\.recover/);
     assert.doesNotMatch(tree.stdout, /\.day\.md\.99999\.tmp/);
-    assert.match(tree.stdout, /^\.cache\.tmp$/m);
+    assert.doesNotMatch(tree.stdout, /^\.cache\.tmp$/m);
   } finally {
     await relay.close();
   }
@@ -1355,7 +1448,7 @@ test("a manifest line is durable before its temp exists", async () => {
   assert.equal((await fs.readFile(path.join(data, NOTE_TEMP_MANIFEST), "utf8")).trim(), "");
 });
 
-test("one manifest fsync records every temp in a pass before any temp exists", async () => {
+test("the manifest file and state directory are synced before any temp exists", async () => {
   const dir = await tempDir();
   const vault = path.join(dir, "vault");
   const notes = path.join(vault, "notes");
@@ -1527,7 +1620,13 @@ test("a startup sweep removes only a claimed manifest temp", async () => {
   assert.equal(await fs.readFile(decoy, "utf8"), lines.join("\n") + "\n");
 
   await fs.unlink(path.join(data, NOTE_TEMP_MANIFEST));
-  const recorded = lines.filter((line) => line !== `notes/.extra.md.${dead}.tmp`);
+  const recorded = [
+    `notes/.plan.md.${dead}.tmp`,
+    `.held-note.md.${process.pid}.tmp`,
+    `notes/.linked.md.${dead}.tmp`,
+    `linked-dir/.secret.md.${dead}.tmp`,
+  ];
+  if (foreign) recorded.push(`notes/.foreign.md.${dead}.tmp`);
   await fs.writeFile(path.join(data, NOTE_TEMP_MANIFEST), recorded.join("\n") + "\n");
   const again = await startRelay({ token: TOKEN, vault, data, port: 0, gitUrl: "" });
   try {
@@ -1542,17 +1641,80 @@ test("a startup sweep removes only a claimed manifest temp", async () => {
     if (foreign) assert.equal(await fs.readFile(foreign, "utf8"), "other-user\n");
     const manifest = await fs.readFile(path.join(data, NOTE_TEMP_MANIFEST), "utf8");
     assert.equal(manifest.includes(`notes/.plan.md.${dead}.tmp`), false, manifest);
-    assert.equal(manifest.includes(`notes/.extra.md.${dead}.tmp`), false, manifest);
     assert.equal(manifest.includes(`.held-note.md.${process.pid}.tmp`), true, manifest);
-    assert.equal(manifest.includes(`.report.docx.${dead}.tmp`), true, manifest);
-    assert.equal(manifest.includes(`docs/.cache/.cache.${dead}.tmp`), true, manifest);
     assert.equal(manifest.includes(`notes/.linked.md.${dead}.tmp`), true, manifest);
     assert.equal(manifest.includes(`linked-dir/.secret.md.${dead}.tmp`), true, manifest);
-    assert.equal(manifest.includes(`../outside/.secret.md.${dead}.tmp`), true, manifest);
+    assert.equal(manifest.includes(".docx"), false, manifest);
+    assert.equal(manifest.includes(".cache"), false, manifest);
+    assert.equal(manifest.includes(".."), false, manifest);
     if (foreign) assert.equal(manifest.includes(`notes/.foreign.md.${dead}.tmp`), true, manifest);
   } finally {
     await again.close();
   }
+});
+
+test("a hostile manifest is not written through", async () => {
+  assert.equal(MANIFEST_REFUSED_LINE.includes("/"), false);
+  assert.equal(MANIFEST_RESET_LINE.includes("/"), false);
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await fs.mkdir(vault);
+  await fs.mkdir(data, { mode: 0o755 });
+  const note = path.join(vault, "secret.md");
+  const day = path.join(vault, "day.md");
+  await fs.writeFile(note, "secret-bytes\n");
+  await fs.link(note, path.join(data, NOTE_TEMP_MANIFEST));
+  await saveNoteFile(day, "day\n", undefined, { vault, stateDir: data });
+  assert.equal(await fs.readFile(note, "utf8"), "secret-bytes\n");
+  assert.equal(await fs.readFile(day, "utf8"), "day\n");
+  assert.equal((await fs.lstat(path.join(data, NOTE_TEMP_MANIFEST))).nlink > 1, true);
+  const elsewhere = path.join(dir, "elsewhere");
+  await fs.writeFile(elsewhere, "keep-target\n");
+  await fs.unlink(path.join(data, NOTE_TEMP_MANIFEST));
+  await fs.symlink(elsewhere, path.join(data, NOTE_TEMP_MANIFEST));
+  await saveNoteFile(day, "day-again\n", undefined, { vault, stateDir: data });
+  assert.equal(await fs.readFile(day, "utf8"), "day-again\n");
+  assert.equal(await fs.readFile(elsewhere, "utf8"), "keep-target\n");
+  assert.equal((await fs.lstat(path.join(data, NOTE_TEMP_MANIFEST))).isSymbolicLink(), true);
+  assert.equal(manifestNoticeLogged(data).refused, true);
+
+  const modeDir = path.join(dir, "mode-data");
+  await fs.mkdir(modeDir, { mode: 0o755 });
+  const planted = path.join(modeDir, NOTE_TEMP_MANIFEST);
+  await fs.writeFile(planted, "", { mode: 0o644 });
+  await fs.chmod(planted, 0o644);
+  await saveNoteFile(day, "day-mode\n", undefined, { vault, stateDir: modeDir });
+  assert.equal(await fs.readFile(day, "utf8"), "day-mode\n");
+  assert.equal((await fs.stat(planted)).mode & 0o777, 0o600);
+  assert.equal(manifestNoticeLogged(modeDir).refused, false);
+
+  const badDir = path.join(dir, "bad-data");
+  await fs.mkdir(badDir, { mode: 0o755 });
+  await fs.writeFile(path.join(badDir, NOTE_TEMP_MANIFEST), "not a temp\n", { mode: 0o600 });
+  await saveNoteFile(day, "day-bad\n", undefined, { vault, stateDir: badDir });
+  assert.equal(await fs.readFile(day, "utf8"), "day-bad\n");
+  const badAside = (await fs.readdir(badDir)).filter((name) => name.startsWith(NOTE_TEMP_MANIFEST + "."));
+  assert.equal(badAside.length, 1, badAside.join(","));
+  assert.equal(await fs.readFile(path.join(badDir, badAside[0]), "utf8"), "not a temp\n");
+  assert.equal(manifestNoticeLogged(badDir).reset, true);
+  await fs.writeFile(path.join(badDir, NOTE_TEMP_MANIFEST), "also bad\n", { mode: 0o600 });
+  await saveNoteFile(day, "day-bad-2\n", undefined, { vault, stateDir: badDir });
+  const badAsideAgain = (await fs.readdir(badDir)).filter((name) => name.startsWith(NOTE_TEMP_MANIFEST + "."));
+  assert.equal(badAsideAgain.length, 2, badAsideAgain.join(","));
+  assert.equal(manifestNoticeLogged(badDir).reset, true);
+
+  const hugeDir = path.join(dir, "huge-data");
+  await fs.mkdir(hugeDir, { mode: 0o755 });
+  await fs.writeFile(path.join(hugeDir, NOTE_TEMP_MANIFEST), Buffer.alloc(1024 * 1024 + 1, 0x61));
+  await saveNoteFile(day, "day-huge\n", undefined, { vault, stateDir: hugeDir });
+  assert.equal(await fs.readFile(day, "utf8"), "day-huge\n");
+  const hugeAside = (await fs.readdir(hugeDir)).filter((name) => name.startsWith(NOTE_TEMP_MANIFEST + "."));
+  assert.equal(hugeAside.length, 1, hugeAside.join(","));
+  assert.ok((await fs.stat(path.join(hugeDir, hugeAside[0]))).size > 1024 * 1024);
+  assert.equal(manifestNoticeLogged(hugeDir).reset, true);
+  const fresh = await fs.readFile(path.join(hugeDir, NOTE_TEMP_MANIFEST), "utf8");
+  assert.equal(fresh.includes("a".repeat(32)), false, fresh.slice(0, 40));
 });
 
 test("relay refuses an app vault", async () => {

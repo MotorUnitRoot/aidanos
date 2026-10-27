@@ -16,10 +16,9 @@ const SHIELD = "\uE000";
 // After a full scrub, anything past this size is dropped. A secret that
 // straddles the cut is masked first, so its head is not left behind.
 export const REDACT_INPUT_CAP = 64 * 1024;
-// Past this size the full scrub is no longer cheap. The text is cut at the
-// last break before 64 KB, and the trailing partial token is dropped, before
-// the mask runs. 1 MB still takes the full scrub (measured around 4 ms).
-const REDACT_CHEAP_BYTES = 2 * 1024 * 1024;
+// How much of a listed secret is read with each chunk. The overlap is the
+// whole pattern, so a match on the join is replaced before the next chunk.
+const REDACT_CHUNK = 64 * 1024;
 // How far a cut walks back to finish a token. A line with no break in this
 // window keeps the character boundary instead of collapsing to the marker.
 const CAP_BREAK_WINDOW = 256;
@@ -50,23 +49,57 @@ export function restoreShields(text, kept) {
   });
 }
 
+// Replace needle in chunks. The unsent tail is one shorter than the needle,
+// so a match that straddles two chunks is still whole when it is replaced.
+function maskLiteral(text, needle, replacement) {
+  if (!needle) return text;
+  const n = needle.length;
+  const step = Math.max(REDACT_CHUNK, n);
+  let pending = "";
+  let out = "";
+  const take = (final) => {
+    const hold = final ? 0 : n - 1;
+    let commit = pending.length - hold;
+    if (commit <= 0) return;
+    let i = 0;
+    let piece = "";
+    while (i < commit) {
+      const at = pending.indexOf(needle, i);
+      if (at === -1 || at >= commit) {
+        piece += pending.slice(i, commit);
+        i = commit;
+        break;
+      }
+      piece += pending.slice(i, at) + replacement;
+      i = at + n;
+      if (i > commit) commit = i;
+    }
+    out += piece;
+    pending = pending.slice(commit);
+  };
+  for (let i = 0; i < text.length; i += step) {
+    pending += text.slice(i, Math.min(text.length, i + step));
+    take(false);
+  }
+  take(true);
+  return out;
+}
+
 export function redact(text, secrets) {
   // Strip the shield marker before any scrubbing so a log line cannot forge
-  // a kept frame. Mask the whole text, then cap. A text too large to mask
-  // cheaply is cut at the last break before 64 KB first, which drops the
-  // partial token sitting on that cut.
+  // a kept frame. Mask the whole text, at every size, then cut. A listed
+  // secret is replaced in chunks whose overlap is the whole pattern, so a
+  // space or a line break on the 64 KB boundary cannot leave the head behind.
   let out = String(text ?? "").replace(/\uE000/g, "");
-  const cheap = Buffer.byteLength(out) <= REDACT_CHEAP_BYTES;
-  if (!cheap) out = cutAtBreak(out, REDACT_INPUT_CAP);
   const list = [];
   for (const secret of secrets || []) {
     const value = String(secret || "").trim();
     if (value && !list.includes(value)) list.push(value);
   }
   for (const secret of list) {
-    out = out.split(secret).join("***");
+    out = maskLiteral(out, secret, "***");
     const encoded = encodeURIComponent(secret);
-    if (encoded !== secret) out = out.split(encoded).join("***");
+    if (encoded !== secret) out = maskLiteral(out, encoded, "***");
   }
   out = out.replace(/x-access-token:[^@\s]+/gi, "x-access-token:***");
   out = out.replace(/Bearer\s+\S+/gi, "Bearer ***");
@@ -81,7 +114,7 @@ export function redact(text, secrets) {
   out = scrubLocations(out, kept);
   out = out.replace(/file:\/\/\S+/gi, "[url]");
   out = restoreShields(out, kept);
-  if (cheap) out = cutAtBreak(out, REDACT_INPUT_CAP);
+  out = cutAtBreak(out, REDACT_INPUT_CAP);
   return capLocations(out);
 }
 

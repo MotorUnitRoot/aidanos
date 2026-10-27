@@ -2382,6 +2382,8 @@ function conflictMineNow() {
   return paperConflict.mine;
 }
 
+const GIT_LOCK_PAUSE = "Sync is paused: another git app left a lock in this vault. Close it, then sync resumes.";
+
 async function resolveConflictKeep() {
   if (!paperConflict) return;
   const info = paperConflict;
@@ -2450,8 +2452,12 @@ async function resolveConflictKeep() {
     }
     closePaperConflict();
     if (info.git) {
-      await afterGitChoice(info.kind === "note" ? info.path : ("log/" + info.date + ".md"));
+      const sync = await afterGitChoice(info.kind === "note" ? info.path : ("log/" + info.date + ".md"));
       if (gitJoin) return;
+      if (sync && sync.lockKept) {
+        setStatus(GIT_LOCK_PAUSE, "error");
+        return;
+      }
     }
     setStatus("Saved", "saved");
     setTimeout(() => { if ($("status").textContent === "Saved") setStatus(""); }, 1500);
@@ -2527,7 +2533,8 @@ async function afterGitChoice(path) {
   while (Date.now() < deadline) {
     let data = null;
     try { data = await api("/api/sync"); } catch { data = null; }
-    if (!data || data.enabled === false) return;
+    if (!data || data.enabled === false) return data;
+    if (data.lockKept) return data;
     const conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
     const still = conflicts.some((item) => item && String(item.path || "").replace(/\\/g, "/") === rel);
     if (still) {
@@ -2746,6 +2753,10 @@ function surfaceGitConflict(data) {
     return;
   }
   if (gitJoin && !data.join) closeGitJoin();
+  if (data.lockKept && !paperConflict && !gitJoin) {
+    setStatus(GIT_LOCK_PAUSE, "error");
+    return;
+  }
   if (data.error && !paperConflict && !gitJoin && currentView() === "today") {
     setStatus(String(data.error), "error");
     return;

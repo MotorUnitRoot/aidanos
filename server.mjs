@@ -643,6 +643,9 @@ const GIT_DIR_STICKY = 0o1000;
 // dev, ino, size, ctime, and birthtime when the platform reports one.
 const staleGitLocks = new Map();
 const gitLockKeptLogged = new Set();
+// Vaults whose index.lock we left in place. Sync status reports this so
+// the editor does not say Saved while git is stuck.
+const gitLockBlocked = new Set();
 let gitLockBeforeUnlinkForTest = null;
 
 function lockIdentity(st) {
@@ -687,6 +690,15 @@ function reportGitLockKept(key) {
 
 function clearGitLockKept(key) {
   gitLockKeptLogged.delete(key);
+  gitLockBlocked.delete(key);
+}
+
+function markGitLockBlocked(key) {
+  gitLockBlocked.add(key);
+}
+
+export function gitLockBlocksVault(vault = VAULT) {
+  return gitLockBlocked.has(vaultKey(vault));
 }
 
 function vaultKey(vault) {
@@ -754,9 +766,17 @@ async function processHoldsLock(file, dev, ino) {
   return lsofHolds(file);
 }
 
-// "held", "free", or "unknown". Another user's descriptor directory that we
-// cannot read is unknown: the lock stays.
+// "held", "free", or "unknown". A holder of index.lock has to be able to
+// write the vault, so a process owned by another user is skipped. pid 1
+// is root and its descriptor directory is unreadable; that is not a failed
+// read of a process we own. A read error on a process we do own stays
+// unknown, and the lock stays.
+// On Linux, deleting index.lock and creating it again can reuse the inode
+// and report the same ctime, birthtime, and size. All four identity fields
+// can match a file this relay did not record.
 function linuxProcessHolds(dev, ino) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (typeof uid !== "number") return "unknown";
   let pids;
   try {
     pids = fsSync.readdirSync("/proc");
@@ -765,7 +785,23 @@ function linuxProcessHolds(dev, ino) {
   }
   for (const pid of pids) {
     if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
-    const fdDir = "/proc/" + pid + "/fd";
+    const procDir = "/proc/" + pid;
+    let owner;
+    try {
+      owner = fsSync.statSync(procDir).uid;
+    } catch {
+      continue;
+    }
+    if (owner !== uid) continue;
+    const fdDir = procDir + "/fd";
+    let fdOwner;
+    try {
+      fdOwner = fsSync.statSync(fdDir).uid;
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
+      return "unknown";
+    }
+    if (fdOwner !== uid) continue;
     let fds;
     try {
       fds = fsSync.readdirSync(fdDir);
@@ -778,6 +814,7 @@ function linuxProcessHolds(dev, ino) {
         const st = fsSync.statSync(path.join(fdDir, fd));
         if (st.dev === dev && st.ino === ino) return "held";
       } catch (error) {
+        if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
         if (error && (error.code === "EACCES" || error.code === "EPERM")) return "unknown";
       }
     }
@@ -949,20 +986,24 @@ export async function releaseRememberedGitLock(vault = VAULT) {
   const same = sameLock(recorded, current);
   const holders = await processHoldsLock(lockPath, st.dev, st.ino);
   if (holders === "unknown") {
+    markGitLockBlocked(key);
     reportGitLockKept(key);
     return;
   }
   if (holders === "held") {
+    markGitLockBlocked(key);
     if (!same) reportGitLockKept(key);
     return;
   }
   if (!same) {
     staleGitLocks.delete(key);
+    markGitLockBlocked(key);
     reportGitLockKept(key);
     return;
   }
   staleGitLocks.delete(key);
   if (!unlinkRecordedLock(vault, current)) {
+    markGitLockBlocked(key);
     reportGitLockKept(key);
     return;
   }
@@ -1163,8 +1204,9 @@ function publicConflicts() {
 }
 
 function syncStatus() {
+  const lockKept = gitLockBlocksVault();
   if (!vaultGit.enabled) {
-    return { enabled: false, ok: true, error: "", conflicts: [], join: false, left: "" };
+    return { enabled: false, ok: true, error: "", conflicts: [], join: false, left: "", lockKept: false };
   }
   const conflicts = publicConflicts();
   const join = Boolean(vaultGit.join) && conflicts.length === 0;
@@ -1176,6 +1218,7 @@ function syncStatus() {
     conflicts,
     join,
     left: vaultGit.left || "",
+    lockKept,
   };
 }
 
@@ -1186,6 +1229,7 @@ function finishGitNotice() {
     conflicts: status.conflicts,
     join: status.join,
     left: status.left,
+    lockKept: status.lockKept,
   });
   if (notice === vaultGit.notice) return;
   vaultGit.notice = notice;
@@ -1197,6 +1241,7 @@ function finishGitNotice() {
     conflicts: status.conflicts,
     join: status.join,
     left: status.left,
+    lockKept: Boolean(status.lockKept),
   });
 }
 

@@ -22,6 +22,7 @@ import {
   NOTE_TEMP_MANIFEST,
   discardOpenNoteTemps,
   foldInFailureLine,
+  logToken,
   manifestNoticeLogged,
   mirrorFailureLine,
   mirrorNoteFailureLine,
@@ -1229,6 +1230,9 @@ test("fold-in, mirror, and foreign-folder lines keep their wording", () => {
   assert.equal(hashed.includes("day.md"), false, hashed);
   assert.equal(redact(hashed, []), hashed);
   assert.match(hashed, /^fold-in failed for [a-f0-9]{12} EACCES$/);
+  assert.equal(logToken(""), "no-doc-id");
+  assert.equal(logToken(undefined), "no-doc-id");
+  assert.equal(foldInFailureLine("", err), "fold-in failed for no-doc-id EACCES");
   const oldFold = redact("fold-in failed for day.md EACCES", []);
   assert.equal(oldFold.includes("day.md"), false, oldFold);
   const oldForeign = redact("This folder is not the relay's notes (log/2026-10-23.md). Pass an empty folder", []);
@@ -1284,29 +1288,58 @@ test("a log line does not glue a cut bracket to the truncation mark", () => {
 });
 
 test("a secret straddling the 64 KB cap is fully masked", () => {
-  function padTo(start) {
+  function padTo(start, oneLine) {
+    if (oneLine) return "b".repeat(start);
     let pad = "";
     while (Buffer.byteLength(pad) + 2 <= start) pad += "b\n";
     pad += "b".repeat(start - Buffer.byteLength(pad));
     assert.equal(Buffer.byteLength(pad), start);
     return pad;
   }
-  function straddling(start, length) {
+  function straddling(start, boundary, oneLine) {
+    const length = 96;
     const secret = "Zk7" + "Q".repeat(length - 3);
-    assert.equal(Buffer.byteLength(secret), length);
-    assert.ok(start + length > start + 13);
-    const cleaned = redact(padTo(start) + secret + "\n", [secret]);
-    const tail = cleaned.slice(-80);
-    assert.equal(cleaned.includes(secret), false, tail);
-    assert.equal(cleaned.includes("Zk7"), false, tail);
-    assert.equal(cleaned.includes(secret.slice(0, 13)), false, tail);
-    assert.equal(cleaned.includes("Q"), false, tail);
-    assert.equal(cleaned.includes("***"), true, tail);
+    const cleaned = redact(padTo(start, oneLine) + secret + "\n", [secret]);
+    assert.equal(cleaned.includes(secret), false, String(start));
+    assert.equal(cleaned.includes("Zk7"), false, String(start));
+    assert.equal(cleaned.includes("Q"), false, String(start));
+    if (start + 4 <= boundary) assert.equal(cleaned.includes("***"), true, String(start));
   }
-  straddling(65523, 47);
-  straddling(65523, 14);
-  straddling(65523, 80);
-  straddling(LOG_LINE_CAP - 13, 47);
+  for (const boundary of [LOG_LINE_CAP, REDACT_INPUT_CAP]) {
+    const oneLine = boundary === LOG_LINE_CAP;
+    for (let start = boundary - 80; start <= boundary + 8; start += 1) {
+      straddling(start, boundary, oneLine);
+    }
+  }
+});
+
+test("a secret past 2 MB is masked before the 64 KB cut", () => {
+  function padTo(start) {
+    let pad = "";
+    while (Buffer.byteLength(pad) + 2 <= start) pad += "b\n";
+    pad += "b".repeat(start - Buffer.byteLength(pad));
+    return pad;
+  }
+  function place(secret, start) {
+    const input = padTo(start) + secret + "\n" + "b".repeat(2 * 1024 * 1024);
+    assert.ok(Buffer.byteLength(input) > 2 * 1024 * 1024);
+    return redact(input, [secret]);
+  }
+  const pem = "-----BEGIN PRIVATE KEY-----\nMIIEsecretbody\n-----END PRIVATE KEY-----";
+  const pemNewline = pem.indexOf("\n");
+  const pemCleaned = place(pem, REDACT_INPUT_CAP - 5 - pemNewline);
+  assert.equal(pemCleaned.includes("-----BEGIN"), false, pemCleaned.slice(-120));
+  assert.equal(pemCleaned.includes("PRIVATE"), false, pemCleaned.slice(-120));
+  assert.equal(pemCleaned.includes("MIIE"), false, pemCleaned.slice(-120));
+  assert.equal(pemCleaned.includes(pem), false);
+  assert.equal(pemCleaned.includes("***"), true, pemCleaned.slice(-120));
+  const spaced = "super secret value";
+  const spacedCleaned = place(spaced, REDACT_INPUT_CAP - spaced.indexOf(" "));
+  assert.equal(spacedCleaned.includes("super"), false, spacedCleaned.slice(-120));
+  assert.equal(spacedCleaned.includes("secret"), false, spacedCleaned.slice(-120));
+  assert.equal(spacedCleaned.includes("value"), false, spacedCleaned.slice(-120));
+  assert.equal(spacedCleaned.includes(spaced), false);
+  assert.equal(spacedCleaned.includes("***"), true, spacedCleaned.slice(-120));
 });
 
 test("twenty thousand stack frames restore in one pass", () => {
@@ -1550,7 +1583,7 @@ test("a fresh backup pushes to an empty repo", async () => {
   try {
     await fs.writeFile(
       path.join(vault, ".gitignore"),
-      ".aidanos/\n*.recover\n.*.tmp\n# keep\nuser.tmp\n# aidanos: drop the old wide temp rule\n",
+      ".aidanos/\n*.recover\n# keep\nuser.tmp\n.*.tmp\n# aidanos: drop the old wide temp rule\n.*.tmp\n",
     );
     await fs.writeFile(path.join(vault, "day.md"), "today\n");
     await fs.writeFile(path.join(vault, "day.md.leftover.recover"), "secret\n");
@@ -1565,15 +1598,16 @@ test("a fresh backup pushes to an empty repo", async () => {
     assert.match(ignore, /^\*\.recover$/m);
     assert.match(ignore, /^# keep$/m);
     assert.match(ignore, /^user\.tmp$/m);
-    assert.match(ignore, /^\.\*\.md\.\*\.tmp$/m);
-    assert.equal(ignore.split(/\r?\n/).filter((line) => line.trim() === ".*.tmp").length, 0);
+    assert.match(ignore, /^# aidanos-relay\n\.\*\.md\.\*\.tmp$/m);
+    assert.equal(ignore.split(/\r?\n/).filter((line) => line.trim() === ".*.tmp").length, 1);
+    assert.match(ignore, /^\.\*\.tmp$/m);
     assert.doesNotMatch(ignore, /aidanos: drop the old wide temp rule/);
     const exclude = await fs.readFile(path.join(vault, ".git", "info", "exclude"), "utf8");
     assert.match(exclude, /^\*\.recover$/m);
     const tree = await git(["--git-dir", bare, "ls-tree", "-r", "--name-only", "main"]);
     assert.doesNotMatch(tree.stdout, /\.recover/);
     assert.doesNotMatch(tree.stdout, /\.day\.md\.99999\.tmp/);
-    assert.match(tree.stdout, /^\.cache\.tmp$/m);
+    assert.doesNotMatch(tree.stdout, /^\.cache\.tmp$/m);
   } finally {
     await relay.close();
   }

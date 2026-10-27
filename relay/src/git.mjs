@@ -83,7 +83,19 @@ function runGit(args, cwd, secrets, timeoutMs = 20000, extraEnv = {}) {
   });
 }
 
-const OLD_WIDE_TEMP_COMMENT = "# aidanos: drop the old wide temp rule";
+// The relay's own mark. A rule is removed only when this exact comment
+// introduces that exact line. A user's `.*.tmp` has no mark and stays.
+const RELAY_GITIGNORE_COMMENT = "# aidanos-relay";
+const RELAY_OLD_WIDE_COMMENT = "# aidanos: drop the old wide temp rule";
+const RELAY_OLD_WIDE_RULE = ".*.tmp";
+
+function addRelayRule(kept, present, line) {
+  if (present.has(line)) return;
+  kept.push(RELAY_GITIGNORE_COMMENT);
+  kept.push(line);
+  present.add(RELAY_GITIGNORE_COMMENT);
+  present.add(line);
+}
 
 async function ensureGitignore(vault) {
   const file = path.join(vault, ".gitignore");
@@ -96,18 +108,22 @@ async function ensureGitignore(vault) {
   const raw = text.split(/\r?\n/);
   const kept = [];
   for (let i = 0; i < raw.length; i += 1) {
-    // 938d78a appended a bare `.*.tmp`. The comment is the marker added
-    // with that cleanup. Both go. A different temp rule stays.
     const trimmed = raw[i].trim();
-    if (trimmed === OLD_WIDE_TEMP_COMMENT || trimmed === ".*.tmp") continue;
+    // Only the wide rule the relay itself wrote, and only the exact
+    // comment that marks it. The user's own `.*.tmp` is a different line.
+    if (trimmed === RELAY_OLD_WIDE_COMMENT) {
+      const next = i + 1 < raw.length ? raw[i + 1].trim() : "";
+      if (next === RELAY_OLD_WIDE_RULE) i += 1;
+      continue;
+    }
     kept.push(raw[i]);
   }
   while (kept.length && kept[kept.length - 1] === "") kept.pop();
   const present = new Set(kept.map((line) => line.trim()));
-  if (!present.has(".aidanos/")) kept.push(".aidanos/");
-  if (!present.has("*.recover")) kept.push("*.recover");
+  addRelayRule(kept, present, ".aidanos/");
+  addRelayRule(kept, present, "*.recover");
   // Note temps are `.{name}.md.{pid}.tmp`. That shape is the rule we add.
-  if (!present.has(".*.md.*.tmp")) kept.push(".*.md.*.tmp");
+  addRelayRule(kept, present, ".*.md.*.tmp");
   const next = kept.join("\n") + "\n";
   if (next !== text) await fs.writeFile(file, next);
   await ensureRecoverExcluded(vault);

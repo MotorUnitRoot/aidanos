@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { authenticatedGitUrl, acquireGitTurn, GIT_LOCK_KEPT_LINE, redactSecrets, releaseGitTurn, releaseRememberedGitLock, rememberUnlinkLock, sanitizeGitError, seedBundledVault, setGitLockBeforeUnlinkForTest, setGitLockHoldersForTest } from "./server.mjs";
+import { authenticatedGitUrl, acquireGitTurn, GIT_LOCK_KEPT_LINE, gitLockBlocksVault, redactSecrets, releaseGitTurn, releaseRememberedGitLock, rememberUnlinkLock, sanitizeGitError, seedBundledVault, setGitLockBeforeUnlinkForTest, setGitLockHoldersForTest } from "./server.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
@@ -453,10 +453,6 @@ function lockTmp() {
   return fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "aidanos-lock-"));
 }
 
-function holdersKnownFree() {
-  setGitLockHoldersForTest(() => false);
-}
-
 async function captureErrors(fn) {
   const lines = [];
   const prev = console.error;
@@ -484,12 +480,10 @@ async function gitLockIgnoresASymlinkedGit() {
     const lock = path.join(vault, ".git", "index.lock");
     fs.writeFileSync(lock, "held\n");
     rememberUnlinkLock(gitLockMessage(path.join(via, ".git", "index.lock")), via);
-    holdersKnownFree();
     await releaseRememberedGitLock(via);
     assert(fs.existsSync(lock), "a symlinked git path deleted index.lock");
     assert(fs.readFileSync(lock, "utf8") === "held\n", "a symlinked git path changed the lock");
   } finally {
-    setGitLockHoldersForTest(null);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
@@ -510,6 +504,7 @@ async function gitLockKeepsALiveGitProcess() {
     rememberUnlinkLock(gitLockMessage(lock), vault);
     await releaseRememberedGitLock(vault);
     assert(fs.existsSync(lock), "a live git process's lock was removed");
+    assert(gitLockBlocksVault(vault), "a held lock did not block sync");
   } finally {
     try { child.stdin.end(); } catch { /* already closed */ }
     await new Promise((resolve) => child.on("close", resolve));
@@ -535,7 +530,6 @@ async function gitLockIgnoresPathsOutsideGit() {
       [gitLockMessage(outside), gitLockMessage(named), gitLockMessage(configLock)].join("\n"),
       vault,
     );
-    holdersKnownFree();
     const kept = await captureErrors(() => releaseRememberedGitLock(vault));
     assert(fs.readFileSync(outside, "utf8") === "out\n", "a lock outside the vault was removed");
     assert(fs.readFileSync(named, "utf8") === "note\n", "a lock outside .git was removed");
@@ -560,7 +554,6 @@ async function gitLockRemovesOnlyARecordedLock() {
     const aside = path.join(vault, ".git", "index.lock.aside");
     fs.renameSync(lock, aside);
     fs.writeFileSync(lock, "second\n");
-    holdersKnownFree();
     const kept = await captureErrors(() => releaseRememberedGitLock(vault));
     assert(fs.readFileSync(lock, "utf8") === "second\n", "a replaced lock inode was removed");
     assert(fs.readFileSync(aside, "utf8") === "first\n", "the recorded inode was unlinked");
@@ -569,16 +562,17 @@ async function gitLockRemovesOnlyARecordedLock() {
     fs.unlinkSync(lock);
     fs.writeFileSync(lock, "recorded\n");
     rememberUnlinkLock(gitLockMessage(lock), vault);
-    holdersKnownFree();
+    // Real /proc scan. The test hook is not set.
     await releaseRememberedGitLock(vault);
     assert(!fs.existsSync(lock), "the recorded index.lock was kept");
+    assert(!gitLockBlocksVault(vault), "a removed lock still blocks sync");
     fs.writeFileSync(lock, "old\n");
     const old = (Date.now() - 15 * 60 * 1000 - 5000) / 1000;
     fs.utimesSync(lock, old, old);
-    holdersKnownFree();
     const staleKept = await captureErrors(() => releaseRememberedGitLock(vault));
     assert(fs.readFileSync(lock, "utf8") === "old\n", "an unrecorded stale index.lock was removed");
     assert(staleKept.includes(GIT_LOCK_KEPT_LINE), "an unrecorded stale index.lock was removed without a message");
+    assert(gitLockBlocksVault(vault), "a kept lock did not block sync");
     assert(!staleKept.some((line) => line.includes(tmp) || line.includes("index.lock")), "the kept message named a path");
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -596,7 +590,6 @@ async function gitLockKeepsAReusedInode() {
     rememberUnlinkLock(gitLockMessage(lock), vault);
     fs.unlinkSync(lock);
     fs.writeFileSync(lock, "fresh-lock\n");
-    holdersKnownFree();
     const kept = await captureErrors(() => releaseRememberedGitLock(vault));
     assert(fs.readFileSync(lock, "utf8") === "fresh-lock\n", "a reused inode was removed");
     assert(kept.includes(GIT_LOCK_KEPT_LINE), "a reused inode was removed without a message");
@@ -617,7 +610,6 @@ async function gitLockKeepsALockSwappedBeforeUnlink() {
     const lock = path.join(vault, ".git", "index.lock");
     fs.writeFileSync(lock, "recorded\n");
     rememberUnlinkLock(gitLockMessage(lock), vault);
-    holdersKnownFree();
     setGitLockBeforeUnlinkForTest(() => {
       fs.unlinkSync(lock);
       fs.writeFileSync(lock, "swapped\n");

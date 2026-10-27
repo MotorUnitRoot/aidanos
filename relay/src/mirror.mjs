@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { closeSync, constants as fsConstants, fstatSync, fsyncSync, openSync, readSync, unlinkSync, writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -106,13 +107,27 @@ function digest(text) {
   return crypto.createHash("sha256").update(String(text), "utf8").digest("hex");
 }
 
-// `.{note}.{pid}.tmp` beside the note. The pid is the relay's, so a later
+// `.{note}.md.{pid}.tmp` beside the note. The pid is the relay's, so a later
 // start can tell a crashed write from one this process still holds.
-const NOTE_TEMP_NAME = /^\.(.+)\.(\d+)\.tmp$/;
-const openNoteTemps = new Set();
+const NOTE_TEMP_BASENAME = /^\.(.+\.md)\.(\d+)\.tmp$/;
+const RELAY_MARKER_HEADER = "aidanos-relay-folder v2";
+const RELAY_MARKER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export const NOTE_TEMP_MANIFEST = "note-temps";
+const openNoteTemps = new Map();
+let manifestChain = Promise.resolve();
 
 function noteTempPath(file, pid = process.pid) {
   return path.join(path.dirname(file), `.${path.basename(file)}.${pid}.tmp`);
+}
+
+function withManifest(work) {
+  const run = manifestChain.then(work, work);
+  manifestChain = run.then(() => {}, () => {});
+  return run;
+}
+
+function manifestFile(stateDir) {
+  return path.join(stateDir, NOTE_TEMP_MANIFEST);
 }
 
 function pidAlive(pid) {
@@ -143,57 +158,265 @@ async function removeOwnedRegular(file) {
 // Temps this process has written and not yet renamed. Called when the save
 // wait gives up, so the whole note does not stay in the vault under a dot name.
 export async function discardOpenNoteTemps() {
-  const pending = [...openNoteTemps];
-  await Promise.all(pending.map((file) => removeOwnedRegular(file)));
+  const pending = [...openNoteTemps.entries()];
+  await Promise.all(pending.map(async ([file, meta]) => {
+    await removeOwnedRegular(file);
+    await dropManifestIfGone(file, meta);
+  }));
 }
 
-// Dead pids only. A symlink is left alone, including one that points at a
-// directory, and a file we do not own is left alone. lstat, never stat.
-export async function sweepStaleNoteTemps(root) {
-  const uid = typeof process.getuid === "function" ? process.getuid() : null;
-  if (typeof uid !== "number") return;
-  await sweepNoteTempDir(root);
+function markerTextId(text) {
+  if (typeof text !== "string") return "";
+  const lines = text.split("\n");
+  if (lines.length !== 3 || lines[2] !== "") return "";
+  if (lines[0] !== RELAY_MARKER_HEADER || !RELAY_MARKER_ID.test(lines[1])) return "";
+  return lines[1];
 }
 
-async function sweepNoteTempDir(dir) {
-  let entries;
+function outsideMarker(vault) {
+  const resolved = path.resolve(vault);
+  return path.join(path.dirname(resolved), "." + path.basename(resolved) + ".aidanos-relay-id");
+}
+
+function readRegularFile(file) {
+  let fd;
   try {
-    entries = await fs.readdir(dir, { withFileTypes: true });
+    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   } catch {
-    return;
+    return null;
   }
-  for (const entry of entries) {
-    if (entry.isSymbolicLink()) continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (entry.name === ".git") continue;
-      await sweepNoteTempDir(full);
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > 1024 * 1024) return null;
+    const buf = Buffer.alloc(st.size);
+    let off = 0;
+    while (off < buf.length) {
+      const n = readSync(fd, buf, off, buf.length - off, off);
+      if (n <= 0) break;
+      off += n;
+    }
+    return buf.toString("utf8", 0, off);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+async function markersMatch(vault, stateDir) {
+  if (!vault || !stateDir) return false;
+  const vaultId = markerTextId(readRegularFile(path.join(vault, ".aidanos", "relay-folder")));
+  const dataId = markerTextId(readRegularFile(path.join(stateDir, "relay-folder")));
+  const outsideId = markerTextId(readRegularFile(outsideMarker(vault)));
+  return Boolean(vaultId && vaultId === dataId && vaultId === outsideId);
+}
+
+function parseManifestLine(line) {
+  if (typeof line !== "string" || !line || line.includes("\\") || line.includes("\0")) return null;
+  if (line.startsWith("/") || path.win32.isAbsolute(line)) return null;
+  const parts = line.split("/");
+  if (parts.some((part) => part === "" || part === "." || part === "..")) return null;
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    if (parts[i].startsWith(".")) return null;
+  }
+  const match = NOTE_TEMP_BASENAME.exec(parts[parts.length - 1]);
+  if (!match) return null;
+  const pid = Number(match[2]);
+  if (!Number.isSafeInteger(pid)) return null;
+  return { rel: line, pid };
+}
+
+function unlinkSameFile(file, dev, ino, uid) {
+  let fd;
+  try {
+    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch {
+    return false;
+  }
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== dev || opened.ino !== ino || opened.uid !== uid) return false;
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    unlinkSync(file);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+async function unlinkOwnedTemp(vault, rel, uid) {
+  const root = path.resolve(vault);
+  let cursor = root;
+  let rootSt;
+  try {
+    rootSt = await fs.lstat(cursor);
+  } catch {
+    return "keep";
+  }
+  if (rootSt.isSymbolicLink() || !rootSt.isDirectory()) return "keep";
+  const parts = rel.split("/");
+  for (let i = 0; i < parts.length; i += 1) {
+    cursor = path.join(cursor, parts[i]);
+    let st;
+    try {
+      st = await fs.lstat(cursor);
+    } catch (error) {
+      return error && error.code === "ENOENT" ? "drop" : "keep";
+    }
+    if (st.isSymbolicLink()) return "keep";
+    if (i + 1 < parts.length) {
+      if (!st.isDirectory()) return "keep";
       continue;
     }
-    if (!entry.isFile()) continue;
-    const match = NOTE_TEMP_NAME.exec(entry.name);
-    if (!match) continue;
-    const pid = Number(match[2]);
-    if (!Number.isSafeInteger(pid) || pidAlive(pid)) continue;
-    await removeOwnedRegular(full);
+    if (!st.isFile() || st.uid !== uid) return "keep";
+    return unlinkSameFile(cursor, st.dev, st.ino, uid) ? "drop" : "keep";
   }
+  return "keep";
+}
+
+function rewriteManifest(stateDir, lines) {
+  const file = manifestFile(stateDir);
+  const body = lines.length ? lines.join("\n") + "\n" : "";
+  const fd = openSync(file, fsConstants.O_WRONLY | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW);
+  try {
+    writeSync(fd, body);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// Only paths this relay recorded, and only after the folder markers match.
+// Anything else — a home directory, a dot folder, a symlink, a path with `..` —
+// stays where it is. There is no directory walk.
+export async function sweepStaleNoteTemps(vault, stateDir) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (typeof uid !== "number") return;
+  if (!(await markersMatch(vault, stateDir))) return;
+  await withManifest(async () => {
+    const text = readRegularFile(manifestFile(stateDir));
+    if (text == null) return;
+    const lines = text.split("\n").filter((line) => line.length > 0);
+    const kept = [];
+    for (const line of lines) {
+      const parsed = parseManifestLine(line);
+      if (!parsed || pidAlive(parsed.pid)) {
+        kept.push(line);
+        continue;
+      }
+      const action = await unlinkOwnedTemp(vault, parsed.rel, uid);
+      if (action !== "drop") kept.push(line);
+    }
+    if (kept.length === lines.length && kept.every((line, index) => line === lines[index])) return;
+    try {
+      rewriteManifest(stateDir, kept);
+    } catch { /* a replaced manifest is left alone */ }
+  });
+}
+
+function tempRelative(vault, file) {
+  const root = path.resolve(vault);
+  const abs = path.resolve(file);
+  const rel = path.relative(root, abs);
+  if (!rel || rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) {
+    throw new Error("note temp is outside the vault");
+  }
+  const posix = rel.split(path.sep).join("/");
+  if (!parseManifestLine(posix)) throw new Error("note temp is outside the vault");
+  return posix;
+}
+
+async function appendManifest(stateDir, rel) {
+  await fs.mkdir(stateDir, { recursive: true });
+  await withManifest(async () => {
+    const fd = openSync(
+      manifestFile(stateDir),
+      fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      writeSync(fd, rel + "\n");
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  });
+}
+
+async function dropManifest(stateDir, rel) {
+  await withManifest(async () => {
+    const text = readRegularFile(manifestFile(stateDir));
+    if (text == null) return;
+    const lines = text.split("\n").filter((line) => line.length > 0 && line !== rel);
+    try {
+      rewriteManifest(stateDir, lines);
+    } catch { /* the entry stays until a later sweep can read the manifest */ }
+  });
+}
+
+async function dropManifestIfGone(file, meta) {
+  if (!meta || !meta.rel || !meta.stateDir) return;
+  try {
+    await fs.lstat(file);
+    return;
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") return;
+  }
+  await dropManifest(meta.stateDir, meta.rel);
 }
 
 // Write the note beside its final name, then rename it into place. A reader
-// sees the previous file or the whole new file.
-export async function saveNoteFile(file, text, beforeRename) {
+// sees the previous file or the whole new file. The temp's path is recorded
+// and fsynced before the temp exists.
+export async function saveNoteFile(file, text, beforeRename, options = {}) {
   const tmp = noteTempPath(file);
-  openNoteTemps.add(tmp);
+  const vault = options.vault || "";
+  const stateDir = options.stateDir || "";
+  let rel = "";
+  if (vault && stateDir) {
+    rel = tempRelative(vault, tmp);
+    await appendManifest(stateDir, rel);
+  }
+  const meta = { rel, stateDir };
+  openNoteTemps.set(tmp, meta);
   try {
     await fs.writeFile(tmp, text);
     if (typeof beforeRename === "function") await beforeRename();
     await fs.rename(tmp, file);
   } finally {
     openNoteTemps.delete(tmp);
+    await dropManifestIfGone(tmp, meta);
   }
 }
 
-export function createMirror({ repo, vault, debounceMs = 400, secrets = [], track = (work) => work() }) {
+// A note name in these lines is what a later scrub would have to guess at.
+// The id is already a token, or a short hash when it is not.
+export function logToken(value) {
+  const text = String(value ?? "");
+  if (/^[A-Za-z0-9]{6,80}$/.test(text)) return text;
+  return crypto.createHash("sha256").update(text).digest("hex").slice(0, 12);
+}
+
+export function logCode(error) {
+  const code = error && error.code ? String(error.code) : "";
+  if (/^[A-Za-z0-9_]+$/.test(code)) return code;
+  return "ERROR";
+}
+
+export function foldInFailureLine(docId, error) {
+  return "fold-in failed for " + logToken(docId) + " " + logCode(error);
+}
+
+export function mirrorNoteFailureLine(docId, error) {
+  return "mirror failed for " + logToken(docId) + " " + logCode(error);
+}
+
+export function mirrorFailureLine(error) {
+  return "mirror failed: " + logCode(error);
+}
+
+export function createMirror({ repo, vault, debounceMs = 400, secrets = [], track = (work) => work(), stateDir = "" }) {
   const lastWritten = new Map();
   const incorporated = new Map();
   let records = null;
@@ -294,7 +517,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
         lastWritten.set(notePath, merged);
         incorporated.set(notePath, fileHash);
       } catch (error) {
-        logSafe(secrets, "fold-in failed for", notePath, error instanceof Error ? error.message : error);
+        logSafe(secrets, foldInFailureLine(docId, error));
       }
     }
   }
@@ -329,7 +552,12 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
         }
         continue;
       }
-      await saveNoteFile(file, text);
+      try {
+        await saveNoteFile(file, text, undefined, { vault, stateDir });
+      } catch (error) {
+        logSafe(secrets, mirrorNoteFailureLine(docId, error));
+        continue;
+      }
       lastWritten.set(notePath, text);
       known[notePath] = digest(text);
       changed = true;
@@ -347,7 +575,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
         noteMirror(performance.now() - started);
       }
     })).catch((error) => {
-      logSafe(secrets, "mirror failed:", error instanceof Error ? error.message : error);
+      logSafe(secrets, mirrorFailureLine(error));
     });
     return chain;
   }

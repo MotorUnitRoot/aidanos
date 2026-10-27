@@ -91,17 +91,20 @@ async function ensureGitignore(vault) {
   } catch {
     text = "";
   }
-  const lines = text.split(/\r?\n/).map((line) => line.trim());
-  const missing = [];
-  if (!lines.includes(".aidanos/")) missing.push(".aidanos/");
-  if (!lines.includes("*.recover")) missing.push("*.recover");
-  // Relay note temps are `.{name}.{pid}.tmp`. The leading dot keeps ordinary
-  // `*.tmp` names, which are not this pattern, out of the rule.
-  if (!lines.includes(".*.tmp")) missing.push(".*.tmp");
-  if (missing.length) {
-    const prefix = text.length > 0 && !text.endsWith("\n") ? text + "\n" : text;
-    await fs.writeFile(file, prefix + missing.join("\n") + "\n");
+  const kept = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (line.trim() === ".*.tmp") continue;
+    kept.push(line);
   }
+  while (kept.length && kept[kept.length - 1] === "") kept.pop();
+  const present = new Set(kept.map((line) => line.trim()));
+  if (!present.has(".aidanos/")) kept.push(".aidanos/");
+  if (!present.has("*.recover")) kept.push("*.recover");
+  // Note temps are `.{name}.md.{pid}.tmp`. A wider `.*.tmp` rule would hide
+  // a file the user named themselves, so an exact copy of that older line goes too.
+  if (!present.has(".*.md.*.tmp")) kept.push(".*.md.*.tmp");
+  const next = kept.join("\n") + "\n";
+  if (next !== text) await fs.writeFile(file, next);
   await ensureRecoverExcluded(vault);
 }
 

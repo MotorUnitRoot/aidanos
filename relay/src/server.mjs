@@ -443,13 +443,8 @@ async function describeForeign(dir) {
 
 function foreignFolderError(found) {
   const parts = ["This folder is not the relay's own folder."];
-  if (found.notes.length) {
-    parts.push("It contains notes (" + found.notes.slice(0, 3).join(", ") + ").");
-  }
   if (found.gitRemote) parts.push("It has a git remote.");
-  if (!found.notes.length && !found.gitRemote) {
-    parts.push("It already has files, and it has no relay marker.");
-  }
+  else parts.push("It already has files, and it has no relay marker.");
   parts.push("Pass an empty folder, or the folder the relay marked earlier.");
   return parts.join(" ");
 }
@@ -586,8 +581,8 @@ export async function startRelay(options = {}) {
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
   await installIndexTrace((line) => logSafe(secrets, line));
   await assertNotClientVault(vault);
-  await sweepStaleNoteTemps(vault);
   await claimRelayFolders(vault, dataDir);
+  await sweepStaleNoteTemps(vault, dataDir);
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
   const failures = new Map();
@@ -730,6 +725,7 @@ export async function startRelay(options = {}) {
         debounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
         secrets,
         track: trackInflight,
+        stateDir: dataDir,
       });
       // Fold a file that changed while this process was stopped before any device
       // can connect. Doing it later lets that device's offline edit arrive first,
@@ -1187,7 +1183,7 @@ export async function startRelay(options = {}) {
     trackInflight(() => saveNoteFile(noteFile, body, async () => {
       if (staged) await fs.writeFile(String(staged), body);
       await new Promise((resolve) => setTimeout(resolve, delay));
-    })).catch(() => { /* the shutdown wait still sees this save leave the set */ });
+    }, { vault, stateDir: dataDir })).catch(() => { /* the shutdown wait still sees this save leave the set */ });
   }
   return api;
 }

@@ -449,7 +449,7 @@ function sumName(entries, name, docId) {
 }
 
 function field(stat) {
-  return stat.n + "x/" + stat.ms.toFixed(1) + "ms";
+  return stat.n + "x " + stat.ms.toFixed(1) + "ms";
 }
 
 export function finishIndex(kind) {
@@ -473,7 +473,7 @@ export function finishIndex(kind) {
   for (const name of STEP_NAMES) parts.push(name + "=" + field(sumName(open.entries, name, INDEX_ID)));
   parts.push("mirror=" + field(sumName(open.entries, "mirror", null)));
   parts.push("git=" + field(sumName(open.entries, "git", null)));
-  parts.push("otherdoc=" + otherDocN + "x/" + otherDocMs.toFixed(1) + "ms");
+  parts.push("otherdoc=" + otherDocN + "x " + otherDocMs.toFixed(1) + "ms");
   parts.push("other=" + seconds(other));
   parts.push("blocked=" + seconds(open.blocked));
   write(parts.join(" "));

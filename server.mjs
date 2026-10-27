@@ -62,7 +62,11 @@ const GIT_RETRY_MS = (() => {
 })();
 const PUBLIC = __dirname;
 const PORT_RAW = Number(process.env.PORT);
-const PORT = Number.isInteger(PORT_RAW) && PORT_RAW > 0 && PORT_RAW < 65536 ? PORT_RAW : 3847;
+const PORT = process.env.PORT === "0"
+  ? 0
+  : Number.isInteger(PORT_RAW) && PORT_RAW > 0 && PORT_RAW < 65536
+    ? PORT_RAW
+    : 3847;
 const HOST = process.env.AIDANOS_HOST || "127.0.0.1";
 const DAY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.md$/;
 const MTIME_SKEW_MS = 1;
@@ -235,6 +239,7 @@ function runGit(args, { cwd, timeoutMs = 20000 } = {}) {
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      rememberUnlinkLock(err);
       if (code === 0) resolve({ out, err });
       else reject(new Error((err || out || ("git " + args[0] + " failed")).trim()));
     });
@@ -626,8 +631,68 @@ function enqueueVaultWork(fn) {
   return run;
 }
 
+const staleGitLocks = new Set();
+
+function rememberUnlinkLock(errText) {
+  const re = /unable to unlink '([^']+\.lock)'/g;
+  let match;
+  while ((match = re.exec(String(errText || "")))) staleGitLocks.add(match[1]);
+}
+
+// A vault that was closed while git still held index.lock keeps the lock,
+// because git cannot unlink it. The next sync, once the vault is open again,
+// drops that regular file. A symlink is left alone.
+function releaseRememberedGitLock() {
+  const paths = [...staleGitLocks];
+  staleGitLocks.clear();
+  const root = path.resolve(VAULT);
+  for (const remembered of paths) {
+    const abs = path.isAbsolute(remembered) ? path.resolve(remembered) : path.resolve(root, remembered);
+    const rel = path.relative(root, abs);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) continue;
+    let st;
+    try {
+      st = fsSync.lstatSync(abs);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isFile()) continue;
+    try { fsSync.unlinkSync(abs); } catch { /* the next git reports the lock */ }
+  }
+}
+
+// Tests set AIDANOS_TEST_GIT_TURN to a file outside the vault. Git work holds
+// it for the whole job, so a test can close the vault only while no git is
+// inside it. Unset, this is a no-op.
+async function acquireGitTurn() {
+  const file = String(process.env.AIDANOS_TEST_GIT_TURN || "");
+  if (!file) return "";
+  for (;;) {
+    try {
+      const fd = fsSync.openSync(file, fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY, 0o600);
+      fsSync.closeSync(fd);
+      return file;
+    } catch (error) {
+      if (!error || error.code !== "EEXIST") throw error;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+}
+
+function releaseGitTurn(file) {
+  if (!file) return;
+  try { fsSync.unlinkSync(file); } catch { /* the holder already released it */ }
+}
+
 function enqueueVaultGit(work) {
-  const run = enqueueVaultWork(work);
+  const run = enqueueVaultWork(async () => {
+    const turn = await acquireGitTurn();
+    try {
+      return await work();
+    } finally {
+      releaseGitTurn(turn);
+    }
+  });
   vaultGit.chain = run.then(() => {}, () => {});
   return run;
 }
@@ -1895,6 +1960,7 @@ async function syncVault(commitPaths, resolvePaths) {
   if (vaultGit.syncPaused) return;
   try {
     await assertVaultOpen();
+    releaseRememberedGitLock();
     await syncVaultBody();
   } catch (e) {
     if (e && e.aidanosStop) {
@@ -3063,6 +3129,7 @@ const server = http.createServer(async (req, res) => {
       try {
         await enqueueVaultGit(async () => {
           await assertVaultOpen();
+          releaseRememberedGitLock();
           const result = await joinVault();
           await noteUnrelated().catch(() => {});
           status = result.status;
@@ -3745,13 +3812,15 @@ async function boot() {
   startLogWatch();
   startVaultSyncLoop();
   server.listen(PORT, HOST, () => {
+    const bound = server.address();
+    const openPort = bound && typeof bound === "object" ? bound.port : PORT;
     console.log(`AidanOS`);
     console.log(`  vault: ${VAULT}`);
     if (vaultGit.enabled) {
       console.log(`  git:   ${vaultGit.error ? "error" : "on"}`);
     }
     console.log(`  host:  ${HOST}`);
-    console.log(`  open:  http://${HOST === "0.0.0.0" ? "127.0.0.1" : HOST}:${PORT}`);
+    console.log(`  open:  http://${HOST === "0.0.0.0" ? "127.0.0.1" : HOST}:${openPort}`);
   });
 }
 

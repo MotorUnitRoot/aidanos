@@ -13,6 +13,13 @@ import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
+import {
+  NOTE_TEMP_MANIFEST,
+  foldInFailureLine,
+  mirrorFailureLine,
+  mirrorNoteFailureLine,
+  sweepStaleNoteTemps,
+} from "../src/mirror.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
 import { FATAL_FALLBACK_NAME, FILE_LOG_CAP, LOG_LINE_CAP, flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, redact, stampLine } from "../src/redact.mjs";
 import { INDEX_TRACE_ENTRY_CAP, beginIndexRequest, emptyLateState, finishIndexReply, installIndexTrace, nextLoopLateLine, noteGitWork, noteMirror } from "../src/index-trace.mjs";
@@ -873,8 +880,8 @@ test("an index trace window drops the oldest entries past the cap", async () => 
   }
   const steps = lines.filter((line) => line.startsWith("index steps"));
   assert.equal(steps.length, 1);
-  assert.match(steps[0], /git=0x\/0\.0ms/);
-  assert.match(steps[0], new RegExp("mirror=" + INDEX_TRACE_ENTRY_CAP + "x/"));
+  assert.match(steps[0], /git=0x 0\.0ms/);
+  assert.match(steps[0], new RegExp("mirror=" + INDEX_TRACE_ENTRY_CAP + "x "));
 });
 
 test("index trace turns off when automerge internals are missing", async () => {
@@ -1013,24 +1020,124 @@ test("path prefixes and relative paths are scrubbed", () => {
   assert.equal(upperPath, "open [path]");
 });
 
-test("a log line is capped at 8 KB before it is scrubbed", () => {
+test("a log line drops a partial token at the 8 KB cut", () => {
   assert.equal(LOG_LINE_CAP, 8 * 1024);
   const secret = "/Users/ada/Vault/secret-plan.md";
   const over = "a".repeat(LOG_LINE_CAP) + secret;
   const capped = redact(over, []);
   assert.equal(capped.includes(secret), false, capped);
   assert.equal(capped.includes("/Users"), false, capped);
-  assert.equal(capped.endsWith("[truncated]"), true);
+  assert.equal(capped.includes("aaaa"), false, capped);
   assert.ok(Buffer.byteLength(capped) <= LOG_LINE_CAP + Buffer.byteLength("[truncated]"));
-  const prefix = "path=/Users/ada/Vault/notes " + "b".repeat(LOG_LINE_CAP);
+  const prefix = "path=/Users/ada/Vault/notes " + "b ".repeat(LOG_LINE_CAP);
   const scrubbed = redact(prefix, []);
   assert.equal(scrubbed.includes("/Users"), false, scrubbed);
   assert.equal(scrubbed.includes("[path]"), true, scrubbed);
   assert.equal(scrubbed.includes("[truncated]"), true, scrubbed);
+  assert.ok(Buffer.byteLength(scrubbed) <= LOG_LINE_CAP + Buffer.byteLength("[truncated]"));
+
+  let head = "";
+  while (Buffer.byteLength(head) < LOG_LINE_CAP - 8) head += "safe ";
+  const crossing = head + "PrivateFolder/plan.md Secret Plan.md " + "tail ".repeat(2000);
+  const crossed = redact(crossing, []);
+  assert.equal(crossed.includes("Private"), false, crossed.slice(0, 80));
+  assert.equal(crossed.includes("Secret"), false, crossed.slice(0, 80));
+  assert.equal(crossed.includes("Plan"), false, crossed.slice(0, 80));
+  assert.equal(crossed.includes("[truncated]"), true);
+  assert.ok(Buffer.byteLength(crossed) <= LOG_LINE_CAP + Buffer.byteLength("[truncated]"));
+
+  let words = "";
+  while (Buffer.byteLength(words) < LOG_LINE_CAP - 4) words += "ok ";
+  const partial = redact(words + "PrivateFolderExtra", []);
+  assert.equal(partial.includes("Private"), false, partial.slice(-40));
+  assert.equal(partial.endsWith("[truncated]"), true);
+});
+
+test("slash tokens stay only for stack frames, ratios, and the fixed list", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const install = path.join(repoRoot, "relay", "src", "x.mjs");
+  assert.equal(redact("fail " + install + ":4:8", []), "fail relay/src/x.mjs:4:8");
+  assert.equal(redact("at file://" + install + ":4:8", []), "at relay/src/x.mjs:4:8");
+  const shaped = path.join("/tmp", "not-the-repo", "relay", "src", "x.mjs");
+  const masked = redact("fail " + shaped + ":1:1", []);
+  assert.equal(masked.includes("relay/src"), false, masked);
+  assert.equal(masked.includes("x.mjs"), false, masked);
+  assert.equal(masked.startsWith("fail [path]"), true, masked);
+  const relativeFrame = redact("at relay/src/x.mjs:1:1", []);
+  assert.equal(relativeFrame.includes("relay/src"), false, relativeFrame);
+  assert.equal(relativeFrame.startsWith("at [path]"), true, relativeFrame);
+  assert.equal(
+    redact("at node:internal/modules/cjs/loader:198:15", []),
+    "at node:internal/modules/cjs/loader:198:15",
+  );
+  const bareNode = redact("at node:internal/modules/cjs/loader", []);
+  assert.equal(bareNode.includes("modules/cjs"), false, bareNode);
+  assert.equal(redact("batch 2/5 done", []), "batch 2/5 done");
+  assert.equal(redact("HTTP/1.1 200", []), "HTTP/1.1 200");
+  assert.equal(redact("12 KB/s now", []), "12 KB/s now");
+  assert.equal(redact("slow MB/s", []), "slow MB/s");
+  assert.equal(redact("type application/json", []), "type application/json");
+  assert.equal(redact("type text/plain", []), "type text/plain");
+  assert.equal(redact("notes/secret.md", []).includes("notes"), false);
+  assert.equal(redact("step 3x/1.2ms", []).includes("3x/"), false);
+});
+
+test("note suffixes, windows paths, and encoded slashes are scrubbed", () => {
+  const txt = redact("wrote Secret Plan.txt today", []);
+  assert.equal(txt.includes("Secret"), false, txt);
+  assert.equal(txt.includes(".txt"), false, txt);
+  const markdown = redact("wrote Secret Plan.markdown today", []);
+  assert.equal(markdown.includes("Secret"), false, markdown);
+  assert.equal(markdown.includes(".markdown"), false, markdown);
+  const mdx = redact("wrote Secret Plan.mdx today", []);
+  assert.equal(mdx.includes("Secret"), false, mdx);
+  assert.equal(mdx.includes(".mdx"), false, mdx);
+  const drive = redact("open C:\\Users\\ada\\Vault\\plan.md", []);
+  assert.equal(drive.includes("Users"), false, drive);
+  assert.equal(drive.includes("plan"), false, drive);
+  assert.equal(drive, "open [path]");
+  const unc = redact("open \\\\server\\share\\plan.md", []);
+  assert.equal(unc.includes("server"), false, unc);
+  assert.equal(unc.includes("share"), false, unc);
+  assert.equal(unc, "open [path]");
+  const encoded = redact("open notes%2Fplan.md next", []);
+  assert.equal(encoded.includes("notes"), false, encoded);
+  assert.equal(encoded.includes("%2F"), false, encoded);
+  assert.equal(encoded, "open [path] next");
+  const lower = redact("open notes%2fplan.md next", []);
+  assert.equal(lower.includes("notes"), false, lower);
+  assert.equal(lower, "open [path] next");
+});
+
+test("fold-in, mirror, and foreign-folder lines keep their wording", () => {
+  const err = Object.assign(new Error("EACCES: permission denied, open '/vault/day.md'"), { code: "EACCES" });
+  const id = "AbC123xyz";
+  const fold = foldInFailureLine(id, err);
+  assert.equal(fold, "fold-in failed for AbC123xyz EACCES");
+  assert.equal(redact(fold, []), fold);
+  const note = mirrorNoteFailureLine(id, err);
+  assert.equal(note, "mirror failed for AbC123xyz EACCES");
+  assert.equal(redact(note, []), note);
+  const outer = mirrorFailureLine(err);
+  assert.equal(outer, "mirror failed: EACCES");
+  assert.equal(redact(outer, []), outer);
+  const hashed = foldInFailureLine("day.md", err);
+  assert.equal(hashed.includes("day.md"), false, hashed);
+  assert.equal(redact(hashed, []), hashed);
+  assert.match(hashed, /^fold-in failed for [a-f0-9]{12} EACCES$/);
+  const oldFold = redact("fold-in failed for day.md EACCES", []);
+  assert.equal(oldFold.includes("day.md"), false, oldFold);
+  const oldForeign = redact("This folder is not the relay's notes (log/2026-10-23.md). Pass an empty folder", []);
+  assert.equal(oldForeign.includes("2026-10-23"), false, oldForeign);
+  const oldConflict = redact("conflict copy kept for Secret Plan.md after merge", []);
+  assert.equal(oldConflict.includes("Secret"), false, oldConflict);
+  const oldWrote = redact("wrote Secret Plan.md today", []);
+  assert.equal(oldWrote.includes("Secret"), false, oldWrote);
 });
 
 test("a location scrub is linear on adversarial input", () => {
-  const piece = "(a/".repeat(400) + "a/a/a/".repeat(200) + " ".repeat(1500);
+  const piece = "(a/".repeat(200) + "a/a/a/".repeat(100) + " Secret Plan.txt Name.markdown Name.mdx "
+    + "C:\\Users\\ada\\plan.md \\\\server\\share\\notes notes%2Fplan.md " + " ".repeat(800);
   assert.ok(piece.length < LOG_LINE_CAP, piece.length);
   let input = "";
   while (Buffer.byteLength(input) < 1024 * 1024) input += piece + "\n";
@@ -1041,6 +1148,10 @@ test("a location scrub is linear on adversarial input", () => {
   assert.ok(elapsed < 100, "scrubbed in " + elapsed + "ms");
   assert.equal(cleaned.includes("(a/"), false);
   assert.equal(cleaned.includes("a/a/a/"), false);
+  assert.equal(cleaned.includes("Secret"), false);
+  assert.equal(cleaned.includes("Users"), false);
+  assert.equal(cleaned.includes("server"), false);
+  assert.equal(cleaned.includes("%2F"), false);
 });
 
 test("relay rejects a bad token and accepts the real one", async () => {
@@ -1177,9 +1288,11 @@ test("a fresh backup pushes to an empty repo", async () => {
     gitIntervalMs: 0,
   });
   try {
+    await fs.writeFile(path.join(vault, ".gitignore"), "# keep\n.*.tmp\nuser.tmp\n");
     await fs.writeFile(path.join(vault, "day.md"), "today\n");
     await fs.writeFile(path.join(vault, "day.md.leftover.recover"), "secret\n");
     await fs.writeFile(path.join(vault, ".day.md.99999.tmp"), "secret-temp\n");
+    await fs.writeFile(path.join(vault, ".cache.tmp"), "user-temp\n");
     const result = await relay.backupNow();
     assert.equal(result.pushed, true);
     const listed = await git(["--git-dir", bare, "log", "--oneline", "main"]);
@@ -1187,12 +1300,16 @@ test("a fresh backup pushes to an empty repo", async () => {
     const ignore = await fs.readFile(path.join(vault, ".gitignore"), "utf8");
     assert.match(ignore, /\.aidanos\//);
     assert.match(ignore, /^\*\.recover$/m);
-    assert.match(ignore, /^\.\*\.tmp$/m);
+    assert.match(ignore, /^# keep$/m);
+    assert.match(ignore, /^user\.tmp$/m);
+    assert.match(ignore, /^\.\*\.md\.\*\.tmp$/m);
+    assert.doesNotMatch(ignore, /^\.\*\.tmp$/m);
     const exclude = await fs.readFile(path.join(vault, ".git", "info", "exclude"), "utf8");
     assert.match(exclude, /^\*\.recover$/m);
     const tree = await git(["--git-dir", bare, "ls-tree", "-r", "--name-only", "main"]);
     assert.doesNotMatch(tree.stdout, /\.recover/);
-    assert.doesNotMatch(tree.stdout, /\.tmp/);
+    assert.doesNotMatch(tree.stdout, /\.day\.md\.99999\.tmp/);
+    assert.match(tree.stdout, /^\.cache\.tmp$/m);
   } finally {
     await relay.close();
   }
@@ -1209,41 +1326,78 @@ function deadPid() {
   return 0;
 }
 
-test("a stale note temp is removed at startup and a live one stays", async () => {
+test("an unclaimed folder keeps every temp, including a wrong vault", async () => {
+  const dead = deadPid();
+  assert.ok(dead > 1);
+  const dir = await tempDir();
+  const home = path.join(dir, "home");
+  const poison = path.join(dir, "poison");
+  await fs.mkdir(path.join(home, "Documents", "proj", ".cache"), { recursive: true });
+  await fs.mkdir(poison);
+  const note = path.join(home, `.secret-plan.md.${dead}.tmp`);
+  const docx = path.join(home, `.report.docx.${dead}.tmp`);
+  const dot = path.join(home, "Documents", "proj", ".cache", `.cache.${dead}.tmp`);
+  const build = path.join(home, "Documents", "proj", `.build.${dead}.tmp`);
+  await fs.writeFile(note, "note\n");
+  await fs.writeFile(docx, "docx\n");
+  await fs.writeFile(dot, "dot\n");
+  await fs.writeFile(build, "build\n");
+  const listed = [
+    `.secret-plan.md.${dead}.tmp`,
+    `.report.docx.${dead}.tmp`,
+    `Documents/proj/.cache/.cache.${dead}.tmp`,
+    `Documents/proj/.build.${dead}.tmp`,
+    `../elsewhere/.secret.md.${dead}.tmp`,
+  ];
+  await fs.writeFile(path.join(poison, NOTE_TEMP_MANIFEST), listed.join("\n") + "\n");
+  await sweepStaleNoteTemps(home, poison);
+  await assert.rejects(
+    startRelay({ token: TOKEN, vault: home, data: poison, port: 0, gitUrl: "" }),
+    /not the relay's own folder/,
+  );
+  assert.equal(await fs.readFile(note, "utf8"), "note\n");
+  assert.equal(await fs.readFile(docx, "utf8"), "docx\n");
+  assert.equal(await fs.readFile(dot, "utf8"), "dot\n");
+  assert.equal(await fs.readFile(build, "utf8"), "build\n");
+  assert.equal(await fs.readFile(path.join(poison, NOTE_TEMP_MANIFEST), "utf8"), listed.join("\n") + "\n");
+  await assert.rejects(fs.stat(path.join(home, ".aidanos", "relay-folder")));
+});
+
+test("a startup sweep removes only a claimed manifest temp", async () => {
   const dead = deadPid();
   assert.ok(dead > 1);
   const dir = await tempDir();
   const vault = path.join(dir, "vault");
   const data = path.join(dir, "data");
-  await fs.mkdir(vault);
-  const stale = path.join(vault, `.secret-plan.md.${dead}.tmp`);
-  await fs.writeFile(stale, "whole note\n");
+  const outside = path.join(dir, "outside");
   const first = await startRelay({ token: TOKEN, vault, data, port: 0, gitUrl: "" });
   await first.close();
-  await assert.rejects(fs.lstat(stale), (error) => error && error.code === "ENOENT");
 
   const notes = path.join(vault, "notes");
-  const outside = path.join(dir, "outside");
+  const dotDir = path.join(vault, "docs", ".cache");
   await fs.mkdir(notes);
+  await fs.mkdir(dotDir, { recursive: true });
   await fs.mkdir(outside);
   const nested = path.join(notes, `.plan.md.${dead}.tmp`);
+  const unlisted = path.join(notes, `.extra.md.${dead}.tmp`);
   const live = path.join(vault, `.held-note.md.${process.pid}.tmp`);
-  const other = path.join(vault, "keep.md.tmp");
-  const plain = path.join(vault, ".note.tmp");
+  const docx = path.join(vault, `.report.docx.${dead}.tmp`);
+  const dot = path.join(dotDir, `.cache.${dead}.tmp`);
   const linked = path.join(vault, "real-secret.md");
-  const link = path.join(vault, `.linked.md.${dead}.tmp`);
+  const link = path.join(notes, `.linked.md.${dead}.tmp`);
   const outsideTemp = path.join(outside, `.secret.md.${dead}.tmp`);
   await fs.writeFile(nested, "nested note\n");
+  await fs.writeFile(unlisted, "not listed\n");
   await fs.writeFile(live, "still writing\n");
-  await fs.writeFile(other, "not our pattern\n");
-  await fs.writeFile(plain, "no pid\n");
+  await fs.writeFile(docx, "docx\n");
+  await fs.writeFile(dot, "dot\n");
   await fs.writeFile(linked, "do not follow\n");
   await fs.symlink(linked, link);
   await fs.writeFile(outsideTemp, "outside note\n");
   await fs.symlink(outside, path.join(vault, "linked-dir"));
   let foreign = "";
   try {
-    foreign = path.join(vault, `.foreign.md.${dead}.tmp`);
+    foreign = path.join(notes, `.foreign.md.${dead}.tmp`);
     await fs.writeFile(foreign, "other-user\n");
     await fs.chown(foreign, 65534, 65534);
   } catch {
@@ -1251,16 +1405,49 @@ test("a stale note temp is removed at startup and a live one stays", async () =>
     foreign = "";
   }
 
+  const lines = [
+    `notes/.plan.md.${dead}.tmp`,
+    `notes/.extra.md.${dead}.tmp`,
+    `.held-note.md.${process.pid}.tmp`,
+    `.report.docx.${dead}.tmp`,
+    `docs/.cache/.cache.${dead}.tmp`,
+    `notes/.linked.md.${dead}.tmp`,
+    `linked-dir/.secret.md.${dead}.tmp`,
+    `../outside/.secret.md.${dead}.tmp`,
+  ];
+  if (foreign) lines.push(`notes/.foreign.md.${dead}.tmp`);
+  const decoy = path.join(dir, "decoy-manifest");
+  await fs.writeFile(decoy, lines.join("\n") + "\n");
+  await fs.symlink(decoy, path.join(data, NOTE_TEMP_MANIFEST));
+  await sweepStaleNoteTemps(vault, data);
+  assert.equal(await fs.readFile(nested, "utf8"), "nested note\n");
+  assert.equal((await fs.lstat(path.join(data, NOTE_TEMP_MANIFEST))).isSymbolicLink(), true);
+  assert.equal(await fs.readFile(decoy, "utf8"), lines.join("\n") + "\n");
+
+  await fs.unlink(path.join(data, NOTE_TEMP_MANIFEST));
+  const recorded = lines.filter((line) => line !== `notes/.extra.md.${dead}.tmp`);
+  await fs.writeFile(path.join(data, NOTE_TEMP_MANIFEST), recorded.join("\n") + "\n");
   const again = await startRelay({ token: TOKEN, vault, data, port: 0, gitUrl: "" });
   try {
     await assert.rejects(fs.lstat(nested), (error) => error && error.code === "ENOENT");
+    assert.equal(await fs.readFile(unlisted, "utf8"), "not listed\n");
     assert.equal(await fs.readFile(live, "utf8"), "still writing\n");
-    assert.equal(await fs.readFile(other, "utf8"), "not our pattern\n");
-    assert.equal(await fs.readFile(plain, "utf8"), "no pid\n");
+    assert.equal(await fs.readFile(docx, "utf8"), "docx\n");
+    assert.equal(await fs.readFile(dot, "utf8"), "dot\n");
     assert.equal(await fs.readFile(linked, "utf8"), "do not follow\n");
     assert.equal((await fs.lstat(link)).isSymbolicLink(), true);
     assert.equal(await fs.readFile(outsideTemp, "utf8"), "outside note\n");
     if (foreign) assert.equal(await fs.readFile(foreign, "utf8"), "other-user\n");
+    const manifest = await fs.readFile(path.join(data, NOTE_TEMP_MANIFEST), "utf8");
+    assert.equal(manifest.includes(`notes/.plan.md.${dead}.tmp`), false, manifest);
+    assert.equal(manifest.includes(`notes/.extra.md.${dead}.tmp`), false, manifest);
+    assert.equal(manifest.includes(`.held-note.md.${process.pid}.tmp`), true, manifest);
+    assert.equal(manifest.includes(`.report.docx.${dead}.tmp`), true, manifest);
+    assert.equal(manifest.includes(`docs/.cache/.cache.${dead}.tmp`), true, manifest);
+    assert.equal(manifest.includes(`notes/.linked.md.${dead}.tmp`), true, manifest);
+    assert.equal(manifest.includes(`linked-dir/.secret.md.${dead}.tmp`), true, manifest);
+    assert.equal(manifest.includes(`../outside/.secret.md.${dead}.tmp`), true, manifest);
+    if (foreign) assert.equal(manifest.includes(`notes/.foreign.md.${dead}.tmp`), true, manifest);
   } finally {
     await again.close();
   }
@@ -1693,7 +1880,7 @@ test("an index reply is a handful of steps", async () => {
   const line = seen.filter((entry) => entry.includes("index steps ")).pop();
   assert.ok(line, "missing index steps\n" + seen.join("\n"));
   const count = (name) => {
-    const match = line.match(new RegExp("\\b" + name + "=(\\d+)x/"));
+    const match = line.match(new RegExp("\\b" + name + "=(\\d+)x "));
     assert.ok(match, name + " missing in " + line);
     return Number(match[1]);
   };
@@ -2163,13 +2350,33 @@ test("relay refuses a notes folder", async () => {
   await fs.writeFile(path.join(vault, "readme.txt"), "notes\n");
   await fs.mkdir(path.join(vault, ".git"), { recursive: true });
   await fs.writeFile(path.join(vault, ".git", "config"), '[remote "origin"]\n\turl = /tmp/notes.git\n');
+  const withRemote = "This folder is not the relay's own folder. It has a git remote. Pass an empty folder, or the folder the relay marked earlier.";
   await assert.rejects(
     startRelay({ token: TOKEN, vault, data: path.join(dir, "data"), port: 0, gitUrl: "" }),
-    /notes|git remote/,
+    (error) => {
+      assert.equal(error.message, withRemote);
+      assert.equal(error.message.includes("2026-10-23"), false);
+      assert.equal(error.message.includes("readme"), false);
+      assert.equal(redact(error.message, []), error.message);
+      return true;
+    },
   );
   assert.equal(await fs.readFile(path.join(vault, "log", "2026-10-23.md"), "utf8"), "# day\n");
   await assert.rejects(fs.stat(path.join(vault, ".aidanos", "relay-folder")));
   await assert.rejects(fs.stat(path.join(dir, "data")));
+  const plain = path.join(dir, "plain");
+  await fs.mkdir(plain);
+  await fs.writeFile(path.join(plain, "readme.txt"), "notes\n");
+  const withFiles = "This folder is not the relay's own folder. It already has files, and it has no relay marker. Pass an empty folder, or the folder the relay marked earlier.";
+  await assert.rejects(
+    startRelay({ token: TOKEN, vault: plain, data: path.join(dir, "plain-data"), port: 0, gitUrl: "" }),
+    (error) => {
+      assert.equal(error.message, withFiles);
+      assert.equal(error.message.includes("readme"), false);
+      assert.equal(redact(error.message, []), error.message);
+      return true;
+    },
+  );
 });
 
 test("relay ignores the old vault variables and accepts its own marked folder", async () => {

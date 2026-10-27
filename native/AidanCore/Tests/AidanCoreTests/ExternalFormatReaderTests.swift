@@ -954,9 +954,6 @@ final class ExternalFormatReaderTests: XCTestCase {
     }
 
     /// A long non-English `@a(` line stays a linear scan.
-    /// The simulator's wall clock missed 5s on this same linear read
-    /// (PR 68 run 40494027733 recorded 9.597s; c70a892 recorded 25.577s).
-    /// That clock is not the bound there.
     /// The step count is: twice the mentions stay within 3x.
     func testNonEnglishLineStaysWithinTheTimeBound() {
         let half = "é" + String(repeating: "@a(", count: 175_000)
@@ -974,6 +971,8 @@ final class ExternalFormatReaderTests: XCTestCase {
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing non-english-bound \(elapsed)")
+        // macOS keeps this 5s wall. The simulator missed it on the same
+        // read (PR 68 run 40494027733 recorded 9.597s; c70a892 recorded 25.577s).
         #if !targetEnvironment(simulator)
         XCTAssertLessThan(elapsed, 5)
         #endif

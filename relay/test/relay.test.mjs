@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { closeSync, constants as fsConstants, openSync, readSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, openSync, readSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -14,9 +14,13 @@ import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import {
+  MANIFEST_ASIDE_LINE,
   MANIFEST_REFUSED_LINE,
   MANIFEST_RESET_LINE,
+  MANIFEST_UNRECORDED_LINE,
+  NOTE_TEMP_KEPT_LINE,
   NOTE_TEMP_MANIFEST,
+  discardOpenNoteTemps,
   foldInFailureLine,
   manifestNoticeLogged,
   mirrorFailureLine,
@@ -24,6 +28,9 @@ import {
   rememberVaultRoot,
   saveNoteBatch,
   saveNoteFile,
+  setAfterManifestRenameForTest,
+  setBeforeManifestPathForTest,
+  setBeforeOwnedUnlinkForTest,
   sweepStaleNoteTemps,
 } from "../src/mirror.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
@@ -1163,6 +1170,9 @@ test("slash tokens stay only for stack frames, ratios, and the fixed list", () =
     redact("at node:internal/modules/cjs/loader:198:15", []),
     "at node:internal/modules/cjs/loader:198:15",
   );
+  assert.equal(redact("at node:fs:1:1", []), "at node:fs:1:1");
+  assert.equal(redact("at node:path:1:1", []), "at node:path:1:1");
+  assert.equal(redact("at node:fs/promises:1:1", []), "at node:fs/promises:1:1");
   const bareNode = redact("at node:internal/modules/cjs/loader", []);
   assert.equal(bareNode.includes("modules/cjs"), false, bareNode);
   assert.equal(redact("batch 2/5 done", []), "batch 2/5 done");
@@ -1250,6 +1260,13 @@ test("a node frame is kept only when it stays inside node", () => {
   assert.equal(scrubbed.includes("diary"), false, scrubbed);
   assert.equal(scrubbed.includes("vault"), false, scrubbed);
   assert.equal(scrubbed.includes(".."), false, scrubbed);
+  const users = "node:users/colby/vault/page:1:2";
+  const lowered = redact("at " + users, []);
+  assert.equal(lowered.includes("users"), false, lowered);
+  assert.equal(lowered.includes("colby"), false, lowered);
+  assert.equal(lowered.includes("vault"), false, lowered);
+  assert.equal(lowered.includes("page"), false, lowered);
+  assert.equal(lowered.includes("node:users"), false, lowered);
 });
 
 test("a log line does not glue a cut bracket to the truncation mark", () => {
@@ -1258,6 +1275,37 @@ test("a log line does not glue a cut bracket to the truncation mark", () => {
   assert.equal(capped.includes("[[truncated]"), false, capped.slice(-24));
   assert.equal(capped.endsWith("[truncated]"), true, capped.slice(-24));
   assert.equal(capped.includes("secret"), false, capped.slice(-24));
+  const brackets = "a".repeat(LOG_LINE_CAP - 2) + "[[path]]";
+  const cut = redact(brackets, []);
+  assert.equal(cut.includes("[[truncated]"), false, cut.slice(-24));
+  assert.equal(cut.endsWith("[truncated]"), true, cut.slice(-24));
+  assert.equal(cut.includes("path"), false, cut.slice(-24));
+});
+
+test("a secret straddling the 64 KB cap is fully masked", () => {
+  function padTo(start) {
+    let pad = "";
+    while (Buffer.byteLength(pad) + 2 <= start) pad += "b\n";
+    pad += "b".repeat(start - Buffer.byteLength(pad));
+    assert.equal(Buffer.byteLength(pad), start);
+    return pad;
+  }
+  function straddling(start, length) {
+    const secret = "Zk7" + "Q".repeat(length - 3);
+    assert.equal(Buffer.byteLength(secret), length);
+    assert.ok(start + length > start + 13);
+    const cleaned = redact(padTo(start) + secret + "\n", [secret]);
+    const tail = cleaned.slice(-80);
+    assert.equal(cleaned.includes(secret), false, tail);
+    assert.equal(cleaned.includes("Zk7"), false, tail);
+    assert.equal(cleaned.includes(secret.slice(0, 13)), false, tail);
+    assert.equal(cleaned.includes("Q"), false, tail);
+    assert.equal(cleaned.includes("***"), true, tail);
+  }
+  straddling(65523, 47);
+  straddling(65523, 14);
+  straddling(65523, 80);
+  straddling(LOG_LINE_CAP - 13, 47);
 });
 
 test("twenty thousand stack frames restore in one pass", () => {
@@ -1328,7 +1376,7 @@ test("a location scrub is linear on adversarial input", () => {
   const huge = fill(1024 * 1024) + "TAILTOKEN-99999\n";
   const hugeStarted = performance.now();
   const hugeCleaned = redact(huge, []);
-  assert.ok(performance.now() - hugeStarted < 1000, "1 MB scrub");
+  assert.ok(performance.now() - hugeStarted < 100, "1 MB scrub");
   assert.equal(hugeCleaned.includes("TAILTOKEN-99999"), false);
   assert.equal(hugeCleaned.includes("Secret"), false);
 });
@@ -1469,7 +1517,7 @@ test("a fresh backup pushes to an empty repo", async () => {
   try {
     await fs.writeFile(
       path.join(vault, ".gitignore"),
-      "# keep\n.*.tmp\nuser.tmp\n# aidanos: drop the old wide temp rule\n.*.tmp\n",
+      ".aidanos/\n*.recover\n.*.tmp\n# keep\nuser.tmp\n# aidanos: drop the old wide temp rule\n",
     );
     await fs.writeFile(path.join(vault, "day.md"), "today\n");
     await fs.writeFile(path.join(vault, "day.md.leftover.recover"), "secret\n");
@@ -1485,14 +1533,14 @@ test("a fresh backup pushes to an empty repo", async () => {
     assert.match(ignore, /^# keep$/m);
     assert.match(ignore, /^user\.tmp$/m);
     assert.match(ignore, /^\.\*\.md\.\*\.tmp$/m);
-    assert.equal(ignore.split(/\r?\n/).filter((line) => line.trim() === ".*.tmp").length, 1);
+    assert.equal(ignore.split(/\r?\n/).filter((line) => line.trim() === ".*.tmp").length, 0);
     assert.doesNotMatch(ignore, /aidanos: drop the old wide temp rule/);
     const exclude = await fs.readFile(path.join(vault, ".git", "info", "exclude"), "utf8");
     assert.match(exclude, /^\*\.recover$/m);
     const tree = await git(["--git-dir", bare, "ls-tree", "-r", "--name-only", "main"]);
     assert.doesNotMatch(tree.stdout, /\.recover/);
     assert.doesNotMatch(tree.stdout, /\.day\.md\.99999\.tmp/);
-    assert.doesNotMatch(tree.stdout, /^\.cache\.tmp$/m);
+    assert.match(tree.stdout, /^\.cache\.tmp$/m);
   } finally {
     await relay.close();
   }
@@ -1697,7 +1745,18 @@ test("a startup sweep removes only a claimed manifest temp", async () => {
     `linked-dir/.secret.md.${dead}.tmp`,
     `../outside/.secret.md.${dead}.tmp`,
   ];
+  let hard = "";
+  try {
+    const hardTarget = path.join(notes, "hard-target.md");
+    hard = path.join(notes, `.hard.md.${dead}.tmp`);
+    await fs.writeFile(hardTarget, "hard\n");
+    await fs.link(hardTarget, hard);
+  } catch {
+    if (hard) await fs.rm(hard, { force: true });
+    hard = "";
+  }
   if (foreign) lines.push(`notes/.foreign.md.${dead}.tmp`);
+  if (hard) lines.push(`notes/.hard.md.${dead}.tmp`);
   const decoy = path.join(dir, "decoy-manifest");
   await fs.writeFile(decoy, lines.join("\n") + "\n");
   await fs.symlink(decoy, path.join(data, NOTE_TEMP_MANIFEST));
@@ -1714,6 +1773,7 @@ test("a startup sweep removes only a claimed manifest temp", async () => {
     `linked-dir/.secret.md.${dead}.tmp`,
   ];
   if (foreign) recorded.push(`notes/.foreign.md.${dead}.tmp`);
+  if (hard) recorded.push(`notes/.hard.md.${dead}.tmp`);
   await fs.writeFile(path.join(data, NOTE_TEMP_MANIFEST), recorded.join("\n") + "\n");
   const again = await startRelay({ token: TOKEN, vault, data, port: 0, gitUrl: "" });
   try {
@@ -1726,15 +1786,20 @@ test("a startup sweep removes only a claimed manifest temp", async () => {
     assert.equal((await fs.lstat(link)).isSymbolicLink(), true);
     assert.equal(await fs.readFile(outsideTemp, "utf8"), "outside note\n");
     if (foreign) assert.equal(await fs.readFile(foreign, "utf8"), "other-user\n");
+    if (hard) {
+      assert.equal(await fs.readFile(hard, "utf8"), "hard\n");
+      assert.equal(await fs.readFile(path.join(notes, "hard-target.md"), "utf8"), "hard\n");
+    }
     const manifest = await fs.readFile(path.join(data, NOTE_TEMP_MANIFEST), "utf8");
     assert.equal(manifest.includes(`notes/.plan.md.${dead}.tmp`), false, manifest);
     assert.equal(manifest.includes(`.held-note.md.${process.pid}.tmp`), true, manifest);
-    assert.equal(manifest.includes(`notes/.linked.md.${dead}.tmp`), true, manifest);
-    assert.equal(manifest.includes(`linked-dir/.secret.md.${dead}.tmp`), true, manifest);
+    assert.equal(manifest.includes(`notes/.linked.md.${dead}.tmp`), false, manifest);
+    assert.equal(manifest.includes(`linked-dir/.secret.md.${dead}.tmp`), false, manifest);
     assert.equal(manifest.includes(".docx"), false, manifest);
     assert.equal(manifest.includes(".cache"), false, manifest);
     assert.equal(manifest.includes(".."), false, manifest);
-    if (foreign) assert.equal(manifest.includes(`notes/.foreign.md.${dead}.tmp`), true, manifest);
+    if (foreign) assert.equal(manifest.includes(`notes/.foreign.md.${dead}.tmp`), false, manifest);
+    if (hard) assert.equal(manifest.includes(`notes/.hard.md.${dead}.tmp`), false, manifest);
   } finally {
     await again.close();
   }
@@ -1802,6 +1867,216 @@ test("a hostile manifest is not written through", async () => {
   assert.equal(manifestNoticeLogged(hugeDir).reset, true);
   const fresh = await fs.readFile(path.join(hugeDir, NOTE_TEMP_MANIFEST), "utf8");
   assert.equal(fresh.includes("a".repeat(32)), false, fresh.slice(0, 40));
+});
+
+test("a bad manifest keeps the lines that parse and sets the file aside", async () => {
+  const dead = deadPid();
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await fs.mkdir(vault);
+  await fs.mkdir(data, { mode: 0o755 });
+  const before = `.kept.md.${dead}.tmp`;
+  const after = `notes/.also.md.${dead}.tmp`;
+  const original = [before, "not a temp", after].join("\n") + "\n";
+  await fs.writeFile(path.join(data, NOTE_TEMP_MANIFEST), original, { mode: 0o600 });
+  const day = path.join(vault, "day.md");
+  await saveNoteFile(day, "day\n", undefined, { vault, stateDir: data });
+  assert.equal(await fs.readFile(day, "utf8"), "day\n");
+  const names = (await fs.readdir(data)).filter((name) => /^note-temps\.\d+T\d+\.\d+\.\d+$/.test(name));
+  assert.equal(names.length, 1, names.join(","));
+  assert.equal(await fs.readFile(path.join(data, names[0]), "utf8"), original);
+  const active = await fs.readFile(path.join(data, NOTE_TEMP_MANIFEST), "utf8");
+  assert.equal(active.includes(before), true, active);
+  assert.equal(active.includes(after), true, active);
+  assert.equal(active.includes("not a temp"), false, active);
+  assert.equal(manifestNoticeLogged(data).reset, true);
+});
+
+test("only the newest three set-aside manifests are kept", async () => {
+  assert.equal(MANIFEST_ASIDE_LINE.includes("/"), false);
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await fs.mkdir(vault);
+  await fs.mkdir(data, { mode: 0o755 });
+  const day = path.join(vault, "day.md");
+  const seen = [];
+  const write = console.error;
+  console.error = (...args) => { seen.push(args.map(String).join(" ")); };
+  try {
+    for (let n = 1; n <= 5; n += 1) {
+      await fs.writeFile(path.join(data, NOTE_TEMP_MANIFEST), "bad-" + n + "\n", { mode: 0o600 });
+      await saveNoteFile(day, "day-" + n + "\n", undefined, { vault, stateDir: data });
+    }
+  } finally {
+    console.error = write;
+  }
+  const names = (await fs.readdir(data)).filter((name) => /^note-temps\.\d+T\d+\.\d+\.\d+$/.test(name));
+  assert.equal(names.length, 3, names.join(","));
+  const bodies = [];
+  for (const name of names) bodies.push(await fs.readFile(path.join(data, name), "utf8"));
+  bodies.sort();
+  assert.deepEqual(bodies, ["bad-3\n", "bad-4\n", "bad-5\n"]);
+  const counts = seen.flatMap((line) => {
+    const match = line.match(/note temp manifest aside (\d+)/);
+    return match ? [Number(match[1])] : [];
+  });
+  assert.deepEqual(counts, [1, 1]);
+  assert.equal(seen.some((line) => line.includes(dir)), false, seen.join("\n"));
+});
+
+async function swapStateDir(data) {
+  const held = data + "-held";
+  await fs.rename(data, held);
+  await fs.mkdir(data, { mode: 0o755 });
+  await fs.writeFile(path.join(data, "precious"), "keep\n");
+  return held;
+}
+
+test("a manifest path rename refuses a swapped state directory", async () => {
+  const prev = process.env.NODE_ENV;
+  process.env.NODE_ENV = "test";
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await fs.mkdir(vault);
+  await fs.mkdir(data, { mode: 0o755 });
+  await fs.writeFile(path.join(data, NOTE_TEMP_MANIFEST), "not a temp\n", { mode: 0o600 });
+  const day = path.join(vault, "day.md");
+  const seen = [];
+  const write = console.error;
+  console.error = (...args) => { seen.push(args.map(String).join(" ")); };
+  let held = "";
+  try {
+    setBeforeManifestPathForTest(async () => { held = await swapStateDir(data); });
+    await saveNoteFile(day, "day\n", undefined, { vault, stateDir: data });
+    assert.equal(await fs.readFile(day, "utf8"), "day\n");
+    assert.equal(await fs.readFile(path.join(data, "precious"), "utf8"), "keep\n");
+    assert.deepEqual(await fs.readdir(data), ["precious"]);
+    assert.equal(await fs.readFile(path.join(held, NOTE_TEMP_MANIFEST), "utf8"), "not a temp\n");
+    assert.equal(seen.some((line) => line.includes(MANIFEST_REFUSED_LINE)), true, seen.join("\n"));
+    assert.equal(seen.some((line) => line.includes(MANIFEST_RESET_LINE)), false, seen.join("\n"));
+    assert.equal(seen.some((line) => line.includes(dir)), false, seen.join("\n"));
+  } finally {
+    setBeforeManifestPathForTest(null);
+    setAfterManifestRenameForTest(null);
+    console.error = write;
+    if (prev == null) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prev;
+  }
+});
+
+test("a manifest rename refuses when the state directory changes after the rename", async () => {
+  const prev = process.env.NODE_ENV;
+  process.env.NODE_ENV = "test";
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await fs.mkdir(vault);
+  await fs.mkdir(data, { mode: 0o755 });
+  const day = path.join(vault, "day.md");
+  const seen = [];
+  const write = console.error;
+  console.error = (...args) => { seen.push(args.map(String).join(" ")); };
+  let held = "";
+  try {
+    setAfterManifestRenameForTest(async () => { held = await swapStateDir(data); });
+    await saveNoteFile(day, "day\n", undefined, { vault, stateDir: data });
+    assert.equal(await fs.readFile(day, "utf8"), "day\n");
+    assert.equal(await fs.readFile(path.join(data, "precious"), "utf8"), "keep\n");
+    assert.equal((await fs.readdir(data)).includes(NOTE_TEMP_MANIFEST), false);
+    assert.equal((await fs.readdir(held)).includes(NOTE_TEMP_MANIFEST), true);
+    assert.equal(seen.some((line) => line.includes(MANIFEST_REFUSED_LINE)), true, seen.join("\n"));
+    assert.equal(seen.some((line) => line.includes(dir)), false, seen.join("\n"));
+  } finally {
+    setBeforeManifestPathForTest(null);
+    setAfterManifestRenameForTest(null);
+    console.error = write;
+    if (prev == null) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prev;
+  }
+});
+
+test("a refused manifest logs the doc id and leaves the temp", async () => {
+  const prev = process.env.NODE_ENV;
+  process.env.NODE_ENV = "test";
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await fs.mkdir(vault);
+  await fs.mkdir(data, { mode: 0o755 });
+  const day = path.join(vault, "day.md");
+  const docId = "AbC123xyz";
+  const seen = [];
+  const write = console.error;
+  console.error = (...args) => { seen.push(args.map(String).join(" ")); };
+  try {
+    setBeforeManifestPathForTest(async () => { await swapStateDir(data); });
+    const errors = await saveNoteBatch([{
+      file: day,
+      text: "day\n",
+      docId,
+      async beforeRename() {
+        await discardOpenNoteTemps();
+        throw new Error("stop");
+      },
+    }], { vault, stateDir: data });
+    assert.equal(errors.length, 1);
+    const temps = (await fs.readdir(vault)).filter((name) => name.endsWith(".tmp"));
+    assert.equal(temps.length, 1, temps.join(","));
+    assert.equal(await fs.readFile(path.join(vault, temps[0]), "utf8"), "day\n");
+    await assert.rejects(fs.stat(day));
+    const logged = seen.filter((line) => line.includes(MANIFEST_UNRECORDED_LINE));
+    assert.equal(logged.length, 1, seen.join("\n"));
+    assert.equal(logged[0].includes(docId), true, logged[0]);
+    assert.equal(seen.some((line) => line.includes(dir) || line.includes(".tmp") || line.includes("day.md")), false, seen.join("\n"));
+  } finally {
+    setBeforeManifestPathForTest(null);
+    console.error = write;
+    if (prev == null) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prev;
+  }
+});
+
+test("a note temp swapped before unlink is kept", async () => {
+  const prev = process.env.NODE_ENV;
+  process.env.NODE_ENV = "test";
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  const marker = relayMarkerText("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+  await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
+  await fs.mkdir(data, { mode: 0o755 });
+  await fs.writeFile(path.join(vault, ".aidanos", "relay-folder"), marker);
+  await fs.writeFile(path.join(data, "relay-folder"), marker);
+  await fs.writeFile(relayIdFile(vault), marker);
+  const dead = deadPid();
+  assert.ok(dead > 1);
+  const rel = `.day.md.${dead}.tmp`;
+  const file = path.join(vault, rel);
+  await fs.writeFile(file, "original\n");
+  await fs.writeFile(path.join(data, NOTE_TEMP_MANIFEST), rel + "\n");
+  const seen = [];
+  const write = console.error;
+  console.error = (...args) => { seen.push(args.map(String).join(" ")); };
+  try {
+    setBeforeOwnedUnlinkForTest(() => {
+      unlinkSync(file);
+      writeFileSync(file, "swapped-temp\n");
+    });
+    await sweepStaleNoteTemps(vault, data);
+    assert.equal(await fs.readFile(file, "utf8"), "swapped-temp\n");
+    const manifest = await fs.readFile(path.join(data, NOTE_TEMP_MANIFEST), "utf8");
+    assert.equal(manifest.includes(rel), true, manifest);
+    assert.equal(seen.some((line) => line.includes(NOTE_TEMP_KEPT_LINE)), true, seen.join("\n"));
+    assert.equal(seen.some((line) => line.includes(dir) || line.includes(".tmp")), false, seen.join("\n"));
+  } finally {
+    setBeforeOwnedUnlinkForTest(null);
+    console.error = write;
+    if (prev == null) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prev;
+  }
 });
 
 test("relay refuses an app vault", async () => {

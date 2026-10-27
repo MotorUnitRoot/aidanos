@@ -2382,7 +2382,7 @@ function conflictMineNow() {
   return paperConflict.mine;
 }
 
-const GIT_LOCK_PAUSE = "Sync is paused: a lock in this vault may be from another app or a crash. Close it, then sync resumes.";
+const GIT_LOCK_PAUSE = "Sync is paused: a lock in this vault is still open. Close it, then sync resumes.";
 
 async function resolveConflictKeep() {
   if (!paperConflict) return;

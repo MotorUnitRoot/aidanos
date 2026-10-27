@@ -1278,6 +1278,14 @@ test("a node frame is kept only when it stays inside node", () => {
   assert.equal(maskedMedical.includes("colby"), false, maskedMedical);
   assert.equal(maskedMedical.includes("medical"), false, maskedMedical);
   assert.equal(maskedMedical.includes("notes"), false, maskedMedical);
+  const underFs = "node:internal/fs/users/colby/notes/medical:1:2";
+  const maskedUnderFs = redact("at " + underFs, []);
+  assert.equal(maskedUnderFs.includes(underFs), false, maskedUnderFs);
+  assert.equal(maskedUnderFs.includes("users"), false, maskedUnderFs);
+  assert.equal(maskedUnderFs.includes("colby"), false, maskedUnderFs);
+  assert.equal(maskedUnderFs.includes("medical"), false, maskedUnderFs);
+  assert.equal(maskedUnderFs.includes("notes"), false, maskedUnderFs);
+  assert.equal(redact("at " + kept, []), "at " + kept);
 });
 
 test("a log line does not glue a cut bracket to the truncation mark", () => {
@@ -1482,15 +1490,73 @@ test("a note path is prepared from the claimed root, not a fresh realpath", asyn
 test("github tokens that are not listed are masked", () => {
   const ghp = "ghp_" + "a".repeat(36);
   const gho = "gho_" + "b".repeat(36);
+  const ghs = "ghs_" + "e".repeat(36);
+  const ghu = "ghu_" + "f".repeat(36);
+  const ghr = "ghr_" + "g".repeat(36);
+  const longGhp = "ghp_" + "h".repeat(48);
   const pat = "github_pat_" + "c".repeat(22) + "_" + "d".repeat(59);
-  const cleaned = redact("see " + ghp + " " + gho + " " + pat + " end", []);
+  const longerPat = "github_pat_" + "i".repeat(100);
+  const glued = "xx" + ghp + "yy" + "zz" + longerPat + "QQ";
+  const cleaned = redact("see " + ghp + " " + gho + " " + ghs + " " + ghu + " " + ghr + " " + longGhp + " " + pat + " " + longerPat + " end " + glued, []);
   assert.equal(cleaned.includes(ghp), false, "unlisted ghp_ was kept");
   assert.equal(cleaned.includes(gho), false, "unlisted gho_ was kept");
+  assert.equal(cleaned.includes(ghs), false, "unlisted ghs_ was kept");
+  assert.equal(cleaned.includes(ghu), false, "unlisted ghu_ was kept");
+  assert.equal(cleaned.includes(ghr), false, "unlisted ghr_ was kept");
+  assert.equal(cleaned.includes(longGhp), false, "a ghp_ longer than 36 was kept");
   assert.equal(cleaned.includes(pat), false, "unlisted github_pat_ was kept");
+  assert.equal(cleaned.includes(longerPat), false, "a longer github_pat_ was kept");
   assert.equal(cleaned.includes("ghp_"), false, "ghp_ prefix was kept");
   assert.equal(cleaned.includes("gho_"), false, "gho_ prefix was kept");
+  assert.equal(cleaned.includes("ghs_"), false, "ghs_ prefix was kept");
+  assert.equal(cleaned.includes("ghu_"), false, "ghu_ prefix was kept");
+  assert.equal(cleaned.includes("ghr_"), false, "ghr_ prefix was kept");
   assert.equal(cleaned.includes("github_pat_"), false, "github_pat_ prefix was kept");
+  assert.equal(cleaned.includes("h".repeat(48)), false, "the long ghp_ body was kept");
   assert.equal(cleaned.includes("***"), true, "a listed-shape token was not masked");
+});
+
+test("secrets swept across the 64 KB cut leak no characters", () => {
+  function leakedPrefix(cleaned, secret) {
+    const body = String(cleaned)
+      .replaceAll("[truncated]", "")
+      .replaceAll("[path]", "")
+      .replaceAll("[note]", "")
+      .replaceAll("[url]", "")
+      .replaceAll("***", "");
+    let n = 0;
+    while (n < secret.length && body.includes(secret.slice(0, n + 1))) n += 1;
+    return n;
+  }
+  function pathFiller(start) {
+    if (start <= 0) return "";
+    const body = start - 1;
+    return "/q".repeat(Math.floor(body / 2)) + (body % 2 ? "x" : "") + " ";
+  }
+  const relay = "9" + "f".repeat(63);
+  const pat = "github_pat_" + "C".repeat(71);
+  const jwt = "eyJ" + "Q".repeat(366);
+  assert.equal(relay.length, 64);
+  assert.equal(pat.length, 82);
+  assert.equal(jwt.length, 369);
+  const cases = [
+    { name: "relay", secret: relay, listed: true },
+    { name: "pat", secret: pat, listed: false },
+    { name: "jwt", secret: jwt, listed: true },
+  ];
+  for (const item of cases) {
+    for (const shorten of [true, false]) {
+      for (let offset = -50; offset <= 50; offset += 1) {
+        const start = REDACT_INPUT_CAP + offset;
+        const filler = shorten ? pathFiller(start) : "b".repeat(start);
+        assert.equal(Buffer.byteLength(filler), start);
+        const secrets = item.listed ? [item.secret] : [];
+        const cleaned = redact(filler + item.secret, secrets);
+        const leaked = leakedPrefix(cleaned, item.secret);
+        assert.equal(leaked, 0, item.name + " " + (shorten ? "path" : "plain") + " @" + offset + " leaked " + leaked);
+      }
+    }
+  }
 });
 
 test("a 30 MB adversarial line is clipped before it is masked", () => {

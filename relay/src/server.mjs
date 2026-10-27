@@ -24,7 +24,7 @@ import {
   watchRepo,
 } from "./index-trace.mjs";
 import { createMirror } from "./mirror.mjs";
-import { installFileLog, logFatal, logSafe, stampLine } from "./redact.mjs";
+import { flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, stampLine } from "./redact.mjs";
 import { describeSyncFrame } from "./sync-log.mjs";
 
 const DEFAULT_PORT = 3750;
@@ -1145,14 +1145,27 @@ async function main() {
     );
     process.exit(1);
   }
-  for (const line of startupLines({ lan: args.lan || Boolean(args.lanAddress), port: relay.port, phone: relay.phone })) {
-    writeSync(line.startsWith("WARNING") ? 2 : 1, stampLine(line) + "\n");
-  }
+  let closing = false;
   const shutdown = () => {
-    relay.close().then(() => process.exit(0));
+    if (closing) return;
+    closing = true;
+    const finish = () => {
+      try {
+        pauseFileLog();
+        logSafe([], "relay log closed");
+      } catch { /* the flush still runs */ }
+      try {
+        flushFileLog();
+      } catch { /* exit still runs */ }
+      process.exit(0);
+    };
+    Promise.resolve(relay.close()).then(finish, finish);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  for (const line of startupLines({ lan: args.lan || Boolean(args.lanAddress), port: relay.port, phone: relay.phone })) {
+    writeSync(line.startsWith("WARNING") ? 2 : 1, stampLine(line) + "\n");
+  }
 }
 
 const invoked = process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;

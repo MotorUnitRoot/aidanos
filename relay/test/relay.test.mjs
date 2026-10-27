@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { closeSync, openSync } from "node:fs";
+import { closeSync, openSync, writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -14,7 +14,7 @@ import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
-import { installFileLog, logSafe, redact, stampLine } from "../src/redact.mjs";
+import { installFileLog, logFatal, logSafe, redact, stampLine } from "../src/redact.mjs";
 import { emptyLateState, installIndexTrace, nextLoopLateLine } from "../src/index-trace.mjs";
 import { cbor } from "@automerge/automerge-repo";
 import { describeSyncFrame, logSyncFrame } from "../src/sync-log.mjs";
@@ -168,6 +168,115 @@ test("a stalled log stays under the cap and drops the rest once", async () => {
     writer.destroy();
     server.close();
   }
+});
+
+test("a fatal log writes queued lines first", async () => {
+  const dir = await tempDir();
+  const file = path.join(dir, "stderr.log");
+  const fd = openSync(file, "w");
+  const installed = installFileLog(fd);
+  try {
+    logSafe([], "queued-one");
+    logSafe([], "queued-two");
+    logFatal([], "fatal-line");
+  } finally {
+    installed.restore();
+    closeSync(fd);
+  }
+  const text = await fs.readFile(file, "utf8");
+  const lines = text.trim().split("\n");
+  assert.match(lines[0], /queued-one$/);
+  assert.match(lines[1], /queued-two$/);
+  assert.match(lines[2], /fatal-line$/);
+});
+
+test("a full pipe does not throw out of a fatal log", async () => {
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const accepted = new Promise((resolve) => server.once("connection", resolve));
+  const writer = net.connect(port, "127.0.0.1");
+  const reader = await accepted;
+  await once(writer, "connect");
+  reader.pause();
+  reader.on("error", () => {});
+  writer.on("error", () => {});
+  const fd = writer._handle.fd;
+  const chunk = Buffer.alloc(64 * 1024, 0x61);
+  let blocked = false;
+  try {
+    for (;;) writeSync(fd, chunk);
+  } catch (error) {
+    assert.equal(error.code, "EAGAIN");
+    blocked = true;
+  }
+  assert.equal(blocked, true);
+  const installed = installFileLog(fd, { cap: 32 * 1024 });
+  try {
+    logSafe([], "queued before fatal");
+    assert.doesNotThrow(() => logFatal([], "fatal on a full pipe"));
+  } finally {
+    installed.restore();
+    reader.destroy();
+    writer.destroy();
+    server.close();
+  }
+});
+
+async function signalFlushesLastLine(signal) {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await fs.mkdir(vault);
+  await fs.mkdir(data);
+  const file = path.join(dir, "stderr.log");
+  const fd = openSync(file, "w");
+  const server = fileURLToPath(new URL("../src/server.mjs", import.meta.url));
+  const env = { ...process.env, AIDANOS_RELAY_TOKEN: TOKEN };
+  delete env.AIDANOS_RELAY_TOKEN_FILE;
+  delete env.AIDANOS_RELAY_GIT_URL;
+  delete env.AIDANOS_RELAY_GIT_TOKEN;
+  const child = spawn(process.execPath, [server, "--vault", vault, "--data", data, "--port", "0"], {
+    env,
+    stdio: ["ignore", "pipe", fd],
+  });
+  let stdout = "";
+  const ready = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("no LISTENING\n" + stdout)), 20000);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (!stdout.includes("LISTENING")) return;
+      clearTimeout(timer);
+      resolve();
+    });
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error("exited " + code + " before LISTENING\n" + stdout));
+    });
+  });
+  try {
+    await ready;
+  } catch (error) {
+    closeSync(fd);
+    child.kill("SIGKILL");
+    throw error;
+  }
+  child.kill(signal);
+  const [code, delivered] = await once(child, "exit");
+  closeSync(fd);
+  assert.equal(delivered, null);
+  assert.equal(code, 0);
+  const text = await fs.readFile(file, "utf8");
+  const lines = text.split("\n").filter((entry) => entry.trim() !== "");
+  assert.match(lines[lines.length - 1] || "", /relay log closed$/);
+}
+
+test("a SIGTERM flushes the last log line", async () => {
+  await signalFlushesLastLine("SIGTERM");
+});
+
+test("a SIGINT flushes the last log line", async () => {
+  await signalFlushesLastLine("SIGINT");
 });
 
 test("index trace turns off when automerge internals are missing", async () => {
@@ -1083,7 +1192,7 @@ test("a late warm-up disposes only its own session", async () => {
       supportedProtocolVersions: ["1"],
       peerMetadata: { storageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", isEphemeral: true },
     });
-    const held = await new Promise((resolve, reject) => {
+    const joined = await new Promise((resolve, reject) => {
       const ws = new WebSocket(relay.url, { headers: { Authorization: "Bearer " + TOKEN } });
       const timer = setTimeout(() => {
         ws.terminate();
@@ -1099,10 +1208,12 @@ test("a late warm-up disposes only its own session", async () => {
         }
         if (!message || message.type !== "peer") return;
         clearTimeout(timer);
-        resolve(ws);
+        resolve({ ws, senderId: message.senderId });
       });
       ws.on("error", () => {});
     });
+    const held = joined.ws;
+    const targetId = joined.senderId;
     let heldClosed = false;
     held.on("close", () => {
       heldClosed = true;
@@ -1116,14 +1227,49 @@ test("a late warm-up disposes only its own session", async () => {
     assert.notEqual(finished, gaveUp, "the late warm-up never finished");
     assert.equal(heldClosed, false, "the already-connected socket closed");
     assert.equal(held.readyState, WebSocket.OPEN);
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("the live socket did not pong")), 2500);
-      held.once("pong", () => {
-        clearTimeout(timer);
-        resolve();
+    const docId = noteId("notes/late-open.md");
+    await importDoc(relay.repo, docId, { kind: "note", text: "still open" });
+    let local = Automerge.init();
+    let syncState = Automerge.initSyncState();
+    const synced = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("the live socket did not sync")), 4000);
+      function send() {
+        const [next, syncMessage] = Automerge.generateSyncMessage(local, syncState);
+        syncState = next;
+        if (!syncMessage) return false;
+        held.send(cbor.encode({
+          type: "request",
+          senderId: "phone-late",
+          targetId,
+          documentId: docId,
+          data: syncMessage,
+        }));
+        return true;
+      }
+      held.on("message", (data) => {
+        let message;
+        try {
+          message = cbor.decode(data);
+        } catch {
+          return;
+        }
+        if (!message || message.documentId !== docId || !message.data) return;
+        const result = Automerge.receiveSyncMessage(local, syncState, message.data);
+        local = result[0];
+        syncState = result[1];
+        if (local && local.text === "still open") {
+          clearTimeout(timer);
+          resolve(local.text);
+          return;
+        }
+        send();
       });
-      held.ping();
+      if (!send()) {
+        clearTimeout(timer);
+        reject(new Error("the local note had nothing to request"));
+      }
     });
+    assert.equal(synced, "still open");
     held.close();
     const peer = await expectPeer(relay.url, join);
     assert.equal(peer.type, "peer");

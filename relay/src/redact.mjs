@@ -43,13 +43,103 @@ export function logSafe(secrets, ...parts) {
 }
 
 // A startup refusal calls process.exit on the next line. The async file
-// log drops that line: the bytes are still in the stream when the process
-// ends. writeSync lands them before the exit.
+// log drops that line, and any line still queued ahead of it, when the
+// process ends. writeSync lands them before the exit. A full non-blocking
+// pipe answers EAGAIN; that must not throw past the exit.
 let fileLogFd = null;
+let fileLogStream = null;
+
+function isAgain(error) {
+  return !!error && (error.code === "EAGAIN" || error.code === "EWOULDBLOCK");
+}
+
+function chunkBytes(item) {
+  if (!item || item.chunk == null) return Buffer.alloc(0);
+  if (Buffer.isBuffer(item.chunk)) return item.chunk;
+  return Buffer.from(String(item.chunk), item.encoding || "utf8");
+}
+
+function writeSyncSome(fd, buffer) {
+  try {
+    const wrote = writeSync(fd, buffer, 0, buffer.length);
+    return wrote > 0 ? wrote : 0;
+  } catch (error) {
+    if (isAgain(error)) return -1;
+    throw error;
+  }
+}
+
+// Write the lines already sitting in the async stream, up to the cap.
+// Stop when the pipe is full. Clearing the queue keeps the stream from
+// writing those bytes again on the next turn.
+export function flushFileLog(maxBytes = FILE_LOG_CAP) {
+  const stream = fileLogStream;
+  const fd = fileLogFd == null ? process.stderr.fd : fileLogFd;
+  if (typeof fd !== "number" || fd < 0) return;
+  if (!stream || !stream._writableState || !Array.isArray(stream._writableState.buffered)) return;
+  const state = stream._writableState;
+  const kept = [];
+  const done = [];
+  let length = 0;
+  let budget = Number(maxBytes) > 0 ? Number(maxBytes) : FILE_LOG_CAP;
+  let stopped = false;
+  for (const item of state.buffered) {
+    const bytes = chunkBytes(item);
+    if (stopped || budget <= 0) {
+      kept.push(item);
+      length += bytes.length;
+      continue;
+    }
+    const slice = bytes.length > budget ? bytes.subarray(0, budget) : bytes;
+    const wrote = slice.length === 0 ? 0 : writeSyncSome(fd, slice);
+    if (wrote < 0) {
+      stopped = true;
+      kept.push(item);
+      length += bytes.length;
+      continue;
+    }
+    budget -= wrote;
+    if (wrote < bytes.length) {
+      stopped = true;
+      kept.push({ chunk: bytes.subarray(wrote), encoding: "buffer", callback: item.callback });
+      length += bytes.length - wrote;
+      continue;
+    }
+    if (typeof item.callback === "function") done.push(item.callback);
+  }
+  state.buffered = kept;
+  state.length = length;
+  if (typeof state.bufferedIndex === "number") state.bufferedIndex = 0;
+  for (const callback of done) {
+    try { callback(); } catch { /* a queued callback must not block the exit */ }
+  }
+}
+
+// Keep the next console.error in the queue. An idle stream would otherwise
+// hand that line to an async write, where flush can no longer see it.
+export function pauseFileLog() {
+  const stream = fileLogStream;
+  if (!stream || typeof stream.cork !== "function" || stream.destroyed) return;
+  try {
+    stream.cork();
+  } catch { /* the flush still runs */ }
+}
 
 export function logFatal(secrets, ...parts) {
+  pauseFileLog();
+  try {
+    flushFileLog();
+  } catch (error) {
+    if (!isAgain(error)) throw error;
+  }
   const line = stampLine(formatParts(secrets, parts)) + "\n";
-  writeSync(fileLogFd == null ? process.stderr.fd : fileLogFd, line);
+  const fd = fileLogFd == null ? process.stderr.fd : fileLogFd;
+  try {
+    writeSync(fd, line);
+  } catch (error) {
+    if (isAgain(error)) return;
+    throw error;
+  }
 }
 
 // Node writes a regular file with writeSync. On the Apple runner those
@@ -66,10 +156,12 @@ export function installFileLog(fd = process.stderr.fd, options = {}) {
   const cap = Number(options.cap) > 0 ? Number(options.cap) : FILE_LOG_CAP;
   const previous = console.error;
   const previousFd = fileLogFd;
+  const previousStream = fileLogStream;
   fileLogFd = fd;
   const highWaterMark = Math.min(16 * 1024, Math.max(1024, Math.floor(cap / 2)));
   const stream = createWriteStream("", { fd, autoClose: false, highWaterMark });
   stream.on("error", () => {});
+  fileLogStream = stream;
   let dropped = 0;
   let announced = false;
 
@@ -107,6 +199,7 @@ export function installFileLog(fd = process.stderr.fd, options = {}) {
     restore() {
       console.error = previous;
       fileLogFd = previousFd;
+      fileLogStream = previousStream;
     },
   };
 }

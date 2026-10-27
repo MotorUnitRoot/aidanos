@@ -23,7 +23,7 @@ import {
   traceStorage,
   watchRepo,
 } from "./index-trace.mjs";
-import { createMirror, discardOpenNoteTemps, saveNoteFile, sweepStaleNoteTemps } from "./mirror.mjs";
+import { createMirror, discardOpenNoteTemps, rememberVaultRoot, saveNoteFile, sweepStaleNoteTemps } from "./mirror.mjs";
 import { flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, setFatalFallbackDir, stampLine } from "./redact.mjs";
 import { describeSyncFrame } from "./sync-log.mjs";
 
@@ -582,6 +582,8 @@ export async function startRelay(options = {}) {
   await installIndexTrace((line) => logSafe(secrets, line));
   await assertNotClientVault(vault);
   await claimRelayFolders(vault, dataDir);
+  // One realpath for the life of this process. A save must not call it again.
+  rememberVaultRoot(vault);
   await sweepStaleNoteTemps(vault, dataDir);
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);

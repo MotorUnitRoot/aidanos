@@ -199,7 +199,7 @@ function assertClientSurfacesConflict() {
   const afterChoice = app.slice(app.indexOf("function afterGitChoice("), app.indexOf("function gitConflictForOpenPage("));
   assert(afterChoice.indexOf("conflicts.length") < afterChoice.indexOf("openGitJoin("), "a remaining conflict hides Bring them in");
   assert(keepFn.includes("afterGitChoice(") && takeFn.includes("afterGitChoice("), "a choice looks for changes still waiting");
-  const lockPause = "Sync is paused: another git app left a lock in this vault. Close it, then sync resumes.";
+  const lockPause = "Sync is paused: a lock in this vault may be from another app or a crash. Close it, then sync resumes.";
   assert(app.includes(lockPause), "a kept lock says sync is paused");
   assert(keepFn.includes('setStatus(GIT_LOCK_PAUSE, "error")'), "the lock pause is an error");
   assert(keepFn.indexOf("GIT_LOCK_PAUSE") < keepFn.lastIndexOf('setStatus("Saved"'), "Saved waits until the lock check");

@@ -24,6 +24,7 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { createHash, randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { noteSaveStyle, reportRecoveryFiles, writeNoteText } from "./editor/note-save.mjs";
@@ -159,6 +160,8 @@ export function redactSecrets(msg, secrets) {
     if (auth && auth !== url) s = s.split(auth).join("[url]");
   }
   s = s.replace(/x-access-token:[^@\s]+/gi, "x-access-token:***");
+  s = s.replace(/(?:ghp|gho)_[A-Za-z0-9]{36}(?![A-Za-z0-9])/g, "***");
+  s = s.replace(/github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}(?![A-Za-z0-9])/g, "***");
   s = s.replace(/https?:\/\/[^\s]+/gi, "[url]");
   s = s.replace(/file:\/\/[^\s]+/gi, "[url]");
   return s;
@@ -648,7 +651,7 @@ const gitLockKeptLogged = new Set();
 const gitLockBlocked = new Set();
 let gitLockBeforeUnlinkForTest = null;
 
-function lockIdentity(st) {
+function lockIdentity(st, hash) {
   const birth = st.birthtimeMs;
   return {
     dev: st.dev,
@@ -656,6 +659,7 @@ function lockIdentity(st) {
     size: st.size,
     ctimeMs: st.ctimeMs,
     birthtimeMs: typeof birth === "number" && birth > 0 ? birth : null,
+    hash: typeof hash === "string" ? hash : "",
   };
 }
 
@@ -664,7 +668,51 @@ function sameLock(recorded, live) {
   if (recorded.dev !== live.dev || recorded.ino !== live.ino) return false;
   if (recorded.size !== live.size || recorded.ctimeMs !== live.ctimeMs) return false;
   if (recorded.birthtimeMs != null && live.birthtimeMs != null && recorded.birthtimeMs !== live.birthtimeMs) return false;
+  if (!recorded.hash || !live.hash || recorded.hash !== live.hash) return false;
   return true;
+}
+
+// rename(2) keeps the inode and the bytes, and it updates ctime. The check
+// after the quarantine rename still requires the same device, inode, size,
+// birthtime when both sides have one, and content hash. ctime may move
+// forward. A ctime that goes backwards is not the file we just renamed.
+function sameMovedLock(recorded, live) {
+  if (!recorded || !live) return false;
+  if (recorded.dev !== live.dev || recorded.ino !== live.ino) return false;
+  if (recorded.size !== live.size) return false;
+  if (recorded.birthtimeMs != null && live.birthtimeMs != null && recorded.birthtimeMs !== live.birthtimeMs) return false;
+  if (!recorded.hash || !live.hash || recorded.hash !== live.hash) return false;
+  if (typeof live.ctimeMs !== "number" || live.ctimeMs < recorded.ctimeMs) return false;
+  return true;
+}
+
+// A planted lock bigger than this is not hashed and therefore not deleted.
+const LOCK_HASH_MAX = 1024 * 1024;
+
+function readLockFile(lockPath) {
+  let fd = -1;
+  try {
+    fd = fsSync.openSync(lockPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+    const st = fsSync.fstatSync(fd);
+    if (!st.isFile()) return null;
+    if (st.size > LOCK_HASH_MAX) return { st, hash: "" };
+    const hash = createHash("sha256");
+    const buf = Buffer.alloc(Math.min(64 * 1024, Math.max(1, st.size)));
+    let left = st.size;
+    while (left > 0) {
+      const n = fsSync.readSync(fd, buf, 0, Math.min(buf.length, left));
+      if (n <= 0) return null;
+      hash.update(buf.subarray(0, n));
+      left -= n;
+    }
+    return { st, hash: hash.digest("hex") };
+  } catch {
+    return null;
+  } finally {
+    if (fd >= 0) {
+      try { fsSync.closeSync(fd); } catch { /* the caller still decides */ }
+    }
+  }
 }
 
 // The holder check can take the whole lsof wait. A test uses this to swap
@@ -781,10 +829,15 @@ function procDenied(error) {
 // EACCES or EPERM while reading a same-uid process is unknown, and the
 // lock is kept. It is not "no holder". A recorded lock is deleted only
 // when every same-uid process was inspected and none has the inode open.
+// The recorded identity includes a sha256 of the bytes. A same-size file
+// created again does not match that hash, so it is kept. Removal renames
+// the lock to a unique quarantine name, then checks the inode, the hash,
+// and the holder on that renamed file before unlink. rename updates
+// ctime, so that check allows ctime to move forward and rejects a ctime
+// that goes backwards. A failed re-check renames it back, or leaves it
+// and reports the pause.
 // Same-account gap: an unreadable same-uid process keeps the lock even
-// when it does not hold it. On Linux, deleting index.lock and creating it
-// again can reuse the inode and match ctime, birthtime, and size, so all
-// four identity fields can match a file this relay did not record.
+// when it does not hold it.
 async function linuxProcessHolds(dev, ino) {
   try {
     return await scanLinuxHolders(dev, ino);
@@ -883,10 +936,21 @@ function lsofHolds(file) {
   });
 }
 
-// True when the lock is gone or this call removed it. False leaves it in place.
-// The walk is repeated immediately before the path unlink: the open above it
-// can sit behind a long holder check, and the inode may have been reused.
-function unlinkRecordedLock(vault, identity) {
+function restoreQuarantine(quarantine, lockPath) {
+  try {
+    fsSync.renameSync(quarantine, lockPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// True when this call removed the recorded lock. False leaves a lock in place.
+// The file is renamed to a unique quarantine name first. The renamed file
+// must still be that inode and hash, with ctime equal or newer, and no
+// holder. A failed re-check renames it back when index.lock is free, and
+// otherwise leaves the quarantine file. Neither path prints the file name.
+async function quarantineRecordedLock(vault, identity) {
   if (process.env.NODE_ENV === "test" && gitLockBeforeUnlinkForTest) {
     const fn = gitLockBeforeUnlinkForTest;
     gitLockBeforeUnlinkForTest = null;
@@ -895,13 +959,6 @@ function unlinkRecordedLock(vault, identity) {
   const git = resolveGitDir(vault);
   if (!git) return false;
   const lockPath = path.join(git.dir, GIT_INDEX_LOCK);
-  let st;
-  try {
-    st = fsSync.lstatSync(lockPath);
-  } catch (error) {
-    return Boolean(error && error.code === "ENOENT");
-  }
-  if (st.isSymbolicLink() || !st.isFile() || !sameLock(identity, lockIdentity(st))) return false;
   let parent;
   try {
     parent = fsSync.lstatSync(git.dir);
@@ -909,34 +966,31 @@ function unlinkRecordedLock(vault, identity) {
     return false;
   }
   if (parent.isSymbolicLink() || !parent.isDirectory() || parent.dev !== git.dev || parent.ino !== git.ino) return false;
-  let fd = -1;
-  try {
-    fd = fsSync.openSync(lockPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
-    const opened = fsSync.fstatSync(fd);
-    if (!opened.isFile() || !sameLock(identity, lockIdentity(opened))) return false;
-  } catch {
-    return false;
-  } finally {
-    if (fd >= 0) {
-      try { fsSync.closeSync(fd); } catch { /* the unlink still decides */ }
-    }
-  }
+  const opened = readLockFile(lockPath);
+  if (!opened || !sameLock(identity, lockIdentity(opened.st, opened.hash))) return false;
   const againGit = resolveGitDir(vault);
   if (!againGit || againGit.dev !== git.dev || againGit.ino !== git.ino || againGit.dir !== git.dir) return false;
-  const againPath = path.join(againGit.dir, GIT_INDEX_LOCK);
-  let again;
+  const quarantine = path.join(againGit.dir, ".aidanos-lock-" + randomBytes(8).toString("hex"));
   try {
-    again = fsSync.lstatSync(againPath);
-  } catch (error) {
-    return Boolean(error && error.code === "ENOENT");
-  }
-  if (again.isSymbolicLink() || !again.isFile() || !sameLock(identity, lockIdentity(again))) return false;
-  try {
-    fsSync.unlinkSync(againPath);
+    fsSync.renameSync(lockPath, quarantine);
   } catch {
     return false;
   }
-  return true;
+  const moved = readLockFile(quarantine);
+  const movedIdentity = moved ? lockIdentity(moved.st, moved.hash) : null;
+  const stillSame = Boolean(movedIdentity && sameMovedLock(identity, movedIdentity));
+  const holders = stillSame ? await processHoldsLock(quarantine, moved.st.dev, moved.st.ino) : "unknown";
+  if (stillSame && holders === "free") {
+    try {
+      fsSync.unlinkSync(quarantine);
+      return true;
+    } catch {
+      restoreQuarantine(quarantine, lockPath);
+      return false;
+    }
+  }
+  restoreQuarantine(quarantine, lockPath);
+  return false;
 }
 
 // Git's "unable to unlink" text is not a path we may delete. The only
@@ -965,15 +1019,19 @@ export function rememberUnlinkLock(errText, vault = VAULT) {
       continue;
     }
     if (parent.isSymbolicLink() || !parent.isDirectory() || parent.dev !== git.dev || parent.ino !== git.ino) continue;
-    recorded = lockIdentity(st);
+    const opened = readLockFile(lockPath);
+    if (!opened || !opened.hash) continue;
+    recorded = lockIdentity(opened.st, opened.hash);
   }
   if (recorded) staleGitLocks.set(key, recorded);
 }
 
 // Drop index.lock only when it is still the file our failed git recorded
-// (device, inode, size, ctime, and birthtime where both sides have one)
-// and no live process has it open. That identity is required again, from
-// a fresh walk of .git, immediately before unlink. A lock this relay did
+// (device, inode, size, ctime, birthtime where both sides have one, and
+// the sha256 of the bytes) and no live process has it open. Removal
+// renames that file aside. The renamed file must still be that inode and
+// hash, with ctime equal or newer, and a free holder, before unlink. A
+// lock this relay did
 // not record stays, however old it is. A symlink on the way to .git, a
 // lock outside .git, and a lock a live git still holds stay put. A lock
 // we leave in place is logged once per vault with no path.
@@ -1013,9 +1071,15 @@ export async function releaseRememberedGitLock(vault = VAULT) {
     clearGitLockKept(key);
     return;
   }
-  const current = lockIdentity(st);
+  const opened = readLockFile(lockPath);
+  if (!opened || !opened.hash) {
+    markGitLockBlocked(key);
+    reportGitLockKept(key);
+    return;
+  }
+  const current = lockIdentity(opened.st, opened.hash);
   const same = sameLock(recorded, current);
-  const holders = await processHoldsLock(lockPath, st.dev, st.ino);
+  const holders = await processHoldsLock(lockPath, opened.st.dev, opened.st.ino);
   if (holders === "unknown") {
     markGitLockBlocked(key);
     reportGitLockKept(key);
@@ -1033,7 +1097,7 @@ export async function releaseRememberedGitLock(vault = VAULT) {
     return;
   }
   staleGitLocks.delete(key);
-  if (!unlinkRecordedLock(vault, current)) {
+  if (!await quarantineRecordedLock(vault, current)) {
     markGitLockBlocked(key);
     reportGitLockKept(key);
     return;

@@ -13,9 +13,14 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 const SLASH_ALLOW = new Set(["HTTP/1.1", "KB/s", "MB/s", "application/json", "text/plain"]);
 const NOTE_EXTS = ["markdown", "mdx", "txt", "md"];
 const SHIELD = "\uE000";
-// After a full scrub, anything past this size is dropped. A secret that
-// straddles the cut is masked first, so its head is not left behind.
+// After a full scrub, anything past this size is dropped. The line is
+// clipped to this size plus the longest secret before that scrub, and a
+// secret that straddles the cut is still inside the window, so its head
+// is not left behind.
 export const REDACT_INPUT_CAP = 64 * 1024;
+// github_pat_ is 11 + 22 + 1 + 59. A token that crosses the 64 KB cut is
+// inside the pre-mask window, then replaced, then the cut drops the tail.
+const GITHUB_TOKEN_SPAN = 93;
 // How much of a listed secret is read with each chunk. The overlap is the
 // whole pattern, so a match on the join is replaced before the next chunk.
 const REDACT_CHUNK = 64 * 1024;
@@ -25,8 +30,8 @@ const REDACT_CHUNK = 64 * 1024;
 // secret's head. The whole text is masked before this cut, and any
 // trailing piece that still begins a listed secret is then dropped.
 const CAP_BREAK_WINDOW = 256;
-// Adversarial scrub of the '(a/' path piece, one run, this host:
-// 1 MB 24.9 ms, 2 MB 41.2 ms. Both stay under the 100 ms test bound.
+// The line is clipped to 64 KB plus the longest secret before this scrub.
+// A 30 MB adversarial line is one pass over that window, under 100 ms.
 // A Node stack frame we may show. A builtin module, or a node:internal
 // path whose characters are only [a-z_/] with an optional .js suffix and
 // whose first segment is a known Node prefix. Not every string that
@@ -47,9 +52,11 @@ const NODE_INTERNAL_PREFIXES = new Set([
 const NODE_BUILTINS = new Set(builtinModules.map((name) => name.startsWith("node:") ? name.slice(5) : name));
 
 // Byte length without a Buffer. The cut stays on a code point, same as
-// walking a UTF-8 continuation byte back to its lead.
+// walking a UTF-8 continuation byte back to its lead. A code unit is at
+// most 3 UTF-8 bytes, so a short string fits without a walk. A longer
+// string stops at the cap and does not read the tail.
 function utf8PrefixEnd(text, cap) {
-  if (Buffer.byteLength(text) <= cap) return text.length;
+  if (text.length * 3 <= cap) return text.length;
   let bytes = 0;
   let i = 0;
   const n = text.length;
@@ -61,6 +68,22 @@ function utf8PrefixEnd(text, cap) {
     i += code > 0xffff ? 2 : 1;
   }
   return i;
+}
+
+function maskSpan(secrets) {
+  let span = GITHUB_TOKEN_SPAN;
+  for (let i = 0; i < secrets.length; i += 1) {
+    const secret = secrets[i];
+    if (secret.length > span) span = secret.length;
+    const encoded = encodeURIComponent(secret);
+    if (encoded.length > span) span = encoded.length;
+  }
+  return span;
+}
+
+function clipBeforeMask(text, span) {
+  const end = utf8PrefixEnd(text, REDACT_INPUT_CAP + span);
+  return end >= text.length ? text : text.slice(0, end);
 }
 
 // After a cut, a suffix that is only the start of a listed secret is the
@@ -142,15 +165,15 @@ function maskLiteral(text, needle, replacement) {
 
 export function redact(text, secrets) {
   // Strip the shield marker before any scrubbing so a log line cannot forge
-  // a kept frame. Mask the whole text, at every size, then cut. A listed
-  // secret is replaced in chunks whose overlap is the whole pattern, so a
-  // space or a line break on the 64 KB boundary cannot leave the head behind.
-  let out = String(text ?? "").replace(/\uE000/g, "");
+  // a kept frame. Clip to 64 KB plus the longest secret first, then mask.
+  // A listed secret that crosses the cut is fully inside that window, so a
+  // space or a line break on the boundary cannot leave the head behind.
   const list = [];
   for (const secret of secrets || []) {
     const value = String(secret || "").trim();
     if (value && !list.includes(value)) list.push(value);
   }
+  let out = clipBeforeMask(String(text ?? ""), maskSpan(list)).replace(/\uE000/g, "");
   const tails = [];
   for (const secret of list) {
     out = maskLiteral(out, secret, "***");
@@ -162,6 +185,8 @@ export function redact(text, secrets) {
     }
   }
   out = out.replace(/x-access-token:[^@\s]+/gi, "x-access-token:***");
+  out = out.replace(/(?:ghp|gho)_[A-Za-z0-9]{36}(?![A-Za-z0-9])/g, "***");
+  out = out.replace(/github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}(?![A-Za-z0-9])/g, "***");
   out = out.replace(/Bearer\s+\S+/gi, "Bearer ***");
   out = out.replace(/Authorization:\s*Basic\s+\S+/gi, "Authorization: Basic ***");
   out = out.replace(/AIDANOS_(?:RELAY|VAULT_GIT)_TOKEN=\S+/g, "AIDANOS_TOKEN=***");

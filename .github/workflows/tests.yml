@@ -30,6 +30,7 @@ jobs:
       - name: npm test
         env:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          AIDANOS_TEST_ALLOW_SUDO: "1"
         run: npm test
       - name: flaw-scan rules
         run: node .github/flaw-scan.mjs --self-test

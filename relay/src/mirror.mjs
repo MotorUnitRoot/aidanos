@@ -416,8 +416,12 @@ let asideSeq = 0;
 let beforeManifestPathForTest = null;
 let afterManifestRenameForTest = null;
 
-// The path rename is the act. A test swaps the state directory in that
-// window. Off unless this process is a test.
+// Original race: the state directory was checked, then note-temps was
+// renamed by path. A swap of that directory in the gap published the
+// manifest into the replacement. The rename is still the act. The held
+// directory handle is compared with a fresh open before the rename and
+// again after it; a mismatch refuses the manifest. A test swaps the
+// state directory in that window. Off unless this process is a test.
 export function setBeforeManifestPathForTest(fn) {
   if (process.env.NODE_ENV !== "test") return;
   beforeManifestPathForTest = typeof fn === "function" ? fn : null;
@@ -637,11 +641,12 @@ async function quarantineManifest(dirHandle, stateDir, uid) {
   await pruneAsideManifests(dirHandle, stateDir, uid);
 }
 
-// Read note-temps through the state directory descriptor. A hard link or a
-// symlink is refused before any rename or chmod, so a note that shares the
-// inode is left byte for byte. An oversized file is renamed aside. A file
-// with a bad line keeps the lines that parse, then the original is renamed
-// aside and the directory is fsynced.
+// Read note-temps through the state directory descriptor. Original race:
+// a hard link to this inode was rewritten along with the manifest, so a
+// note that shared the inode changed. A hard link or a symlink is refused
+// before any rename or chmod, and that note is left byte for byte. An
+// oversized file is renamed aside. A file with a bad line keeps the lines
+// that parse, then the original is renamed aside and the directory is fsynced.
 async function readManifest(dirHandle, stateDir, uid) {
   const filePath = manifestAt(dirHandle.fd, stateDir, NOTE_TEMP_MANIFEST);
   let handle;
@@ -851,10 +856,11 @@ async function writeSyncedTemp(tmp, text) {
 // onto the note, the manifest file again when that temp line is dropped,
 // and the state directory after the drop. A corrupt manifest adds one more
 // fsync of that directory when the bad file is renamed aside, before those
-// five. Same-account gap: the note's directory is not fsynced after the
-// rename, so a crash can lose the directory entry even though the temp was
-// fsynced and the note stayed mode 0600. A refused manifest still saves
-// the note, logs the doc id, and does not delete the temp it could not record.
+// five. Original race: the note's directory is not fsynced after the
+// rename. A crash can lose the directory entry even though the temp was
+// fsynced and the note stayed mode 0600. Same-account gap. A refused
+// manifest still saves the note, logs the doc id, and does not delete
+// the temp it could not record.
 export async function saveNoteBatch(entries, options = {}) {
   const vault = options.vault || "";
   const stateDir = options.stateDir || "";

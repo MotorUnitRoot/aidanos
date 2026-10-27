@@ -2382,7 +2382,16 @@ function conflictMineNow() {
   return paperConflict.mine;
 }
 
-const GIT_LOCK_PAUSE = "Sync is paused: a lock in this vault is still open. Close it, then sync resumes.";
+const GIT_LOCK_RECOVERY = "It may be from another app or a crash.";
+const GIT_LOCK_PAUSE_OPEN = "Sync is paused: a lock in this vault is still open. Close it, then sync resumes. " + GIT_LOCK_RECOVERY;
+const GIT_LOCK_PAUSE_UNREADABLE = "Sync is paused: a lock in this vault could not be read. " + GIT_LOCK_RECOVERY;
+const GIT_LOCK_PAUSE_OVERSIZE = "Sync is paused: a lock in this vault is over 1 MB. " + GIT_LOCK_RECOVERY;
+
+function gitLockPauseText(reason) {
+  if (reason === "unreadable") return GIT_LOCK_PAUSE_UNREADABLE;
+  if (reason === "oversize") return GIT_LOCK_PAUSE_OVERSIZE;
+  return GIT_LOCK_PAUSE_OPEN;
+}
 
 async function resolveConflictKeep() {
   if (!paperConflict) return;
@@ -2455,7 +2464,7 @@ async function resolveConflictKeep() {
       const sync = await afterGitChoice(info.kind === "note" ? info.path : ("log/" + info.date + ".md"));
       if (gitJoin) return;
       if (sync && sync.lockKept) {
-        setStatus(GIT_LOCK_PAUSE, "error");
+        setStatus(gitLockPauseText(sync && sync.lockReason), "error");
         return;
       }
     }
@@ -2754,7 +2763,7 @@ function surfaceGitConflict(data) {
   }
   if (gitJoin && !data.join) closeGitJoin();
   if (data.lockKept && !paperConflict && !gitJoin) {
-    setStatus(GIT_LOCK_PAUSE, "error");
+    setStatus(gitLockPauseText(data.lockReason), "error");
     return;
   }
   if (data.error && !paperConflict && !gitJoin && currentView() === "today") {

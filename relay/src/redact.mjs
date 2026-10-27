@@ -88,9 +88,10 @@ function utf8ByteLength(text) {
 }
 
 // Bytes, not UTF-16 code units. A listed secret and its encoded form are
-// both counted, and so is the longest gh[pousr]_ token. A github_pat_
-// longer than that still matches inside this window: the pattern has no
-// upper bound, and the raw cut drops whatever remains past 64 KB.
+// both counted. GH_APP_TOKEN_BYTES is only a margin floor: gh[pousr]_ and
+// github_pat_ have no upper bound, so a body that starts in this window
+// is masked to the end of that run. The raw cut drops whatever remains
+// past 64 KB.
 function maskMarginBytes(secrets) {
   let span = GH_APP_TOKEN_BYTES;
   for (let i = 0; i < secrets.length; i += 1) {

@@ -251,6 +251,8 @@ jobs:
           fi
       - name: Sample notes and screenshots
         run: node sample-notes-test.mjs && node --test external-format-cases-test.mjs && node sample-screens-test.mjs
+      - name: Sample screens in the second order
+        run: node sample-screens-test.mjs --order second
       - name: A screenshot run with no pictures is a failure
         if: always()
         run: |

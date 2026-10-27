@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { authenticatedGitUrl, acquireGitTurn, GIT_LOCK_KEPT_LINE, gitLockBlocksVault, redactSecrets, releaseGitTurn, releaseRememberedGitLock, rememberUnlinkLock, sanitizeGitError, seedBundledVault, setGitLockBeforeMoveForTest, setGitLockBeforeUnlinkForTest, setGitLockHoldersForTest, sweepAbandonedGitLocks } from "./server.mjs";
+import { authenticatedGitUrl, acquireGitTurn, GIT_LOCK_KEPT_LINE, gitLockBlocksVault, gitLockPauseReason, redactSecrets, releaseGitTurn, releaseRememberedGitLock, rememberUnlinkLock, sanitizeGitError, seedBundledVault, setGitLockBeforeMoveForTest, setGitLockBeforeUnlinkForTest, setGitLockHoldersForTest, sweepAbandonedGitLocks } from "./server.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
@@ -661,6 +661,11 @@ async function gitLockOverOneMegabyteDoesNotLeakFds() {
     assert(after <= before, "an over-1 MB index.lock grew open fds from " + before + " to " + after);
     assert(fs.existsSync(lock), "an over-1 MB index.lock was removed");
     assert(fs.statSync(lock).size > 1024 * 1024, "the over-1 MB index.lock was truncated");
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.existsSync(lock), "an over-1 MB index.lock was removed on release");
+    assert(fs.statSync(lock).size > 1024 * 1024, "release truncated the over-1 MB index.lock");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "an over-1 MB index.lock was removed without a message");
+    assert(gitLockPauseReason(vault) === "oversize", "an over-1 MB lock paused as " + gitLockPauseReason(vault));
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -718,6 +723,7 @@ async function gitLockKeepsSameUidScanError() {
     assert(fs.readFileSync(lock, "utf8") === "recorded\n", "a same-uid scan error removed the lock");
     assert(kept.includes(GIT_LOCK_KEPT_LINE), "a same-uid scan error was removed without a message");
     assert(gitLockBlocksVault(vault), "a scan error did not block sync");
+    assert(gitLockPauseReason(vault) === "unreadable", "a scan error paused as " + gitLockPauseReason(vault));
   } finally {
     if (deniedPid) {
       try { process.kill(deniedPid, "SIGKILL"); } catch { /* already gone */ }

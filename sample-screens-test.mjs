@@ -71,6 +71,45 @@ const screens = JSON.parse(fs.readFileSync(path.join(fixture, "screens.json"), "
 assert(Array.isArray(screens.widths) && screens.widths.includes(1280) && screens.widths.includes(390), "screens.json widths");
 assert(Array.isArray(screens.states) && screens.states.length > 0, "screens.json states");
 
+// Fixed second pass. Conflict is opened from the door, then a later state
+// has to see the restored sample. The order is not shuffled.
+const SECOND_SCREEN_ORDER = [
+  "door",
+  "conflict",
+  "today",
+  "door-proposals",
+  "timeline",
+  "month",
+  "plan",
+  "capture",
+  "ask",
+  "project",
+  "map",
+  "stage",
+  "conflict-edit",
+  "editor-normal",
+  "editor-empty",
+  "editor-first",
+  "editor-loading",
+  "editor-error",
+];
+
+function screenOrder() {
+  const flag = process.argv.indexOf("--order");
+  if (flag === -1) return screens.states.slice();
+  const name = String(process.argv[flag + 1] || "");
+  if (name !== "second") throw new Error("unknown screen order " + name);
+  assert(SECOND_SCREEN_ORDER.length === screens.states.length, "second order dropped a state");
+  assert(new Set(SECOND_SCREEN_ORDER).size === SECOND_SCREEN_ORDER.length, "second order repeats a state");
+  for (const state of SECOND_SCREEN_ORDER) {
+    assert(screens.states.includes(state), "second order has an unknown state " + state);
+  }
+  const conflictAt = SECOND_SCREEN_ORDER.indexOf("conflict");
+  assert(SECOND_SCREEN_ORDER[conflictAt - 1] === "door", "second order does not open conflict from the door");
+  assert(SECOND_SCREEN_ORDER[conflictAt + 1] !== "conflict-edit", "second order leaves the conflict sample in place");
+  return SECOND_SCREEN_ORDER.slice();
+}
+
 const bin = chromeBin();
 const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sample-"));
 fs.cpSync(path.join(fixture, "vault"), vault, { recursive: true });
@@ -301,15 +340,23 @@ try {
     }, 8000, "today view");
   }
 
-  async function prepareToday() {
+  async function openShowcaseDay() {
     if (await onLatchDay()) return;
+    // Today from the door or from a map opens the clock's day. This step
+    // then opens the sample day, after that navigation has started, so the
+    // sample day is the one left on screen.
     await showToday();
-    await openAsk(LATCH);
-    await clickHit(LATCH);
+    await evalJs(`openDay(${JSON.stringify(SHOWCASE)}, { force: true })`);
     await waitFor(async () => {
       if (await onLatchDay()) return true;
-      return await pageText();
+      const text = await pageText();
+      return text ? text.slice(0, 120) : "empty";
     }, 8000, "showcase day");
+  }
+
+  async function prepareToday() {
+    if (await onLatchDay()) return;
+    await openShowcaseDay();
   }
 
   async function expandRail() {
@@ -461,20 +508,10 @@ try {
       await evalJs(`document.getElementById("conflict-sheet").scrollIntoView({ block: "center" })`);
       return;
     }
-    await showToday();
-    // A flash left by the today step is not this step's. Wait it out, then
-    // open the latch hit so this step sees its own flash. The step does not
-    // depend on running after stage.
-    await waitFor(async () => {
-      const flashing = await evalJs(`!!document.querySelector("#paper .is-flash")`);
-      return flashing === false ? true : "flashing";
-    }, 2000, "latch flash idle");
-    await openAsk(LATCH);
-    await clickHit(LATCH);
-    // The latch hit flashes its line after the day text is already visible.
-    // That flash repaints the paper and scrolls. One click, after the flash
-    // class is gone and this line is still under the pointer.
-    let sawFlash = false;
+    await openShowcaseDay();
+    // The line is clicked once it sits still. A flash from another step is
+    // waited out. This step does not search for the latch, and it does not
+    // need the previous screen to have opened the day.
     let placed = false;
     let stillTop = null;
     let point = null;
@@ -497,13 +534,11 @@ try {
       })()`);
       if (!snap) return "missing";
       if (snap.state === "flashing") {
-        sawFlash = true;
         placed = false;
         stillTop = null;
         point = null;
         return "flashing";
       }
-      if (!sawFlash) return "waiting for the latch flash";
       if (!placed) {
         await evalJs(`(() => {
           const line = [...document.querySelectorAll("#paper .md-line")].find((el) => (el.innerText || "").includes("reading room stays open"));
@@ -564,13 +599,53 @@ try {
     );
   }
 
+  function showcaseBytes() {
+    return fs.readFileSync(path.join(fixture, "vault", "log", SHOWCASE + ".md"));
+  }
+
+  function showcaseMatches() {
+    try {
+      return fs.readFileSync(path.join(vault, "log", SHOWCASE + ".md")).equals(showcaseBytes());
+    } catch (err) {
+      return false;
+    }
+  }
+
+  async function pageHref() {
+    try {
+      return await evalJs("location.href");
+    } catch (err) {
+      return "navigating";
+    }
+  }
+
   async function reloadSample() {
-    restoreShowcase();
+    // Leave the page before restoring. A save still in flight from the
+    // conflict edit would otherwise write the sample back after the copy.
+    await send("Page.navigate", { url: "about:blank" }, sessionId);
+    await waitFor(async () => {
+      const href = await pageHref();
+      return href === "about:blank" ? true : href;
+    }, 8000, "blank");
+    const want = showcaseBytes();
+    const livePath = path.join(vault, "log", SHOWCASE + ".md");
+    const settleBy = Date.now() + 4000;
+    let settled = false;
+    while (Date.now() < settleBy) {
+      restoreShowcase();
+      await sleep(50);
+      if (!fs.readFileSync(livePath).equals(want)) continue;
+      await sleep(100);
+      if (fs.readFileSync(livePath).equals(want)) {
+        settled = true;
+        break;
+      }
+    }
+    assert(settled, "sample file did not stay restored");
     const stamp = Date.now();
-    await evalJs(`window.__aidanReload = ${stamp}`);
     await send("Page.navigate", { url: "http://127.0.0.1:" + port + "/?fresh=" + stamp }, sessionId);
     await waitFor(async () => {
-      const ok = await evalJs(`document.readyState === "complete" && !!document.getElementById("door-input") && window.__aidanReload !== ${stamp} && document.body.classList.contains("view-door") && !document.body.classList.contains("has-conflict")`);
+      const ok = await evalJs(`document.readyState === "complete" && !!document.getElementById("door-input") && document.body.classList.contains("view-door") && !document.body.classList.contains("has-conflict")`);
       return ok === true ? true : ok;
     }, 12000, "reload");
     await evalJs(`localStorage.clear(); sessionStorage.clear();`);
@@ -821,12 +896,15 @@ try {
   }
 
   fs.mkdirSync(shotDir, { recursive: true });
+  const states = screenOrder();
   let previous = null;
-  for (const state of screens.states) {
-    // The conflict sheet stays up for the edit that follows it. Any other
-    // next step starts from the restored sample, so this shot can sit
-    // immediately after today.
-    if (previous === "conflict" && state !== "conflict-edit") await reloadSample();
+  for (const state of states) {
+    // The conflict sheet stays up for the edit that follows it. Every other
+    // state restores the sample first when conflict changed it, then opens
+    // what it needs itself.
+    const sheetUp = await evalJs(`!!(document.body && document.body.classList.contains("has-conflict") && document.getElementById("conflict-sheet") && !document.getElementById("conflict-sheet").hidden)`);
+    const keepConflict = (state === "conflict" || state === "conflict-edit") && sheetUp === true;
+    if (!keepConflict && (previous === "conflict" || !showcaseMatches())) await reloadSample();
     previous = state;
     for (const width of screens.widths) {
       await setWidth(width);

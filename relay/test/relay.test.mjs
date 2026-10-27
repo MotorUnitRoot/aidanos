@@ -1396,6 +1396,25 @@ test("github tokens that are not listed are masked", () => {
   assert.equal(cleaned.includes("***"), true, "a listed-shape token was not masked");
 });
 
+test("a gh token body longer than 251 leaves no tail", () => {
+  const body300 = "m".repeat(300);
+  const body1000 = "n".repeat(1000);
+  const token300 = "ghp_" + body300;
+  const token1000 = "gho_" + body1000;
+  const short = "ghs_" + "q".repeat(35);
+  const cleaned = redact("pre " + token300 + " gap " + token1000 + " sep " + short, []);
+  assert.equal(cleaned.includes(token300), false, "a 300-character body was kept");
+  assert.equal(cleaned.includes(token1000), false, "a 1000-character body was kept");
+  assert.equal(cleaned.includes(body300), false, "a 300-character body left its characters");
+  assert.equal(cleaned.includes(body1000), false, "a 1000-character body left its characters");
+  assert.equal(cleaned.includes(body300.slice(251)), false, "a 300-character body kept a tail");
+  assert.equal(cleaned.includes(body1000.slice(251)), false, "a 1000-character body kept a tail");
+  assert.equal(cleaned.includes("m"), false, "a 300-character body left a character");
+  assert.equal(cleaned.includes("n"), false, "a 1000-character body left a character");
+  assert.equal(cleaned.includes(short), true, "a 35-character body was masked");
+  assert.equal(cleaned.includes("***"), true, "a long token was not masked");
+});
+
 test("secrets swept across the 64 KB cut leak no characters", () => {
   function leakedPrefix(cleaned, secret) {
     const body = String(cleaned)

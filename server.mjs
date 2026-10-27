@@ -650,8 +650,10 @@ const staleGitLocks = new Map();
 const staleGitLockFds = new Map();
 const gitLockKeptLogged = new Set();
 // Vaults whose index.lock we left in place. Sync status reports this so
-// the editor does not say Saved while git is stuck.
+// the editor does not say Saved while git is stuck. The reason is
+// "open", "unreadable", or "oversize".
 const gitLockBlocked = new Set();
+const gitLockReason = new Map();
 let gitLockBeforeUnlinkForTest = null;
 let gitLockBeforeMoveForTest = null;
 
@@ -690,9 +692,8 @@ function sameMovedLock(recorded, live) {
   return true;
 }
 
-// m4. An index.lock bigger than this is not hashed and is never recorded.
-// Release then sees an empty hash, leaves the file in place, and pauses
-// sync. Fail closed: a lock we cannot identify is not deleted.
+// m4. An index.lock over 1 MB is not hashed and is never recorded.
+// The file stays where it is and sync pauses. Fail closed.
 const LOCK_HASH_MAX = 1024 * 1024;
 const QUARANTINE_NAME = /^\.aidanos-lock-[0-9a-f]{16}$/;
 
@@ -792,14 +793,20 @@ function reportGitLockKept(key) {
 function clearGitLockKept(key) {
   gitLockKeptLogged.delete(key);
   gitLockBlocked.delete(key);
+  gitLockReason.delete(key);
 }
 
-function markGitLockBlocked(key) {
+function markGitLockBlocked(key, reason = "open") {
   gitLockBlocked.add(key);
+  gitLockReason.set(key, reason === "unreadable" || reason === "oversize" ? reason : "open");
 }
 
 export function gitLockBlocksVault(vault = VAULT) {
   return gitLockBlocked.has(vaultKey(vault));
+}
+
+export function gitLockPauseReason(vault = VAULT) {
+  return gitLockReason.get(vaultKey(vault)) || "";
 }
 
 function vaultKey(vault) {
@@ -878,21 +885,13 @@ function procDenied(error) {
 // "held", "free", or "unknown". Reads are async so the scan does not sit
 // on the event loop. A holder has to be able to write the vault, so a
 // process owned by another uid is skipped. pid 1 is root. Its descriptor
-// directory is not a failed read of a process we own.
-// m6. EACCES or EPERM while reading a same-uid process is unknown, and
-// the lock is kept. On Linux that is a non-dumpable process (dumpable 0):
+// directory is not a failed read of a process we own. A recorded lock is
+// deleted only when every same-uid process was inspected and none has
+// the inode open.
+// m6. EACCES or EPERM on a same-uid process is unknown. The lock stays
+// and sync pauses. On Linux that is a non-dumpable process (dumpable 0):
 // its descriptor directory is unreadable even when it does not hold the
-// lock. Fail closed. It is not "no holder". A recorded lock is deleted
-// only when every same-uid process was inspected and none has the inode open.
-// The recorded identity includes a sha256 of the bytes. The fd from that
-// record stays open, so a same-bytes recreate in the same tick gets a new
-// inode and is kept. Removal links the lock to a unique quarantine name
-// created exclusively, then compares fstat of the recorded fd with stat
-// of that name. ctime may move forward. A failed re-check links the
-// quarantine back only when index.lock is absent. EEXIST keeps the
-// quarantine and reports the pause.
-// Same-account gap: an unreadable same-uid process keeps the lock even
-// when it does not hold it.
+// lock. Fail closed. It is not "no holder".
 async function linuxProcessHolds(dev, ino) {
   try {
     return await scanLinuxHolders(dev, ino);
@@ -1007,6 +1006,9 @@ function restoreQuarantine(quarantine, lockPath) {
   return true;
 }
 
+// Hard-link quarantine. link(2) fails on exFAT and on some network
+// mounts, which do not support hard links. No quarantine name is created,
+// index.lock stays, and sync pauses. Fail closed.
 function linkExclusiveQuarantine(lockPath, dir) {
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const quarantine = path.join(dir, ".aidanos-lock-" + randomBytes(8).toString("hex"));
@@ -1135,7 +1137,7 @@ export function rememberUnlinkLock(errText, vault = VAULT) {
     }
     if (parent.isSymbolicLink() || !parent.isDirectory() || parent.dev !== git.dev || parent.ino !== git.ino) continue;
     // m4. Over 1 MB the hash is empty, so this lock is never recorded.
-    // Close the fd before continuing. An empty hash does not keep it.
+    // Close the fd. The file itself stays for release to pause on.
     const opened = openLockFd(lockPath);
     if (!opened || !opened.hash) {
       closeFd(opened && opened.fd);
@@ -1198,19 +1200,20 @@ export async function releaseRememberedGitLock(vault = VAULT) {
     clearGitLockKept(key);
     return;
   }
-  // m4. No hash means the lock was over 1 MB or could not be read.
-  // It was never recorded. Leave it and pause sync. Fail closed.
   const opened = readLockFile(lockPath);
   if (!opened || !opened.hash) {
-    markGitLockBlocked(key);
+    // m4. Over 1 MB is not recorded. The file stays and sync pauses. Fail closed.
+    const oversize = Boolean(opened && opened.st && opened.st.size > LOCK_HASH_MAX);
+    markGitLockBlocked(key, oversize ? "oversize" : "unreadable");
     reportGitLockKept(key);
     return;
   }
   const current = lockIdentity(opened.st, opened.hash);
   const same = sameLock(recorded, current);
   const holders = await processHoldsLock(lockPath, opened.st.dev, opened.st.ino);
+  // m6. An unreadable same-uid process keeps the lock. Fail closed.
   if (holders === "unknown") {
-    markGitLockBlocked(key);
+    markGitLockBlocked(key, "unreadable");
     reportGitLockKept(key);
     return;
   }
@@ -1266,13 +1269,19 @@ export async function sweepAbandonedGitLocks(vault = VAULT) {
     const opened = openLockFd(file);
     if (!opened || !opened.hash) {
       closeFd(opened && opened.fd);
-      markGitLockBlocked(key);
+      const oversize = Boolean(opened && opened.st && opened.st.size > LOCK_HASH_MAX);
+      markGitLockBlocked(key, oversize ? "oversize" : "unreadable");
       reportGitLockKept(key);
       continue;
     }
     try {
       const identity = lockIdentity(opened.st, opened.hash);
       const holders = await processHoldsLock(file, opened.st.dev, opened.st.ino);
+      if (holders === "unknown") {
+        markGitLockBlocked(key, "unreadable");
+        reportGitLockKept(key);
+        continue;
+      }
       if (holders !== "free" || !sameDevice(opened.fd, file)) {
         markGitLockBlocked(key);
         reportGitLockKept(key);
@@ -1504,8 +1513,9 @@ function publicConflicts() {
 
 function syncStatus() {
   const lockKept = gitLockBlocksVault();
+  const lockReason = lockKept ? (gitLockPauseReason() || "open") : "";
   if (!vaultGit.enabled) {
-    return { enabled: false, ok: true, error: "", conflicts: [], join: false, left: "", lockKept: false };
+    return { enabled: false, ok: true, error: "", conflicts: [], join: false, left: "", lockKept: false, lockReason: "" };
   }
   const conflicts = publicConflicts();
   const join = Boolean(vaultGit.join) && conflicts.length === 0;
@@ -1518,6 +1528,7 @@ function syncStatus() {
     join,
     left: vaultGit.left || "",
     lockKept,
+    lockReason,
   };
 }
 
@@ -1529,6 +1540,7 @@ function finishGitNotice() {
     join: status.join,
     left: status.left,
     lockKept: status.lockKept,
+    lockReason: status.lockReason || "",
   });
   if (notice === vaultGit.notice) return;
   vaultGit.notice = notice;
@@ -1541,6 +1553,7 @@ function finishGitNotice() {
     join: status.join,
     left: status.left,
     lockKept: Boolean(status.lockKept),
+    lockReason: status.lockReason || "",
   });
 }
 

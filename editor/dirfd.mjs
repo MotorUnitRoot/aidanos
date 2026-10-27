@@ -12,7 +12,8 @@
 // not execute /dev/fd, so it executes the path that was just checked. Before
 // that exec, every folder from / down to the helper is lstat'd. Each one
 // must be owned by root or the current user, and must not be group or world
-// writable unless it is sticky and owned by root.
+// writable unless it is sticky and owned by root. A root-owned symlink,
+// such as macOS /tmp or /var, is followed. Any other symlink is refused.
 
 import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -88,11 +89,26 @@ function helperFile(env = process.env) {
 }
 
 // Folders from / down to leafDir. A group or other write bit is allowed only
-// on a sticky directory owned by root, which is the /tmp case. A symlink, a
-// missing folder, or an owner who is neither root nor this user is refused.
+// on a sticky directory owned by root, which is the /tmp case. A missing
+// folder, or an owner who is neither root nor this user, is refused.
+// macOS /tmp and /var are root-owned symlinks. Those are followed and the
+// real folders are checked. Any other symlink is refused.
+const MAX_ANCESTOR_LINKS = 8;
+
 export function ancestorFault(leafDir, uid = typeof process.getuid === "function" ? process.getuid() : null) {
   if (typeof uid !== "number") return "ancestor";
-  const abs = path.resolve(String(leafDir || ""));
+  let abs = path.resolve(String(leafDir || ""));
+  const seenLinks = new Set();
+  for (let hop = 0; hop <= MAX_ANCESTOR_LINKS; hop++) {
+    const step = walkAncestors(abs, uid, seenLinks);
+    if (step.fault) return step.fault;
+    if (!step.next) return "";
+    abs = step.next;
+  }
+  return "ancestor";
+}
+
+function walkAncestors(abs, uid, seenLinks) {
   const chain = [];
   let cursor = abs;
   for (;;) {
@@ -107,15 +123,31 @@ export function ancestorFault(leafDir, uid = typeof process.getuid === "function
     try {
       st = fsSync.lstatSync(dir);
     } catch {
-      return "ancestor";
+      return { fault: "ancestor" };
     }
-    if (st.isSymbolicLink() || !st.isDirectory()) return "ancestor";
+    if (st.isSymbolicLink()) {
+      if (st.uid !== 0 || seenLinks.has(dir)) return { fault: "ancestor" };
+      seenLinks.add(dir);
+      let target;
+      try {
+        target = fsSync.readlinkSync(dir);
+      } catch {
+        return { fault: "ancestor" };
+      }
+      const linked = path.resolve(path.dirname(dir), target);
+      const rest = path.relative(dir, abs);
+      const next = !rest || rest.startsWith("..") || path.isAbsolute(rest)
+        ? linked
+        : path.resolve(linked, rest);
+      return { next };
+    }
+    if (!st.isDirectory()) return { fault: "ancestor" };
     const writable = (st.mode & GROUP_OR_OTHER_WRITE) !== 0;
     const stickyRoot = (st.mode & STICKY) !== 0 && st.uid === 0;
-    if (writable && !stickyRoot) return "ancestor-writable";
-    if (st.uid !== 0 && st.uid !== uid) return "ancestor-owner";
+    if (writable && !stickyRoot) return { fault: "ancestor-writable" };
+    if (st.uid !== 0 && st.uid !== uid) return { fault: "ancestor-owner" };
   }
-  return "";
+  return {};
 }
 
 export function installFaultText(fault) {

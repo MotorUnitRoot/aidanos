@@ -895,6 +895,12 @@ await check("a helper under a bad ancestor is refused, and /tmp is allowed", asy
     assert(ownedError.code === "DIRFD" && ownedError.reason === "ancestor-owner", ownedError.reason || ownedError.code);
     assert(!fs.existsSync(path.join(vault, "owned.recover")), "an ancestor owned by another user ran the helper");
 
+    const real = path.join(base, "real");
+    const via = path.join(base, "via");
+    fs.mkdirSync(path.join(real, "child"), { recursive: true });
+    fs.symlinkSync(real, via);
+    assert(ancestorFault(path.join(via, "child")) === "ancestor", "a user-owned symlink ancestor was allowed");
+
     const sticky = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sticky-"));
     const stickyTool = path.join(sticky, "dirfd-tool");
     fs.copyFileSync(shippedHelper(), stickyTool);

@@ -107,7 +107,22 @@ jobs:
           exit 1
       - name: AidanCore tests on macOS
         working-directory: native/AidanCore
-        run: swift test --force-resolved-versions
+        env:
+          AIDANOS_TEST_RELAY_LOG_DIR: ${{ runner.temp }}/relay-macos
+        run: |
+          mkdir -p "$RUNNER_TEMP/relay-macos"
+          swift test --force-resolved-versions
+      - name: macOS relay log
+        if: always()
+        run: |
+          echo "---- relay-macos.log ----"
+          dir="$RUNNER_TEMP/relay-macos"
+          if [ -d "$dir" ]; then
+            find "$dir" -type f -name 'aidanos-relay-*.log' | sort | while IFS= read -r file; do
+              echo "---- $(basename "$file") ----"
+              cat "$file"
+            done
+          fi
       - name: Build the Mac app
         run: >
           xcodebuild build
@@ -158,11 +173,12 @@ jobs:
           xcodebuild test -scheme AidanCore -destination "id=${sim_id}" -parallel-testing-enabled NO -onlyUsePackageVersionsFromResolvedFile CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
           status=$?
           set -e
-          if [ "$status" != 0 ]; then
-            echo "---- relay log ----"
-            cat "$RUNNER_TEMP/relay-ios.log" || true
-          fi
           exit "$status"
+      - name: iOS relay log
+        if: always()
+        run: |
+          echo "---- relay-ios.log ----"
+          cat "$RUNNER_TEMP/relay-ios.log" || true
 
   sample-notes:
     runs-on: ubuntu-latest

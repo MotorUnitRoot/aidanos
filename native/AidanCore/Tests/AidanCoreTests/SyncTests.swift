@@ -1046,7 +1046,13 @@ private final class TestRelay {
         environment["AIDANOS_RELAY_GIT_URL"] = ""
         process.environment = environment
         process.currentDirectoryURL = server.deletingLastPathComponent().deletingLastPathComponent()
-        let log = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let logDirectory = ProcessInfo.processInfo.environment["AIDANOS_TEST_RELAY_LOG_DIR"]
+            .flatMap { $0.isEmpty ? nil : $0 } ?? NSTemporaryDirectory()
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: logDirectory, isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let log = URL(fileURLWithPath: logDirectory, isDirectory: true)
             .appendingPathComponent("aidanos-relay-\(UUID().uuidString).log")
         FileManager.default.createFile(atPath: log.path, contents: nil)
         let handle = try FileHandle(forWritingTo: log)

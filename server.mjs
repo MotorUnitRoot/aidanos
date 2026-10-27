@@ -762,7 +762,7 @@ async function processHoldsLock(file, dev, ino) {
     if (forced === "unknown") return "unknown";
     return forced ? "held" : "free";
   }
-  if (process.platform === "linux") return linuxProcessHolds(file, dev, ino);
+  if (process.platform === "linux") return linuxProcessHolds(dev, ino);
   return lsofHolds(file);
 }
 
@@ -775,28 +775,25 @@ function procDenied(error) {
 }
 
 // "held", "free", or "unknown". Reads are async so the scan does not sit
-// on the event loop. A holder has to be able to write the vault, so
-// another uid is skipped. pid 1 is root. Its descriptor directory is not
-// a failed read of a process we own.
-// EACCES or EPERM on a same-uid process is not a live holder. ptrace_scope
-// hides siblings on the GitHub runner, and stat of one descriptor can fail
-// when the path walk is denied. A recorded lock whose identity still
-// matches is removed when no inspectable process of our uid has the inode
-// open. A read error that is not permission or a gone process, on a
-// descriptor directory we own, stays unknown and the lock stays.
-// Same-account gap: a process we cannot ptrace can hold index.lock and
-// this scan will not see it. On Linux, deleting index.lock and creating
-// it again can reuse the inode and match ctime, birthtime, and size, so
-// all four identity fields can match a file this relay did not record.
-async function linuxProcessHolds(file, dev, ino) {
+// on the event loop. A holder has to be able to write the vault, so a
+// process owned by another uid is skipped. pid 1 is root. Its descriptor
+// directory is not a failed read of a process we own.
+// EACCES or EPERM while reading a same-uid process is unknown, and the
+// lock is kept. It is not "no holder". A recorded lock is deleted only
+// when every same-uid process was inspected and none has the inode open.
+// Same-account gap: an unreadable same-uid process keeps the lock even
+// when it does not hold it. On Linux, deleting index.lock and creating it
+// again can reuse the inode and match ctime, birthtime, and size, so all
+// four identity fields can match a file this relay did not record.
+async function linuxProcessHolds(dev, ino) {
   try {
-    return await scanLinuxHolders(file, dev, ino);
+    return await scanLinuxHolders(dev, ino);
   } catch {
     return "unknown";
   }
 }
 
-async function scanLinuxHolders(file, dev, ino) {
+async function scanLinuxHolders(dev, ino) {
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   if (typeof uid !== "number") return "unknown";
   let pids;
@@ -805,57 +802,53 @@ async function scanLinuxHolders(file, dev, ino) {
   } catch {
     return "unknown";
   }
-  const lockPath = path.resolve(file);
   for (const pid of pids) {
     if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
     const procDir = "/proc/" + pid;
     let owner;
     try {
       owner = (await fs.stat(procDir)).uid;
-    } catch {
-      continue;
+    } catch (error) {
+      if (procGone(error)) continue;
+      return "unknown";
     }
     if (owner !== uid) continue;
-    const found = await descriptorsHold(procDir + "/fd", uid, dev, ino, lockPath);
+    const found = await descriptorsHold(procDir + "/fd", dev, ino);
     if (found === "held" || found === "unknown") return found;
   }
   return "free";
 }
 
-async function descriptorsHold(fdDir, uid, dev, ino, lockPath) {
-  let fdOwner;
+async function descriptorsHold(fdDir, dev, ino) {
   try {
-    fdOwner = (await fs.stat(fdDir)).uid;
+    await fs.stat(fdDir);
   } catch (error) {
-    if (procGone(error) || procDenied(error)) return "skip";
+    if (procGone(error)) return "skip";
     return "unknown";
   }
-  if (fdOwner !== uid) return "skip";
   let fds;
   try {
     fds = await fs.readdir(fdDir);
   } catch (error) {
-    if (procGone(error) || procDenied(error)) return "skip";
+    if (procGone(error)) return "skip";
     return "unknown";
   }
   for (const fd of fds) {
-    if (await descriptorHolds(fdDir + "/" + fd, dev, ino, lockPath)) return "held";
+    const held = await descriptorHolds(fdDir + "/" + fd, dev, ino);
+    if (held === "unknown") return "unknown";
+    if (held === true) return "held";
   }
   return "skip";
 }
 
-async function descriptorHolds(fdPath, dev, ino, lockPath) {
+async function descriptorHolds(fdPath, dev, ino) {
   try {
     const st = await fs.stat(fdPath);
     if (st.dev === dev && st.ino === ino) return true;
     return false;
   } catch (error) {
-    if (!procDenied(error)) return false;
-  }
-  try {
-    const link = await fs.readlink(fdPath);
-    return link === lockPath;
-  } catch {
+    if (procGone(error)) return false;
+    if (procDenied(error)) return "unknown";
     return false;
   }
 }

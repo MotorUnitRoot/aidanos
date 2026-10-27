@@ -230,28 +230,33 @@ try {
   async function openAsk(query) {
     await evalJs(`document.getElementById("ask-close").click()`);
     await evalJs(`document.getElementById("ask-open").click()`);
+    // Submit runs the search now. An input event would clear the list again
+    // 140ms later. The click waits until this submit has finished rendering.
     await evalJs(`(() => {
       const q = document.getElementById("ask-q");
       q.focus();
       q.value = ${JSON.stringify(query)};
-      q.dispatchEvent(new Event("input", { bubbles: true }));
+      document.getElementById("ask-form").requestSubmit();
       return true;
     })()`);
     await waitFor(async () => {
-      const found = await evalJs(`(() => {
+      const state = await evalJs(`(() => {
+        const q = document.getElementById("ask-q");
         const hits = document.getElementById("ask-hits");
-        const buttons = hits ? [...hits.querySelectorAll("button")] : [];
-        return buttons.some((button) => (button.textContent || "").toLowerCase().includes(${JSON.stringify(query.toLowerCase())}));
+        if (!q || !hits || q.value !== ${JSON.stringify(query)}) return "query";
+        if (hits.querySelector(".ask-finding")) return "finding";
+        const ready = [...hits.querySelectorAll("button")].some((button) => (button.textContent || "").toLowerCase().includes(${JSON.stringify(query.toLowerCase())}));
+        return ready ? true : "no hit";
       })()`);
-      if (found === true) return true;
-      return await evalJs(`(document.getElementById("ask-hits") && document.getElementById("ask-hits").innerText) || ""`);
+      if (state === true) return true;
+      return state;
     }, 8000, "ask " + query);
   }
 
   async function clickHit(query) {
     const clicked = await evalJs(`(() => {
       const hits = document.getElementById("ask-hits");
-      const button = [...hits.querySelectorAll("button")].find((item) => (item.textContent || "").toLowerCase().includes(${JSON.stringify(query.toLowerCase())}));
+      const button = hits ? [...hits.querySelectorAll("button")].find((item) => (item.textContent || "").toLowerCase().includes(${JSON.stringify(query.toLowerCase())})) : null;
       if (!button) return "no hit";
       button.click();
       return true;
@@ -457,24 +462,71 @@ try {
       return;
     }
     await prepareToday();
-    await evalJs(`(() => {
-      const line = [...document.querySelectorAll("#paper .md-line")].find((el) => (el.innerText || "").includes("reading room stays open"));
-      if (line) line.scrollIntoView({ block: "center" });
+    // The latch hit flashes its line after the day text is already visible.
+    // That flash repaints the paper and scrolls. One click, after the flash
+    // class is gone and this line is still under the pointer.
+    let sawFlash = false;
+    let placed = false;
+    let stillTop = null;
+    let point = null;
+    await waitFor(async () => {
+      const snap = await evalJs(`(() => {
+        const ask = document.getElementById("ask-modal");
+        if (ask && !ask.hidden) return { state: "ask open" };
+        const flashing = !!document.querySelector("#paper .is-flash");
+        const line = [...document.querySelectorAll("#paper .md-line")].find((el) => (el.innerText || "").includes("reading room stays open"));
+        if (!line) return { state: flashing ? "flashing" : "no line" };
+        if (flashing) return { state: "flashing" };
+        const body = line.querySelector(".md-body") || line;
+        const rect = body.getBoundingClientRect();
+        if (rect.width < 8 || rect.height < 8) return { state: "no box" };
+        const x = rect.left + Math.min(24, Math.max(0, rect.width / 2));
+        const y = rect.top + rect.height / 2;
+        const hit = document.elementFromPoint(x, y);
+        const onLine = !!(hit && (hit === line || line.contains(hit)));
+        return { state: onLine ? "ready" : "covered", top: rect.top, x: x, y: y };
+      })()`);
+      if (!snap) return "missing";
+      if (snap.state === "flashing") {
+        sawFlash = true;
+        placed = false;
+        stillTop = null;
+        point = null;
+        return "flashing";
+      }
+      if (!sawFlash) return "waiting for the latch flash";
+      if (!placed) {
+        await evalJs(`(() => {
+          const line = [...document.querySelectorAll("#paper .md-line")].find((el) => (el.innerText || "").includes("reading room stays open"));
+          if (line) line.scrollIntoView({ block: "center", behavior: "auto" });
+          return true;
+        })()`);
+        placed = true;
+        stillTop = null;
+        return "placing";
+      }
+      if (snap.state !== "ready") {
+        stillTop = null;
+        point = null;
+        return snap.state;
+      }
+      if (stillTop == null || Math.abs(snap.top - stillTop) > 0.5) {
+        stillTop = snap.top;
+        point = null;
+        return "moving";
+      }
+      point = { x: snap.x, y: snap.y };
       return true;
-    })()`);
-    const point = await evalJs(`(() => {
-      const line = [...document.querySelectorAll("#paper .md-line")].find((el) => (el.innerText || "").includes("reading room stays open"));
-      if (!line) return null;
-      const body = line.querySelector(".md-body") || line;
-      const rect = body.getBoundingClientRect();
-      return { x: rect.left + Math.min(24, rect.width / 2), y: rect.top + rect.height / 2 };
-    })()`);
-    assert(point && point.x > 0, "showcase line is not on screen");
+    }, 8000, "edit the day line");
+    assert(point && point.x > 0 && point.y > 0, "showcase line is not on screen");
     await send("Input.dispatchMouseEvent", {
-      type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1,
+      type: "mouseMoved", x: point.x, y: point.y, button: "none",
     }, sessionId);
     await send("Input.dispatchMouseEvent", {
-      type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1,
+      type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: 1,
+    }, sessionId);
+    await send("Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1,
     }, sessionId);
     await waitFor(async () => {
       const ok = await evalJs(`!![...document.querySelectorAll("#paper .md-line.is-source")].find((el) => (el.innerText || "").includes("reading room stays open"))`);

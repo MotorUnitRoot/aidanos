@@ -23,6 +23,7 @@ import {
 import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import { installIndexTrace, noteGitWork } from "./index-trace.mjs";
+import { saveNoteFile } from "./mirror.mjs";
 import {
   flushFileLog,
   installFileLog,
@@ -48,6 +49,44 @@ const SESSION_TIMEOUT_MS = 30_000;
 // A second signal exits the same way, without waiting out the deadline.
 export const SHUTDOWN_DEADLINE_MS = 5000;
 export const SHUTDOWN_TIMEOUT_LINE = "relay close timed out";
+// launchd waits about 20s after SIGTERM. Saves get 12s, then close gets 5s.
+export const SAVE_WAIT_MS = 12_000;
+export const SAVE_WAIT_TIMEOUT_LINE = "in-flight saves timed out";
+export const SLOW_SAVE_NOTE_NAME = "held-note.md";
+
+export function slowSaveNoteBody() {
+  return "whole-note-line\n".repeat(256);
+}
+
+const inflightSaves = new Set();
+
+function trackInflight(work) {
+  const run = Promise.resolve().then(work);
+  inflightSaves.add(run);
+  return run.finally(() => inflightSaves.delete(run));
+}
+
+function saveWaitBound(env = process.env) {
+  if (env.NODE_ENV === "test") {
+    const raw = Number(env.AIDANOS_RELAY_TEST_SAVE_WAIT_MS);
+    if (Number.isFinite(raw) && raw >= 50 && raw <= SAVE_WAIT_MS) return raw;
+  }
+  return SAVE_WAIT_MS;
+}
+
+function waitForInflightSaves(ms) {
+  if (inflightSaves.size === 0) return Promise.resolve("settled");
+  return new Promise((resolve) => {
+    const deadline = Date.now() + ms;
+    const check = () => {
+      if (inflightSaves.size === 0) return resolve("settled");
+      const left = deadline - Date.now();
+      if (left <= 0) return resolve("timeout");
+      setTimeout(check, Math.min(20, left));
+    };
+    check();
+  });
+}
 
 function shutdownDeadline(env = process.env) {
   if (env.NODE_ENV === "test") {
@@ -615,6 +654,8 @@ export async function startRelay(options = {}) {
   let nextConn = 1;
   let budgetTimer = null;
   let keepAliveTimer = null;
+  let accepting = true;
+  const workerSaves = new Map();
 
   function currentHost() {
     return live && live.host ? live.host : null;
@@ -689,6 +730,31 @@ export async function startRelay(options = {}) {
     if (msg.kind === "close") closeConn(entry, msg.code);
   }
 
+  function noteWorkerSave(msg) {
+    if (!msg || msg.phase === "reset") {
+      for (const resolve of workerSaves.values()) resolve();
+      workerSaves.clear();
+      return;
+    }
+    if (!Number.isInteger(msg.id)) return;
+    if (msg.phase === "start") {
+      if (workerSaves.has(msg.id)) return;
+      let resolve;
+      const promise = new Promise((done) => {
+        resolve = done;
+      });
+      workerSaves.set(msg.id, resolve);
+      inflightSaves.add(promise);
+      promise.finally(() => inflightSaves.delete(promise));
+      return;
+    }
+    if (msg.phase === "end") {
+      const resolve = workerSaves.get(msg.id);
+      workerSaves.delete(msg.id);
+      if (resolve) resolve();
+    }
+  }
+
   async function openSession() {
     const debounce = Number(options.mirrorDebounceMs ?? env.AIDANOS_MIRROR_DEBOUNCE_MS);
     const host = createWorkerHost({
@@ -708,6 +774,7 @@ export async function startRelay(options = {}) {
         closeAll(1011);
       },
       onSocket: deliver,
+      onSave: noteWorkerSave,
     });
     try {
       await host.start();
@@ -779,14 +846,7 @@ export async function startRelay(options = {}) {
       entry.wss.close();
       if (typeof entry.httpServer.closeAllConnections === "function") entry.httpServer.closeAllConnections();
     }
-    await Promise.all(
-      servers.map(
-        (entry) =>
-          new Promise((resolve) => {
-            entry.httpServer.close(() => resolve());
-          }),
-      ),
-    );
+    await Promise.all(servers.map((entry) => whenServerClosed(entry.httpServer)));
     for (const entry of servers) entry.wss.emit("close");
   }
 
@@ -871,6 +931,11 @@ export async function startRelay(options = {}) {
 
   for (const host of hosts) {
     const httpServer = http.createServer((req, res) => {
+      if (!accepting) {
+        res.writeHead(503, { "content-length": 0 });
+        res.end();
+        return;
+      }
       const pathOnly = String(req.url || "").split("?")[0];
       if (pathOnly === "/health") {
         const status = syncStatus();
@@ -940,9 +1005,12 @@ export async function startRelay(options = {}) {
     const cap = payloadLimit(rawCap);
     const wss = new WebSocketServer({ noServer: true, maxPayload: cap });
     const entry = { httpServer, host, wss };
+    httpServer.on("connection", (socket) => {
+      if (!accepting) socket.destroy();
+    });
     httpServer.on("upgrade", (req, socket, head) => {
       const hostNow = currentHost();
-      if (!live || !hostNow || !hostNow.warm || hostNow.crashLoop) {
+      if (!accepting || !live || !hostNow || !hostNow.warm || hostNow.crashLoop) {
         socket.destroy();
         return;
       }
@@ -1208,19 +1276,23 @@ export async function startRelay(options = {}) {
         entry.wss.close();
         if (typeof entry.httpServer.closeAllConnections === "function") entry.httpServer.closeAllConnections();
       }
-      await Promise.all(
-        servers.map(
-          (entry) =>
-            new Promise((resolve) => {
-              entry.httpServer.close(() => resolve());
-            }),
-        ),
-      );
+      await Promise.all(servers.map((entry) => whenServerClosed(entry.httpServer)));
       // The websocket adapter clears its ping timer on "close". A client that
       // already went away can leave that timer running, which holds the
       // process open after the tests have finished.
       for (const entry of servers) entry.wss.emit("close");
       if (session && session.repo && typeof session.repo.shutdown === "function") await session.repo.shutdown();
+    },
+    async stopAcceptingAndDrainSaves() {
+      accepting = false;
+      if (live && live.mirror) live.mirror.stop();
+      for (const entry of servers) {
+        try {
+          if (entry.httpServer.listening) entry.httpServer.close();
+        } catch { /* close() stops the rest */ }
+      }
+      const result = await waitForInflightSaves(saveWaitBound(env));
+      if (result === "timeout") logSafe(secrets, SAVE_WAIT_TIMEOUT_LINE);
     },
   };
   if (env.NODE_ENV === "test") {
@@ -1230,7 +1302,28 @@ export async function startRelay(options = {}) {
     api.workerHolding = () => Boolean(live && live.host && live.host.holding);
     api.refusedDocs = () => (live && live.host ? [...live.host.refused] : []);
   }
+  if (env.NODE_ENV === "test" && env.AIDANOS_RELAY_TEST_SLOW_SAVE === "1") {
+    const body = slowSaveNoteBody();
+    const noteFile = path.join(vault, SLOW_SAVE_NOTE_NAME);
+    const staged = env.AIDANOS_RELAY_TEST_SAVE_STAGED;
+    const hold = Number(env.AIDANOS_RELAY_TEST_SAVE_HOLD_MS);
+    const delay = Number.isFinite(hold) && hold >= 0 ? hold : 900;
+    trackInflight(() => saveNoteFile(noteFile, body, async () => {
+      if (staged) await fs.writeFile(String(staged), body);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    })).catch(() => { /* the shutdown wait still sees this save leave the set */ });
+  }
   return api;
+}
+
+function whenServerClosed(server) {
+  return new Promise((resolve) => {
+    if (!server.listening) {
+      resolve();
+      return;
+    }
+    server.close(() => resolve());
+  });
 }
 
 function portFromEnv(env = process.env) {
@@ -1267,7 +1360,7 @@ async function main() {
       vault: args.vault || undefined,
       data: args.data || undefined,
       port: args.port == null || Number.isNaN(args.port) ? undefined : args.port,
-      allowReset: process.env.AIDANOS_RELAY_ALLOW_RESET === "1",
+      allowReset: process.env.NODE_ENV === "test" && process.env.AIDANOS_RELAY_ALLOW_RESET === "1",
     });
   } catch (error) {
     logFatal(
@@ -1278,6 +1371,7 @@ async function main() {
   }
   let closing = false;
   let settled = false;
+  let deadlineTimer = null;
   let giveUp = () => {};
   const shutdown = () => {
     if (settled) return;
@@ -1286,11 +1380,10 @@ async function main() {
       return;
     }
     closing = true;
-    const timer = setTimeout(() => giveUp(), shutdownDeadline());
     const exitWith = (code, line) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (deadlineTimer) clearTimeout(deadlineTimer);
       try {
         pauseFileLog();
         logSafe([], line);
@@ -1301,10 +1394,17 @@ async function main() {
       process.exit(code);
     };
     giveUp = () => exitWith(1, SHUTDOWN_TIMEOUT_LINE);
-    Promise.resolve(relay.close()).then(
-      () => exitWith(0, "relay log closed"),
-      () => exitWith(0, "relay log closed"),
-    );
+    const beginClose = () => {
+      if (settled) return;
+      // The 5s close deadline starts only after in-flight saves settle,
+      // or after the 12s save bound has already been logged.
+      deadlineTimer = setTimeout(() => giveUp(), shutdownDeadline());
+      Promise.resolve(relay.close()).then(
+        () => exitWith(0, "relay log closed"),
+        () => exitWith(0, "relay log closed"),
+      );
+    };
+    Promise.resolve(relay.stopAcceptingAndDrainSaves()).then(beginClose, beginClose);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

@@ -1,6 +1,6 @@
 // Scrub secrets before anything is printed. The git token and the relay
 // token must never appear in a log line.
-import { closeSync, constants as fsConstants, createWriteStream, fchmodSync, lstatSync, openSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, createWriteStream, fchmodSync, fstatSync, ftruncateSync, lstatSync, openSync, writeSync } from "node:fs";
 import path from "node:path";
 import { formatWithOptions } from "node:util";
 
@@ -22,6 +22,11 @@ export function redact(text, secrets) {
   out = out.replace(/AIDANOS_(?:RELAY|VAULT_GIT)_TOKEN=\S+/g, "AIDANOS_TOKEN=***");
   out = out.replace(/https?:\/\/[^\s]+/gi, "[url]");
   out = out.replace(/file:\/\/[^\s]+/gi, "[url]");
+  // Same scrub for stderr and fatal.log. A vault path or a note file name
+  // must not land in either. Document ids have neither a slash nor a .md suffix.
+  out = out.replace(/(^|[\s"'`(])(?:\/|~\/)[^\s"'`)]+/g, "$1[path]");
+  out = out.replace(/(^|[\s"'`(])[^\s"'`)]+\/[^\s"'`)]+\.md\b/g, "$1[path]");
+  out = out.replace(/(^|[\s"'`(=:])[^\s"'`)/]+\.md\b/g, "$1[note]");
   return out;
 }
 
@@ -49,9 +54,11 @@ export function logSafe(secrets, ...parts) {
 // pipe answers EAGAIN; that must not throw past the exit.
 let fileLogFd = null;
 let fileLogStream = null;
-// Lines console.error accepted. Flush uses Node's queue when that queue
-// is visible, and these bytes when it is not.
+// Bytes accepted by console.error whose write callback has not run.
+// A finished write drops its buffer here, so a later flush cannot write
+// that line again. Held bytes stay under the same cap as the stream.
 let fileLogPending = [];
+let fileLogPendingBytes = 0;
 let takeDropNotice = () => "";
 // Last resort for a fatal line when stderr stays full. The relay sets this
 // to its own state directory before it can exit.
@@ -66,6 +73,30 @@ function chunkBytes(item) {
   if (!item || item.chunk == null) return Buffer.alloc(0);
   if (Buffer.isBuffer(item.chunk)) return item.chunk;
   return Buffer.from(String(item.chunk), item.encoding || "utf8");
+}
+
+function rememberPending(bytes) {
+  fileLogPending.push(bytes);
+  fileLogPendingBytes += bytes.length;
+}
+
+function forgetPending(bytes) {
+  const index = fileLogPending.indexOf(bytes);
+  if (index === -1) return;
+  fileLogPending.splice(index, 1);
+  fileLogPendingBytes -= bytes.length;
+  if (fileLogPendingBytes < 0) fileLogPendingBytes = 0;
+}
+
+function setPending(buffers) {
+  fileLogPending = buffers;
+  fileLogPendingBytes = 0;
+  for (const bytes of buffers) fileLogPendingBytes += bytes.length;
+}
+
+function heldLogBytes(stream) {
+  const queued = stream && typeof stream.writableLength === "number" ? stream.writableLength : 0;
+  return Math.max(fileLogPendingBytes, queued);
 }
 
 function writeSyncSome(fd, buffer) {
@@ -115,13 +146,13 @@ function writeBounded(fd, parts, maxBytes, asStreamItem) {
   return { kept, length };
 }
 
-// Write the lines already sitting in the async stream, up to the cap.
+// Write the lines still sitting in the async stream, up to the cap.
 // Stop when the pipe is full. Clearing the queue keeps the stream from
 // writing those bytes again on the next turn.
 // Node keeps those lines in stream._writableState.buffered. That array
-// is not a public API. When it is missing, the lines recorded at log
-// time are written instead. A later Node that already wrote them can
-// repeat a line. Losing the line is the failure this path avoids.
+// is not a public API. When it is missing, only the bytes whose write
+// callback has not run are written. A line that already drained is not
+// in that list, so this path does not write it a second time.
 export function flushFileLog(maxBytes = FILE_LOG_CAP) {
   const stream = fileLogStream;
   const fd = fileLogFd == null ? process.stderr.fd : fileLogFd;
@@ -129,14 +160,14 @@ export function flushFileLog(maxBytes = FILE_LOG_CAP) {
   const state = stream && stream._writableState;
   if (!state || !Array.isArray(state.buffered)) {
     const drained = writeBounded(fd, fileLogPending, maxBytes, false);
-    fileLogPending = drained.kept;
+    setPending(drained.kept);
     return;
   }
   const drained = writeBounded(fd, state.buffered, maxBytes, true);
   state.buffered = drained.kept;
   state.length = drained.length;
   if (typeof state.bufferedIndex === "number") state.bufferedIndex = 0;
-  fileLogPending = drained.kept.map((item) => chunkBytes(item));
+  setPending(drained.kept.map((item) => chunkBytes(item)));
 }
 
 // Keep the next console.error in the queue. An idle stream would otherwise
@@ -161,37 +192,117 @@ function waitForPipe(ms) {
   if (ms > 0) Atomics.wait(fatalWait, 0, 0, ms);
 }
 
-// A full pipe refuses the write with EAGAIN. Retry until the window is
-// gone, then append the unread bytes to a fixed file. The file is created
-// mode 0600 and is not a symlink: O_NOFOLLOW applies to the last component,
-// and the directory itself is refused when it is a link.
-function appendFatalFallback(bytes) {
-  if (!fatalFallbackDir || !bytes || bytes.length === 0) return false;
-  const nofollow = fsConstants.O_NOFOLLOW;
-  if (typeof nofollow !== "number") return false;
-  let dirStat;
+const GROUP_OR_OTHER_WRITE = 0o022;
+const STICKY = 0o1000;
+const FATAL_RESTART_LINE = "fatal log restarted\n";
+
+// Every directory on the state path, not only the last component. A symlink
+// is refused even when root owns it. Other owner rules match the helper walk:
+// root or this user, and group or other write only on a sticky root directory.
+function stateDirAllowed(dir, uid) {
+  if (typeof uid !== "number") return false;
+  const abs = path.resolve(dir);
+  const parts = abs.split(path.sep).filter(Boolean);
+  let cursor = path.parse(abs).root;
+  const check = (st) => {
+    if (!st || st.isSymbolicLink() || !st.isDirectory()) return false;
+    const writable = (st.mode & GROUP_OR_OTHER_WRITE) !== 0;
+    const stickyRoot = (st.mode & STICKY) !== 0 && st.uid === 0;
+    if (writable && !stickyRoot) return false;
+    if (st.uid !== 0 && st.uid !== uid) return false;
+    return true;
+  };
+  let rootStat;
   try {
-    dirStat = lstatSync(fatalFallbackDir);
+    rootStat = lstatSync(cursor);
   } catch {
     return false;
   }
-  if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) return false;
-  const file = path.join(fatalFallbackDir, FATAL_FALLBACK_NAME);
+  if (!check(rootStat)) return false;
+  for (const part of parts) {
+    cursor = path.join(cursor, part);
+    let st;
+    try {
+      st = lstatSync(cursor);
+    } catch {
+      return false;
+    }
+    if (!check(st)) return false;
+  }
+  return cursor === abs;
+}
+
+function refuseFatalFallback(stderrFd, bytes) {
+  try {
+    if (typeof stderrFd === "number" && stderrFd >= 0 && bytes && bytes.length > 0) writeSync(stderrFd, bytes);
+  } catch { /* one attempt, then the exit continues */ }
+  return false;
+}
+
+function fatalPayload(size, bytes) {
+  const incoming = Buffer.isBuffer(bytes) ? bytes : Buffer.from(String(bytes));
+  if (size + incoming.length <= FILE_LOG_CAP) return { restart: false, bytes: incoming };
+  const marker = Buffer.from(FATAL_RESTART_LINE);
+  const room = FILE_LOG_CAP - marker.length;
+  if (room <= 0) return null;
+  const body = incoming.length > room ? incoming.subarray(incoming.length - room) : incoming;
+  return { restart: true, bytes: Buffer.concat([marker, body]) };
+}
+
+// A full pipe refuses the write with EAGAIN. Retry until the window is
+// gone, then append the unread bytes to a fixed file. The state directory
+// is opened as a descriptor and walked first: no symlink anywhere on its
+// path. The file is opened O_NOFOLLOW|O_APPEND|O_CREAT, then fstat must
+// show a regular file, one link, and our uid before any fchmod or write.
+// Past 1 MiB the file is truncated and restarted with a marker. A refusal
+// skips the file and tries stderr once.
+function appendFatalFallback(bytes, stderrFd) {
+  if (!fatalFallbackDir || !bytes || bytes.length === 0) return false;
+  const nofollow = fsConstants.O_NOFOLLOW;
+  const directory = fsConstants.O_DIRECTORY;
+  if (typeof nofollow !== "number" || typeof directory !== "number") return refuseFatalFallback(stderrFd, bytes);
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (!stateDirAllowed(fatalFallbackDir, uid)) return refuseFatalFallback(stderrFd, bytes);
+  let dirfd = -1;
   let fd = -1;
   try {
+    dirfd = openSync(fatalFallbackDir, fsConstants.O_RDONLY | directory | nofollow);
+    const openedDir = fstatSync(dirfd);
+    const listedDir = lstatSync(fatalFallbackDir);
+    if (
+      !openedDir.isDirectory() ||
+      openedDir.isSymbolicLink() ||
+      openedDir.dev !== listedDir.dev ||
+      openedDir.ino !== listedDir.ino
+    ) {
+      return refuseFatalFallback(stderrFd, bytes);
+    }
+    const filePath = process.platform === "linux"
+      ? "/proc/self/fd/" + dirfd + "/" + FATAL_FALLBACK_NAME
+      : path.join(fatalFallbackDir, FATAL_FALLBACK_NAME);
     fd = openSync(
-      file,
+      filePath,
       fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND | nofollow,
       0o600,
     );
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1 || st.uid !== uid) {
+      return refuseFatalFallback(stderrFd, bytes);
+    }
+    const payload = fatalPayload(st.size, bytes);
+    if (!payload) return refuseFatalFallback(stderrFd, bytes);
     fchmodSync(fd, 0o600);
-    writeSync(fd, bytes);
+    if (payload.restart) ftruncateSync(fd, 0);
+    writeSync(fd, payload.bytes);
     return true;
   } catch {
-    return false;
+    return refuseFatalFallback(stderrFd, bytes);
   } finally {
     if (fd >= 0) {
       try { closeSync(fd); } catch { /* the exit still runs */ }
+    }
+    if (dirfd >= 0) {
+      try { closeSync(dirfd); } catch { /* the exit still runs */ }
     }
   }
 }
@@ -212,7 +323,7 @@ function writeFatalLine(fd, line, deadline) {
     }
     const left = deadline - Date.now();
     if (left <= 0) {
-      appendFatalFallback(bytes.subarray(offset));
+      appendFatalFallback(bytes.subarray(offset), fd);
       return;
     }
     waitForPipe(Math.min(5, left));
@@ -249,10 +360,11 @@ export function installFileLog(fd = process.stderr.fd, options = {}) {
   const previousFd = fileLogFd;
   const previousStream = fileLogStream;
   const previousPending = fileLogPending;
+  const previousPendingBytes = fileLogPendingBytes;
   const previousNotice = takeDropNotice;
   const previousFallback = fatalFallbackDir;
   fileLogFd = fd;
-  fileLogPending = [];
+  setPending([]);
   if (options.fallbackDir) fatalFallbackDir = path.resolve(String(options.fallbackDir));
   const highWaterMark = Math.min(16 * 1024, Math.max(1024, Math.floor(cap / 2)));
   const stream = createWriteStream("", { fd, autoClose: false, highWaterMark });
@@ -268,10 +380,11 @@ export function installFileLog(fd = process.stderr.fd, options = {}) {
   function announce() {
     if (announced || dropped === 0) return;
     const text = noticeText();
-    if (stream.writableLength + Buffer.byteLength(text) > cap) return;
+    const bytes = Buffer.from(text);
+    if (heldLogBytes(stream) + bytes.length > cap) return;
     announced = true;
-    fileLogPending.push(Buffer.from(text));
-    stream.write(text);
+    rememberPending(bytes);
+    stream.write(text, () => forgetPending(bytes));
   }
 
   // A fatal exit cannot wait for drain. The notice is written after the
@@ -293,12 +406,13 @@ export function installFileLog(fd = process.stderr.fd, options = {}) {
     const text = formatWithOptions({ colors: false }, ...args) + "\n";
     const size = Buffer.byteLength(text);
     const reserve = announced ? 0 : DROP_NOTICE_RESERVE;
-    if (stream.writableLength + size + reserve > cap) {
+    if (heldLogBytes(stream) + size + reserve > cap) {
       dropped += 1;
       return;
     }
-    fileLogPending.push(Buffer.from(text));
-    stream.write(text);
+    const bytes = Buffer.from(text);
+    rememberPending(bytes);
+    stream.write(text, () => forgetPending(bytes));
   };
 
   return {
@@ -306,11 +420,15 @@ export function installFileLog(fd = process.stderr.fd, options = {}) {
     get dropped() {
       return dropped;
     },
+    get held() {
+      return fileLogPendingBytes;
+    },
     restore() {
       console.error = previous;
       fileLogFd = previousFd;
       fileLogStream = previousStream;
       fileLogPending = previousPending;
+      fileLogPendingBytes = previousPendingBytes;
       takeDropNotice = previousNotice;
       fatalFallbackDir = previousFallback;
     },

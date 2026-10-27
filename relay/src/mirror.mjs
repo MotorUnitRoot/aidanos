@@ -111,7 +111,16 @@ function digest(text) {
   return crypto.createHash("sha256").update(String(text), "utf8").digest("hex");
 }
 
-export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
+// Write the note beside its final name, then rename it into place. A reader
+// sees the previous file or the whole new file.
+export async function saveNoteFile(file, text, beforeRename) {
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
+  await fs.writeFile(tmp, text);
+  if (typeof beforeRename === "function") await beforeRename();
+  await fs.rename(tmp, file);
+}
+
+export function createMirror({ repo, vault, debounceMs = 400, secrets = [], track = (work) => work() }) {
   const lastWritten = new Map();
   const incorporated = new Map();
   let records = null;
@@ -275,7 +284,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
   }
 
   async function syncDisk() {
-    chain = chain.then(async () => {
+    chain = chain.then(() => track(async () => {
       const started = performance.now();
       try {
         await foldOutside();
@@ -283,7 +292,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
       } finally {
         noteMirror(performance.now() - started);
       }
-    }).catch((error) => {
+    })).catch((error) => {
       logSafe(secrets, "mirror failed:", error instanceof Error ? error.message : error);
     });
     return chain;

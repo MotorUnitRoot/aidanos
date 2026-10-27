@@ -131,6 +131,7 @@ const CONTROL = new Set([
   "echo",
   "holding",
   "startup-error",
+  "save",
 ]);
 
 // ws reuses a pooled Buffer. Transferring its underlying ArrayBuffer detaches

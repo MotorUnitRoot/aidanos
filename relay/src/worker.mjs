@@ -230,8 +230,21 @@ async function run() {
     process.exit(1);
   }
   warmSyncEngine();
+  let saveSeq = 1;
+  function trackSave(work) {
+    const id = saveSeq;
+    saveSeq += 1;
+    post({ v: 1, kind: "save", id, phase: "start" });
+    return Promise.resolve().then(work).finally(() => {
+      post({ v: 1, kind: "save", id, phase: "end" });
+    });
+  }
   const inner = new NodeFSStorageAdapter(data.dataDir);
   const storage = traceStorage(new SafeStorage(data.dataDir, inner));
+  for (const method of ["save", "remove", "removeRange"]) {
+    const raw = storage[method].bind(storage);
+    storage[method] = (...args) => trackSave(() => raw(...args));
+  }
   const adapter = new ParentAdapter();
   const repo = new Repo({
     storage,
@@ -247,6 +260,7 @@ async function run() {
     vault: data.vault,
     debounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
     secrets: [],
+    track: trackSave,
   });
   await preloadStoredNotes(repo);
   await mirror.now();

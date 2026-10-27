@@ -521,7 +521,8 @@ test("a mirror write onto a symlink or a hard link is refused", async () => {
     await relay.mirrorNow();
     assert.equal(await fs.readFile(target, "utf8"), "secret-target");
     assert.equal((await fs.lstat(file)).isSymbolicLink(), true);
-    assert.equal(seen.some((line) => line.includes("mirror write refused notes/hello.md")), true);
+    assert.equal(seen.some((line) => line.includes("mirror write refused")), true);
+    assert.equal(seen.some((line) => line.includes("notes/hello.md")), false);
   } finally {
     console.error = write;
     await relay.close();

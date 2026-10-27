@@ -328,6 +328,10 @@ export function createWorkerHost(options = {}) {
       host.holding = msg.done !== true;
       return;
     }
+    if (msg.kind === "save") {
+      if (child === worker && typeof options.onSave === "function") options.onSave(msg);
+      return;
+    }
     if (msg.kind === "ack") onSocket(msg);
   }
 
@@ -352,6 +356,9 @@ export function createWorkerHost(options = {}) {
 
   function onExit(child, code) {
     if (child !== worker) return;
+    try {
+      if (typeof options.onSave === "function") options.onSave({ phase: "reset" });
+    } catch { /* a stuck save must not block the exit */ }
     if (restarting) return;
     restarting = true;
     worker = null;

@@ -14,15 +14,19 @@ import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
-import { FATAL_FALLBACK_NAME, flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, redact, stampLine } from "../src/redact.mjs";
+import { FATAL_FALLBACK_NAME, FILE_LOG_CAP, flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, redact, stampLine } from "../src/redact.mjs";
 import { emptyLateState, installIndexTrace, nextLoopLateLine } from "../src/index-trace.mjs";
 import { cbor } from "@automerge/automerge-repo";
 import { describeSyncFrame, logSyncFrame } from "../src/sync-log.mjs";
 import {
   LAN_WARNING,
   MAX_PAYLOAD,
+  SAVE_WAIT_MS,
+  SAVE_WAIT_TIMEOUT_LINE,
   SHUTDOWN_DEADLINE_MS,
   SHUTDOWN_TIMEOUT_LINE,
+  SLOW_SAVE_NOTE_NAME,
+  slowSaveNoteBody,
   loadToken,
   nodeRequirement,
   parseArgs,
@@ -41,6 +45,10 @@ const exec = promisify(execFile);
 
 async function tempDir() {
   return fs.mkdtemp(path.join(os.tmpdir(), "aidanos-relay-"));
+}
+
+async function realTempDir() {
+  return fs.realpath(await tempDir());
 }
 
 function git(args, cwd) {
@@ -151,6 +159,7 @@ test("a stalled log stays under the cap and drops the rest once", async () => {
     assert.ok(installed.dropped > 0, "the cap was never hit");
     for (let i = 0; i < 200; i += 1) logSafe([], line);
     assert.ok(installed.stream.writableLength <= cap, "buffered " + installed.stream.writableLength);
+    assert.ok(installed.held <= cap, "held " + installed.held);
     const dropped = installed.dropped;
     const finished = once(installed.stream, "finish");
     const ended = once(reader, "end");
@@ -315,8 +324,105 @@ test("a fatal log writes the drop notice before the fatal line", async () => {
   }
 });
 
-test("a fatal line on a full pipe lands in the pipe or the fallback file", async () => {
+test("a drained log is not written again by a fatal line", async () => {
   const dir = await tempDir();
+  const file = path.join(dir, "stderr.log");
+  const fd = openSync(file, "w");
+  const installed = installFileLog(fd);
+  try {
+    for (let i = 0; i < 100; i += 1) logSafe([], "drained-" + i);
+    const ready = Date.now() + 5000;
+    while (installed.held !== 0 || installed.stream.writableLength !== 0) {
+      if (Date.now() > ready) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(installed.held, 0);
+    logFatal([], "fatal-after-drain");
+  } finally {
+    installed.restore();
+    closeSync(fd);
+  }
+  const lines = (await fs.readFile(file, "utf8")).trim().split("\n");
+  const counts = new Map();
+  for (const line of lines) {
+    const match = line.match(/drained-(\d+)$/);
+    if (!match) continue;
+    counts.set(match[1], (counts.get(match[1]) || 0) + 1);
+  }
+  assert.equal(counts.size, 100);
+  for (const count of counts.values()) assert.equal(count, 1);
+  assert.equal(lines.filter((line) => line.endsWith("fatal-after-drain")).length, 1);
+  assert.equal(lines.length, 101);
+});
+
+test("logged lines do not accumulate after they drain", { timeout: 120000 }, async () => {
+  const redactUrl = new URL("../src/redact.mjs", import.meta.url).href;
+  const script = `
+    import { openSync, closeSync } from "node:fs";
+    import { installFileLog, logSafe } from ${JSON.stringify(redactUrl)};
+    const fd = openSync("/dev/null", "w");
+    const installed = installFileLog(fd);
+    const line = "n".repeat(48);
+    async function pump(count) {
+      let i = 0;
+      while (i < count) {
+        const end = Math.min(count, i + 2000);
+        for (; i < end; i += 1) logSafe([], line);
+        if (installed.held > 256 * 1024 || installed.stream.writableLength > 256 * 1024) {
+          await new Promise((resolve) => {
+            const timer = setTimeout(resolve, 5000);
+            installed.stream.once("drain", () => {
+              clearTimeout(timer);
+              resolve();
+            });
+          });
+        } else {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      }
+    }
+    async function untilQuiet() {
+      const start = Date.now();
+      while (installed.held !== 0 || installed.stream.writableLength !== 0) {
+        if (Date.now() - start > 20000) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    await pump(100000);
+    await untilQuiet();
+    global.gc();
+    const before = process.memoryUsage();
+    await pump(1000000);
+    await untilQuiet();
+    global.gc();
+    const after = process.memoryUsage();
+    console.log(JSON.stringify({
+      dropped: installed.dropped,
+      held: installed.held,
+      heap: after.heapUsed - before.heapUsed,
+      rss: after.rss - before.rss,
+    }));
+    installed.restore();
+    closeSync(fd);
+  `;
+  const child = spawn(process.execPath, ["--expose-gc", "--input-type=module", "-e", script], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const [code] = await once(child, "exit");
+  assert.equal(code, 0, stderr || stdout);
+  const stats = JSON.parse(stdout);
+  assert.equal(stats.dropped, 0, stdout);
+  assert.equal(stats.held, 0, stdout);
+  assert.ok(stats.heap < 8 * 1024 * 1024, "heap grew " + stats.heap);
+  assert.ok(stats.rss < 12 * 1024 * 1024, "rss grew " + stats.rss);
+});
+
+test("a fatal line on a full pipe lands in the pipe or the fallback file", async () => {
+  const dir = await realTempDir();
   const pipe = fullFifo(dir);
   const marker = "fatal-on-a-full-pipe";
   const installed = installFileLog(pipe.fd, { cap: 32 * 1024, fallbackDir: dir });
@@ -352,7 +458,7 @@ test("a fatal line on a full pipe lands in the pipe or the fallback file", async
 });
 
 test("a fatal fallback does not follow a symlink", async () => {
-  const dir = await tempDir();
+  const dir = await realTempDir();
   const target = path.join(dir, "target.log");
   await fs.writeFile(target, "untouched\n");
   const linkDir = path.join(dir, "state");
@@ -375,6 +481,106 @@ test("a fatal fallback does not follow a symlink", async () => {
   const linkStat = await fs.lstat(path.join(linkDir, FATAL_FALLBACK_NAME));
   assert.equal(linkStat.isSymbolicLink(), true);
   assert.equal(await fs.readFile(target, "utf8"), "untouched\n");
+});
+
+test("a fatal fallback refuses a symlink one level up", async () => {
+  const root = await realTempDir();
+  const realParent = path.join(root, "real");
+  await fs.mkdir(realParent);
+  const linkParent = path.join(root, "via-link");
+  await fs.symlink(realParent, linkParent);
+  const state = path.join(linkParent, "state");
+  await fs.mkdir(state);
+  const pipe = fullFifo(root);
+  const marker = "fatal-skipped-parent-symlink";
+  const installed = installFileLog(pipe.fd, { cap: 32 * 1024, fallbackDir: state });
+  let piped = "";
+  try {
+    pipe.fill();
+    assert.doesNotThrow(() => logFatal([], marker));
+    piped = pipe.read();
+  } finally {
+    installed.restore();
+    pipe.close();
+  }
+  const fallen = path.join(realParent, "state", FATAL_FALLBACK_NAME);
+  await assert.rejects(fs.lstat(fallen), { code: "ENOENT" });
+  assert.equal(piped.includes(marker), false);
+});
+
+test("a fatal fallback refuses a hard link", async () => {
+  const dir = await realTempDir();
+  const other = path.join(dir, "other.log");
+  await fs.writeFile(other, "keep-this-secret\n");
+  await fs.chmod(other, 0o640);
+  await fs.link(other, path.join(dir, FATAL_FALLBACK_NAME));
+  const before = await fs.lstat(other);
+  const pipe = fullFifo(dir);
+  const marker = "fatal-skipped-hard-link";
+  const installed = installFileLog(pipe.fd, { cap: 32 * 1024, fallbackDir: dir });
+  try {
+    pipe.fill();
+    assert.doesNotThrow(() => logFatal([], marker));
+  } finally {
+    installed.restore();
+    pipe.close();
+  }
+  const after = await fs.lstat(other);
+  assert.equal(after.mode & 0o777, before.mode & 0o777);
+  assert.equal(after.nlink, 2);
+  assert.equal(await fs.readFile(other, "utf8"), "keep-this-secret\n");
+  assert.equal((await fs.readFile(path.join(dir, FATAL_FALLBACK_NAME), "utf8")).includes(marker), false);
+});
+
+test("a fatal fallback stays within 1 MiB", async () => {
+  const dir = await realTempDir();
+  const file = path.join(dir, FATAL_FALLBACK_NAME);
+  const filled = openSync(file, "w", 0o600);
+  writeSync(filled, Buffer.alloc(FILE_LOG_CAP, 0x61));
+  closeSync(filled);
+  const pipe = fullFifo(dir);
+  const marker = "fatal-over-cap";
+  const installed = installFileLog(pipe.fd, { cap: 32 * 1024, fallbackDir: dir });
+  try {
+    pipe.fill();
+    assert.doesNotThrow(() => logFatal([], marker));
+  } finally {
+    installed.restore();
+    pipe.close();
+  }
+  const st = await fs.lstat(file);
+  assert.equal(st.isSymbolicLink(), false);
+  assert.equal(st.mode & 0o777, 0o600);
+  assert.ok(st.size <= FILE_LOG_CAP, "fatal.log is " + st.size);
+  assert.ok(st.size < FILE_LOG_CAP, "fatal.log kept the previous megabyte");
+  const text = await fs.readFile(file, "utf8");
+  assert.equal(text.startsWith("fatal log restarted\n"), true);
+  assert.equal(text.includes(marker), true);
+  assert.equal(text.includes("aaa"), false);
+});
+
+test("a fatal fallback redacts a vault path and a note file name", async () => {
+  const dir = await realTempDir();
+  const pipe = fullFifo(dir);
+  const planted = "/Users/ada/Vault/notes/secret-plan.md";
+  const noteName = "shopping-list.md";
+  const docId = "01abc234-def0-4567-8901-23456789abcd";
+  const installed = installFileLog(pipe.fd, { cap: 32 * 1024, fallbackDir: dir });
+  let piped = "";
+  try {
+    pipe.fill();
+    assert.doesNotThrow(() => logFatal([], "save failed", planted, "note=" + noteName, "doc=" + docId));
+    piped = pipe.read();
+  } finally {
+    installed.restore();
+    pipe.close();
+  }
+  const text = await fs.readFile(path.join(dir, FATAL_FALLBACK_NAME), "utf8");
+  assert.equal(text.includes(planted), false, text);
+  assert.equal(text.includes("secret-plan.md"), false, text);
+  assert.equal(text.includes(noteName), false, text);
+  assert.equal(text.includes(docId), true, text);
+  assert.equal(piped.includes(planted), false);
 });
 
 async function signalFlushesLastLine(signal) {
@@ -507,6 +713,149 @@ test("a second signal exits a hung close", { timeout: 20000 }, async () => {
   assert.ok(result.elapsed < 3000, "second signal waited " + result.elapsed + "ms");
 });
 
+async function spawnRelay(dir, envExtra = {}) {
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await fs.mkdir(vault, { recursive: true });
+  await fs.mkdir(data, { recursive: true });
+  const stderr = path.join(dir, "stderr.log");
+  const fd = openSync(stderr, "w");
+  const server = fileURLToPath(new URL("../src/server.mjs", import.meta.url));
+  const env = { ...process.env, AIDANOS_RELAY_TOKEN: TOKEN, ...envExtra };
+  delete env.AIDANOS_RELAY_TOKEN_FILE;
+  delete env.AIDANOS_RELAY_GIT_URL;
+  delete env.AIDANOS_RELAY_GIT_TOKEN;
+  delete env.AIDANOS_RELAY_TEST_HANG_CLOSE;
+  if (!Object.prototype.hasOwnProperty.call(envExtra, "NODE_ENV")) delete env.NODE_ENV;
+  if (!Object.prototype.hasOwnProperty.call(envExtra, "AIDANOS_RELAY_ALLOW_RESET")) delete env.AIDANOS_RELAY_ALLOW_RESET;
+  for (const name of [
+    "AIDANOS_RELAY_TEST_SLOW_SAVE",
+    "AIDANOS_RELAY_TEST_SAVE_STAGED",
+    "AIDANOS_RELAY_TEST_SAVE_HOLD_MS",
+    "AIDANOS_RELAY_TEST_SAVE_WAIT_MS",
+    "AIDANOS_RELAY_TEST_SHUTDOWN_MS",
+  ]) {
+    if (!Object.prototype.hasOwnProperty.call(envExtra, name)) delete env[name];
+  }
+  const child = spawn(process.execPath, [server, "--vault", vault, "--data", data, "--port", "0"], {
+    env,
+    stdio: ["ignore", "pipe", fd],
+  });
+  let stdout = "";
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no LISTENING\n" + stdout)), 20000);
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+        if (!stdout.includes("LISTENING")) return;
+        clearTimeout(timer);
+        resolve();
+      });
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        reject(new Error("exited " + code + " before LISTENING\n" + stdout));
+      });
+    });
+  } catch (error) {
+    closeSync(fd);
+    child.kill("SIGKILL");
+    throw error;
+  }
+  const port = Number((stdout.match(/LISTENING 127\.0\.0\.1 (\d+)/) || [])[1]);
+  return { child, vault, data, port, stderr, fd };
+}
+
+async function waitForPath(file) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    try {
+      await fs.stat(file);
+      return;
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  throw new Error("missing " + file);
+}
+
+test("a slow save in flight at SIGTERM finishes and the file is whole", { timeout: 20000 }, async () => {
+  assert.equal(SAVE_WAIT_MS, 12000);
+  assert.equal(SHUTDOWN_DEADLINE_MS, 5000);
+  const dir = await tempDir();
+  const staged = path.join(dir, "staged");
+  const body = slowSaveNoteBody();
+  const started = await spawnRelay(dir, {
+    NODE_ENV: "test",
+    AIDANOS_RELAY_TEST_SLOW_SAVE: "1",
+    AIDANOS_RELAY_TEST_SAVE_STAGED: staged,
+    AIDANOS_RELAY_TEST_SAVE_HOLD_MS: "900",
+    AIDANOS_RELAY_TEST_SHUTDOWN_MS: "400",
+  });
+  try {
+    await waitForPath(staged);
+  } catch (error) {
+    closeSync(started.fd);
+    started.child.kill("SIGKILL");
+    throw error;
+  }
+  const began = Date.now();
+  started.child.kill("SIGTERM");
+  const [code] = await once(started.child, "exit");
+  const elapsed = Date.now() - began;
+  closeSync(started.fd);
+  const note = await fs.readFile(path.join(started.vault, SLOW_SAVE_NOTE_NAME), "utf8");
+  const names = await fs.readdir(started.vault);
+  const text = await fs.readFile(started.stderr, "utf8");
+  assert.equal(code, 0, text);
+  assert.equal(note, body);
+  assert.equal(note, await fs.readFile(staged, "utf8"));
+  assert.equal(names.some((name) => name.endsWith(".tmp")), false);
+  assert.equal(text.includes(SAVE_WAIT_TIMEOUT_LINE), false, text);
+  assert.equal(text.includes(SHUTDOWN_TIMEOUT_LINE), false, text);
+  assert.match(text, /relay log closed/);
+  assert.ok(elapsed >= 700, "exited in " + elapsed + "ms");
+  assert.ok(elapsed < 5000, "exited in " + elapsed + "ms");
+});
+
+test("a save that outlasts the shutdown bound is logged before close", { timeout: 20000 }, async () => {
+  const dir = await tempDir();
+  const staged = path.join(dir, "staged");
+  const body = slowSaveNoteBody();
+  const started = await spawnRelay(dir, {
+    NODE_ENV: "test",
+    AIDANOS_RELAY_TEST_SLOW_SAVE: "1",
+    AIDANOS_RELAY_TEST_SAVE_STAGED: staged,
+    AIDANOS_RELAY_TEST_SAVE_HOLD_MS: "2000",
+    AIDANOS_RELAY_TEST_SAVE_WAIT_MS: "150",
+    AIDANOS_RELAY_TEST_SHUTDOWN_MS: "400",
+  });
+  try {
+    await waitForPath(staged);
+  } catch (error) {
+    closeSync(started.fd);
+    started.child.kill("SIGKILL");
+    throw error;
+  }
+  const began = Date.now();
+  started.child.kill("SIGTERM");
+  const [code] = await once(started.child, "exit");
+  const elapsed = Date.now() - began;
+  closeSync(started.fd);
+  const text = await fs.readFile(started.stderr, "utf8");
+  let note = "";
+  try {
+    note = await fs.readFile(path.join(started.vault, SLOW_SAVE_NOTE_NAME), "utf8");
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  assert.equal(code, 0, text);
+  assert.match(text, new RegExp(SAVE_WAIT_TIMEOUT_LINE));
+  assert.match(text, /relay log closed/);
+  assert.notEqual(note, body);
+  assert.ok(elapsed < 1500, "waited out the save in " + elapsed + "ms");
+});
+
 test("index trace turns off when automerge internals are missing", async () => {
   const lines = [];
   await installIndexTrace((line) => lines.push(line), {
@@ -596,6 +945,12 @@ test("redact removes the token and the git url", () => {
   assert.equal(short.includes("Bearer a"), false);
   const long = "q".repeat(64);
   assert.equal(redact("Bearer " + long, []).includes("q"), false);
+  const planted = "save failed /Users/ada/Vault/notes/secret-plan.md note=shopping-list.md doc=01abc234-def0-4567-8901-23456789abcd";
+  const locations = redact(planted, []);
+  assert.equal(locations.includes("/Users/ada"), false);
+  assert.equal(locations.includes("secret-plan.md"), false);
+  assert.equal(locations.includes("shopping-list.md"), false);
+  assert.equal(locations.includes("01abc234-def0-4567-8901-23456789abcd"), true);
 });
 
 test("relay rejects a bad token and accepts the real one", async () => {
@@ -1217,6 +1572,31 @@ test("reset is off unless a supervisor asked for it", async () => {
     assert.equal(hidden.status, 404);
   } finally {
     await relay.close();
+  }
+});
+
+test("reset is off when NODE_ENV is production or unset", { timeout: 40000 }, async () => {
+  for (const nodeEnv of ["production", ""]) {
+    const dir = await tempDir();
+    const extra = { AIDANOS_RELAY_ALLOW_RESET: "1" };
+    if (nodeEnv) extra.NODE_ENV = nodeEnv;
+    const started = await spawnRelay(dir, extra);
+    const note = path.join(started.vault, "kept.md");
+    await fs.writeFile(note, "keep-this-note\n");
+    const marker = await fs.readFile(path.join(started.data, "relay-folder"), "utf8");
+    try {
+      const response = await fetch("http://127.0.0.1:" + started.port + "/reset", {
+        method: "POST",
+        headers: { authorization: "Bearer " + TOKEN },
+      });
+      assert.equal(response.status, 404, nodeEnv || "unset");
+      assert.equal(await fs.readFile(note, "utf8"), "keep-this-note\n");
+      assert.equal(await fs.readFile(path.join(started.data, "relay-folder"), "utf8"), marker);
+    } finally {
+      started.child.kill("SIGTERM");
+      await once(started.child, "exit");
+      closeSync(started.fd);
+    }
   }
 });
 

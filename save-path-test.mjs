@@ -880,6 +880,7 @@ await check("a helper under a bad ancestor is refused, and /tmp is allowed", asy
   fs.chmodSync(ownedBin, 0o755);
   fs.chmodSync(owned, 0o755);
   const gave = chownOther(owned);
+  let sticky = "";
   try {
     assert(ancestorFault(writable) === "ancestor-writable", ancestorFault(writable));
     assert(installFaultText("ancestor-writable") === "group-writable ancestor", installFaultText("ancestor-writable"));
@@ -901,12 +902,15 @@ await check("a helper under a bad ancestor is refused, and /tmp is allowed", asy
     fs.symlinkSync(real, via);
     assert(ancestorFault(path.join(via, "child")) === "ancestor", "a user-owned symlink ancestor was allowed");
 
-    const sticky = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sticky-"));
+    // /tmp is the sticky root directory. On macOS it is a root-owned symlink
+    // to /private/tmp, so this path also checks that follow. The per-user
+    // temp directory is neither sticky nor owned by root.
+    const tmpReal = fs.statSync("/tmp");
+    assert(tmpReal.isDirectory() && tmpReal.uid === 0 && (tmpReal.mode & 0o1000) !== 0, "/tmp is not a sticky root directory");
+    sticky = fs.mkdtempSync(path.join("/tmp", "aidanos-sticky-"));
     const stickyTool = path.join(sticky, "dirfd-tool");
     fs.copyFileSync(shippedHelper(), stickyTool);
     fs.chmodSync(stickyTool, 0o755);
-    const tmpStat = fs.lstatSync(os.tmpdir());
-    assert(tmpStat.uid === 0 && (tmpStat.mode & 0o1000) !== 0, "the temp directory is not a sticky root directory");
     assert(ancestorFault(sticky) === "", ancestorFault(sticky) || "sticky ancestor was refused");
     await withHelperEnv({ AIDANOS_DIRFD_TOOL: stickyTool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
       createExclusive(folder, "sticky.recover", Buffer.from("ok\n"), "helper"));
@@ -916,6 +920,8 @@ await check("a helper under a bad ancestor is refused, and /tmp is allowed", asy
     if (gave) chownTo(process.getuid(), owned);
     fs.chmodSync(writable, 0o755);
     fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(vault, { recursive: true, force: true });
+    if (sticky) fs.rmSync(sticky, { recursive: true, force: true });
   }
 });
 

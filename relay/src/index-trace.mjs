@@ -135,26 +135,57 @@ function wrap(obj, key, name) {
   obj[key] = wrapped;
 }
 
+const PROTO_METHODS = [
+  "receiveSyncMessage",
+  "generateSyncMessage",
+  "applyAndReturnPatches",
+  "save",
+  "saveSince",
+  "diff",
+  "loadIncremental",
+];
+const API_METHODS = ["decodeSyncMessage", "encodeSyncState", "decodeSyncState"];
+
+function tracedShape(loaded) {
+  const proto = loaded && loaded.wasm && loaded.wasm.Automerge && loaded.wasm.Automerge.prototype;
+  const api = loaded && loaded.ApiHandler;
+  if (!proto || !api) throw new Error("missing automerge internals");
+  for (const key of PROTO_METHODS) {
+    if (typeof proto[key] !== "function") throw new Error("missing automerge internals");
+  }
+  for (const key of API_METHODS) {
+    if (typeof api[key] !== "function") throw new Error("missing automerge internals");
+  }
+  return { proto, api };
+}
+
+function wrapLoaded(loaded) {
+  const { proto, api } = tracedShape(loaded);
+  wrap(proto, "receiveSyncMessage", "receive");
+  wrap(proto, "generateSyncMessage", "generate");
+  wrap(proto, "applyAndReturnPatches", "patches");
+  wrap(proto, "save", "save");
+  wrap(proto, "saveSince", "saveSince");
+  wrap(proto, "diff", "diff");
+  wrap(proto, "loadIncremental", "loadIncremental");
+  wrap(api, "decodeSyncMessage", "decode");
+  wrap(api, "encodeSyncState", "encodeState");
+  wrap(api, "decodeSyncState", "decodeState");
+}
+
 // low_level.js is ESM. The wasm class is CJS. Both are already loaded by
-// the time the relay starts; this only wraps the live functions.
+// the time the relay starts; this only wraps the live functions. A missing
+// or reshaped private file turns tracing off. It must not stop the relay.
+async function loadAutomergeInternals() {
+  const entry = import.meta.resolve("@automerge/automerge");
+  const wasm = require(fileURLToPath(new URL("../wasm_bindgen_output/nodejs/automerge_wasm.cjs", entry)));
+  const { ApiHandler } = await import(new URL("../low_level.js", entry).href);
+  return { wasm, ApiHandler };
+}
+
 function patchAutomerge() {
   if (!patching) {
-    patching = (async () => {
-      const entry = import.meta.resolve("@automerge/automerge");
-      const wasm = require(fileURLToPath(new URL("../wasm_bindgen_output/nodejs/automerge_wasm.cjs", entry)));
-      const { ApiHandler } = await import(new URL("../low_level.js", entry).href);
-      const proto = wasm.Automerge && wasm.Automerge.prototype;
-      wrap(proto, "receiveSyncMessage", "receive");
-      wrap(proto, "generateSyncMessage", "generate");
-      wrap(proto, "applyAndReturnPatches", "patches");
-      wrap(proto, "save", "save");
-      wrap(proto, "saveSince", "saveSince");
-      wrap(proto, "diff", "diff");
-      wrap(proto, "loadIncremental", "loadIncremental");
-      wrap(ApiHandler, "decodeSyncMessage", "decode");
-      wrap(ApiHandler, "encodeSyncState", "encodeState");
-      wrap(ApiHandler, "decodeSyncState", "decodeState");
-    })();
+    patching = loadAutomergeInternals().then(wrapLoaded);
   }
   return patching;
 }
@@ -238,10 +269,23 @@ function startLagTimer() {
   if (timer.unref) timer.unref();
 }
 
-export function installIndexTrace(log) {
+export async function installIndexTrace(log, options = {}) {
   if (typeof log === "function") write = log;
   startLagTimer();
-  return patchAutomerge();
+  const custom = typeof options.load === "function";
+  try {
+    if (custom) {
+      wrapLoaded(await options.load());
+      return;
+    }
+    await patchAutomerge();
+  } catch {
+    // One line. Sync keeps running with the timers still in place and
+    // without the private Automerge wrappers. A test load must not
+    // disable the real wrappers for the rest of the process.
+    write("index trace off");
+    if (!custom) patching = Promise.resolve();
+  }
 }
 
 export function beginFrame(docId) {

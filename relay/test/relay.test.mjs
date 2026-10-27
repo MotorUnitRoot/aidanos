@@ -18,6 +18,7 @@ import {
   foldInFailureLine,
   mirrorFailureLine,
   mirrorNoteFailureLine,
+  saveNoteFile,
   sweepStaleNoteTemps,
 } from "../src/mirror.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
@@ -1325,6 +1326,22 @@ function deadPid() {
   }
   return 0;
 }
+
+test("a note temp is recorded when the vault path is a symlink", async () => {
+  const dir = await tempDir();
+  const real = path.join(dir, "real");
+  const link = path.join(dir, "link");
+  const data = path.join(dir, "data");
+  await fs.mkdir(real);
+  await fs.mkdir(data);
+  await fs.symlink(real, link);
+  const file = path.join(real, "day.md");
+  await saveNoteFile(file, "hello\n", undefined, { vault: link, stateDir: data });
+  assert.equal(await fs.readFile(file, "utf8"), "hello\n");
+  const manifest = await fs.readFile(path.join(data, NOTE_TEMP_MANIFEST), "utf8");
+  assert.equal(manifest.includes(".."), false, manifest);
+  assert.equal(manifest.trim(), "");
+});
 
 test("an unclaimed folder keeps every temp, including a wrong vault", async () => {
   const dead = deadPid();

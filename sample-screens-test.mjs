@@ -230,11 +230,15 @@ try {
   async function openAsk(query) {
     await evalJs(`document.getElementById("ask-close").click()`);
     await evalJs(`document.getElementById("ask-open").click()`);
+    // Setting the field and dispatching input waits 140ms, then runAsk clears
+    // the list. The empty search ask-open already started can paint the latch
+    // inside that gap, and the clear lands before the click. Submit runs the
+    // query now and does not schedule that second clear.
     await evalJs(`(() => {
       const q = document.getElementById("ask-q");
       q.focus();
       q.value = ${JSON.stringify(query)};
-      q.dispatchEvent(new Event("input", { bubbles: true }));
+      document.getElementById("ask-form").requestSubmit();
       return true;
     })()`);
     await waitFor(async () => {
@@ -249,14 +253,18 @@ try {
   }
 
   async function clickHit(query) {
-    const clicked = await evalJs(`(() => {
-      const hits = document.getElementById("ask-hits");
-      const button = [...hits.querySelectorAll("button")].find((item) => (item.textContent || "").toLowerCase().includes(${JSON.stringify(query.toLowerCase())}));
-      if (!button) return "no hit";
-      button.click();
-      return true;
-    })()`);
-    assert(clicked === true, "click " + query + " " + clicked);
+    // Find and click in one page turn, and keep trying through a clear.
+    // The 8s budget is the same one the search wait already uses.
+    await waitFor(async () => {
+      const clicked = await evalJs(`(() => {
+        const hits = document.getElementById("ask-hits");
+        const button = hits ? [...hits.querySelectorAll("button")].find((item) => (item.textContent || "").toLowerCase().includes(${JSON.stringify(query.toLowerCase())})) : null;
+        if (!button) return "no hit";
+        button.click();
+        return true;
+      })()`);
+      return clicked === true ? true : clicked;
+    }, 8000, "click " + query);
   }
 
   async function prepareDoor() {

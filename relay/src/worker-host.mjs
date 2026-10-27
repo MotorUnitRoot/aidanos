@@ -419,6 +419,10 @@ export function createWorkerHost(options = {}) {
         // The worker is already gone.
       }
     },
+    async finishSaves() {
+      wakeWorker(wake);
+      await host.rpc("finishSaves", {});
+    },
     async now() {
       await repo._settle();
       await repo._refresh([...repo._handles.keys()]);

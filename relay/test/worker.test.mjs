@@ -529,6 +529,37 @@ test("a mirror write onto a symlink or a hard link is refused", async () => {
   }
 });
 
+test("shutdown asks the worker to finish an in-flight save", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault,
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+    testSaveHoldMs: 400,
+  });
+  try {
+    const id = noteId("notes/held.md");
+    relay.repo.import(Automerge.save(Automerge.from({ kind: "index", paths: { "notes/held.md": id } })), { docId: INDEX_ID });
+    const handle = relay.repo.import(Automerge.save(Automerge.from({ kind: "note", text: "Hello" })), { docId: id });
+    await relay.mirrorNow();
+    assert.equal(await fs.readFile(path.join(vault, "notes", "held.md"), "utf8"), "Hello");
+    handle.change((doc) => {
+      Automerge.updateText(doc, ["text"], "Hello finished");
+    });
+    const started = Date.now();
+    await Promise.all([relay.mirrorNow(), relay.stopAcceptingAndDrainSaves()]);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 300, "drain returned in " + elapsed + "ms");
+    assert.equal(await fs.readFile(path.join(vault, "notes", "held.md"), "utf8"), "Hello finished");
+  } finally {
+    await relay.close();
+  }
+});
+
 test("the directory helper works from a worker thread", async () => {
   const dir = await tempDir();
   const reply = await new Promise((resolve, reject) => {

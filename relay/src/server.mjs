@@ -1285,14 +1285,31 @@ export async function startRelay(options = {}) {
     },
     async stopAcceptingAndDrainSaves() {
       accepting = false;
-      if (live && live.mirror) live.mirror.stop();
       for (const entry of servers) {
         try {
           if (entry.httpServer.listening) entry.httpServer.close();
         } catch { /* close() stops the rest */ }
       }
-      const result = await waitForInflightSaves(saveWaitBound(env));
-      if (result === "timeout") logSafe(secrets, SAVE_WAIT_TIMEOUT_LINE);
+      const bound = saveWaitBound(env);
+      const session = live;
+      const asked = session && session.mirror && typeof session.mirror.finishSaves === "function"
+        ? session.mirror.finishSaves().then(() => "settled", () => "settled")
+        : Promise.resolve("settled");
+      let timed = false;
+      const timeout = new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          timed = true;
+          resolve("timeout");
+        }, bound);
+        asked.then(() => clearTimeout(timer), () => clearTimeout(timer));
+      });
+      const [workerResult, localResult] = await Promise.all([
+        Promise.race([asked, timeout]),
+        waitForInflightSaves(bound),
+      ]);
+      if (workerResult === "timeout" || localResult === "timeout" || timed) {
+        logSafe(secrets, SAVE_WAIT_TIMEOUT_LINE);
+      }
     },
   };
   if (env.NODE_ENV === "test") {

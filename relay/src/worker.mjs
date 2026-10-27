@@ -231,13 +231,23 @@ async function run() {
   }
   warmSyncEngine();
   let saveSeq = 1;
+  let armSaveHold = false;
+  const saveTasks = new Set();
   function trackSave(work) {
     const id = saveSeq;
     saveSeq += 1;
     post({ v: 1, kind: "save", id, phase: "start" });
-    return Promise.resolve().then(work).finally(() => {
+    const run = Promise.resolve().then(async () => {
+      if (armSaveHold && test && test.saveHoldMs) {
+        await new Promise((resolve) => setTimeout(resolve, test.saveHoldMs));
+      }
+      return work();
+    }).finally(() => {
       post({ v: 1, kind: "save", id, phase: "end" });
     });
+    saveTasks.add(run);
+    run.finally(() => saveTasks.delete(run));
+    return run;
   }
   const inner = new NodeFSStorageAdapter(data.dataDir);
   const storage = traceStorage(new SafeStorage(data.dataDir, inner));
@@ -264,6 +274,7 @@ async function run() {
   });
   await preloadStoredNotes(repo);
   await mirror.now();
+  armSaveHold = true;
   const peerMetadata = await repo.networkSubsystem.peerMetadata;
   if (!adapter.peerId) throw new Error("The sync engine was not ready.");
   post({
@@ -337,6 +348,12 @@ async function run() {
     }
     if (method === "stop") {
       mirror.stop();
+      return { result: { ok: true }, transfer: [] };
+    }
+    if (method === "finishSaves") {
+      mirror.stop();
+      await mirror.idle();
+      await Promise.all([...saveTasks]);
       return { result: { ok: true }, transfer: [] };
     }
     throw new Error("failed");

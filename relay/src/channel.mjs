@@ -199,5 +199,7 @@ export function workerTestHook(options, env = process.env) {
   if (options.testCrashOnBoot === true) hook.crashOnBoot = true;
   if (options.testEcho === true) hook.echo = true;
   if (options.testBadChannel === true) hook.badChannel = true;
+  const saveHold = Number(options.testSaveHoldMs);
+  if (Number.isFinite(saveHold) && saveHold > 0) hook.saveHoldMs = saveHold;
   return Object.keys(hook).length ? hook : null;
 }

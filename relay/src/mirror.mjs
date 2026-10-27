@@ -917,6 +917,7 @@ export async function saveNoteFile(file, text, beforeRename, options = {}) {
 // The id is already a token, or a short hash when it is not.
 export function logToken(value) {
   const text = String(value ?? "");
+  if (!text) return "no-doc-id";
   if (/^[A-Za-z0-9]{6,80}$/.test(text)) return text;
   return crypto.createHash("sha256").update(text).digest("hex").slice(0, 12);
 }

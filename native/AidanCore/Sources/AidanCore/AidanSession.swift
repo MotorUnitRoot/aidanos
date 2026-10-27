@@ -77,7 +77,6 @@ public final class AidanSession: SyncHost {
     private var link: RelayLink?
     private var syncByteLimit = SyncLimits.maxMessageBytes
     private var oversized: Set<String> = []
-    private var lastOutbound: String?
     private var watcher: DispatchSourceTimer?
     private let peerId: String
     private let storageId: String
@@ -339,7 +338,6 @@ public final class AidanSession: SyncHost {
         lock.lock()
         desiredURL = nil
         desiredToken = nil
-        lastOutbound = nil
         reconnectWork?.cancel()
         let current = link
         link = nil
@@ -524,12 +522,6 @@ public final class AidanSession: SyncHost {
         conflictCallback?()
     }
 
-    func noteSent(docId: String) {
-        lock.lock()
-        lastOutbound = docId
-        lock.unlock()
-    }
-
     /// The note's sync message does not fit. Sync stops for this note only.
     func noteTooLarge(docId: String) {
         lock.lock()
@@ -548,19 +540,11 @@ public final class AidanSession: SyncHost {
 
     func linkFailed(_ error: Error) {
         if case AidanError.payloadTooLarge = error {
-            lock.lock()
-            let docId = lastOutbound
-            lastOutbound = nil
-            if let docId {
-                let inserted = oversized.insert(docId).inserted
-                let message = Self.tooLargeMessage(path: pathLocked(for: docId) ?? docId, limit: syncByteLimit)
-                let callback = inserted ? onError : nil
-                lock.unlock()
-                callback?(message)
-                linkClosed()
-                return
-            }
-            lock.unlock()
+            // The socket is already closing. The note was named when its frame
+            // was dropped. Reconnecting would read that frame again.
+            stopTrying()
+            setConnection(.disconnected)
+            return
         }
         guard Self.isTerminal(error) else {
             linkClosed()
@@ -601,7 +585,6 @@ public final class AidanSession: SyncHost {
             openingGate.unlock()
         }
         lock.lock()
-        lastOutbound = nil
         let next = RelayLink()
         link?.close()
         link = next

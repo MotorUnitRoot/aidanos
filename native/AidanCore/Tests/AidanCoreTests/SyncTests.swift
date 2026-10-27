@@ -550,6 +550,60 @@ final class SyncTests: XCTestCase {
         XCTAssertNotEqual(try mac.text(big), bigText)
     }
 
+    func testOversizedNoteFromTheRelayStopsOnlyThatNote() throws {
+        let relay = try TestRelay.start()
+        defer { relay.stop() }
+        let phone = try AidanSession(vault: try temporaryVault())
+        let mac = try AidanSession(vault: try temporaryVault())
+        phone.maxSyncBytes = 2_000
+        phone.reconnectPause = 0.2
+        let reconnects = Counter()
+        phone.onConnection = { state in
+            if state == .reconnecting { reconnects.add() }
+        }
+        defer {
+            phone.disconnect()
+            mac.disconnect()
+        }
+        try phone.connect(relayURL: relay.url, token: relay.token)
+        try mac.connect(relayURL: relay.url, token: relay.token)
+        let small = "notes/small-\(UUID().uuidString).md"
+        let big = "notes/big-\(UUID().uuidString).md"
+        try mac.replace(small, with: "Hi")
+        let smallArrived = try waitUntil(seconds: 20, label: "oversized-inbound-small") {
+            (try? phone.text(small)) == "Hi"
+        }
+        XCTAssertTrue(smallArrived)
+        if !smallArrived { return }
+        let reported = Flag()
+        phone.onError = { message in
+            reported.set(message)
+        }
+        let bigText = (0..<900).map { String(format: "word-%04d ", $0) }.joined()
+        try mac.replace(big, with: bigText)
+        let sawError = try waitUntil(seconds: 20, label: "oversized-inbound-error") { reported.get() }
+        XCTAssertTrue(sawError)
+        let reportedText = reported.message()
+        let namesBig = reportedText.contains(big) || reportedText.contains(DocumentIds.noteId(big))
+        XCTAssertTrue(namesBig, reportedText)
+        XCTAssertFalse(reportedText.contains(small), reportedText)
+        XCTAssertFalse(reportedText.contains(DocumentIds.noteId(small)), reportedText)
+        XCTAssertTrue(reportedText.contains("Other notes keep syncing"), reportedText)
+        XCTAssertEqual(phone.connection, .connected)
+        XCTAssertEqual(reconnects.get(), 0)
+        Thread.sleep(forTimeInterval: 0.6)
+        XCTAssertEqual(phone.connection, .connected)
+        XCTAssertEqual(reconnects.get(), 0)
+        try mac.applyEdit(small, from: "Hi", to: "Hi!")
+        let edited = try waitUntil(seconds: 20, label: "oversized-inbound-edited") {
+            (try? phone.text(small)) == "Hi!"
+        }
+        XCTAssertTrue(edited)
+        XCTAssertNotEqual(try? phone.text(big), bigText)
+        XCTAssertEqual(phone.connection, .connected)
+        XCTAssertEqual(reconnects.get(), 0)
+    }
+
     func testAppRefusesTheRelayFolder() throws {
         let vault = try temporaryVault()
         try FileManager.default.createDirectory(at: vault.appendingPathComponent(".aidanos"), withIntermediateDirectories: true)
@@ -680,6 +734,21 @@ private func rebuiltSession(path: String, text: String) throws -> (URL, AidanSes
     let again = try AidanSession(vault: vault)
     again.reconnectPause = 60
     return (vault, again)
+}
+
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func add() {
+        lock.lock()
+        value += 1
+        lock.unlock()
+    }
+    func get() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
 }
 
 private final class Flag: @unchecked Sendable {

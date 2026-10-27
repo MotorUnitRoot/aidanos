@@ -111,9 +111,9 @@ private func readValue(_ data: Data, _ cursor: inout Int, depth: Int = 0) throws
         let magnitude = try readLength(info, data, &cursor)
         return .negative(-1 - Int64(bitPattern: magnitude))
     case 2:
-        return .bytes(try readBytes(info, data, &cursor))
+        return .bytes(try readBytes(info, data, &cursor, depth: depth))
     case 3:
-        let bytes = try readBytes(info, data, &cursor)
+        let bytes = try readBytes(info, data, &cursor, depth: depth)
         guard let text = String(data: bytes, encoding: .utf8) else {
             throw AidanError.protocol("The relay sent text that is not UTF-8.")
         }
@@ -194,7 +194,7 @@ private func readLength(_ info: UInt8, _ data: Data, _ cursor: inout Int) throws
     return value
 }
 
-private func readBytes(_ info: UInt8, _ data: Data, _ cursor: inout Int) throws -> Data {
+private func readBytes(_ info: UInt8, _ data: Data, _ cursor: inout Int, depth: Int) throws -> Data {
     if info == 31 {
         var out = Data()
         while try peek(data, cursor) != 0xFF {

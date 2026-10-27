@@ -87,6 +87,7 @@ jobs:
           # The simulator cannot start its own relay, so every iOS test shares
           # this process. POST /reset empties the folder in that process.
           # Starting Node again while the simulator is up is too slow.
+          # Reset stays off unless NODE_ENV=test as well as the allow flag.
           # This loop only starts a new process if the current one dies.
           # --cpu-prof writes the profile when this process exits. The stop
           # step SIGTERMs it; a kill -9 would leave the profile empty.
@@ -100,6 +101,7 @@ jobs:
               rm -rf "$vault" "$data"
               mkdir -p "$vault" "$data" "$cpu"
               AIDANOS_RELAY_TOKEN=aidanos-test-token-0123456789abcdef \
+                NODE_ENV=test \
                 AIDANOS_RELAY_ALLOW_RESET=1 \
                 node --cpu-prof --cpu-prof-dir "$cpu" src/server.mjs --port 3757 \
                 --vault "$vault" --data "$data" >> "$log" 2>&1 < /dev/null &

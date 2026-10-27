@@ -39,12 +39,12 @@ async function tempDir() {
   return fs.mkdtemp(path.join(os.tmpdir(), "relay-worker-"));
 }
 
-function joinFrame(senderId) {
+function joinFrame(senderId, extra = {}) {
   return encode({
     type: "join",
     senderId,
     supportedProtocolVersions: ["1"],
-    peerMetadata: { storageId: STORAGE_ID, isEphemeral: false },
+    peerMetadata: { storageId: STORAGE_ID, isEphemeral: false, ...extra },
   });
 }
 
@@ -228,12 +228,18 @@ test("test hooks and the worker env stay off outside the test process", () => {
   assert.equal(workerTestHook({ testCrash: true }, { NODE_ENV: "test" }).crash, true);
   const env = trimmedWorkerEnv({
     PATH: "/usr/bin",
+    HOME: "/home/ada",
+    NODE_ENV: "test",
     AIDANOS_RELAY_TOKEN: TOKEN,
     AIDANOS_RELAY_ALLOW_RESET: "1",
-    OTHER: "kept",
+    GITHUB_TOKEN: "ghp-secret",
+    OTHER: "dropped",
   });
   assert.equal(env.PATH, "/usr/bin");
-  assert.equal(env.OTHER, "kept");
+  assert.equal(env.HOME, "/home/ada");
+  assert.equal(env.NODE_ENV, "test");
+  assert.equal(env.OTHER, undefined);
+  assert.equal(env.GITHUB_TOKEN, undefined);
   assert.equal(Object.keys(env).some((key) => key.startsWith("AIDANOS_")), false);
   assert.deepEqual(workerExecArgv({ CI: "" }, ["--cpu-prof", "--cpu-prof-dir", "/tmp/p"]), []);
   assert.deepEqual(
@@ -267,6 +273,12 @@ test("storage bytes are written with mode 0600 and a symlink is left untouched",
   assert.equal(await fs.readFile(file, "utf8"), "second");
   const temps = (await fs.readdir(root)).filter((name) => name.startsWith(".tmp-"));
   assert.equal(temps.length, 0);
+  const tmpDir = path.join(root, ".relay-tmp");
+  const tmpInfo = await fs.lstat(tmpDir);
+  assert.equal(tmpInfo.isDirectory(), true);
+  assert.equal(tmpInfo.mode & 0o777, 0o700);
+  const leftover = (await fs.readdir(tmpDir)).filter((name) => name.startsWith(".tmp-"));
+  assert.equal(leftover.length, 0);
 });
 
 test("a symlinked storage folder is refused before markers are written", async () => {
@@ -455,7 +467,9 @@ test("two crashes on one document refuse later frames for it", async () => {
     assert.equal(health.status, 200);
     assert.equal(body.status, "ok");
     assert.equal(relay.refusedDocs().includes(id), true);
-    assert.equal(seen.some((line) => line.includes("refused document " + id)), true);
+    const poison = seen.filter((line) => line.includes("poison document"));
+    assert.ok(poison.length >= 1, seen.join("\n"));
+    assert.equal(poison.some((line) => line.includes(id)), false, poison.join("\n"));
   } finally {
     console.error = write;
     await relay.close();
@@ -555,7 +569,7 @@ test("a mirror write onto a symlink or a hard link is refused", async () => {
     await relay.mirrorNow();
     assert.equal(await fs.readFile(target, "utf8"), "secret-target");
     assert.equal((await fs.lstat(file)).isSymbolicLink(), true);
-    assert.equal(seen.some((line) => line.includes("mirror write refused")), true);
+    assert.equal(seen.some((line) => line.includes("mirror failed for " + id)), true, seen.join("\n"));
     assert.equal(seen.some((line) => line.includes("notes/hello.md")), false);
   } finally {
     console.error = write;
@@ -879,17 +893,16 @@ test("a bad worker message is dropped and the socket stays up", async () => {
     ws.send(requestFrame("bad-1", noteId("notes/bad.md")));
     await new Promise((resolve) => setTimeout(resolve, 200));
     assert.equal(ws.readyState, WebSocket.OPEN);
-    const again = onceMessage(ws, (message) => message.type === "peer");
-    ws.send(joinFrame("bad-1"));
-    const message = await again;
-    assert.equal(message.type, "peer");
+    ws.send(requestFrame("bad-1", noteId("notes/other.md")));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(ws.readyState, WebSocket.OPEN);
     ws.close();
   } finally {
     await relay.close();
   }
 });
 
-test("a duplicate peer id closes the older socket", async () => {
+test("a duplicate peer id keeps the existing device", async () => {
   const dir = await tempDir();
   const seen = [];
   const write = console.error;
@@ -905,16 +918,15 @@ test("a duplicate peer id closes the older socket", async () => {
   try {
     const older = await openSocket(relay.url);
     const firstPeer = onceMessage(older, (message) => message.type === "peer");
-    const closed = onceClose(older);
     older.send(joinFrame("same-peer"));
     await firstPeer;
     const newer = await openSocket(relay.url);
-    const secondPeer = onceMessage(newer, (message) => message.type === "peer");
+    const closed = onceClose(newer);
     newer.send(joinFrame("same-peer"));
-    await secondPeer;
-    assert.equal(await closed, 1000);
-    assert.equal(seen.some((line) => line.includes("closed the older sync connection for a duplicate peer id")), true);
-    newer.close();
+    assert.equal(await closed, 1008);
+    assert.equal(older.readyState, WebSocket.OPEN);
+    assert.equal(seen.some((line) => line.includes("kept the existing device for a duplicate peer id")), true);
+    older.close();
   } finally {
     console.error = write;
     await relay.close();
@@ -927,7 +939,9 @@ test("logs do not include the relay token", async () => {
   const write = console.error;
   console.error = (text) => seen.push(String(text));
   const previous = process.env.AIDANOS_RELAY_TOKEN;
+  const previousGithub = process.env.GITHUB_TOKEN;
   process.env.AIDANOS_RELAY_TOKEN = TOKEN;
+  process.env.GITHUB_TOKEN = "ghp-test-secret";
   const relay = await startRelay({
     token: TOKEN,
     vault: path.join(dir, "vault"),
@@ -944,12 +958,425 @@ test("logs do not include the relay token", async () => {
     ws.close();
     const text = seen.join("\n");
     assert.equal(text.includes(TOKEN), false);
-    assert.equal(text.includes("worker saw AIDANOS_ env"), false);
+    assert.equal(text.includes("ghp-test-secret"), false);
+    assert.equal(text.includes("worker saw secret env"), false);
   } finally {
     console.error = write;
     if (previous == null) delete process.env.AIDANOS_RELAY_TOKEN;
     else process.env.AIDANOS_RELAY_TOKEN = previous;
+    if (previousGithub == null) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousGithub;
     await relay.close();
+  }
+});
+
+test("a second join on the same socket is closed", async () => {
+  const dir = await tempDir();
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  try {
+    const ws = await openSocket(relay.url);
+    const peer = onceMessage(ws, (message) => message.type === "peer");
+    const closed = onceClose(ws);
+    ws.send(joinFrame("once"));
+    await peer;
+    ws.send(joinFrame("twice"));
+    assert.equal(await closed, 1008);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("the same device token replaces the older socket", async () => {
+  const dir = await tempDir();
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(String(text));
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  try {
+    const older = await openSocket(relay.url);
+    const firstPeer = onceMessage(older, (message) => message.type === "peer");
+    const closed = onceClose(older);
+    older.send(joinFrame("same-peer", { deviceToken: "device-token-1" }));
+    await firstPeer;
+    const newer = await openSocket(relay.url);
+    const secondPeer = onceMessage(newer, (message) => message.type === "peer");
+    newer.send(joinFrame("same-peer", { deviceToken: "device-token-1" }));
+    await secondPeer;
+    assert.equal(await closed, 1000);
+    assert.equal(newer.readyState, WebSocket.OPEN);
+    assert.equal(seen.some((line) => line.includes("closed the older sync connection for a duplicate peer id")), true);
+    newer.close();
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+});
+
+async function waitReady(relay) {
+  await waitFor(async () => (await fetch(relay.healthURL)).status === 200, 12_000, "not ready");
+}
+
+async function waitDown(relay) {
+  await waitFor(async () => (await fetch(relay.healthURL)).status !== 200, 12_000, "did not crash");
+}
+
+async function crashRequest(relay, sender, id) {
+  await waitReady(relay);
+  const ws = await openSocket(relay.url);
+  const peer = onceMessage(ws, (message) => message.type === "peer");
+  const closed = onceClose(ws, 12_000);
+  ws.send(joinFrame(sender));
+  await peer;
+  ws.send(requestFrame(sender, id));
+  assert.equal(await closed, 1011);
+  await waitDown(relay);
+}
+
+async function assertKeptAndOtherSyncs(relay, seen, id) {
+  await waitReady(relay);
+  assert.equal(relay.refusedDocs().includes(id), true);
+  const poison = seen.filter((line) => line.includes("poison document"));
+  assert.ok(poison.length >= 1, seen.join("\n"));
+  assert.equal(poison.some((line) => line.includes(id)), false);
+  const health = await fetch(relay.healthURL);
+  const body = await health.json();
+  assert.equal(health.status, 200);
+  assert.equal(body.status, "ok");
+  const bad = await openSocket(relay.url);
+  const badPeer = onceMessage(bad, (message) => message.type === "peer");
+  const badClosed = onceClose(bad);
+  bad.send(joinFrame("after-bad"));
+  await badPeer;
+  bad.send(requestFrame("after-bad", id));
+  assert.equal(await badClosed, 1008);
+  const other = noteId("notes/other-ok.md");
+  const ws = await openSocket(relay.url);
+  const peer = onceMessage(ws, (message) => message.type === "peer");
+  ws.send(joinFrame("after-ok"));
+  await peer;
+  const answer = onceMessage(
+    ws,
+    (entry) => entry.type === "sync" || entry.type === "request" || entry.type === "doc-unavailable",
+    12_000,
+  );
+  ws.send(requestFrame("after-ok", other));
+  const message = await answer;
+  assert.equal(typeof message.type, "string");
+  const again = await fetch(relay.healthURL);
+  const againBody = await again.json();
+  assert.equal(again.status, 200);
+  assert.equal(againBody.status, "ok");
+  ws.close();
+}
+
+test("a crash on the next tick refuses that document and leaves another syncing", async () => {
+  const dir = await tempDir();
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(String(text));
+  const id = noteId("notes/delay.md");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+    testCrashDelay: "immediate",
+    testCrashDoc: id,
+  });
+  try {
+    await crashRequest(relay, "delay-0", id);
+    await crashRequest(relay, "delay-1", id);
+    await assertKeptAndOtherSyncs(relay, seen, id);
+    assert.equal(seen.some((line) => line.includes("worker crash loop")), false);
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+});
+
+test("a crash after a timer refuses that document and leaves another syncing", async () => {
+  const dir = await tempDir();
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(String(text));
+  const id = noteId("notes/timer.md");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+    testCrashDelay: "timer",
+    testCrashDoc: id,
+  });
+  try {
+    await crashRequest(relay, "timer-0", id);
+    await crashRequest(relay, "timer-1", id);
+    await assertKeptAndOtherSyncs(relay, seen, id);
+    assert.equal(seen.some((line) => line.includes("worker crash loop")), false);
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+});
+
+test("a crash inside the storage save refuses that document", async () => {
+  const dir = await tempDir();
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(String(text));
+  const id = noteId("notes/save.md");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+    testCrashSave: true,
+    testCrashDoc: id,
+  });
+  try {
+    for (let n = 0; n < 2; n += 1) {
+      await waitReady(relay);
+      try {
+        await relay.repo.import(Automerge.save(Automerge.from({ kind: "note", text: "save-" + n })), { docId: id });
+      } catch {
+        // The worker exits inside the save.
+      }
+      await waitDown(relay);
+    }
+    await assertKeptAndOtherSyncs(relay, seen, id);
+    assert.equal(seen.some((line) => line.includes("worker crash loop")), false);
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+});
+
+test("a busy worker crash mid-request and mid-save charges the document", async () => {
+  const dir = await tempDir();
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(String(text));
+  const id = noteId("notes/busy-crash.md");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+    testCrashBusy: "request",
+    testCrashDoc: id,
+  });
+  try {
+    await crashRequest(relay, "busy-req", id);
+    assert.equal(relay.refusedDocs().includes(id), false);
+    const health = await (async () => {
+      await waitReady(relay);
+      return fetch(relay.healthURL);
+    })();
+    assert.equal(health.status, 200);
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+  const saveDir = await tempDir();
+  const saveSeen = [];
+  console.error = (text) => saveSeen.push(String(text));
+  const saveRelay = await startRelay({
+    token: TOKEN,
+    vault: path.join(saveDir, "vault"),
+    data: path.join(saveDir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+    testCrashBusy: "save",
+    testCrashDoc: id,
+  });
+  try {
+    await waitReady(saveRelay);
+    try {
+      await saveRelay.repo.import(Automerge.save(Automerge.from({ kind: "note", text: "busy-save" })), { docId: id });
+    } catch {
+      // The worker exits during the save spin.
+    }
+    await waitDown(saveRelay);
+    await waitReady(saveRelay);
+    const body = await (await fetch(saveRelay.healthURL)).json();
+    assert.equal(body.status, "ok");
+    assert.equal(saveSeen.some((line) => line.includes("worker crash loop")), false);
+  } finally {
+    console.error = write;
+    await saveRelay.close();
+  }
+});
+
+test("growing ArrayBuffer and Automerge memory trips the rss watchdog", async () => {
+  const dir = await tempDir();
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(String(text));
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+    testWasmOom: true,
+    testRssHeadroom: 32 * 1024 * 1024,
+  });
+  try {
+    await waitFor(() => seen.some((line) => line.includes("worker rss")), 20_000, "rss watchdog did not fire");
+    await waitReady(relay);
+    const health = await fetch(relay.healthURL);
+    const body = await health.json();
+    assert.equal(health.status, 200);
+    assert.equal(body.status, "ok");
+    const ws = await openSocket(relay.url);
+    const peer = onceMessage(ws, (message) => message.type === "peer", 8000);
+    ws.send(joinFrame("after-rss"));
+    await peer;
+    ws.close();
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+});
+
+test("a worker that stops answering pings is restarted", async () => {
+  const dir = await tempDir();
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(String(text));
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+    testHang: true,
+  });
+  try {
+    await waitFor(() => seen.some((line) => line.includes("worker heartbeat")), 20_000, "heartbeat did not restart the worker");
+    assert.equal(seen.some((line) => /worker exited code=\d+, restart in \d+ms/.test(line)), true, seen.join("\n"));
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+});
+
+test("a torn storage temp is ignored and the index doc still loads", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  const id = noteId("notes/keep.md");
+  const full = "index-note-survives";
+  const first = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  first.repo.import(Automerge.save(Automerge.from({ kind: "index", paths: { "notes/keep.md": id } })), { docId: INDEX_ID });
+  first.repo.import(Automerge.save(Automerge.from({ kind: "note", text: full })), { docId: id });
+  await first.repo.flush();
+  await first.close();
+  async function plant(directory) {
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const fullPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) await plant(fullPath);
+    }
+    await fs.writeFile(path.join(directory, ".tmp-999999-deadbeef"), Buffer.from("torn"));
+  }
+  await plant(data);
+  const live = path.join(data, ".tmp-" + process.pid + "-aa");
+  await fs.writeFile(live, Buffer.from("live-temp"));
+  const second = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  try {
+    const index = await second.repo.find(INDEX_ID);
+    assert.equal(index.doc().paths["notes/keep.md"], id);
+    const note = await second.repo.find(id);
+    assert.equal(note.doc().text, full);
+    await assert.rejects(fs.lstat(path.join(data, ".relay-tmp", ".tmp-999999-deadbeef")), { code: "ENOENT" });
+    const still = await fs.readFile(live, "utf8");
+    assert.equal(still, "live-temp");
+  } finally {
+    await second.close();
+  }
+});
+
+test("a recovery sibling is not folded into the shared note", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(String(text));
+  const id = noteId("notes/keep.md");
+  const full = "version-one-" + "abc".repeat(40);
+  const first = await startRelay({
+    token: TOKEN,
+    vault,
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  first.repo.import(Automerge.save(Automerge.from({ kind: "index", paths: { "notes/keep.md": id } })), { docId: INDEX_ID });
+  first.repo.import(Automerge.save(Automerge.from({ kind: "note", text: full })), { docId: id });
+  await first.mirrorNow();
+  await first.repo.flush();
+  await first.close();
+  const file = path.join(vault, "notes", "keep.md");
+  await fs.writeFile(file, "torn");
+  await fs.writeFile(file + ".1.ab.recover", full);
+  const second = await startRelay({
+    token: TOKEN,
+    vault,
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  try {
+    const handle = await second.repo.find(id);
+    assert.equal(handle.doc().text, full);
+    assert.equal(seen.some((line) => line.includes("fold-in failed for " + id + " RECOVER")), true, seen.join("\n"));
+    assert.equal(seen.some((line) => line.includes("keep.md")), false, seen.join("\n"));
+  } finally {
+    console.error = write;
+    await second.close();
   }
 });
 

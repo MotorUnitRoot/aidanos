@@ -175,6 +175,7 @@ check_arch() {
     expect_status 2 stat name extra
     expect_status 2 unlink name 1 2 extra
     expect_status 2 unlink-self name
+    expect_status 2 rename onlyone
     expect_status 2 nope name
     node --input-type=module - "$work/tool" << 'EOF'
 import { spawnSync } from "node:child_process";
@@ -202,10 +203,27 @@ function run(execPath) {
 const byPath = run(tool);
 console.log("exec-path " + JSON.stringify(byPath));
 if (process.platform === "darwin") console.log("exec-devfd " + JSON.stringify(run("/dev/fd/4")));
+const created = spawnSync(tool, ["creat", "temp-name"], {
+  input: "hello-note",
+  stdio: ["pipe", "pipe", "pipe", dirFd, toolFd],
+  env: {},
+  encoding: "utf8",
+});
+const renamed = spawnSync(tool, ["rename", "temp-name", "final-name"], {
+  stdio: ["ignore", "pipe", "pipe", dirFd, toolFd],
+  env: {},
+  encoding: "utf8",
+});
+const renamedBody = fs.existsSync(path.join(dir, "final-name"))
+  ? fs.readFileSync(path.join(dir, "final-name"), "utf8")
+  : "";
 fs.closeSync(toolFd);
 fs.closeSync(dirFd);
 fs.rmSync(dir, { recursive: true, force: true });
 if (byPath.status !== 0 || byPath.stdout !== "missing") process.exit(1);
+if (created.status !== 0) process.exit(1);
+if (renamed.status !== 0 || String(renamed.stdout || "").trim() !== "ok") process.exit(1);
+if (renamedBody !== "hello-note") process.exit(1);
 EOF
   fi
   if [ ! -f "$pinned" ]; then

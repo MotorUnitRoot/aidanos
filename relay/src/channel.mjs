@@ -16,6 +16,15 @@ export const BACKOFF_START_MS = 1000;
 export const BACKOFF_MAX_MS = 30_000;
 export const WORKER_HEAP_MB = 512;
 export const WORKER_OOM_HEAP_MB = 96;
+// V8's old-space cap does not include WebAssembly or ArrayBuffer memory.
+// The accept thread stops the worker when process RSS crosses this.
+export const WORKER_RSS_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024);
+export const WORKER_RPC_MS = 20_000;
+// Longer than a CPU-busy test hold, and longer than the health "silent" mark,
+// so a worker that stops answering pings is restarted without tripping a 5s spin.
+export const HUNG_RESTART_MS = 15_000;
+export const INFLIGHT_SLOT = 8192;
+export const INFLIGHT_BYTES = 8 + (4 + INFLIGHT_SLOT) * 2;
 export const HEALTH_OK = "ok";
 export const HEALTH_WARMING = "warming";
 export const HEALTH_SILENT = "worker silent";
@@ -110,6 +119,54 @@ export function readSlot(slot) {
   return { seq, conn, docId };
 }
 
+export function createInflight() {
+  return new SharedArrayBuffer(INFLIGHT_BYTES);
+}
+
+function inflightSlotOffset(index) {
+  return 8 + (index & 1) * (4 + INFLIGHT_SLOT);
+}
+
+// Two slots. The writer fills the inactive one, then publishes its index.
+// A crash mid-write leaves the previous complete set for the parent to read.
+export function writeInflight(buf, ids) {
+  if (!buf) return;
+  const unique = [];
+  const seen = new Set();
+  const list = Array.isArray(ids) ? ids : [];
+  for (const id of list) {
+    const text = String(id || "").replace(/[\r\n]/g, "");
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    unique.push(text);
+  }
+  let body = unique.join("\n");
+  while (Buffer.byteLength(body) > INFLIGHT_SLOT && unique.length) {
+    unique.pop();
+    body = unique.join("\n");
+  }
+  const bytes = Buffer.from(body);
+  const ints = new Int32Array(buf);
+  const active = Atomics.load(ints, 0) & 1;
+  const next = 1 - active;
+  const base = inflightSlotOffset(next);
+  const view = new Uint8Array(buf);
+  view.fill(0, base + 4, base + 4 + INFLIGHT_SLOT);
+  if (bytes.length) view.set(bytes, base + 4);
+  Atomics.store(new Int32Array(buf, base, 1), 0, bytes.length);
+  Atomics.store(ints, 0, next);
+}
+
+export function readInflight(buf) {
+  if (!buf) return [];
+  const ints = new Int32Array(buf);
+  const active = Atomics.load(ints, 0) & 1;
+  const base = inflightSlotOffset(active);
+  const length = Atomics.load(new Int32Array(buf, base, 1), 0);
+  if (!Number.isInteger(length) || length <= 0 || length > INFLIGHT_SLOT) return [];
+  return Buffer.from(new Uint8Array(buf, base + 4, length)).toString("utf8").split("\n").filter(Boolean);
+}
+
 export function resetWake(wake) {
   if (!wake) return;
   Atomics.store(new Int32Array(wake), 0, 0);
@@ -133,6 +190,7 @@ const CONTROL = new Set([
   "startup-error",
   "save",
   "temps-discarded",
+  "inflight",
 ]);
 
 // ws reuses a pooled Buffer. Transferring its underlying ArrayBuffer detaches
@@ -163,10 +221,30 @@ export function acceptWorkerMessage(msg, isOpen) {
   return "drop";
 }
 
+const WORKER_ENV_ALLOW = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+  "NODE_ENV",
+  "CI",
+  "SHELL",
+]);
+const SECRET_ENV = /TOKEN|SECRET|PASSWORD|CREDENTIAL|_KEY/i;
+
+// Allowlist. GITHUB_TOKEN and anything that looks like a secret stay on the
+// accept thread. The worker does not need them to sync.
 export function trimmedWorkerEnv(env = process.env) {
   const out = {};
   for (const [key, value] of Object.entries(env || {})) {
-    if (key.startsWith("AIDANOS_")) continue;
+    if (!WORKER_ENV_ALLOW.has(key) || SECRET_ENV.test(key)) continue;
     if (typeof value === "string") out[key] = value;
   }
   return out;
@@ -207,5 +285,20 @@ export function workerTestHook(options, env = process.env) {
   if (typeof options.testLogLine === "string" && options.testLogLine) {
     hook.logLine = options.testLogLine.slice(0, 64 * 1024);
   }
+  if (typeof options.testCrashDoc === "string" && options.testCrashDoc) {
+    hook.crashDoc = options.testCrashDoc;
+  }
+  if (options.testCrashDelay === "immediate" || options.testCrashDelay === "timer") {
+    hook.crashDelay = options.testCrashDelay;
+  }
+  if (options.testCrashSave === true) hook.crashSave = true;
+  if (options.testCrashBusy === "request" || options.testCrashBusy === "save") {
+    hook.crashBusy = options.testCrashBusy;
+  }
+  if (options.testCrashMidWrite === true) hook.crashMidWrite = true;
+  if (options.testHang === true) hook.hang = true;
+  if (options.testWasmOom === true) hook.wasmOom = true;
+  const headroom = Number(options.testRssHeadroom);
+  if (Number.isFinite(headroom) && headroom > 0) hook.rssHeadroom = headroom;
   return Object.keys(hook).length ? hook : null;
 }

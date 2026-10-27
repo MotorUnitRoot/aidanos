@@ -8,14 +8,20 @@ import {
   CRASH_LOOP_LIMIT,
   CRASH_WINDOW_MS,
   DOC_CRASH_LIMIT,
+  HUNG_RESTART_MS,
   WORKER_HEAP_MB,
   WORKER_OOM_HEAP_MB,
+  WORKER_RPC_MS,
+  WORKER_RSS_BYTES,
   acceptWorkerMessage,
+  createInflight,
   createSlot,
   createWake,
   frameToTransfer,
+  readInflight,
   readSlot,
   resetWake,
+  writeInflight,
   writeSlot,
   trimmedWorkerEnv,
   wakeWorker,
@@ -179,6 +185,7 @@ export function createWorkerHost(options = {}) {
   const hook = workerTestHook(options.test || null);
   const slot = createSlot();
   const wake = createWake();
+  const inflightBuf = createInflight();
   const repo = new RepoProxy(null);
   const echoes = [];
   const refused = new Set();
@@ -196,6 +203,9 @@ export function createWorkerHost(options = {}) {
   let pingTimer = null;
   let tempsResolve = null;
   let readyResolve = null;
+  let rssAtSpawn = process.memoryUsage().rss;
+  let heartbeatStop = false;
+  let rssTripped = false;
   let readyReject = null;
   let readyPromise = null;
   const host = {
@@ -217,7 +227,10 @@ export function createWorkerHost(options = {}) {
   }
 
   function failRpcs() {
-    for (const pending of rpcs.values()) pending.reject(new Error("failed"));
+    for (const pending of rpcs.values()) {
+      if (pending.timer) clearTimeout(pending.timer);
+      pending.reject(new Error("failed"));
+    }
     rpcs.clear();
   }
 
@@ -245,14 +258,20 @@ export function createWorkerHost(options = {}) {
   function spawn() {
     if (stopping || host.crashLoop) return;
     writeSlot(slot, -1, "");
+    writeInflight(inflightBuf, []);
     resetWake(wake);
     restarting = false;
+    heartbeatStop = false;
+    rssAtSpawn = process.memoryUsage().rss;
     const workerUrl = new URL("./worker.mjs", import.meta.url);
     const child = new Worker(workerUrl, {
       eval: false,
       env: trimmedWorkerEnv(),
       execArgv: workerExecArgv(),
       resourceLimits: {
+        // maxOldGenerationSizeMb covers the V8 old space only. WebAssembly
+        // and ArrayBuffer memory sit outside it. The ping loop stops the
+        // worker when process RSS passes WORKER_RSS_BYTES.
         maxOldGenerationSizeMb: hook && hook.oom ? WORKER_OOM_HEAP_MB : WORKER_HEAP_MB,
       },
       workerData: {
@@ -263,6 +282,7 @@ export function createWorkerHost(options = {}) {
         test: hook,
         slot,
         wake,
+        inflight: inflightBuf,
       },
     });
     worker = child;
@@ -304,6 +324,7 @@ export function createWorkerHost(options = {}) {
       host.lastPong = Date.now();
       if (typeof msg.peerId === "string" && msg.peerId) host.peerId = msg.peerId;
       if (msg.peerMetadata && typeof msg.peerMetadata === "object") host.peerMetadata = msg.peerMetadata;
+      if (Number.isFinite(msg.warmMs)) host.warmMs = msg.warmMs;
       sawReady = true;
       markReady();
       return;
@@ -344,20 +365,24 @@ export function createWorkerHost(options = {}) {
 
   function noteCrash() {
     const now = Date.now();
-    const info = readSlot(slot);
     const recent = crashes.filter((at) => now - at < CRASH_WINDOW_MS);
     recent.push(now);
     crashes.length = 0;
     crashes.push(...recent);
-    if (info.docId) {
-      const list = (docCrashes.get(info.docId) || []).filter((at) => now - at < CRASH_WINDOW_MS);
+    const ids = new Set(readInflight(inflightBuf));
+    const info = readSlot(slot);
+    if (info.docId) ids.add(info.docId);
+    let poisoned = false;
+    for (const docId of ids) {
+      const list = (docCrashes.get(docId) || []).filter((at) => now - at < CRASH_WINDOW_MS);
       list.push(now);
-      docCrashes.set(info.docId, list);
-      if (list.length >= DOC_CRASH_LIMIT && !refused.has(info.docId)) {
-        refused.add(info.docId);
-        say("refused document " + info.docId);
+      docCrashes.set(docId, list);
+      if (list.length >= DOC_CRASH_LIMIT && !refused.has(docId)) {
+        refused.add(docId);
+        poisoned = true;
       }
     }
+    if (poisoned) say("poison document");
     return crashes.length >= CRASH_LOOP_LIMIT;
   }
 
@@ -394,6 +419,8 @@ export function createWorkerHost(options = {}) {
     onDown();
     const wait = backoff;
     backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
+    const status = Number.isInteger(code) ? code : 1;
+    say("worker exited code=" + status + ", restart in " + wait + "ms");
     restartTimer = setTimeout(() => {
       restartTimer = null;
       if (!stopping && !host.crashLoop) spawn();
@@ -405,6 +432,21 @@ export function createWorkerHost(options = {}) {
     if (pingTimer) return;
     pingTimer = setInterval(() => {
       if (!port || stopping) return;
+      const rssLimit = hook && Number.isFinite(hook.rssHeadroom)
+        ? rssAtSpawn + hook.rssHeadroom
+        : WORKER_RSS_BYTES;
+      if (!rssTripped && process.memoryUsage().rss > rssLimit) {
+        rssTripped = true;
+        say("worker rss");
+        try { port.terminate(); } catch { /* the worker is already gone */ }
+        return;
+      }
+      if (!heartbeatStop && sawReady && host.lastPong && Date.now() - host.lastPong > HUNG_RESTART_MS) {
+        heartbeatStop = true;
+        say("worker heartbeat");
+        try { port.terminate(); } catch { /* the worker is already gone */ }
+        return;
+      }
       try {
         port.postMessage({ v: 1, kind: "ping" });
       } catch {
@@ -459,10 +501,27 @@ export function createWorkerHost(options = {}) {
     if (!port || stopping) return Promise.reject(new Error("failed"));
     const id = (nextRpc += 1);
     return new Promise((resolve, reject) => {
-      rpcs.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!rpcs.has(id)) return;
+        rpcs.delete(id);
+        reject(new Error("failed"));
+      }, WORKER_RPC_MS);
+      if (timer.unref) timer.unref();
+      rpcs.set(id, {
+        timer,
+        resolve(value) {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject(error) {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
       try {
         port.postMessage({ v: 1, kind: "rpc", id, method, ...fields }, transfer || []);
       } catch (error) {
+        clearTimeout(timer);
         rpcs.delete(id);
         reject(error);
       }

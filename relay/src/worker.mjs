@@ -1,6 +1,7 @@
 // Sync worker. The accept thread keeps the sockets and the token.
 // This thread owns the repo, the storage adapter, and the markdown mirror.
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { parentPort, workerData } from "node:worker_threads";
 import { formatWithOptions } from "node:util";
 import * as Automerge from "@automerge/automerge";
@@ -8,7 +9,7 @@ import { next as AutomergeNext } from "@automerge/automerge/slim";
 import { Repo, NetworkAdapter } from "@automerge/automerge-repo";
 import { decode, encode } from "@automerge/automerge-repo/helpers/cbor.js";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
-import { createLogBudget, frameToTransfer, writeSlot } from "./channel.mjs";
+import { createLogBudget, frameToTransfer, writeInflight, writeSlot } from "./channel.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import {
   beginFrame,
@@ -18,9 +19,16 @@ import {
   watchRepo,
   traceStorage,
 } from "./index-trace.mjs";
-import { createMirror, discardOpenNoteTemps, rememberVaultRoot, saveNoteFile } from "./mirror.mjs";
+import { createMirror, discardOpenNoteTemps, rememberVaultRoot, replaceNoteAtomic, saveNoteFile } from "./mirror.mjs";
 import { logSafe, redact } from "./redact.mjs";
-import { SafeStorage, refuseSymlinkedStorage, storageFolderFault } from "./storage-safe.mjs";
+import { SafeStorage, refuseSymlinkedStorage, storageFolderFault, sweepDeadStorageTemps } from "./storage-safe.mjs";
+
+function cpuSpin(ms) {
+  const end = performance.now() + ms;
+  let n = 0;
+  while (performance.now() < end) n = (n + 1) % 1000003;
+  return n;
+}
 
 const INDEX_TYPES = new Set(["request", "sync", "doc-unavailable"]);
 
@@ -173,7 +181,6 @@ async function run() {
   const data = workerData || {};
   const test = process.env.NODE_ENV === "test" && data.test ? data.test : null;
   const slot = data.slot;
-  const wake = data.wake;
   let busyUsed = false;
   let oomUsed = false;
   let badUsed = false;
@@ -186,7 +193,7 @@ async function run() {
   const logBudget = createLogBudget();
   parentPort.on("message", (msg) => {
     if (msg && msg.kind === "ping") {
-      post({ v: 1, kind: "pong" });
+      if (!(test && test.hang && readyForWork)) post({ v: 1, kind: "pong" });
       return;
     }
     // Acknowledgements have to land while sync work is queued. Otherwise a
@@ -228,8 +235,8 @@ async function run() {
   };
   if (test && typeof test.logLine === "string") console.error(test.logLine);
   for (const key of Object.keys(process.env)) {
-    if (key.startsWith("AIDANOS_")) {
-      logSafe([], "worker saw AIDANOS_ env");
+    if (key.startsWith("AIDANOS_") || /TOKEN|SECRET|PASSWORD|CREDENTIAL|_KEY/i.test(key)) {
+      logSafe([], "worker saw secret env");
       break;
     }
   }
@@ -241,13 +248,47 @@ async function run() {
     await refuseSymlinkedStorage(data.dataDir);
     const fault = storageFolderFault(data.dataDir);
     if (fault) throw new Error("storage folder failed the owner walk");
+    await sweepDeadStorageTemps(data.dataDir);
   } catch {
     post({ v: 1, kind: "startup-error", reason: "startup failed" });
     process.exit(1);
   }
+  const warmStarted = performance.now();
   warmSyncEngine();
+  const warmMs = performance.now() - warmStarted;
+  const inflightBuf = data.inflight;
+  const inflight = new Map();
+  let exiting = false;
+  function die() {
+    exiting = true;
+    process.exit(1);
+  }
+  function publishInflight() {
+    writeInflight(inflightBuf, [...inflight.keys()]);
+    try {
+      post({ v: 1, kind: "inflight", docs: [...inflight.keys()] });
+    } catch {
+      // The parent reads the shared buffer if this post loses the race.
+    }
+  }
+  function enter(docId) {
+    if (!docId) return;
+    inflight.set(docId, (inflight.get(docId) || 0) + 1);
+    publishInflight();
+  }
+  function leave(docId) {
+    if (exiting || !docId) return;
+    const next = (inflight.get(docId) || 1) - 1;
+    if (next <= 0) inflight.delete(docId);
+    else inflight.set(docId, next);
+    publishInflight();
+  }
   let saveSeq = 1;
   let armSaveHold = false;
+  let crashSaveUsed = false;
+  let crashBusySaveUsed = false;
+  let crashDelayUsed = false;
+  let crashBusyRequestUsed = false;
   const saveTasks = new Set();
   function trackSave(work) {
     const id = saveSeq;
@@ -272,7 +313,23 @@ async function run() {
   const storage = traceStorage(new SafeStorage(data.dataDir, inner));
   for (const method of ["save", "remove", "removeRange"]) {
     const raw = storage[method].bind(storage);
-    storage[method] = (...args) => trackSave(() => raw(...args));
+    storage[method] = (...args) => {
+      const key = args[0];
+      const docId = Array.isArray(key) && key.length ? String(key[0]) : "";
+      enter(docId);
+      if (method === "save" && test && readyForWork && crashDocMatches(docId)) {
+        if (test.crashSave && !crashSaveUsed) {
+          crashSaveUsed = true;
+          die();
+        }
+        if (test.crashBusy === "save" && !crashBusySaveUsed) {
+          crashBusySaveUsed = true;
+          cpuSpin(40);
+          die();
+        }
+      }
+      return trackSave(() => raw(...args)).finally(() => leave(docId));
+    };
   }
   const adapter = new ParentAdapter();
   const repo = new Repo({
@@ -283,6 +340,7 @@ async function run() {
   });
   adapter.repo = repo;
   watchRepo(repo);
+  bindRepoMessages(repo);
   const debounce = Number(data.mirrorDebounceMs);
   const mirror = createMirror({
     repo,
@@ -290,6 +348,11 @@ async function run() {
     debounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
     secrets: [],
     track: trackSave,
+    stateDir: data.dataDir,
+    hold(docId) {
+      enter(docId);
+      return () => leave(docId);
+    },
   });
   await preloadStoredNotes(repo);
   await mirror.now();
@@ -301,9 +364,27 @@ async function run() {
     kind: "ready",
     peerId: adapter.peerId,
     peerMetadata: peerMetadata || null,
+    warmMs,
   });
   readyForWork = true;
   drain();
+  if (test && test.wasmOom) {
+    const chunks = [];
+    const big = Automerge.from({ kind: "note", text: "m".repeat(1024 * 1024) });
+    chunks.push(Automerge.save(big));
+    for (let i = 0; i < 24; i += 1) chunks.push(Buffer.alloc(4 * 1024 * 1024));
+    globalThis.__arrayHold = chunks;
+  }
+  if (test && test.crashMidWrite) {
+    setTimeout(() => {
+      const noteFile = path.join(String(data.vault), "notes", "keep.md");
+      replaceNoteAtomic(noteFile, "torn-partial-" + "x".repeat(400), {
+        vault: data.vault,
+        stateDir: data.dataDir,
+        crashMidWrite: true,
+      }).catch(() => {});
+    }, 300);
+  }
   if (test && test.holdNoteMs) {
     const noteFile = path.join(String(data.vault), "held-note.md");
     const body = "whole-note-line\n".repeat(256);
@@ -385,13 +466,41 @@ async function run() {
     throw new Error("failed");
   }
 
+  function crashDocMatches(docId) {
+    if (!test || !test.crashDoc) return true;
+    return docId === test.crashDoc;
+  }
+
   function holdBusy() {
     if (!test || !test.busyMs || busyUsed) return false;
     busyUsed = true;
     post({ v: 1, kind: "holding" });
-    Atomics.wait(new Int32Array(wake), 0, 0, test.busyMs);
+    cpuSpin(test.busyMs);
     post({ v: 1, kind: "holding", done: true });
     return true;
+  }
+
+  function bindRepoMessages(repoToBind) {
+    const net = repoToBind.networkSubsystem;
+    if (!net || typeof net.listeners !== "function" || typeof net.removeAllListeners !== "function") return;
+    const fns = net.listeners("message").slice();
+    net.removeAllListeners("message");
+    for (const fn of fns) {
+      net.on("message", (msg) => {
+        const docId = msg && typeof msg.documentId === "string" ? msg.documentId : "";
+        enter(docId);
+        const run = (async () => {
+          if (test && test.crashDelay && docId && crashDocMatches(docId) && !crashDelayUsed) {
+            crashDelayUsed = true;
+            if (test.crashDelay === "immediate") await new Promise((resolve) => setImmediate(resolve));
+            else await new Promise((resolve) => setTimeout(resolve, 40));
+            die();
+          }
+          return fn(msg);
+        })();
+        return Promise.resolve(run).finally(() => leave(docId));
+      });
+    }
   }
 
   function runOom() {
@@ -445,6 +554,7 @@ async function run() {
     }
     if (msg.kind === "msg") {
       const docId = documentIdOf(msg.data);
+      enter(docId);
       writeSlot(slot, msg.conn, docId);
       if (test && test.badChannel && !badUsed) {
         badUsed = true;
@@ -461,9 +571,15 @@ async function run() {
       // that cleared it would hide the document from the parent.
       let keepSlot = false;
       try {
-        if (test && test.crash && docId) {
+        if (test && test.crash && docId && crashDocMatches(docId)) {
           keepSlot = true;
-          process.exit(1);
+          die();
+        }
+        if (test && test.crashBusy === "request" && docId && crashDocMatches(docId) && !crashBusyRequestUsed) {
+          crashBusyRequestUsed = true;
+          keepSlot = true;
+          cpuSpin(40);
+          die();
         }
         if (docId) holdBusy();
         if (docId) runOom();
@@ -473,6 +589,7 @@ async function run() {
           const size = msg.data instanceof ArrayBuffer ? msg.data.byteLength : 0;
           post({ v: 1, kind: "ack", conn: msg.conn, bytes: size });
           writeSlot(slot, msg.conn, "");
+          leave(docId);
         }
       }
     }

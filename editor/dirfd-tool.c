@@ -1,7 +1,8 @@
-/* Directory-relative create, stat, and unlink.
+/* Directory-relative create, stat, unlink, and rename.
    The checked directory is inherited as file descriptor 3.
    A name is one path component: a swapped parent path cannot redirect it.
-   This program reads no environment variables. A limit is an argument.
+   renameat stays on that descriptor. This program reads no environment
+   variables. A limit is an argument.
 */
 #if defined(__APPLE__)
 #define _DARWIN_C_SOURCE
@@ -217,6 +218,47 @@ static int unlink_self(void) {
   return 0;
 }
 
+static int owned_regular(const struct stat *st) {
+  if (S_ISLNK(st->st_mode) || !S_ISREG(st->st_mode)) return 0;
+  if (st->st_nlink != 1) return 0;
+  if (st->st_uid != getuid()) return 0;
+  return 1;
+}
+
+/* Replace dest with the temp we just created. Both names are one component
+   in the inherited directory. A symlink or a hard link is left untouched. */
+static int rename_file(const char *from, const char *to) {
+  struct stat src;
+  if (fstatat(DIR_FD, from, &src, AT_SYMLINK_NOFOLLOW) != 0) {
+    fail(errno);
+    return 1;
+  }
+  if (!owned_regular(&src)) {
+    fail(EIO);
+    return 1;
+  }
+  struct stat dst;
+  if (fstatat(DIR_FD, to, &dst, AT_SYMLINK_NOFOLLOW) == 0) {
+    if (!owned_regular(&dst)) {
+      fail(EIO);
+      return 1;
+    }
+  } else if (errno != ENOENT) {
+    fail(errno);
+    return 1;
+  }
+  if (renameat(DIR_FD, from, DIR_FD, to) != 0) {
+    fail(errno);
+    return 1;
+  }
+  if (fsync(DIR_FD) != 0) {
+    fail(errno);
+    return 1;
+  }
+  printf("ok\n");
+  return 0;
+}
+
 static int unlink_file(const char *name, const char *dev_text, const char *ino_text) {
   char *dev_end = NULL;
   char *ino_end = NULL;
@@ -268,6 +310,10 @@ int main(int argc, char **argv) {
   if (strcmp(cmd, "unlink") == 0) {
     if (argc != 5) return 2;
     return unlink_file(name, argv[3], argv[4]);
+  }
+  if (strcmp(cmd, "rename") == 0) {
+    if (argc != 4 || !valid_name(argv[3])) return 2;
+    return rename_file(name, argv[3]);
   }
   return 2;
 }

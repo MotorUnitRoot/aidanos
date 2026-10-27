@@ -748,6 +748,7 @@ async function spawnRelay(dir, envExtra = {}) {
     "AIDANOS_RELAY_TEST_SAVE_WAIT_MS",
     "AIDANOS_RELAY_TEST_SHUTDOWN_MS",
     "AIDANOS_RELAY_TEST_HOLD_NOTE_MS",
+    "AIDANOS_RELAY_TEST_CRASH_MID_WRITE",
   ]) {
     if (!Object.prototype.hasOwnProperty.call(envExtra, name)) delete env[name];
   }
@@ -2301,10 +2302,14 @@ test("reset is off when NODE_ENV is production or unset", { timeout: 40000 }, as
 test("a reset warms the sync engine before devices are told it is ready", async () => {
   warmSyncEngine();
   const source = await fs.readFile(new URL("../src/server.mjs", import.meta.url), "utf8");
+  const workerSource = await fs.readFile(new URL("../src/worker.mjs", import.meta.url), "utf8");
   const activate = source.slice(source.indexOf("async function activateSession"), source.indexOf("async function rotate"));
-  const warm = activate.indexOf("warmSyncEngine()");
   const published = activate.indexOf("live = session");
-  assert.ok(warm > 0 && published > warm);
+  assert.equal(activate.includes("warmSyncEngine()"), false);
+  assert.ok(published > 0);
+  const warmAt = workerSource.indexOf("const warmMs = performance.now() - warmStarted");
+  const readyAt = workerSource.indexOf('kind: "ready"');
+  assert.ok(warmAt > 0 && readyAt > warmAt);
   assert.match(activate, /finally/);
   assert.match(activate, /disposeSession\(session\)/);
   assert.match(activate, /sync engine warm in /);
@@ -2321,6 +2326,55 @@ test("a reset warms the sync engine before devices are told it is ready", async 
   assert.match(source, /join answered in /);
   assert.match(source, /index request/);
   assert.match(source, /index reply in /);
+});
+
+test("a crash between a partial note write and rename keeps the note", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  const id = noteId("notes/keep.md");
+  const full = "version-one-" + "abc".repeat(80);
+  const first = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  importDoc(first.repo, INDEX_ID, { kind: "index", paths: { "notes/keep.md": id } });
+  importDoc(first.repo, id, { kind: "note", text: full });
+  await first.mirrorNow();
+  await first.repo.flush();
+  await first.close();
+  const file = path.join(vault, "notes", "keep.md");
+  assert.equal(await fs.readFile(file, "utf8"), full);
+  const started = await spawnRelay(dir, {
+    NODE_ENV: "test",
+    AIDANOS_RELAY_TEST_CRASH_MID_WRITE: "1",
+  });
+  const [code, signal] = await once(started.child, "exit");
+  closeSync(started.fd);
+  assert.equal(signal, "SIGKILL", "code " + code);
+  assert.equal(await fs.readFile(file, "utf8"), full);
+  const names = await fs.readdir(path.join(vault, "notes"));
+  assert.ok(names.some((name) => name.startsWith(".keep.md.") && name.endsWith(".tmp")), names.join(","));
+  const third = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  try {
+    const handle = await third.repo.find(id);
+    assert.equal(handle.doc().text, full);
+    const index = await third.repo.find(INDEX_ID);
+    assert.equal(index.doc().paths["notes/keep.md"], id);
+  } finally {
+    await third.close();
+  }
 });
 
 test("a failed warm-up closes the session", async () => {

@@ -164,26 +164,9 @@ export function payloadLimit(value) {
   return n;
 }
 
-function asFrame(value) {
-  if (value == null) return null;
-  if (Buffer.isBuffer(value)) return value;
-  if (value instanceof ArrayBuffer) return Buffer.from(value);
-  if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-  if (typeof value === "string") return Buffer.from(value);
-  return null;
-}
-
 // Close unless a storage id is a UUID and every document id is one Automerge accepts.
 // The disk adapter joins both into a path and does not check them.
-export function syncFrameAllowed(value) {
-  const raw = asFrame(value);
-  if (!raw || raw.length === 0) return false;
-  let message;
-  try {
-    message = decode(raw);
-  } catch {
-    return false;
-  }
+export function syncMessageAllowed(message) {
   if (!message || typeof message !== "object") return false;
   const type = typeof message.type === "string" ? message.type : "";
   const meta = message.peerMetadata;
@@ -195,6 +178,22 @@ export function syncFrameAllowed(value) {
     if (!isValidDocumentId(message.documentId)) return false;
   }
   return true;
+}
+
+export function syncFrameAllowed(value) {
+  return syncMessageAllowed(frameMessage(value));
+}
+
+function deviceToken(metadata) {
+  if (!metadata || typeof metadata !== "object") return "";
+  const value = metadata.deviceToken;
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) return "";
+  return value;
+}
+
+function sameDeviceToken(left, right) {
+  if (!left || !right || left.length !== right.length) return false;
+  return timingSafeEqual(Buffer.from(left), Buffer.from(right));
 }
 
 function frameMessage(data) {
@@ -585,6 +584,7 @@ export async function startRelay(options = {}) {
   if (env.NODE_ENV === "test") {
     const holdNote = Number(env.AIDANOS_RELAY_TEST_HOLD_NOTE_MS);
     if (Number.isFinite(holdNote) && holdNote > 0) options.testHoldNoteMs = holdNote;
+    if (env.AIDANOS_RELAY_TEST_CRASH_MID_WRITE === "1") options.testCrashMidWrite = true;
   }
   await installIndexTrace((line) => logSafe(secrets, line), { thread: "main" });
   await assertNotClientVault(vault);
@@ -859,10 +859,11 @@ export async function startRelay(options = {}) {
   async function activateSession(session) {
     let published = false;
     try {
-      const warmStarted = Date.now();
+      // The worker already warmed its own isolate before it posted ready.
+      // Running that WASM here blocks the accept thread on every reset.
       if (typeof options.warm === "function") options.warm();
-      else warmSyncEngine();
-      logSafe(secrets, "sync engine warm in " + seconds(Date.now() - warmStarted));
+      const warmMs = session.host && Number.isFinite(session.host.warmMs) ? session.host.warmMs : 0;
+      logSafe(secrets, "sync engine warm in " + seconds(warmMs));
       if (api) api.repo = session.repo;
       bootedAt = new Date().toISOString();
       live = session;
@@ -1048,8 +1049,8 @@ export async function startRelay(options = {}) {
         ws.on("pong", () => {
           ws.isAlive = true;
         });
-        function logFrame(direction, data) {
-          const message = frameMessage(data);
+        function logFrame(direction, data, decoded) {
+          const message = decoded || frameMessage(data);
           if (!message) return null;
           const type = typeof message.type === "string" ? message.type : "";
           const docId = typeof message.documentId === "string" ? message.documentId : "";
@@ -1088,11 +1089,22 @@ export async function startRelay(options = {}) {
             closeConn(conn, 1008);
             return;
           }
+          if (conn.peerId) {
+            closeConn(conn, 1008);
+            return;
+          }
+          const nextToken = deviceToken(message.peerMetadata);
           const previousId = peers.get(senderId);
           if (previousId != null && previousId !== conn.id) {
             const previous = sockets.get(previousId);
-            logSafe(secrets, "closed the older sync connection for a duplicate peer id");
-            if (previous) closeConn(previous, 1000);
+            if (previous && sameDeviceToken(previous.deviceToken, nextToken)) {
+              logSafe(secrets, "closed the older sync connection for a duplicate peer id");
+              closeConn(previous, 1000);
+            } else {
+              logSafe(secrets, "kept the existing device for a duplicate peer id");
+              closeConn(conn, 1008);
+              return;
+            }
           }
           const host = currentHost();
           if (!host || !host.warm || host.crashLoop) {
@@ -1100,6 +1112,7 @@ export async function startRelay(options = {}) {
             return;
           }
           conn.peerId = senderId;
+          conn.deviceToken = nextToken;
           peers.set(senderId, conn.id);
           const selected = selectProtocol(message.supportedProtocolVersions);
           if (selected == null) {
@@ -1139,7 +1152,7 @@ export async function startRelay(options = {}) {
           }
           const docId = typeof message.documentId === "string" ? message.documentId : "";
           if (docId && host.refused.has(docId)) {
-            logSafe(secrets, "refused document " + docId);
+            logSafe(secrets, "poison document");
             closeConn(conn, 1008);
             return;
           }
@@ -1167,9 +1180,10 @@ export async function startRelay(options = {}) {
         });
         ws.on("message", (data, isBinary) => {
           if (conn.gone) return;
+          const message = frameMessage(isBinary === false && typeof data === "string" ? data : data);
           let allowed = false;
           try {
-            allowed = syncFrameAllowed(data);
+            allowed = syncMessageAllowed(message);
           } catch {
             allowed = false;
           }
@@ -1181,7 +1195,7 @@ export async function startRelay(options = {}) {
             }
             return;
           }
-          const message = logFrame("in", isBinary === false && typeof data === "string" ? data : data);
+          logFrame("in", null, message);
           if (!message || conn.gone) return;
           if (message.type === "join") handleJoin(message);
           else handleDoc(message, data);

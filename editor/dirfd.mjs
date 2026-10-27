@@ -1,7 +1,7 @@
-// Open, stat, and unlink one name on a directory descriptor that was already
-// checked. Node has no openat or unlinkat. On Linux, /proc/self/fd/<dirfd>/name
-// is that operation. On macOS a small helper calls openat, fstatat, and
-// unlinkat on the inherited descriptor.
+// Open, stat, unlink, and rename one name on a directory descriptor that was
+// already checked. Node has no openat, unlinkat, or renameat. On Linux,
+// /proc/self/fd/<dirfd>/name is that operation. On macOS a small helper calls
+// openat, fstatat, unlinkat, and renameat on the inherited descriptor.
 //
 // A pure Node walk is weaker than that helper. O_NOFOLLOW applies only to the
 // last component, so opening vault/notes/file follows a parent that was
@@ -41,7 +41,7 @@ const STICKY = 0o1000;
 // rebuilds that file from dirfd-tool.c and fails unless this SHA-256 matches.
 // A rebuilt binary does not run until this constant is updated.
 const HELPER_SHA256 = {
-  "linux-x64": "78bbeec3aa73aeb0526f8cbe0f17ca20d0eeee1c4dd859e0299960b6964da92d",
+  "linux-x64": "a11fa3f5c70468692bcba1bc1fb30a47151c351100cacf98d830e3f621ef7e2c",
   "darwin-arm64": "0822955a14335f1cbd69239c4eaa886f156a81f76384d29992e8b6567ff6fd3c",
   "darwin-x64": "381a4c24358f62aed38f2377e2e5e084b6eab9cbb66d3b92c5cab2281c336bee",
 };
@@ -754,6 +754,41 @@ async function unlinkWithProc(dirHandle, name, id) {
   return true;
 }
 
+async function renameWithHelper(dirHandle, fromName, toName, tool) {
+  const text = await callHelper(
+    dirHandle,
+    ["rename", plainName(fromName), plainName(toName)],
+    null,
+    tool,
+  );
+  if (String(text || "").trim().split("\n")[0] !== "ok") {
+    const error = new Error("EIO");
+    error.code = "EIO";
+    throw error;
+  }
+}
+
+async function renameWithProc(dirHandle, fromName, toName) {
+  const srcPath = procEntry(dirHandle.fd, fromName);
+  const dstPath = procEntry(dirHandle.fd, toName);
+  const src = await fs.lstat(srcPath);
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (src.isSymbolicLink() || !src.isFile() || src.nlink !== 1) throw badPath();
+  if (typeof uid === "number" && src.uid !== uid) throw badPath();
+  let dst = null;
+  try {
+    dst = await fs.lstat(dstPath);
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  if (dst) {
+    if (dst.isSymbolicLink() || !dst.isFile() || dst.nlink !== 1) throw badPath();
+    if (typeof uid === "number" && dst.uid !== uid) throw badPath();
+  }
+  await fs.rename(srcPath, dstPath);
+  await dirHandle.sync();
+}
+
 function procEntry(dirfd, name) {
   return "/proc/self/fd/" + dirfd + "/" + plainName(name);
 }
@@ -809,6 +844,13 @@ export async function statEntry(dirHandle, name, backend = directoryBackend(), t
 export async function unlinkIfSame(dirHandle, name, id, backend = directoryBackend(), tool = null) {
   if (backend === "helper") return unlinkWithHelper(dirHandle, name, id, tool);
   return unlinkWithProc(dirHandle, name, id);
+}
+
+// Atomic replace inside the checked directory. The temp and the destination
+// are both one path component. A symlink or a second hard link is refused.
+export async function renameEntry(dirHandle, fromName, toName, backend = directoryBackend(), tool = null) {
+  if (backend === "helper") return renameWithHelper(dirHandle, fromName, toName, tool);
+  return renameWithProc(dirHandle, fromName, toName);
 }
 
 // A file this call just created may sit outside the vault when a parent was

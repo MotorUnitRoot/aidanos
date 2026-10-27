@@ -9,6 +9,8 @@ const TEMP_FLAGS =
   fsConstants.O_WRONLY |
   (fsConstants.O_NOFOLLOW || 0);
 const DIR_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY || 0) | (fsConstants.O_NOFOLLOW || 0);
+const RELAY_TMP = ".relay-tmp";
+const TEMP_NAME = /^\.tmp-(\d+)-[0-9a-f]+$/;
 
 function refused() {
   const error = new Error("storage path refused");
@@ -73,6 +75,75 @@ async function assertInside(root, filePath, allowRoot) {
   }
 }
 
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !error || error.code !== "ESRCH";
+  }
+}
+
+function isStorageTempPath(filePath) {
+  return path.resolve(filePath).split(path.sep).some((part) => part === RELAY_TMP || part.startsWith(".tmp-"));
+}
+
+function logSkippedSymlink() {
+  console.error("skipped symlinked chunk");
+}
+
+export async function ensureRelayTmp(root) {
+  const dir = path.join(root, RELAY_TMP);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const info = await fs.lstat(dir);
+  if (info.isSymbolicLink() || !info.isDirectory()) throw refused();
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (typeof uid === "number" && info.uid !== uid) throw refused();
+  await fs.chmod(dir, 0o700);
+  if (storageFolderFault(dir)) throw refused();
+  return dir;
+}
+
+// Dead-pid temps under the storage folder only. Symlinks are not followed.
+// A live pid is left alone; load still skips every `.tmp-` name.
+export async function sweepDeadStorageTemps(root) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (typeof uid !== "number") return;
+  await sweepTempDir(path.resolve(root), uid, 0);
+}
+
+async function sweepTempDir(dir, uid, depth) {
+  if (depth > 6) return;
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await sweepTempDir(full, uid, depth + 1);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    const match = TEMP_NAME.exec(entry.name);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (!Number.isSafeInteger(pid) || pidAlive(pid)) continue;
+    let st;
+    try {
+      st = await fs.lstat(full);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isFile() || st.nlink !== 1 || st.uid !== uid) continue;
+    try { await fs.unlink(full); } catch { /* already gone, or it changed under us */ }
+  }
+}
+
 async function syncDirectory(dir) {
   const handle = await fs.open(dir, DIR_FLAGS);
   try {
@@ -82,17 +153,19 @@ async function syncDirectory(dir) {
   }
 }
 
-// Temp file is created with O_EXCL and mode 0600 inside the storage folder.
-// The file and its folder are fsynced before the rename, so a crash keeps
-// the previous bytes.
+// Temp file is created with O_EXCL and mode 0600 under <root>/.relay-tmp,
+// then renamed into the snapshot folder on the same filesystem. The file
+// and both folders are fsynced, so a crash keeps the previous bytes and
+// loadRange never sees the temp as a chunk.
 export async function writeStorageBytes(root, filePath, bytes) {
   const file = path.resolve(filePath);
   const dir = path.dirname(file);
   await assertInside(root, file, false);
   await fs.mkdir(dir, { recursive: true });
   await assertInside(root, dir, true);
+  const tmpDir = await ensureRelayTmp(root);
   const tmp = path.join(
-    dir,
+    tmpDir,
     ".tmp-" + process.pid + "-" + Math.random().toString(16).slice(2),
   );
   const payload = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
@@ -117,6 +190,7 @@ export async function writeStorageBytes(root, filePath, bytes) {
     try { await fs.unlink(tmp); } catch { /* the temp file is already gone */ }
     throw refused();
   }
+  await syncDirectory(tmpDir);
   await syncDirectory(dir);
   await fs.rename(tmp, file);
   await syncDirectory(dir);
@@ -133,6 +207,16 @@ export class SafeStorage {
     const rawLoad = inner.load.bind(inner);
     inner.load = async (key) => {
       const filePath = inner.getFilePath(key);
+      if (isStorageTempPath(filePath)) return undefined;
+      try {
+        const info = await fs.lstat(filePath);
+        if (info.isSymbolicLink()) {
+          logSkippedSymlink();
+          return undefined;
+        }
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
       try {
         await assertInside(dir, filePath);
       } catch (error) {
@@ -168,8 +252,17 @@ export class SafeStorage {
     await this.inner.remove(key);
   }
 
-  loadRange(prefix) {
-    return this.inner.loadRange(prefix);
+  async loadRange(prefix) {
+    const chunks = await this.inner.loadRange(prefix);
+    if (!Array.isArray(chunks)) return chunks;
+    return chunks.filter((chunk) => {
+      if (!chunk || chunk.data == null) return false;
+      if (!Array.isArray(chunk.key)) return true;
+      return !chunk.key.some((part) => {
+        const name = String(part);
+        return name === RELAY_TMP || name.startsWith(".tmp-");
+      });
+    });
   }
 
   async removeRange(prefix) {

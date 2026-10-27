@@ -5,6 +5,8 @@ import path from "node:path";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { WebSocketServer } from "ws";
+import * as Automerge from "@automerge/automerge";
+import { next as AutomergeNext } from "@automerge/automerge/slim";
 import { Repo, isValidDocumentId } from "@automerge/automerge-repo";
 import { decode } from "@automerge/automerge-repo/helpers/cbor.js";
 import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
@@ -14,7 +16,7 @@ import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import { createMirror } from "./mirror.mjs";
 import { logSafe, stampLine } from "./redact.mjs";
-import { logSyncFrame } from "./sync-log.mjs";
+import { describeSyncFrame } from "./sync-log.mjs";
 
 const DEFAULT_PORT = 3750;
 const MIN_TOKEN_LENGTH = 32;
@@ -113,6 +115,31 @@ function rejectUpgrade(socket) {
       body,
   );
   socket.destroy();
+}
+
+function seconds(millis) {
+  return (millis / 1000).toFixed(3) + "s";
+}
+
+/// The first sync message loads the engine. On a cold simulator that work
+/// blocked the process: run 40425278945 took 48s to accept the other device,
+/// and run 40423525581 took 6.6s for the first index reply. Doing it before
+/// any device is connected keeps that cost off the 15s handshake.
+export function warmSyncEngine() {
+  const local = AutomergeNext.init();
+  const remote = AutomergeNext.init();
+  let localState = AutomergeNext.initSyncState();
+  let remoteState = AutomergeNext.initSyncState();
+  const generated = AutomergeNext.generateSyncMessage(local, localState);
+  localState = generated[0];
+  const request = generated[1];
+  if (!request) return;
+  Automerge.decodeSyncMessage(request);
+  const received = AutomergeNext.receiveSyncMessage(remote, remoteState, request);
+  remoteState = received[1];
+  const reply = AutomergeNext.generateSyncMessage(received[0], remoteState);
+  if (reply[1]) AutomergeNext.receiveSyncMessage(local, localState, reply[1]);
+  AutomergeNext.decodeSyncState(AutomergeNext.encodeSyncState(localState));
 }
 
 function health(gitState, bootedAt, syncUp, resetGeneration) {
@@ -558,6 +585,7 @@ export async function startRelay(options = {}) {
   }
 
   async function rotate() {
+    const started = Date.now();
     const markerId = await ownedMarkerId(vault, dataDir);
     if (!markerId) {
       logSafe(secrets, "reset refused: the folder has no current relay marker");
@@ -579,11 +607,20 @@ export async function startRelay(options = {}) {
         await writeMarkerFile(path.join(vault, ".aidanos", "relay-folder"), marker);
         await writeMarkerFile(path.join(dataDir, "relay-folder"), marker);
         if (typeof options.beforeReopen === "function") await options.beforeReopen();
-        live = await openSession();
+        const session = await openSession();
+        // The new generation stays hidden until the first sync has run.
+        // A device waiting on /health then connects to an engine that already
+        // answered one index round trip, instead of paying for it while the
+        // other device's handshake sits unread.
+        const warmStarted = Date.now();
+        warmSyncEngine();
+        logSafe(secrets, "sync engine warm in " + seconds(Date.now() - warmStarted));
+        live = session;
         bootedAt = new Date().toISOString();
         resetGeneration += 1;
         if (api) api.repo = live.repo;
         logSafe(secrets, "reset complete");
+        logSafe(secrets, "reset ready in " + seconds(Date.now() - started));
         if (typeof options.onReset === "function") options.onReset();
         return;
       } catch (error) {
@@ -712,12 +749,42 @@ export async function startRelay(options = {}) {
         ws.on("error", (error) => {
           logSafe(secrets, "sync connection closed:", error instanceof Error ? error.message : error);
         });
+        const openedAt = Date.now();
+        let joinAnswered = false;
+        let indexRequestAt = null;
+        function noteFrame(direction, data) {
+          let line = "";
+          try {
+            line = describeSyncFrame(direction, data);
+          } catch {
+            line = "";
+          }
+          if (!line) return;
+          logSafe(secrets, line);
+          const now = Date.now();
+          if (!joinAnswered && line === "sync out peer") {
+            joinAnswered = true;
+            logSafe(secrets, "join answered in " + seconds(now - openedAt));
+          }
+          const indexFrame =
+            line.startsWith("sync " + direction + " request doc=" + INDEX_ID) ||
+            line.startsWith("sync " + direction + " sync doc=" + INDEX_ID) ||
+            line.startsWith("sync " + direction + " doc-unavailable doc=" + INDEX_ID);
+          if (!indexFrame) return;
+          if (direction === "in") {
+            indexRequestAt = now;
+            logSafe(secrets, "index request");
+          } else if (indexRequestAt != null) {
+            logSafe(secrets, "index reply in " + seconds(now - indexRequestAt));
+            indexRequestAt = null;
+          }
+        }
         ws.on("message", (data) => {
-          logSyncFrame("in", data, secrets);
+          noteFrame("in", data);
         });
         const send = ws.send;
         ws.send = function sendLogged(...args) {
-          logSyncFrame("out", args[0], secrets);
+          noteFrame("out", args[0]);
           return send.apply(ws, args);
         };
         logSafe(secrets, "accepted a sync connection");

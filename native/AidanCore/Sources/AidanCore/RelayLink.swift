@@ -19,6 +19,7 @@ final class RelayLink {
     private weak var host: SyncHost?
     private var ready: (() -> Void)?
     private var failed: ((Error) -> Void)?
+    private var loggedFirstByte = false
 
     func connect(url: String, token: String, peerId: String, storageId: String, host: SyncHost) throws {
         _ = signal(SIGPIPE, SIG_IGN)
@@ -27,6 +28,7 @@ final class RelayLink {
         self.storageId = storageId
         self.host = host
         let fd = try connectTCP(host: parsed.host, port: parsed.port)
+        SyncLog.write("sync socket open")
         socket = fd
         try upgrade(fd: fd, address: parsed, token: token)
         running = true
@@ -41,6 +43,7 @@ final class RelayLink {
             self?.readLoop()
         }
         try send(encodeJoin(senderId: peerId, storageId: storageId))
+        SyncLog.write("sync sent join")
         SyncLog.write("sync out join")
         let wait = joined.wait(timeout: .now() + 15)
         if wait == .timedOut {
@@ -230,6 +233,7 @@ final class RelayLink {
             "",
         ].joined(separator: "\r\n")
         try writeAll(Data(request.utf8))
+        SyncLog.write("sync sent upgrade")
         let header = try readHTTPHeader(fd: fd)
         let status = httpStatus(header)
         if status == 401 { throw AidanError.authRejected }
@@ -256,6 +260,10 @@ final class RelayLink {
                     continue
                 }
                 throw AidanError.protocol("The relay closed the connection.")
+            }
+            if !loggedFirstByte {
+                loggedFirstByte = true
+                SyncLog.write("sync first byte")
             }
             data.append(buffer[0])
             if data.count >= 4 {

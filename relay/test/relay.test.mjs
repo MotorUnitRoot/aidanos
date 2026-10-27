@@ -26,6 +26,7 @@ import {
   relayMarkerText,
   startRelay,
   startupLines,
+  warmSyncEngine,
 } from "../src/server.mjs";
 
 const TOKEN = "aidanos-test-token-0123456789abcdef";
@@ -645,6 +646,21 @@ test("reset is off unless a supervisor asked for it", async () => {
   } finally {
     await relay.close();
   }
+});
+
+test("a reset warms the sync engine before devices are told it is ready", async () => {
+  warmSyncEngine();
+  const source = await fs.readFile(new URL("../src/server.mjs", import.meta.url), "utf8");
+  const rotate = source.slice(source.indexOf("async function rotate"), source.indexOf("function scheduleReset"));
+  const warm = rotate.indexOf("warmSyncEngine()");
+  const published = rotate.indexOf("live = session");
+  const generation = rotate.indexOf("resetGeneration += 1");
+  assert.ok(warm > 0 && published > warm && generation > published);
+  assert.match(rotate, /sync engine warm in /);
+  assert.match(rotate, /reset ready in /);
+  assert.match(source, /join answered in /);
+  assert.match(source, /index request/);
+  assert.match(source, /index reply in /);
 });
 
 test("an allowed reset checks the token and empties the folder", async () => {

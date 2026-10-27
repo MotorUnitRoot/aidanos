@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isNotePlanFolder, noteSaveStyle, reportRecoveryFiles, writeNoteText } from "./editor/note-save.mjs";
-import { aclListingFault, ancestorFault, createExclusive, directoryBackend, groupWritableHelperMessage, installFaultText, openCheckedDirectory, unlinkIfSame, unlinkOpenedFile } from "./editor/dirfd.mjs";
+import { aclListingFault, aclSpawnCount, ancestorFault, createExclusive, directoryBackend, groupWritableHelperMessage, installFaultText, openCheckedDirectory, resetAclSpawnCount, splitAclListing, unlinkIfSame, unlinkOpenedFile } from "./editor/dirfd.mjs";
 import { ensureRecoverExcluded, isRecoverPath } from "./editor/vault-exclude.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -850,10 +850,6 @@ await check("an untrusted helper answers 503 and the server stays up", async () 
   }
 });
 
-function chownTo(user, target) {
-  return spawnSync("chown", [String(user), target], { encoding: "utf8" }).status === 0;
-}
-
 function stickyParent() {
   const fromEnv = os.tmpdir();
   try {
@@ -866,8 +862,20 @@ function stickyParent() {
   return "/tmp";
 }
 
-function chownOther(target) {
-  return chownTo("nobody", target);
+function rootOwnedHelper() {
+  const candidates = ["/usr/bin/true", "/bin/true", "/usr/bin/ls", "/bin/ls"];
+  for (const file of candidates) {
+    try {
+      const st = fs.lstatSync(file);
+      if (st.isSymbolicLink() || !st.isFile() || st.uid !== 0 || (st.mode & 0o022) !== 0) continue;
+      const parent = fs.lstatSync(path.dirname(file));
+      if (parent.isSymbolicLink() || !parent.isDirectory() || parent.uid !== 0 || (parent.mode & 0o022) !== 0) continue;
+      return file;
+    } catch {
+      // The next candidate may exist on this runner.
+    }
+  }
+  return "";
 }
 
 await check("a helper under a bad ancestor is refused, and /tmp is allowed", async () => {
@@ -882,16 +890,16 @@ await check("a helper under a bad ancestor is refused, and /tmp is allowed", asy
   fs.chmodSync(writableTool, 0o755);
   fs.chmodSync(writableBin, 0o755);
   fs.chmodSync(writable, 0o775);
-  const owned = path.join(base, "owned");
-  const ownedBin = path.join(owned, "bin");
-  fs.mkdirSync(ownedBin, { recursive: true });
-  const ownedTool = path.join(ownedBin, "dirfd-tool");
-  fs.copyFileSync(shippedHelper(), ownedTool);
-  fs.chmodSync(ownedTool, 0o755);
-  fs.chmodSync(ownedBin, 0o755);
-  fs.chmodSync(owned, 0o755);
-  const gave = chownOther(owned);
+  const otherWritable = path.join(base, "other");
+  const otherBin = path.join(otherWritable, "bin");
+  fs.mkdirSync(otherBin, { recursive: true });
+  const otherTool = path.join(otherBin, "dirfd-tool");
+  fs.copyFileSync(shippedHelper(), otherTool);
+  fs.chmodSync(otherTool, 0o755);
+  fs.chmodSync(otherBin, 0o755);
+  fs.chmodSync(otherWritable, 0o707);
   let sticky = "";
+  let rootOver = "";
   try {
     assert(ancestorFault(writable) === "ancestor-writable", ancestorFault(writable));
     assert(installFaultText("ancestor-writable") === "group-writable ancestor", installFaultText("ancestor-writable"));
@@ -900,15 +908,24 @@ await check("a helper under a bad ancestor is refused, and /tmp is allowed", asy
     assert(writableError.code === "DIRFD" && writableError.reason === "ancestor-writable", writableError.reason || writableError.code);
     assert(!fs.existsSync(path.join(vault, "group.recover")), "a group-writable ancestor ran the helper");
 
-    if (!gave) {
-      console.log("skip  ancestor owned by another user: chown nobody failed without sudo");
-    } else {
-      assert(ancestorFault(owned) === "ancestor-owner", ancestorFault(owned));
-      const ownedError = await withHelperEnv({ AIDANOS_DIRFD_TOOL: ownedTool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
-        rejects(() => createExclusive(folder, "owned.recover", Buffer.from("x\n"), "helper")));
-      assert(ownedError.code === "DIRFD" && ownedError.reason === "ancestor-owner", ownedError.reason || ownedError.code);
-      assert(!fs.existsSync(path.join(vault, "owned.recover")), "an ancestor owned by another user ran the helper");
+    assert(ancestorFault(otherWritable) === "ancestor-writable", ancestorFault(otherWritable) || "an other-writable ancestor was allowed");
+    const otherError = await withHelperEnv({ AIDANOS_DIRFD_TOOL: otherTool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => createExclusive(folder, "other.recover", Buffer.from("x\n"), "helper")));
+    assert(otherError.code === "DIRFD" && otherError.reason === "ancestor-writable", otherError.reason || otherError.code);
+    assert(!fs.existsSync(path.join(vault, "other.recover")), "an other-writable ancestor ran the helper");
+
+    rootOver = fs.mkdtempSync(path.join(stickyParent(), "aidanos-root-over-"));
+    let sawRoot = false;
+    let cursor = rootOver;
+    for (;;) {
+      const st = fs.lstatSync(cursor);
+      if (!st.isSymbolicLink() && st.isDirectory() && st.uid === 0) sawRoot = true;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) break;
+      cursor = parent;
     }
+    assert(sawRoot, "no root-owned folder above the user-owned directory");
+    assert(ancestorFault(rootOver) === "", ancestorFault(rootOver) || "a root-owned folder above a user-owned one was refused");
 
     const real = path.join(base, "real");
     const via = path.join(base, "via");
@@ -931,11 +948,12 @@ await check("a helper under a bad ancestor is refused, and /tmp is allowed", asy
     assert(fs.readFileSync(path.join(vault, "sticky.recover"), "utf8") === "ok\n", "a sticky root ancestor was refused");
   } finally {
     await folder.close();
-    if (gave) chownTo(process.getuid(), owned);
     fs.chmodSync(writable, 0o755);
+    fs.chmodSync(otherWritable, 0o755);
     fs.rmSync(base, { recursive: true, force: true });
     fs.rmSync(vault, { recursive: true, force: true });
     if (sticky) fs.rmSync(sticky, { recursive: true, force: true });
+    if (rootOver) fs.rmSync(rootOver, { recursive: true, force: true });
   }
 });
 
@@ -972,26 +990,21 @@ await check("a refused helper does not leave a new note", async () => {
   fs.chmodSync(ancestorBin, 0o755);
   fs.chmodSync(ancestor, 0o775);
   cases.push(["ancestor", ancestorTool, () => fs.chmodSync(ancestor, 0o755)]);
-  const foreign = path.join(dir, "foreign");
-  fs.mkdirSync(foreign);
-  const foreignTool = path.join(foreign, "tool");
-  fs.copyFileSync(shippedHelper(), foreignTool);
-  fs.chmodSync(foreignTool, 0o755);
-  const foreignOk = chownOther(foreignTool);
-  if (foreignOk) cases.push(["owner", foreignTool, () => {}]);
-  else console.log("skip  helper owned by another user: chown nobody failed without sudo");
-  assert(cases.length === (foreignOk ? 7 : 6), "refusal cases were " + cases.length);
+  const rootOwned = rootOwnedHelper();
+  assert(rootOwned, "no root-owned helper candidate on this machine");
+  cases.push(["owner", rootOwned, () => {}]);
+  assert(cases.length === 7, "refusal cases were " + cases.length);
   try {
     for (const [name, tool, cleanup] of cases) {
       const note = path.join(dir, name + ".md");
       const error = await withHelperEnv({ AIDANOS_DIRFD_TOOL: tool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
         rejects(() => writeNoteText(note, "NEW\n", { swapInRequested: false })));
       assert(error.code === "DIRFD", name + " " + error.code + " " + (error.reason || ""));
+      if (name === "owner") assert(error.reason === "owner", name + " " + (error.reason || ""));
       assert(!fs.existsSync(note), name + " left a note");
       cleanup();
     }
   } finally {
-    if (foreignOk) chownTo(process.getuid(), foreignTool);
     fs.chmodSync(wide, 0o755);
     fs.chmodSync(ancestor, 0o755);
   }
@@ -1111,6 +1124,33 @@ await check("startup reports a group-writable helper and refuses a bad install l
   assert(helperSrc.includes("TODO: once Developer ID signing exists"), "the code-signature TODO is missing");
 });
 
+await check("one save lists the helper path in a handful of acl spawns", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-acl-spawns-"));
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bin);
+  const tool = path.join(bin, "dirfd-tool");
+  fs.copyFileSync(shippedHelper(), tool);
+  fs.chmodSync(tool, 0o755);
+  fs.chmodSync(bin, 0o755);
+  fs.chmodSync(dir, 0o755);
+  const note = path.join(dir, "day.md");
+  resetAclSpawnCount();
+  let text = "";
+  try {
+    await withHelperEnv({ AIDANOS_DIRFD_TOOL: tool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      writeNoteText(note, "hello\n", { swapInRequested: false }));
+    text = fs.readFileSync(note, "utf8");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  const spawns = aclSpawnCount();
+  // openTrustedHelper lists the directories, then the file. Each later
+  // helper call lists the directories and the file together.
+  if (process.platform === "darwin") assert(spawns === 5, "acl spawns were " + spawns);
+  else assert(spawns === 0, "acl spawns were " + spawns);
+  assert(text === "hello\n", "the save did not land");
+});
+
 await check("a write ACL for another principal is refused", async () => {
   const clean = [
     "drwxr-xr-x  2 501  20  64 Oct 27 03:00 /private/tmp/aidanos",
@@ -1146,8 +1186,39 @@ await check("a write ACL for another principal is refused", async () => {
   assert(aclListingFault(ownerAllow, 501, "me") === "", "the owner's write ACL was refused");
   assert(aclListingFault(otherAllow, 501, "me") === "acl", "a write ACL for another uid was allowed");
   assert(aclListingFault(namedOther, 501, "me") === "acl", "a named write ACL for someone else was allowed");
+  const addFile = [
+    "drwxr-xr-x+ 2 501  20  64 Oct 27 03:00 /private/tmp/aidanos",
+    " 0: user:0 allow add_file,add_subdirectory",
+    "",
+  ].join("\n");
+  const ownAdd = [
+    "drwxr-xr-x+ 2 501  20  64 Oct 27 03:00 /private/tmp/aidanos",
+    " 0: user:501 allow add_file,add_subdirectory",
+    "",
+  ].join("\n");
   assert(aclListingFault(readOnly, 501, "me") === "", "a read ACL or a deny was refused");
   assert(aclListingFault(unknown, 501, "me") === "acl", "an unreadable ACL line was allowed");
+  assert(aclListingFault(addFile, 501, "me") === "acl", "add_file for another uid was allowed");
+  assert(aclListingFault(ownAdd, 501, "me") === "", "the owner's add_file was refused");
+  const spaced = "drwxr-xr-x  2 501  20  64 Oct 27 03:00 /tmp\n 0:" + " ".repeat(200_000) + "\n";
+  const started = Date.now();
+  const spacedFault = aclListingFault(spaced, 501, "me");
+  const elapsed = Date.now() - started;
+  assert(spacedFault === "acl", "a line of spaces was accepted");
+  assert(elapsed < 500, "acl parse took " + elapsed + "ms");
+  const ordered = [
+    "drwxr-xr-x  2 501  20  64 Oct 27 03:00 /tmp/a",
+    " 0: user:501 allow read",
+    "drwxr-xr-x  2 501  20  64 Oct 27 03:00 /tmp/a/b",
+  ].join("\n");
+  const blocks = splitAclListing(ordered, ["/tmp/a", "/tmp/a/b"]);
+  assert(blocks && blocks.length === 2 && blocks[0].length === 2 && blocks[1].length === 1, "one listing per path");
+  const swapped = [
+    "drwxr-xr-x  2 501  20  64 Oct 27 03:00 /tmp/a/b",
+    "drwxr-xr-x  2 501  20  64 Oct 27 03:00 /tmp/a",
+  ].join("\n");
+  assert(splitAclListing(swapped, ["/tmp/a", "/tmp/a/b"]) === null, "a reordered listing was accepted");
+  assert(splitAclListing(ordered + "\ndrwxr-xr-x  2 501  20  64 Oct 27 03:00 /tmp/extra", ["/tmp/a", "/tmp/a/b"]) === null, "an extra listing was accepted");
   assert(installFaultText("ancestor-acl") === "an ACL grants write to someone other than the owner", installFaultText("ancestor-acl"));
   if (process.platform !== "darwin") {
     console.log("skip  live write ACL: not macOS");

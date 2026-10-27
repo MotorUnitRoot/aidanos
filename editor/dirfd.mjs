@@ -15,7 +15,8 @@
 // writable unless it is sticky and owned by root. A root-owned symlink,
 // such as macOS /tmp or /var, is followed. Any other symlink is refused.
 // On macOS the same walk reads each folder's ACL, and the helper file's ACL,
-// with /bin/ls -lde. A write grant for anyone but the owner is refused.
+// with one /bin/ls -lde -n of every path. The process uid and gid come from
+// getuid and getgid. A write grant for anyone but the owner is refused.
 // The helper does not do that check: it would be reporting on itself.
 
 import { spawn, spawnSync } from "node:child_process";
@@ -98,14 +99,46 @@ function helperFile(env = process.env) {
 // real folders are checked. Any other symlink is refused.
 const MAX_ANCESTOR_LINKS = 8;
 
-export function ancestorFault(leafDir, uid = typeof process.getuid === "function" ? process.getuid() : null) {
+let aclSpawns = 0;
+
+export function resetAclSpawnCount() {
+  aclSpawns = 0;
+}
+
+export function aclSpawnCount() {
+  return aclSpawns;
+}
+
+function selfIds() {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const gid = typeof process.getgid === "function" ? process.getgid() : null;
+  if (typeof uid !== "number" || typeof gid !== "number") return null;
+  return { uid, gid };
+}
+
+// filePath is included in the same listing as the directories. A fault on
+// that file is "helper-acl"; a fault on a directory is "ancestor-acl".
+export function ancestorFault(leafDir, uid = typeof process.getuid === "function" ? process.getuid() : null, filePath = "") {
   if (typeof uid !== "number") return "ancestor";
   let abs = path.resolve(String(leafDir || ""));
   const seenLinks = new Set();
+  const dirs = [];
   for (let hop = 0; hop <= MAX_ANCESTOR_LINKS; hop++) {
     const step = walkAncestors(abs, uid, seenLinks);
-    if (step.fault) return step.fault;
-    if (!step.next) return "";
+    if (step.dirs) dirs.push(...step.dirs);
+    if (step.fault) {
+      const acl = aclFaultFor(dirs.map((dir) => ({ path: dir.path, uid: dir.uid, file: false })));
+      if (acl) return "ancestor-acl";
+      return step.fault;
+    }
+    if (!step.next) {
+      const entries = dirs.map((dir) => ({ path: dir.path, uid: dir.uid, file: false }));
+      if (filePath) entries.push({ path: path.resolve(String(filePath)), uid, file: true });
+      const acl = aclFaultFor(entries);
+      if (acl === "file") return "helper-acl";
+      if (acl) return "ancestor-acl";
+      return "";
+    }
     abs = step.next;
   }
   return "ancestor";
@@ -121,6 +154,7 @@ function walkAncestors(abs, uid, seenLinks) {
     cursor = parent;
   }
   chain.reverse();
+  const dirs = [];
   for (const dir of chain) {
     let st;
     try {
@@ -142,16 +176,16 @@ function walkAncestors(abs, uid, seenLinks) {
       const next = !rest || rest.startsWith("..") || path.isAbsolute(rest)
         ? linked
         : path.resolve(linked, rest);
-      return { next };
+      return { next, dirs };
     }
     if (!st.isDirectory()) return { fault: "ancestor" };
     const writable = (st.mode & GROUP_OR_OTHER_WRITE) !== 0;
     const stickyRoot = (st.mode & STICKY) !== 0 && st.uid === 0;
-    if (writable && !stickyRoot) return { fault: "ancestor-writable" };
-    if (st.uid !== 0 && st.uid !== uid) return { fault: "ancestor-owner" };
-    if (foreignAcl(dir, st.uid)) return { fault: "ancestor-acl" };
+    if (writable && !stickyRoot) return { fault: "ancestor-writable", dirs };
+    if (st.uid !== 0 && st.uid !== uid) return { fault: "ancestor-owner", dirs };
+    dirs.push({ path: dir, uid: st.uid });
   }
-  return {};
+  return { dirs };
 }
 
 export function installFaultText(fault) {
@@ -166,39 +200,146 @@ const WRITE_ACL = new Set([
   "append",
   "delete",
   "delete_child",
+  "add_file",
+  "add_subdirectory",
   "writeattr",
   "writeextattr",
   "writesecurity",
   "chown",
 ]);
 
-// text is the stdout of `/bin/ls -lde -n`. An allow entry that grants one of
-// the write rights to anyone but the owner is a fault. Anything the parser
-// does not recognise is a fault too. An empty string means the listing is clean.
+function isAclSpace(code) {
+  return code === 32 || code === 9;
+}
+
+// One left-to-right pass. A regex with nested space quantifiers stalls on a
+// long run of spaces, which is not a listing we should trust anyway.
+function parseAclEntry(line) {
+  const n = line.length;
+  let i = 0;
+  while (i < n && isAclSpace(line.charCodeAt(i))) i += 1;
+  if (i >= n) return { empty: true };
+  const numStart = i;
+  while (i < n && line.charCodeAt(i) >= 48 && line.charCodeAt(i) <= 57) i += 1;
+  if (i === numStart || i >= n || line.charCodeAt(i) !== 58) return null;
+  i += 1;
+  while (i < n && isAclSpace(line.charCodeAt(i))) i += 1;
+  const principalStart = i;
+  while (i < n && !isAclSpace(line.charCodeAt(i))) i += 1;
+  if (i === principalStart) return null;
+  const principal = line.slice(principalStart, i);
+  while (i < n && isAclSpace(line.charCodeAt(i))) i += 1;
+  if (line.startsWith("inherited", i) && (i + 9 === n || isAclSpace(line.charCodeAt(i + 9)))) {
+    i += 9;
+    while (i < n && isAclSpace(line.charCodeAt(i))) i += 1;
+  }
+  const actionStart = i;
+  while (i < n && !isAclSpace(line.charCodeAt(i))) i += 1;
+  const action = line.slice(actionStart, i);
+  if (action !== "allow" && action !== "deny") return null;
+  while (i < n && isAclSpace(line.charCodeAt(i))) i += 1;
+  let end = n;
+  while (end > i && isAclSpace(line.charCodeAt(end - 1))) end -= 1;
+  if (end <= i) return null;
+  return { principal, action, perms: line.slice(i, end) };
+}
+
+function permList(perms) {
+  const items = [];
+  let start = 0;
+  for (let i = 0; i <= perms.length; i += 1) {
+    if (i !== perms.length && perms.charCodeAt(i) !== 44) continue;
+    let from = start;
+    let to = i;
+    while (from < to && isAclSpace(perms.charCodeAt(from))) from += 1;
+    while (to > from && isAclSpace(perms.charCodeAt(to - 1))) to -= 1;
+    if (to > from) items.push(perms.slice(from, to));
+    start = i + 1;
+  }
+  return items;
+}
+
+// text is the stdout of `/bin/ls -lde -n` for one path. An allow entry that
+// grants one of the write rights to anyone but the owner is a fault. Anything
+// the parser does not recognise is a fault too. An empty string means the
+// listing is clean.
 export function aclListingFault(text, ownerUid, ownerName = "") {
   const lines = String(text || "").split(/\r?\n/);
   while (lines.length && lines[lines.length - 1] === "") lines.pop();
   if (!lines.length) return "acl";
-  const mode = lines[0].split(/\s+/)[0] || "";
+  const mode = lines[0].split(/[ \t]+/)[0] || "";
   if (!/^[-dlcbps]/.test(mode) || mode.length < 10) return "acl";
   for (const line of lines.slice(1)) {
-    if (!line.trim()) continue;
-    const match = line.match(/^\s*\d+:\s+(.+?)\s+(?:inherited\s+)?(allow|deny)\s+(\S.*?)\s*$/);
-    if (!match) return "acl";
-    if (match[2] !== "allow") continue;
-    const perms = match[3].split(",").map((item) => item.trim()).filter(Boolean);
-    if (!perms.some((item) => WRITE_ACL.has(item))) continue;
-    if (aclPrincipalIsOwner(match[1].trim(), ownerUid, ownerName)) continue;
+    const entry = parseAclEntry(line);
+    if (!entry) return "acl";
+    if (entry.empty) continue;
+    if (entry.action !== "allow") continue;
+    if (!permList(entry.perms).some((item) => WRITE_ACL.has(item))) continue;
+    if (aclPrincipalIsOwner(entry.principal, ownerUid, ownerName)) continue;
     return "acl";
   }
   return "";
 }
 
+function decimalId(text) {
+  if (!text) return null;
+  let value = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 48 || code > 57) return null;
+    value = value * 10 + (code - 48);
+  }
+  return value;
+}
+
 function aclPrincipalIsOwner(principal, ownerUid, ownerName) {
-  const numeric = principal.match(/^user:(\d+)$/);
-  if (numeric) return Number(numeric[1]) === ownerUid;
-  const named = principal.match(/^user:(.+)$/);
-  return !!(named && ownerName && named[1] === ownerName);
+  if (principal.startsWith("user:")) {
+    const rest = principal.slice(5);
+    const id = decimalId(rest);
+    if (id != null) return id === ownerUid;
+    return !!(ownerName && rest === ownerName);
+  }
+  return false;
+}
+
+function isAclHeader(line) {
+  if (!line || isAclSpace(line.charCodeAt(0))) return false;
+  const mode = line.split(/[ \t]+/)[0] || "";
+  return /^[-dlcbps]/.test(mode) && mode.length >= 10;
+}
+
+function headerEndsWithPath(header, filePath) {
+  if (!filePath || !header.endsWith(filePath) || header.length === filePath.length) return false;
+  return isAclSpace(header.charCodeAt(header.length - filePath.length - 1));
+}
+
+// One block per path, in the order asked. A missing, extra, or reordered
+// entry is a fault: the caller cannot tell which path was listed.
+export function splitAclListing(text, paths) {
+  const lines = String(text || "").split(/\n/);
+  while (lines.length && lines[lines.length - 1] === "") lines.pop();
+  const blocks = [];
+  let current = null;
+  for (const line of lines) {
+    if (!line) {
+      if (current) blocks.push(current);
+      current = null;
+      continue;
+    }
+    if (isAclHeader(line)) {
+      if (current) blocks.push(current);
+      current = [line];
+      continue;
+    }
+    if (!current) return null;
+    current.push(line);
+  }
+  if (current) blocks.push(current);
+  if (blocks.length !== paths.length) return null;
+  for (let i = 0; i < paths.length; i += 1) {
+    if (!headerEndsWithPath(blocks[i][0], paths[i])) return null;
+  }
+  return blocks;
 }
 
 function trustedLs() {
@@ -227,24 +368,34 @@ function trustedLs() {
   return "";
 }
 
-function foreignAcl(filePath, ownerUid) {
-  if (process.platform !== "darwin") return "";
+// "" is clean. "file" means the helper file's entry. "acl" means a directory.
+function aclFaultFor(entries) {
+  if (process.platform !== "darwin" || !entries.length) return "";
+  const self = selfIds();
+  if (!self || self.gid < 0) return "acl";
   const ls = trustedLs();
   if (!ls) return "acl";
-  const listed = spawnSync(ls, ["-lde", "-n", filePath], {
+  const paths = entries.map((entry) => entry.path);
+  aclSpawns += 1;
+  const listed = spawnSync(ls, ["-lde", "-n", ...paths], {
     encoding: "utf8",
     env: { LC_ALL: "C", PATH: "/bin:/usr/bin" },
     timeout: 5000,
   });
   if (!listed || listed.error || listed.status !== 0) return "acl";
-  let ownerName = "";
-  const id = spawnSync("/usr/bin/id", ["-un", String(ownerUid)], {
-    encoding: "utf8",
-    env: { LC_ALL: "C", PATH: "/bin:/usr/bin" },
-    timeout: 5000,
-  });
-  if (id && id.status === 0) ownerName = String(id.stdout || "").trim();
-  return aclListingFault(listed.stdout, ownerUid, ownerName);
+  const blocks = splitAclListing(listed.stdout, paths);
+  if (!blocks) return "acl";
+  for (let i = 0; i < entries.length; i += 1) {
+    const ownerUid = typeof entries[i].uid === "number" ? entries[i].uid : self.uid;
+    if (aclListingFault(blocks[i].join("\n"), ownerUid, "")) {
+      return entries[i].file ? "file" : "acl";
+    }
+  }
+  return "";
+}
+
+function foreignAcl(filePath, ownerUid) {
+  return aclFaultFor([{ path: filePath, uid: ownerUid, file: true }]) ? "acl" : "";
 }
 
 // A umask 002 checkout leaves the helper group-writable. Saves keep refusing
@@ -384,13 +535,10 @@ function callHelper(dirHandle, args, body, borrowed) {
     // The same checked descriptor is reused for every call in one save.
     // The folder walk still runs before each exec: a parent can change
     // without the open file descriptor changing.
-    const fault = ancestorFault(path.dirname(tool.path));
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    const fault = ancestorFault(path.dirname(tool.path), uid, tool.path);
     if (fault) {
       rejectClosed(helperUnavailable(fault));
-      return;
-    }
-    if (foreignAcl(tool.path, typeof process.getuid === "function" ? process.getuid() : null)) {
-      rejectClosed(helperUnavailable("helper-acl"));
       return;
     }
     // macOS will not execute /dev/fd. Recheck the path, then execute that path.

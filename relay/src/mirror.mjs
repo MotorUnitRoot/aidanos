@@ -441,6 +441,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
   let records = null;
   let timer = null;
   let chain = Promise.resolve();
+  let queued = 0;
   const recordFile = path.join(vault, ".aidanos", "written.json");
 
   async function hashes() {
@@ -613,16 +614,30 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
     return chain;
   }
 
+  function enqueueSync() {
+    queued += 1;
+    const run = syncDisk();
+    run.finally(() => {
+      queued -= 1;
+    });
+    return run;
+  }
+
   function schedule() {
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
-      syncDisk();
+      if (queued < 1) enqueueSync();
     }, debounceMs);
     if (timer.unref) timer.unref();
   }
 
-  const poll = setInterval(schedule, Math.max(debounceMs, 200));
+  // The interval must start the pass itself. Calling schedule() from it
+  // resets the debounce on every tick, and an idle worker never writes.
+  const poll = setInterval(() => {
+    if (queued >= 1) return;
+    enqueueSync();
+  }, Math.max(debounceMs, 200));
   if (poll.unref) poll.unref();
 
   return {
@@ -632,7 +647,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [], trac
         clearTimeout(timer);
         timer = null;
       }
-      await syncDisk();
+      await enqueueSync();
     },
     // Wait for a write that has already started. Does not start another one.
     async idle() {

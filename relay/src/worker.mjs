@@ -259,7 +259,10 @@ async function run() {
       post({ v: 1, kind: "save", id, phase: "end" });
     });
     saveTasks.add(run);
-    run.finally(() => saveTasks.delete(run));
+    // The caller owns run's rejection. This extra finally is only bookkeeping,
+    // and a mirror or storage failure must not become an unhandled rejection
+    // that exits the worker.
+    run.finally(() => saveTasks.delete(run)).catch(() => {});
     return run;
   }
   const inner = new NodeFSStorageAdapter(data.dataDir);

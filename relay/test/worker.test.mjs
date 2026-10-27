@@ -563,6 +563,73 @@ test("a mirror write onto a symlink or a hard link is refused", async () => {
   }
 });
 
+test("the mirror poll writes a note without an explicit flush", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const id = noteId("notes/polled.md");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault,
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 50,
+  });
+  try {
+    relay.repo.import(Automerge.save(Automerge.from({ kind: "index", paths: { "notes/polled.md": id } })), { docId: INDEX_ID });
+    relay.repo.import(Automerge.save(Automerge.from({ kind: "note", text: "from the poll" })), { docId: id });
+    const file = path.join(vault, "notes", "polled.md");
+    await waitFor(async () => {
+      const text = await fs.readFile(file, "utf8").catch(() => "");
+      return text === "from the poll";
+    }, 3000, "the poll did not write the note");
+  } finally {
+    await relay.close();
+  }
+});
+
+test("a mirror failure does not kill the worker", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(String(text));
+  const id = noteId("notes/hello.md");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault,
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  try {
+    relay.repo.import(Automerge.save(Automerge.from({ kind: "index", paths: { "notes/hello.md": id } })), { docId: INDEX_ID });
+    const handle = relay.repo.import(Automerge.save(Automerge.from({ kind: "note", text: "Hello" })), { docId: id });
+    await relay.mirrorNow();
+    const record = path.join(vault, ".aidanos", "written.json");
+    await fs.rm(record, { force: true });
+    await fs.mkdir(record);
+    handle.change((doc) => {
+      Automerge.updateText(doc, ["text"], "Hello changed");
+    });
+    await relay.mirrorNow();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(seen.some((line) => line.includes("worker fatal")), false);
+    assert.equal(seen.some((line) => line.includes("mirror failed")), true);
+    assert.equal((await fetch(relay.healthURL)).status, 200);
+    await fs.rm(record, { recursive: true, force: true });
+    handle.change((doc) => {
+      Automerge.updateText(doc, ["text"], "Hello restored");
+    });
+    await relay.mirrorNow();
+    assert.equal(await fs.readFile(path.join(vault, "notes", "hello.md"), "utf8"), "Hello restored");
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+});
+
 test("a save-wait timeout unlinks a temp the worker still holds", async () => {
   const dir = await tempDir();
   const vault = path.join(dir, "vault");

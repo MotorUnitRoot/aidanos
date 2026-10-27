@@ -14,6 +14,15 @@ import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import { listenHosts } from "./bind.mjs";
 import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
+import {
+  beginFrame,
+  beginIndexRequest,
+  finishIndexReply,
+  installIndexTrace,
+  noteGitWork,
+  traceStorage,
+  watchRepo,
+} from "./index-trace.mjs";
 import { createMirror } from "./mirror.mjs";
 import { logSafe, stampLine } from "./redact.mjs";
 import { describeSyncFrame } from "./sync-log.mjs";
@@ -112,6 +121,22 @@ export function syncFrameAllowed(value) {
     if (!isValidDocumentId(message.documentId)) return false;
   }
   return true;
+}
+
+function frameMessage(data) {
+  let raw = data;
+  if (raw == null) return null;
+  if (ArrayBuffer.isView(raw)) raw = Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
+  else if (raw instanceof ArrayBuffer) raw = Buffer.from(raw);
+  else if (typeof raw === "string") raw = Buffer.from(raw);
+  else if (!Buffer.isBuffer(raw)) return null;
+  try {
+    const message = decode(raw);
+    if (!message || typeof message !== "object") return null;
+    return message;
+  } catch {
+    return null;
+  }
 }
 
 function rejectUpgrade(socket) {
@@ -480,6 +505,7 @@ export async function startRelay(options = {}) {
   const gitUrl = String(options.gitUrl ?? env.AIDANOS_RELAY_GIT_URL ?? "").trim();
   const gitToken = String(options.gitToken ?? env.AIDANOS_RELAY_GIT_TOKEN ?? "").trim();
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
+  await installIndexTrace((line) => logSafe(secrets, line));
   await assertNotClientVault(vault);
   await claimRelayFolders(vault, dataDir);
   const guessLimit = Number(options.guessLimit ?? 5);
@@ -610,11 +636,12 @@ export async function startRelay(options = {}) {
         adapters.push(new NodeWSServerAdapter(attached.view));
       }
       const repo = new Repo({
-        storage: new NodeFSStorageAdapter(dataDir),
+        storage: traceStorage(new NodeFSStorageAdapter(dataDir)),
         network: adapters,
         sharePolicy: async () => true,
         peerId: options.peerId || "aidanos-relay",
       });
+      watchRepo(repo);
       const debounce = Number(options.mirrorDebounceMs ?? process.env.AIDANOS_MIRROR_DEBOUNCE_MS);
       const mirror = createMirror({
         repo,
@@ -921,6 +948,17 @@ export async function startRelay(options = {}) {
         let joinAnswered = false;
         let indexRequestAt = null;
         function noteFrame(direction, data) {
+          const message = frameMessage(data);
+          const docId = message && typeof message.documentId === "string" ? message.documentId : "";
+          const messageType = message && typeof message.type === "string" ? message.type : "";
+          if (docId) beginFrame(docId);
+          // Open the window before describeSyncFrame decodes the message,
+          // so that decode is part of this request and not the previous one.
+          const indexIn =
+            direction === "in" &&
+            docId === INDEX_ID &&
+            (messageType === "request" || messageType === "sync" || messageType === "doc-unavailable");
+          if (indexIn) beginIndexRequest(live && live.repo);
           let line = "";
           try {
             line = describeSyncFrame(direction, data);
@@ -944,6 +982,7 @@ export async function startRelay(options = {}) {
             logSafe(secrets, "index request");
           } else if (indexRequestAt != null) {
             logSafe(secrets, "index reply in " + seconds(now - indexRequestAt));
+            finishIndexReply();
             indexRequestAt = null;
           }
         }
@@ -982,11 +1021,14 @@ export async function startRelay(options = {}) {
   const interval = gitInterval(options.gitIntervalMs, env);
   let gitTimer = null;
   async function runBackup() {
+    const started = Date.now();
     try {
       const result = await backupOnce({ vault, gitUrl, gitToken, secrets, env });
+      noteGitWork(Date.now() - started);
       noteGit(result);
       return result;
     } catch (error) {
+      noteGitWork(Date.now() - started);
       gitState.status = "failed";
       throw error;
     }

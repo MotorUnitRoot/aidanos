@@ -639,6 +639,106 @@ test("the relay logs the handshake it sends and receives", async () => {
   assert.match(text, /sync out peer/);
 });
 
+// The Apple runner spent 13.951s between an index request and its reply.
+// That limit is a step count: a tiny index must not decode, receive,
+// generate, or fully save more than a handful of times. Wall clock stays
+// out of the assertion because a loaded runner can stretch a short call.
+test("an index reply is a handful of steps", async () => {
+  const dir = await tempDir();
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(String(text));
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+  });
+  try {
+    importDoc(relay.repo, INDEX_ID, { kind: "index", paths: { "notes/hello.md": "note-1" } });
+    const local = Automerge.from({ kind: "index", paths: {} });
+    let syncState = Automerge.initSyncState();
+    await new Promise((resolve, reject) => {
+      const ws = new WebSocket(relay.url, { headers: { Authorization: "Bearer " + TOKEN } });
+      const timer = setTimeout(() => {
+        ws.terminate();
+        reject(new Error("no index steps\n" + seen.join("\n")));
+      }, 3000);
+      ws.on("error", (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+      ws.on("open", () => {
+        ws.send(cbor.encode({
+          type: "join",
+          senderId: "phone-1",
+          supportedProtocolVersions: ["1"],
+          peerMetadata: { storageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", isEphemeral: false },
+        }));
+      });
+      ws.on("message", (data) => {
+        let message;
+        try {
+          message = cbor.decode(data);
+        } catch {
+          return;
+        }
+        if (!message || message.type !== "peer") return;
+        const [next, syncMessage] = Automerge.generateSyncMessage(local, syncState);
+        syncState = next;
+        if (!syncMessage) {
+          clearTimeout(timer);
+          ws.close();
+          reject(new Error("the local index had nothing to request"));
+          return;
+        }
+        ws.send(cbor.encode({
+          type: "request",
+          senderId: "phone-1",
+          targetId: message.senderId,
+          documentId: INDEX_ID,
+          data: syncMessage,
+        }));
+        const wait = setInterval(() => {
+          if (!seen.some((line) => line.includes("index steps "))) return;
+          clearInterval(wait);
+          clearTimeout(timer);
+          ws.close();
+          resolve();
+        }, 20);
+      });
+    });
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+  const line = seen.filter((entry) => entry.includes("index steps ")).pop();
+  assert.ok(line, "missing index steps\n" + seen.join("\n"));
+  const count = (name) => {
+    const match = line.match(new RegExp("\\b" + name + "=(\\d+)x/"));
+    assert.ok(match, name + " missing in " + line);
+    return Number(match[1]);
+  };
+  const changes = Number(line.match(/\bchanges=(\d+)/)[1]);
+  const ops = Number(line.match(/\bops=(\d+)/)[1]);
+  const bytes = Number(line.match(/\bbytes=(\d+)/)[1]);
+  assert.ok(changes >= 1 && changes <= 20, line);
+  assert.ok(ops >= 1 && ops <= 400, line);
+  assert.ok(bytes >= 0 && bytes < 100_000, line);
+  assert.equal(line.includes("state=ready"), true, line);
+  assert.ok(count("decode") >= 1 && count("decode") <= 8, line);
+  assert.ok(count("receive") >= 1 && count("receive") <= 4, line);
+  assert.ok(count("generate") >= 1 && count("generate") <= 4, line);
+  assert.ok(count("patches") <= 8, line);
+  assert.ok(count("save") <= 4, line);
+  assert.ok(count("saveSince") <= 4, line);
+  assert.ok(count("loadIncremental") <= 4, line);
+  assert.match(line, /\bother=\d+\.\d{3}s/);
+  assert.match(line, /\bblocked=\d+\.\d{3}s/);
+});
+
 function importDoc(repo, docId, value) {
   return repo.import(Automerge.save(Automerge.from(value)), { docId });
 }

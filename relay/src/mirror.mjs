@@ -1,7 +1,9 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import * as Automerge from "@automerge/automerge";
+import { noteMirror } from "./index-trace.mjs";
 import { logSafe } from "./redact.mjs";
 import { prepareNoteFile, safeNotePath } from "./paths.mjs";
 
@@ -252,8 +254,13 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
 
   async function syncDisk() {
     chain = chain.then(async () => {
-      await foldOutside();
-      await writeNotes();
+      const started = performance.now();
+      try {
+        await foldOutside();
+        await writeNotes();
+      } finally {
+        noteMirror(performance.now() - started);
+      }
     }).catch((error) => {
       logSafe(secrets, "mirror failed:", error instanceof Error ? error.message : error);
     });

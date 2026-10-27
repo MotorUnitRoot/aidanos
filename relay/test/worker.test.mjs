@@ -604,6 +604,39 @@ test("the mirror poll writes a note without an explicit flush", async () => {
   }
 });
 
+test("the mirror writes a note whose kind and id are automerge raw strings", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const notePath = "log/ABC/2026-10-21.md";
+  const id = noteId(notePath);
+  const relay = await startRelay({
+    token: TOKEN,
+    vault,
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 50,
+  });
+  try {
+    let index = Automerge.from({ kind: "index", paths: {} });
+    index = Automerge.change(index, (doc) => {
+      doc.kind = new Automerge.ImmutableString("index");
+      doc.paths[notePath] = new Automerge.ImmutableString(id);
+    });
+    let note = Automerge.from({ kind: "note", text: "" });
+    note = Automerge.change(note, (doc) => {
+      doc.kind = new Automerge.ImmutableString("note");
+      Automerge.splice(doc, ["text"], 0, 0, "Hello");
+    });
+    relay.repo.import(Automerge.save(index), { docId: INDEX_ID });
+    relay.repo.import(Automerge.save(note), { docId: id });
+    const file = path.join(vault, "log", "ABC", "2026-10-21.md");
+    await waitFor(async () => (await fs.readFile(file, "utf8").catch(() => "")) === "Hello", 3000, "raw-string note was not written");
+  } finally {
+    await relay.close();
+  }
+});
+
 test("a mirror failure does not kill the worker", async () => {
   const dir = await tempDir();
   const vault = path.join(dir, "vault");

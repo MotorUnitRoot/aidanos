@@ -21,11 +21,26 @@ function yieldNow() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+// Automerge's raw string is an object with toJSON, not a JS string. The
+// Swift notes use that for kind and for index ids. JSON.stringify of the
+// whole doc used to coerce them, and it also copied every byte of a large
+// note on the sync thread. Read the one field.
+function plainString(value) {
+  if (typeof value === "string") return value;
+  if (!value || typeof value.toJSON !== "function") return null;
+  try {
+    const out = value.toJSON();
+    return typeof out === "string" ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 function noteText(doc) {
-  if (!doc || doc.kind !== "note") return null;
-  if (typeof doc.text === "string") return doc.text;
+  if (!doc || plainString(doc.kind) !== "note") return null;
   if (doc.text == null) return "";
-  return null;
+  const text = plainString(doc.text);
+  return text == null ? null : text;
 }
 
 function changes(before, after) {
@@ -1088,9 +1103,10 @@ export function createMirror({
       } catch {
         continue;
       }
-      if (!doc || doc.kind !== "index" || !doc.paths || typeof doc.paths !== "object") continue;
+      if (!doc || plainString(doc.kind) !== "index" || !doc.paths || typeof doc.paths !== "object") continue;
       for (const [notePath, docId] of Object.entries(doc.paths)) {
-        if (typeof docId === "string" && safeNotePath(notePath)) paths[notePath] = docId;
+        const id = plainString(docId);
+        if (id && safeNotePath(notePath)) paths[notePath] = id;
       }
     }
     return paths;

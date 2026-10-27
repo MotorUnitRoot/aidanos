@@ -1,5 +1,7 @@
 // Scrub secrets before anything is printed. The git token and the relay
 // token must never appear in a log line.
+import { Console } from "node:console";
+import { createWriteStream } from "node:fs";
 
 export function redact(text, secrets) {
   let out = String(text ?? "");
@@ -34,4 +36,23 @@ export function logSafe(secrets, ...parts) {
     })
     .join(" ");
   console.error(stampLine(redact(line, secrets)));
+}
+
+// Node writes a regular file with writeSync. On the Apple runner those
+// writes were the multi-second event-loop gaps: the lag line went out
+// through console.error, the write blocked, and the next tick logged a
+// longer gap. An async stream on the same fd keeps the bytes in that
+// file and returns before the kernel finishes.
+export function installFileLog(fd = process.stderr.fd) {
+  const previous = console.error;
+  const stream = createWriteStream("", { fd, autoClose: false });
+  stream.on("error", () => {});
+  const sink = new Console({ stdout: stream, stderr: stream });
+  console.error = (...args) => sink.error(...args);
+  return {
+    stream,
+    restore() {
+      console.error = previous;
+    },
+  };
 }

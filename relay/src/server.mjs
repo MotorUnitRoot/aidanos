@@ -24,7 +24,7 @@ import {
   watchRepo,
 } from "./index-trace.mjs";
 import { createMirror } from "./mirror.mjs";
-import { logSafe, stampLine } from "./redact.mjs";
+import { installFileLog, logSafe, stampLine } from "./redact.mjs";
 import { describeSyncFrame } from "./sync-log.mjs";
 
 const DEFAULT_PORT = 3750;
@@ -1117,6 +1117,11 @@ function gitInterval(override, env = process.env) {
 }
 
 async function main() {
+  // A terminal stays on the synchronous console. A file or a pipe does
+  // not: Node's file stderr is writeSync, and a full pipe blocks until
+  // the reader drains it. CI and launchd both point this process at a
+  // file. The async stream writes that same fd.
+  if (!process.stderr.isTTY) installFileLog();
   const needed = nodeRequirement();
   if (needed) {
     logSafe([], needed);

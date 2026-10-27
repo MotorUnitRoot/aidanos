@@ -91,6 +91,9 @@ jobs:
           # This loop only starts a new process if the current one dies.
           # --cpu-prof writes the profile when this process exits. The stop
           # step SIGTERMs it; a kill -9 would leave the profile empty.
+          # stdout and stderr are the log file, not this step's pipe.
+          # The harness used to own that pipe, and a slow drain blocked
+          # Node inside console.error. The file is printed in a later step.
           (
             set +e
             echo "$BASHPID" > "$RUNNER_TEMP/relay-ios.loop.pid"
@@ -100,7 +103,7 @@ jobs:
               AIDANOS_RELAY_TOKEN=aidanos-test-token-0123456789abcdef \
                 AIDANOS_RELAY_ALLOW_RESET=1 \
                 node --cpu-prof --cpu-prof-dir "$cpu" src/server.mjs --port 3757 \
-                --vault "$vault" --data "$data" >> "$log" 2>&1 &
+                --vault "$vault" --data "$data" >> "$log" 2>&1 < /dev/null &
               echo $! > "$RUNNER_TEMP/relay-ios.pid"
               wait $!
               code=$?
@@ -108,6 +111,7 @@ jobs:
               sleep 0.2
             done
           ) &
+          disown || true
           for _ in $(seq 1 50); do
             curl -sf http://127.0.0.1:3757/health && exit 0
             sleep 0.2

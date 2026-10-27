@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { closeSync, openSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +12,8 @@ import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
-import { logSafe, redact, stampLine } from "../src/redact.mjs";
+import { installFileLog, logSafe, redact, stampLine } from "../src/redact.mjs";
+import { emptyLateState, nextLoopLateLine } from "../src/index-trace.mjs";
 import { cbor } from "@automerge/automerge-repo";
 import { describeSyncFrame, logSyncFrame } from "../src/sync-log.mjs";
 import {
@@ -86,6 +88,39 @@ test("every relay log line starts with a timestamp", () => {
     console.error = write;
   }
   assert.match(seen[0], /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z LISTENING 127\.0\.0\.1 3757$/);
+});
+
+test("a file log is not a synchronous stderr write", async () => {
+  const dir = await tempDir();
+  const file = path.join(dir, "relay.log");
+  const fd = openSync(file, "a");
+  const installed = installFileLog(fd);
+  const finished = new Promise((resolve) => installed.stream.once("finish", resolve));
+  try {
+    logSafe([], "LISTENING 127.0.0.1 3757");
+  } finally {
+    installed.restore();
+  }
+  installed.stream.end();
+  await finished;
+  closeSync(fd);
+  const text = await fs.readFile(file, "utf8");
+  assert.match(text, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z LISTENING 127\.0\.0\.1 3757\n$/);
+});
+
+test("event loop late lines collapse to one per burst", () => {
+  const state = emptyLateState();
+  assert.equal(nextLoopLateLine(state, 250, 0), null);
+  assert.equal(nextLoopLateLine(state, 400, 100), null);
+  assert.equal(nextLoopLateLine(state, 50, 200), "event loop late 400ms x2");
+  assert.equal(nextLoopLateLine(state, 40, 300), null);
+  assert.equal(nextLoopLateLine(emptyLateState(), 11165, 0), "event loop late 11165ms");
+  const held = emptyLateState();
+  assert.equal(nextLoopLateLine(held, 300, 0), null);
+  assert.equal(nextLoopLateLine(held, 900, 500), null);
+  assert.equal(nextLoopLateLine(held, 450, 1000), "event loop late 900ms x3");
+  assert.equal(nextLoopLateLine(held, 200, 1100), null);
+  assert.equal(nextLoopLateLine(held, 20, 1200), "event loop late 200ms");
 });
 
 test("a sync frame log names the type, document, and heads", () => {

@@ -187,15 +187,53 @@ function retarget(name, documentId) {
   }
 }
 
+// One line per burst. A late tick used to print on every 100ms fire, and
+// each print was a synchronous file write, so the log itself kept the
+// loop late. Short gaps stay buffered until the loop recovers or a
+// second has passed. A gap of a second or more is printed once, then
+// further ticks in that burst only raise the next line's max.
+export function emptyLateState() {
+  return { max: 0, count: 0, since: 0 };
+}
+
+export function nextLoopLateLine(state, late, now) {
+  if (late < LAG_LOG_MS) {
+    if (state.count === 0) return null;
+    const line = formatLate(state);
+    state.max = 0;
+    state.count = 0;
+    state.since = 0;
+    return line;
+  }
+  if (state.count === 0) state.since = now;
+  state.count += 1;
+  if (late > state.max) state.max = late;
+  const overASecond = state.max >= 1000;
+  const windowFull = now - state.since >= 1000;
+  if (!overASecond && !windowFull) return null;
+  const line = formatLate(state);
+  state.max = 0;
+  state.count = 0;
+  state.since = now;
+  return line;
+}
+
+function formatLate(state) {
+  const count = state.count > 1 ? " x" + state.count : "";
+  return "event loop late " + state.max.toFixed(0) + "ms" + count;
+}
+
 function startLagTimer() {
   if (timer) return;
   expectedTick = performance.now() + LAG_INTERVAL_MS;
+  const lateState = emptyLateState();
   timer = setInterval(() => {
     const now = performance.now();
     const late = now - expectedTick;
     expectedTick = now + LAG_INTERVAL_MS;
-    if (late >= LAG_LOG_MS) write("event loop late " + late.toFixed(0) + "ms");
     if (window && late >= LAG_COUNT_MS) window.blocked += late;
+    const line = nextLoopLateLine(lateState, late, now);
+    if (line) write(line);
   }, LAG_INTERVAL_MS);
   if (timer.unref) timer.unref();
 }

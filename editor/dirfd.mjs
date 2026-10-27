@@ -511,10 +511,6 @@ async function aclFaultForAsync(entries) {
   return aclFromListing(request, listed);
 }
 
-function foreignAcl(filePath, ownerUid) {
-  return aclFaultFor([{ path: filePath, uid: ownerUid, file: true }]) ? "acl" : "";
-}
-
 async function foreignAclAsync(filePath, ownerUid) {
   const fault = await aclFaultForAsync([{ path: filePath, uid: ownerUid, file: true }]);
   return fault ? "acl" : "";

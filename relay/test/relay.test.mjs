@@ -804,6 +804,82 @@ test("a reset warm-up timeout keeps the old generation", async () => {
   }
 });
 
+test("a late warm-up disposes only its own session", async () => {
+  const dir = await tempDir();
+  let opens = 0;
+  let releaseLate = null;
+  const late = new Promise((resolve) => {
+    releaseLate = resolve;
+  });
+  let abandoned = null;
+  const abandonedDone = new Promise((resolve) => {
+    abandoned = resolve;
+  });
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    allowReset: true,
+    sessionTimeoutMs: 200,
+    beforeOpenReady() {
+      opens += 1;
+      if (opens === 2) return late;
+    },
+    onAbandonedSession() {
+      abandoned();
+    },
+  });
+  try {
+    const first = await fetch(relay.healthURL);
+    const started = await first.json();
+    assert.equal(first.status, 200);
+    assert.equal(started.ok, true);
+    assert.equal(started.resetGeneration, 0);
+    const accepted = await fetch(relay.healthURL.replace("/health", "/reset"), {
+      method: "POST",
+      headers: { Authorization: "Bearer " + TOKEN },
+    });
+    assert.equal(accepted.status, 200);
+    const deadline = Date.now() + 5000;
+    let live = null;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const response = await fetch(relay.healthURL + "?n=" + Date.now());
+      if (response.status !== 200) continue;
+      live = await response.json();
+      if (live.resetGeneration === 1) break;
+    }
+    assert.equal(live && live.resetGeneration, 1);
+    assert.equal(live.ok, true);
+    assert.equal(live.status, "ok");
+    releaseLate();
+    const gaveUp = Symbol("late");
+    const finished = await Promise.race([
+      abandonedDone,
+      new Promise((resolve) => setTimeout(() => resolve(gaveUp), 5000)),
+    ]);
+    assert.notEqual(finished, gaveUp, "the late warm-up never finished");
+    const join = cbor.encode({
+      type: "join",
+      senderId: "phone-late",
+      supportedProtocolVersions: ["1"],
+      peerMetadata: { storageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", isEphemeral: true },
+    });
+    const peer = await expectPeer(relay.url, join);
+    assert.equal(peer.type, "peer");
+    const health = await fetch(relay.healthURL + "?after=1");
+    const body = await health.json();
+    assert.equal(health.status, 200);
+    assert.equal(body.ok, true);
+    assert.equal(body.status, "ok");
+    assert.equal(body.resetGeneration, 1);
+  } finally {
+    await relay.close();
+  }
+});
+
 test("an allowed reset checks the token and empties the folder", async () => {
   const dir = await tempDir();
   const vault = path.join(dir, "vault");
@@ -1371,6 +1447,30 @@ async function filesUnder(root) {
   }
   await walk(root);
   return out;
+}
+
+function expectPeer(url, frame) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url, { headers: { Authorization: "Bearer " + TOKEN } });
+    const timer = setTimeout(() => {
+      ws.terminate();
+      reject(new Error("the relay did not answer the join"));
+    }, 2500);
+    ws.on("open", () => ws.send(frame));
+    ws.on("message", (data) => {
+      let message;
+      try {
+        message = cbor.decode(data);
+      } catch {
+        return;
+      }
+      if (!message || message.type !== "peer") return;
+      clearTimeout(timer);
+      ws.close();
+      resolve(message);
+    });
+    ws.on("error", () => {});
+  });
 }
 
 function expectClosed(url, frames) {

@@ -538,49 +538,122 @@ export async function startRelay(options = {}) {
   let resetChain = Promise.resolve();
   let api = null;
 
-  async function openSession() {
-    const adapters = [];
-    for (const entry of servers) {
-      adapters.push(new NodeWSServerAdapter(entry.wss));
+  // One adapter must not see the shared server. disconnect() walks
+  // server.clients and terminates every socket, and the "close" listener
+  // runs that for whichever adapter heard it. A timed-out open that finishes
+  // after the retry is live used to emit close on the shared server and
+  // remove its listeners, so sync died while /health still said 200.
+  function sessionSockets(wss) {
+    const connectionListeners = new Map();
+    const closeListeners = new Map();
+    const mine = new Set();
+    let released = false;
+    const view = {
+      on(event, fn) {
+        if (event === "connection") {
+          const wrapped = (socket, request) => {
+            mine.add(socket);
+            socket.once("close", () => mine.delete(socket));
+            fn(socket, request);
+          };
+          connectionListeners.set(fn, wrapped);
+          wss.on("connection", wrapped);
+          return;
+        }
+        if (event === "close") closeListeners.set(fn, fn);
+      },
+      off(event, fn) {
+        if (event === "connection") {
+          const wrapped = connectionListeners.get(fn);
+          if (!wrapped) return;
+          connectionListeners.delete(fn);
+          try { wss.removeListener("connection", wrapped); } catch { /* already gone */ }
+          return;
+        }
+        if (event === "close") closeListeners.delete(fn);
+      },
+      get clients() {
+        return mine;
+      },
+    };
+    function release(keepSockets) {
+      if (released) return;
+      released = true;
+      // The shared sockets belong to the live adapter. Clearing this set
+      // before disconnect() means that call terminates nothing.
+      if (keepSockets) mine.clear();
+      for (const fn of [...closeListeners.values()]) {
+        try { fn(); } catch { /* the adapter clears its timer here */ }
+      }
+      for (const wrapped of connectionListeners.values()) {
+        try { wss.removeListener("connection", wrapped); } catch { /* already gone */ }
+      }
+      connectionListeners.clear();
+      closeListeners.clear();
+      if (!keepSockets) {
+        for (const socket of mine) {
+          try { socket.terminate(); } catch { /* already gone */ }
+        }
+      }
+      mine.clear();
     }
-    const repo = new Repo({
-      storage: new NodeFSStorageAdapter(dataDir),
-      network: adapters,
-      sharePolicy: async () => true,
-      peerId: options.peerId || "aidanos-relay",
-    });
-    const debounce = Number(options.mirrorDebounceMs ?? process.env.AIDANOS_MIRROR_DEBOUNCE_MS);
-    const mirror = createMirror({
-      repo,
-      vault,
-      debounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
-      secrets,
-    });
-    // Fold a file that changed while this process was stopped before any device
-    // can connect. Doing it later lets that device's offline edit arrive first,
-    // and the file then replaces it.
-    await preloadStoredNotes(repo);
-    await mirror.now();
-    // The socket listener is attached only after the storage id is read.
-    // The port stays closed until that has finished, or the first join is missed.
-    await repo.networkSubsystem.peerMetadata;
-    for (const adapter of adapters) {
-      if (!adapter.peerId) throw new Error("The sync engine was not ready.");
-    }
-    return { repo, mirror, adapters };
+    return { view, release };
   }
 
-  async function disposeSession(session) {
+  async function openSession() {
+    const adapters = [];
+    const releases = [];
+    try {
+      for (const entry of servers) {
+        const attached = sessionSockets(entry.wss);
+        releases.push(attached.release);
+        adapters.push(new NodeWSServerAdapter(attached.view));
+      }
+      const repo = new Repo({
+        storage: new NodeFSStorageAdapter(dataDir),
+        network: adapters,
+        sharePolicy: async () => true,
+        peerId: options.peerId || "aidanos-relay",
+      });
+      const debounce = Number(options.mirrorDebounceMs ?? process.env.AIDANOS_MIRROR_DEBOUNCE_MS);
+      const mirror = createMirror({
+        repo,
+        vault,
+        debounceMs: Number.isFinite(debounce) && debounce >= 0 ? debounce : 400,
+        secrets,
+      });
+      // Fold a file that changed while this process was stopped before any device
+      // can connect. Doing it later lets that device's offline edit arrive first,
+      // and the file then replaces it.
+      await preloadStoredNotes(repo);
+      await mirror.now();
+      // The socket listener is attached only after the storage id is read.
+      // The port stays closed until that has finished, or the first join is missed.
+      await repo.networkSubsystem.peerMetadata;
+      for (const adapter of adapters) {
+        if (!adapter.peerId) throw new Error("The sync engine was not ready.");
+      }
+      return {
+        repo,
+        mirror,
+        adapters,
+        release(keepSockets) {
+          for (const releaseOne of releases) releaseOne(keepSockets);
+        },
+      };
+    } catch (error) {
+      for (const releaseOne of releases) releaseOne(true);
+      throw error;
+    }
+  }
+
+  async function disposeSession(session, how) {
     if (!session || session.closed) return;
     session.closed = true;
+    const keepSockets = how === "abandon";
     session.mirror.stop();
-    for (const entry of servers) {
-      for (const ws of [...entry.wss.clients]) ws.terminate();
-      // The adapter clears its ping timer on "close". Emitting it here does not
-      // mark the socket server shut, so the next test can still connect.
-      entry.wss.emit("close");
-      entry.wss.removeAllListeners();
-    }
+    // Drop this adapter only. The shared server stays up for the live session.
+    if (typeof session.release === "function") session.release(keepSockets);
     // The folder is about to be deleted, so do not flush or write it again.
     // Wait only for a rename that has already started.
     await session.mirror.idle();
@@ -593,6 +666,9 @@ export async function startRelay(options = {}) {
       await session.repo.storageSubsystem?.close();
     } catch {
       // Closing storage is best effort. The directory is removed next.
+    }
+    if (keepSockets && typeof options.onAbandonedSession === "function") {
+      try { options.onAbandonedSession(); } catch { /* the test observes the cleanup */ }
     }
   }
 
@@ -612,7 +688,7 @@ export async function startRelay(options = {}) {
       const session = await openSession();
       opened = session;
       if (settled) {
-        await disposeSession(session);
+        await disposeSession(session, "abandon");
         throw warmTimeout();
       }
       return session;
@@ -627,7 +703,7 @@ export async function startRelay(options = {}) {
       return await Promise.race([work, timeout]);
     } catch (error) {
       settled = true;
-      if (opened) await disposeSession(opened);
+      if (opened) await disposeSession(opened, "abandon");
       throw error;
     } finally {
       clearTimeout(timer);
@@ -944,8 +1020,10 @@ export async function startRelay(options = {}) {
       await resetChain.catch(() => {});
       const session = live;
       live = null;
-      if (session) session.mirror.stop();
       if (gitTimer) clearInterval(gitTimer);
+      if (session) {
+        try { await disposeSession(session); } catch { /* shutdown still closes the port */ }
+      }
       for (const entry of servers) {
         for (const ws of [...entry.wss.clients]) ws.terminate();
         entry.wss.close();

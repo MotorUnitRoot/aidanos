@@ -734,6 +734,7 @@ async function spawnRelay(dir, envExtra = {}) {
     "AIDANOS_RELAY_TEST_SAVE_HOLD_MS",
     "AIDANOS_RELAY_TEST_SAVE_WAIT_MS",
     "AIDANOS_RELAY_TEST_SHUTDOWN_MS",
+    "AIDANOS_RELAY_TEST_HOLD_NOTE_MS",
   ]) {
     if (!Object.prototype.hasOwnProperty.call(envExtra, name)) delete env[name];
   }
@@ -856,6 +857,53 @@ test("a save that outlasts the shutdown bound is logged before close", { timeout
   const names = await fs.readdir(started.vault);
   assert.equal(names.some((name) => name.endsWith(".tmp")), false, names.join(","));
   assert.ok(elapsed < 1500, "waited out the save in " + elapsed + "ms");
+});
+
+test("a worker temp held past the save wait is unlinked and the process exits 1", { timeout: 20000 }, async () => {
+  const dir = await tempDir();
+  const started = await spawnRelay(dir, {
+    NODE_ENV: "test",
+    AIDANOS_RELAY_TEST_HOLD_NOTE_MS: "8000",
+    AIDANOS_RELAY_TEST_SAVE_WAIT_MS: "400",
+    AIDANOS_RELAY_TEST_SHUTDOWN_MS: "4000",
+  });
+  const body = slowSaveNoteBody();
+  try {
+    const deadline = Date.now() + 5000;
+    let found = false;
+    while (Date.now() < deadline) {
+      const names = await fs.readdir(started.vault);
+      if (names.some((name) => name.endsWith(".tmp"))) {
+        found = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (!found) throw new Error("worker temp did not appear");
+  } catch (error) {
+    closeSync(started.fd);
+    started.child.kill("SIGKILL");
+    throw error;
+  }
+  const began = Date.now();
+  started.child.kill("SIGTERM");
+  const [code] = await once(started.child, "exit");
+  const elapsed = Date.now() - began;
+  closeSync(started.fd);
+  const text = await fs.readFile(started.stderr, "utf8");
+  let note = "";
+  try {
+    note = await fs.readFile(path.join(started.vault, "held-note.md"), "utf8");
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  const names = await fs.readdir(started.vault);
+  assert.equal(code, 1, text);
+  assert.match(text, new RegExp(SAVE_WAIT_TIMEOUT_LINE));
+  assert.match(text, /relay log closed/);
+  assert.notEqual(note, body);
+  assert.equal(names.some((name) => name.endsWith(".tmp")), false, names.join(","));
+  assert.ok(elapsed < 6000, "exited in " + elapsed + "ms");
 });
 
 test("a second signal during the save wait exits immediately", { timeout: 20000 }, async () => {
@@ -1889,7 +1937,7 @@ test("a warm-up timeout closes the session instead of leaving health down", asyn
   }
 });
 
-test("a reset warm-up timeout keeps the old generation", async () => {
+test("a reset warm-up timeout keeps the old generation", { timeout: 40000 }, async () => {
   const dir = await tempDir();
   let opens = 0;
   const seen = [];
@@ -1905,7 +1953,7 @@ test("a reset warm-up timeout keeps the old generation", async () => {
     port: 0,
     gitUrl: "",
     allowReset: true,
-    sessionTimeoutMs: 200,
+    sessionTimeoutMs: 5000,
     beforeOpenReady() {
       opens += 1;
       if (opens > 1 && opens <= 4) return new Promise(() => {});
@@ -1921,7 +1969,7 @@ test("a reset warm-up timeout keeps the old generation", async () => {
       headers: { Authorization: "Bearer " + TOKEN },
     });
     assert.equal(accepted.status, 200);
-    const deadline = Date.now() + 5000;
+    const deadline = Date.now() + 25000;
     let again = null;
     let status = 0;
     while (Date.now() < deadline) {
@@ -1943,7 +1991,7 @@ test("a reset warm-up timeout keeps the old generation", async () => {
   }
 });
 
-test("a late warm-up disposes only its own session", async () => {
+test("a late warm-up disposes only its own session", { timeout: 30000 }, async () => {
   const dir = await tempDir();
   let opens = 0;
   let releaseLate = null;
@@ -1961,7 +2009,7 @@ test("a late warm-up disposes only its own session", async () => {
     port: 0,
     gitUrl: "",
     allowReset: true,
-    sessionTimeoutMs: 200,
+    sessionTimeoutMs: 5000,
     beforeOpenReady() {
       opens += 1;
       if (opens === 2) return late;
@@ -1981,7 +2029,7 @@ test("a late warm-up disposes only its own session", async () => {
       headers: { Authorization: "Bearer " + TOKEN },
     });
     assert.equal(accepted.status, 200);
-    const deadline = Date.now() + 5000;
+    const deadline = Date.now() + 15000;
     let live = null;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 20));

@@ -587,6 +587,10 @@ export async function startRelay(options = {}) {
   const gitUrl = String(options.gitUrl ?? env.AIDANOS_RELAY_GIT_URL ?? "").trim();
   const gitToken = String(options.gitToken ?? env.AIDANOS_RELAY_GIT_TOKEN ?? "").trim();
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
+  if (env.NODE_ENV === "test") {
+    const holdNote = Number(env.AIDANOS_RELAY_TEST_HOLD_NOTE_MS);
+    if (Number.isFinite(holdNote) && holdNote > 0) options.testHoldNoteMs = holdNote;
+  }
   await installIndexTrace((line) => logSafe(secrets, line), { thread: "main" });
   await assertNotClientVault(vault);
   // A symlink is refused before any marker is written through it.
@@ -656,6 +660,7 @@ export async function startRelay(options = {}) {
   let budgetTimer = null;
   let keepAliveTimer = null;
   let accepting = true;
+  let dropSavesOnClose = false;
   const workerSaves = new Map();
 
   function currentHost() {
@@ -793,8 +798,9 @@ export async function startRelay(options = {}) {
     if (session.host && typeof session.host.wake === "function") session.host.wake();
     session.mirror.stop();
     // The folder is about to be deleted, so do not flush it again.
-    // Wait only for a write that has already started.
-    await session.mirror.idle();
+    // Wait only for a write that has already started. A save the shutdown
+    // bound already gave up on is unlinked instead, and must not hold close.
+    if (how !== "drop-saves") await session.mirror.idle();
     // A timed-out open finishes after the retry is live. Leave those sockets.
     if (!keepSockets) closeAll(1000);
     try { await session.host.stop(); } catch { /* already stopped */ }
@@ -1270,7 +1276,7 @@ export async function startRelay(options = {}) {
       if (budgetTimer) clearInterval(budgetTimer);
       if (keepAliveTimer) clearInterval(keepAliveTimer);
       if (session) {
-        try { await disposeSession(session); } catch { /* shutdown still closes the port */ }
+        try { await disposeSession(session, dropSavesOnClose ? "drop-saves" : undefined); } catch { /* shutdown still closes the port */ }
       }
       for (const entry of servers) {
         for (const ws of [...entry.wss.clients]) ws.terminate();
@@ -1307,7 +1313,14 @@ export async function startRelay(options = {}) {
       const result = workerResult === "timeout" || localResult === "timeout" ? "timeout" : "settled";
       if (result === "timeout") {
         logSafe(secrets, SAVE_WAIT_TIMEOUT_LINE);
+        // Temps created on this thread (the slow-save hook) and temps the
+        // worker still holds. The worker unlinks its own set, then we exit 1.
         await discardOpenNoteTemps();
+        const discard = session && session.mirror && session.mirror.discardTemps;
+        if (typeof discard === "function") {
+          try { await discard(); } catch { /* close still exits 1 */ }
+        }
+        dropSavesOnClose = true;
       }
       return result;
     },

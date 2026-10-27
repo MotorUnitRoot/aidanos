@@ -1,5 +1,6 @@
 // Sync worker. The accept thread keeps the sockets and the token.
 // This thread owns the repo, the storage adapter, and the markdown mirror.
+import path from "node:path";
 import { parentPort, workerData } from "node:worker_threads";
 import { formatWithOptions } from "node:util";
 import * as Automerge from "@automerge/automerge";
@@ -17,7 +18,7 @@ import {
   watchRepo,
   traceStorage,
 } from "./index-trace.mjs";
-import { createMirror } from "./mirror.mjs";
+import { createMirror, discardOpenNoteTemps, saveNoteFile } from "./mirror.mjs";
 import { logSafe, redact } from "./redact.mjs";
 import { SafeStorage, refuseSymlinkedStorage, storageFolderFault } from "./storage-safe.mjs";
 
@@ -201,6 +202,15 @@ async function run() {
       }
       return;
     }
+    // A timed-out save wait has to drop temps this thread still holds, even
+    // while a save is awaiting. Queuing this behind that save would miss it.
+    if (msg && msg.kind === "discard-temps") {
+      discardOpenNoteTemps().then(
+        () => post({ v: 1, kind: "temps-discarded" }),
+        () => post({ v: 1, kind: "temps-discarded" }),
+      );
+      return;
+    }
     queue.push(msg);
     if (readyForWork) drain();
   });
@@ -288,6 +298,13 @@ async function run() {
   });
   readyForWork = true;
   drain();
+  if (test && test.holdNoteMs) {
+    const noteFile = path.join(String(data.vault), "held-note.md");
+    const body = "whole-note-line\n".repeat(256);
+    trackSave(() => saveNoteFile(noteFile, body, () => new Promise((resolve) => {
+      setTimeout(resolve, test.holdNoteMs);
+    })));
+  }
   if (test && test.crashOnBoot) {
     setTimeout(() => process.exit(1), 40);
   }

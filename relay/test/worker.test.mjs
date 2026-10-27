@@ -563,6 +563,41 @@ test("a mirror write onto a symlink or a hard link is refused", async () => {
   }
 });
 
+test("a save-wait timeout unlinks a temp the worker still holds", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const body = "whole-note-line\n".repeat(256);
+  const relay = await startRelay({
+    token: TOKEN,
+    vault,
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+    testHoldNoteMs: 8000,
+    env: { ...process.env, NODE_ENV: "test", AIDANOS_RELAY_TEST_SAVE_WAIT_MS: "300" },
+  });
+  try {
+    await waitFor(async () => {
+      const names = await fs.readdir(vault);
+      return names.some((name) => name.endsWith(".tmp"));
+    }, 5000, "worker temp");
+    const result = await relay.stopAcceptingAndDrainSaves();
+    assert.equal(result, "timeout");
+    const names = await fs.readdir(vault);
+    assert.equal(names.some((name) => name.endsWith(".tmp")), false, names.join(","));
+    let note = "";
+    try {
+      note = await fs.readFile(path.join(vault, "held-note.md"), "utf8");
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    assert.notEqual(note, body);
+  } finally {
+    await relay.close();
+  }
+});
+
 test("shutdown asks the worker to finish an in-flight save", async () => {
   const dir = await tempDir();
   const vault = path.join(dir, "vault");

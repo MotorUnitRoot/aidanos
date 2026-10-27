@@ -194,6 +194,7 @@ export function createWorkerHost(options = {}) {
   let backoff = BACKOFF_START_MS;
   let restartTimer = null;
   let pingTimer = null;
+  let tempsResolve = null;
   let readyResolve = null;
   let readyReject = null;
   let readyPromise = null;
@@ -328,6 +329,12 @@ export function createWorkerHost(options = {}) {
       host.holding = msg.done !== true;
       return;
     }
+    if (msg.kind === "temps-discarded") {
+      const resolve = tempsResolve;
+      tempsResolve = null;
+      if (resolve) resolve();
+      return;
+    }
     if (msg.kind === "save") {
       if (child === worker && typeof options.onSave === "function") options.onSave(msg);
       return;
@@ -422,6 +429,26 @@ export function createWorkerHost(options = {}) {
     async finishSaves() {
       wakeWorker(wake);
       await host.rpc("finishSaves", {});
+    },
+    discardTemps() {
+      if (!port || stopping) return Promise.resolve();
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          tempsResolve = null;
+          resolve();
+        }, 1000);
+        tempsResolve = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        try {
+          port.postMessage({ v: 1, kind: "discard-temps" });
+        } catch {
+          clearTimeout(timer);
+          tempsResolve = null;
+          resolve();
+        }
+      });
     },
     async now() {
       await repo._settle();

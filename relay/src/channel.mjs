@@ -132,6 +132,7 @@ const CONTROL = new Set([
   "holding",
   "startup-error",
   "save",
+  "temps-discarded",
 ]);
 
 // ws reuses a pooled Buffer. Transferring its underlying ArrayBuffer detaches
@@ -201,6 +202,8 @@ export function workerTestHook(options, env = process.env) {
   if (options.testBadChannel === true) hook.badChannel = true;
   const saveHold = Number(options.testSaveHoldMs);
   if (Number.isFinite(saveHold) && saveHold > 0) hook.saveHoldMs = saveHold;
+  const holdNote = Number(options.testHoldNoteMs);
+  if (Number.isFinite(holdNote) && holdNote > 0) hook.holdNoteMs = holdNote;
   if (typeof options.testLogLine === "string" && options.testLogLine) {
     hook.logLine = options.testLogLine.slice(0, 64 * 1024);
   }

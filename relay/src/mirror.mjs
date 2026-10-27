@@ -118,8 +118,15 @@ const NOTE_TEMP_BASENAME = /^\.(.+\.md)\.(\d+)\.tmp$/;
 const RELAY_MARKER_HEADER = "aidanos-relay-folder v2";
 const RELAY_MARKER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export const NOTE_TEMP_MANIFEST = "note-temps";
+export const MANIFEST_REFUSED_LINE = "note temp manifest refused";
+export const MANIFEST_RESET_LINE = "note temp manifest reset";
+const MANIFEST_CAP = 1024 * 1024;
+const GROUP_OR_OTHER_WRITE = 0o022;
+const STICKY = 0o1000;
 const openNoteTemps = new Map();
 let manifestChain = Promise.resolve();
+const manifestRefusalLogged = new Set();
+const manifestResetLogged = new Set();
 // path.resolve(vault) -> realpath(vault). Filled once at claim. A save must
 // not call realpath again: on macOS that stat walks /var -> /private/var
 // and it blocks the process.
@@ -152,10 +159,6 @@ function withManifest(work) {
   const run = manifestChain.then(work, work);
   manifestChain = run.then(() => {}, () => {});
   return run;
-}
-
-function manifestFile(stateDir) {
-  return path.join(stateDir, NOTE_TEMP_MANIFEST);
 }
 
 function pidAlive(pid) {
@@ -261,7 +264,7 @@ function unlinkSameFile(file, dev, ino, uid) {
   }
   try {
     const opened = fstatSync(fd);
-    if (!opened.isFile() || opened.dev !== dev || opened.ino !== ino || opened.uid !== uid) return false;
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== dev || opened.ino !== ino || opened.uid !== uid) return false;
   } finally {
     closeSync(fd);
   }
@@ -297,17 +300,244 @@ async function unlinkOwnedTemp(vault, rel, uid) {
       if (!st.isDirectory()) return "keep";
       continue;
     }
-    if (!st.isFile() || st.uid !== uid) return "keep";
+    if (!st.isFile() || st.nlink !== 1 || st.uid !== uid) return "keep";
     return unlinkSameFile(cursor, st.dev, st.ino, uid) ? "drop" : "keep";
   }
   return "keep";
 }
 
-async function writeAll(handle, text) {
+function manifestNoticeKey(stateDir) {
+  return path.resolve(stateDir);
+}
+
+function logManifestNotice(stateDir, kind) {
+  const seen = kind === "reset" ? manifestResetLogged : manifestRefusalLogged;
+  const key = manifestNoticeKey(stateDir);
+  if (seen.has(key)) return;
+  seen.add(key);
+  logSafe([], kind === "reset" ? MANIFEST_RESET_LINE : MANIFEST_REFUSED_LINE);
+}
+
+export function manifestNoticeLogged(stateDir) {
+  const key = manifestNoticeKey(stateDir);
+  return {
+    refused: manifestRefusalLogged.has(key),
+    reset: manifestResetLogged.has(key),
+  };
+}
+
+// Same directory walk fatal.log uses before it opens the state folder.
+// A symlink anywhere on the path is refused. Group or other write is
+// allowed only on a sticky directory owned by root.
+async function recordedStateDir(dir, uid) {
+  if (typeof uid !== "number") return null;
+  const abs = path.resolve(dir);
+  const parts = abs.split(path.sep).filter(Boolean);
+  let cursor = path.parse(abs).root;
+  const check = (st) => {
+    if (!st || st.isSymbolicLink() || !st.isDirectory()) return false;
+    const writable = (st.mode & GROUP_OR_OTHER_WRITE) !== 0;
+    const stickyRoot = (st.mode & STICKY) !== 0 && st.uid === 0;
+    if (writable && !stickyRoot) return false;
+    if (st.uid !== 0 && st.uid !== uid) return false;
+    return true;
+  };
+  let rootStat;
+  try {
+    rootStat = await fs.lstat(cursor);
+  } catch {
+    return null;
+  }
+  if (!check(rootStat)) return null;
+  let recorded = rootStat;
+  for (const part of parts) {
+    cursor = path.join(cursor, part);
+    let st;
+    try {
+      st = await fs.lstat(cursor);
+    } catch {
+      return null;
+    }
+    if (!check(st)) return null;
+    recorded = st;
+  }
+  if (cursor !== abs) return null;
+  return { dev: recorded.dev, ino: recorded.ino };
+}
+
+function manifestAt(dirfd, stateDir, name) {
+  if (process.platform === "linux") return "/proc/self/fd/" + dirfd + "/" + name;
+  return path.join(stateDir, name);
+}
+
+let asideSeq = 0;
+
+function asideManifestName() {
+  asideSeq += 1;
+  const stamp = new Date().toISOString().replace(/[^0-9T]/g, "");
+  return NOTE_TEMP_MANIFEST + "." + stamp + "." + process.pid + "." + asideSeq;
+}
+
+function parsedManifest(text) {
+  const raw = String(text).split("\n");
+  if (raw.length && raw[raw.length - 1] === "") raw.pop();
+  const lines = [];
+  for (const line of raw) {
+    if (!parseManifestLine(line)) return null;
+    lines.push(line);
+  }
+  return lines;
+}
+
+async function readHandleText(handle, size) {
+  if (!size) return "";
+  const buf = Buffer.alloc(size);
+  let off = 0;
+  while (off < buf.length) {
+    const { bytesRead } = await handle.read(buf, off, buf.length - off, off);
+    if (!bytesRead) break;
+    off += bytesRead;
+  }
+  return buf.toString("utf8", 0, off);
+}
+
+async function closeQuiet(handle) {
+  if (!handle) return;
+  try {
+    await handle.close();
+  } catch { /* already closed */ }
+}
+
+async function syncDirectory(dirHandle) {
+  await dirHandle.sync();
+}
+
+async function openStateDirectory(stateDir) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const nofollow = fsConstants.O_NOFOLLOW;
+  const directory = fsConstants.O_DIRECTORY;
+  if (typeof nofollow !== "number" || typeof directory !== "number" || typeof uid !== "number") {
+    logManifestNotice(stateDir, "refused");
+    return null;
+  }
+  const recorded = await recordedStateDir(stateDir, uid);
+  if (!recorded) {
+    logManifestNotice(stateDir, "refused");
+    return null;
+  }
+  let dirHandle;
+  try {
+    dirHandle = await fs.open(stateDir, fsConstants.O_RDONLY | directory | nofollow);
+  } catch {
+    logManifestNotice(stateDir, "refused");
+    return null;
+  }
+  try {
+    const openedDir = await dirHandle.stat();
+    if (
+      !openedDir.isDirectory() ||
+      openedDir.isSymbolicLink() ||
+      openedDir.dev !== recorded.dev ||
+      openedDir.ino !== recorded.ino
+    ) {
+      logManifestNotice(stateDir, "refused");
+      await dirHandle.close();
+      return null;
+    }
+    return { dirHandle, uid };
+  } catch {
+    logManifestNotice(stateDir, "refused");
+    await closeQuiet(dirHandle);
+    return null;
+  }
+}
+
+async function quarantineManifest(dirHandle, stateDir) {
+  const dirfd = dirHandle.fd;
+  const aside = asideManifestName();
+  await fs.rename(
+    manifestAt(dirfd, stateDir, NOTE_TEMP_MANIFEST),
+    manifestAt(dirfd, stateDir, aside),
+  );
+  await syncDirectory(dirHandle);
+  logManifestNotice(stateDir, "reset");
+}
+
+// Read note-temps through the state directory descriptor. A hard link or a
+// symlink is refused before any rename or chmod, so a note that shares the
+// inode is left byte for byte. An oversized or unparseable file is renamed
+// aside and the directory is fsynced.
+async function readManifest(dirHandle, stateDir, uid) {
+  const filePath = manifestAt(dirHandle.fd, stateDir, NOTE_TEMP_MANIFEST);
+  let handle;
+  try {
+    handle = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return { missing: true, lines: [] };
+    logManifestNotice(stateDir, "refused");
+    return { refused: true, lines: [] };
+  }
+  try {
+    const st = await handle.stat();
+    if (!st.isFile() || st.isSymbolicLink() || st.uid !== uid || st.nlink !== 1) {
+      logManifestNotice(stateDir, "refused");
+      return { refused: true, lines: [] };
+    }
+    if (st.size > MANIFEST_CAP) {
+      await handle.close();
+      handle = null;
+      await quarantineManifest(dirHandle, stateDir);
+      return { reset: true, lines: [] };
+    }
+    const parsed = parsedManifest(await readHandleText(handle, st.size));
+    if (parsed == null) {
+      await handle.close();
+      handle = null;
+      await quarantineManifest(dirHandle, stateDir);
+      return { reset: true, lines: [] };
+    }
+    return { lines: parsed };
+  } finally {
+    await closeQuiet(handle);
+  }
+}
+
+// A new file, created O_EXCL at 0600, fsynced, then renamed over note-temps.
+// The state directory is fsynced after that rename. The old file is never
+// truncated in place.
+async function publishManifest(dirHandle, stateDir, uid, lines) {
+  const dirfd = dirHandle.fd;
+  asideSeq += 1;
+  const tmpName = NOTE_TEMP_MANIFEST + ".new." + process.pid + "." + asideSeq;
+  const tmpPath = manifestAt(dirfd, stateDir, tmpName);
+  const flags = fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
+  const handle = await fs.open(tmpPath, flags, 0o600);
+  try {
+    const st = await handle.stat();
+    if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1 || st.uid !== uid) {
+      const error = new Error("manifest temp refused");
+      error.code = "EPERM";
+      throw error;
+    }
+    await handle.chmod(0o600);
+    const body = lines.length ? lines.join("\n") + "\n" : "";
+    if (body) await writeAllAt(handle, body);
+    await handle.sync();
+  } catch (error) {
+    await closeQuiet(handle);
+    try { await fs.unlink(tmpPath); } catch { /* the next open reports it */ }
+    throw error;
+  }
+  await handle.close();
+  await fs.rename(tmpPath, manifestAt(dirfd, stateDir, NOTE_TEMP_MANIFEST));
+  await syncDirectory(dirHandle);
+}
+
+async function writeAllAt(handle, text) {
   const buf = Buffer.from(text);
   let off = 0;
   while (off < buf.length) {
-    const { bytesWritten } = await handle.write(buf, off, buf.length - off);
+    const { bytesWritten } = await handle.write(buf, off, buf.length - off, off);
     if (!bytesWritten) break;
     off += bytesWritten;
   }
@@ -318,24 +548,36 @@ async function writeAll(handle, text) {
   }
 }
 
-// fsync on the libuv pool. The save waits for it, and the event loop does not.
-async function syncHandle(file, flags, body) {
-  const handle = await fs.open(file, flags, 0o600);
-  try {
-    await writeAll(handle, body);
-    await handle.sync();
-  } finally {
-    await handle.close();
+function sameLines(left, right) {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i] !== right[i]) return false;
   }
+  return true;
 }
 
-async function rewriteManifest(stateDir, lines) {
-  const body = lines.length ? lines.join("\n") + "\n" : "";
-  await syncHandle(
-    manifestFile(stateDir),
-    fsConstants.O_WRONLY | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW,
-    body,
-  );
+// One rewrite for this batch, two fsyncs: the new manifest file, then the
+// state directory after the rename. A refusal writes nothing. The save
+// still stores the note.
+async function updateManifest(stateDir, create, mutate) {
+  await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
+  await withManifest(async () => {
+    const opened = await openStateDirectory(stateDir);
+    if (!opened) return;
+    try {
+      const current = await readManifest(opened.dirHandle, stateDir, opened.uid);
+      if (current.refused) return;
+      if (current.missing && !create) return;
+      const next = await mutate(current.lines);
+      if (!next) return;
+      if (!current.reset && !current.missing && sameLines(next, current.lines)) return;
+      await publishManifest(opened.dirHandle, stateDir, opened.uid, next);
+    } catch {
+      logManifestNotice(stateDir, "refused");
+    } finally {
+      await closeQuiet(opened.dirHandle);
+    }
+  });
 }
 
 // Only paths this relay recorded, and only after the folder markers match.
@@ -345,10 +587,7 @@ export async function sweepStaleNoteTemps(vault, stateDir) {
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   if (typeof uid !== "number") return;
   if (!(await markersMatch(vault, stateDir))) return;
-  await withManifest(async () => {
-    const text = readRegularFile(manifestFile(stateDir));
-    if (text == null) return;
-    const lines = text.split("\n").filter((line) => line.length > 0);
+  await updateManifest(stateDir, false, async (lines) => {
     const kept = [];
     for (const line of lines) {
       const parsed = parseManifestLine(line);
@@ -359,10 +598,7 @@ export async function sweepStaleNoteTemps(vault, stateDir) {
       const action = await unlinkOwnedTemp(vault, parsed.rel, uid);
       if (action !== "drop") kept.push(line);
     }
-    if (kept.length === lines.length && kept.every((line, index) => line === lines[index])) return;
-    try {
-      await rewriteManifest(stateDir, kept);
-    } catch { /* a replaced manifest is left alone */ }
+    return kept;
   });
 }
 
@@ -389,27 +625,14 @@ function tempRelative(vault, file) {
 
 async function appendManifest(stateDir, rels) {
   const lines = (Array.isArray(rels) ? rels : [rels]).filter(Boolean);
-  if (!lines.length) return;
-  await fs.mkdir(stateDir, { recursive: true });
-  await withManifest(async () => {
-    await syncHandle(
-      manifestFile(stateDir),
-      fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
-      lines.join("\n") + "\n",
-    );
-  });
+  if (!lines.length || !stateDir) return;
+  await updateManifest(stateDir, true, async (existing) => existing.concat(lines));
 }
 
 async function dropManifest(stateDir, rels) {
+  if (!stateDir) return;
   const drop = new Set(Array.isArray(rels) ? rels : [rels]);
-  await withManifest(async () => {
-    const text = readRegularFile(manifestFile(stateDir));
-    if (text == null) return;
-    const lines = text.split("\n").filter((line) => line.length > 0 && !drop.has(line));
-    try {
-      await rewriteManifest(stateDir, lines);
-    } catch { /* the entry stays until a later sweep can read the manifest */ }
-  });
+  await updateManifest(stateDir, false, async (existing) => existing.filter((line) => !drop.has(line)));
 }
 
 async function dropManifestIfGone(file, meta) {
@@ -425,8 +648,10 @@ async function dropManifestIfGone(file, meta) {
 
 // Write each note beside its final name, then rename it into place. A reader
 // sees the previous file or the whole new file. Every temp path in this batch
-// is recorded and fsynced before any of those temps exist. One fsync covers
-// the batch, and it runs on the libuv pool so the event loop stays free.
+// is recorded before any of those temps exist. That record is two fsyncs:
+// the new manifest file, then the state directory after the rename onto
+// note-temps. A corrupt manifest adds one more fsync of that directory
+// after it is renamed aside.
 export async function saveNoteBatch(entries, options = {}) {
   const vault = options.vault || "";
   const stateDir = options.stateDir || "";

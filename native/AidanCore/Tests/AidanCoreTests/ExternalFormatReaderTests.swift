@@ -836,13 +836,29 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertLessThanOrEqual(twice, once * 3)
     }
 
+    /// A long closed `@a(` line stays a linear scan.
+    /// The simulator's wall clock missed 5s on this same linear read
+    /// (c70a892 recorded 13.062s). That clock is not the bound there.
+    /// The step count is: twice the mentions stay within 3x.
     func testClosedMentionParenStaysWithinTheTimeBound() {
+        let half = String(repeating: "@a(", count: 175_000) + ")"
         let line = String(repeating: "@a(", count: 350_000) + ")"
+        let halfWork = scanWork(half)
+        let fullWork = scanWork(line)
+        print("reader-work mention-closed-bound \(halfWork) \(fullWork)")
+        XCTAssertGreaterThan(halfWork, 0)
+        XCTAssertLessThanOrEqual(
+            fullWork,
+            halfWork * 3,
+            "reading 350,000 closed mentions took \(fullWork) steps after \(halfWork)"
+        )
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing mention-closed-bound \(elapsed)")
+        #if !targetEnvironment(simulator)
         XCTAssertLessThan(elapsed, 5)
+        #endif
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }
@@ -920,13 +936,30 @@ final class ExternalFormatReaderTests: XCTestCase {
         return work?.count ?? 0
     }
 
+    /// A long non-English `@a(` line stays a linear scan.
+    /// The simulator's wall clock missed 5s on this same linear read
+    /// (PR 68 run 40494027733 recorded 9.597s; c70a892 recorded 25.577s).
+    /// That clock is not the bound there.
+    /// The step count is: twice the mentions stay within 3x.
     func testNonEnglishLineStaysWithinTheTimeBound() {
+        let half = "é" + String(repeating: "@a(", count: 175_000)
         let line = "é" + String(repeating: "@a(", count: 350_000)
+        let halfWork = scanWork(half)
+        let fullWork = scanWork(line)
+        print("reader-work non-english-bound \(halfWork) \(fullWork)")
+        XCTAssertGreaterThan(halfWork, 0)
+        XCTAssertLessThanOrEqual(
+            fullWork,
+            halfWork * 3,
+            "reading 350,000 non-English mentions took \(fullWork) steps after \(halfWork)"
+        )
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing non-english-bound \(elapsed)")
+        #if !targetEnvironment(simulator)
         XCTAssertLessThan(elapsed, 5)
+        #endif
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }

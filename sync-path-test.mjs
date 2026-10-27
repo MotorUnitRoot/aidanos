@@ -234,11 +234,16 @@ async function waitBoundPort(child) {
   throw new Error("open timeout " + child._log());
 }
 
+async function boundBase(child) {
+  const port = Number(await waitBoundPort(child));
+  return { port, base: "http://127.0.0.1:" + port };
+}
+
 async function waitHealth(base, child) {
   const deadline = Date.now() + 12000;
   let last = "";
   while (Date.now() < deadline) {
-    if (child.exitCode != null) throw new Error("server exited " + child.exitCode);
+    if (child.exitCode != null) throw new Error("server exited " + child.exitCode + "\n" + child._log());
     try {
       const res = await fetch(base + "/api/health");
       if (res.ok) return;
@@ -247,7 +252,7 @@ async function waitHealth(base, child) {
     }
     await new Promise((r) => setTimeout(r, 80));
   }
-  throw new Error("health timeout " + last);
+  throw new Error("health timeout " + last + "\n" + child._log());
 }
 
 async function stop(child) {
@@ -290,9 +295,8 @@ async function liveSyncDoesNotFollowOutside() {
 
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault);
-  const port = 28000 + Math.floor(Math.random() * 2000);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: bare,
@@ -301,8 +305,9 @@ async function liveSyncDoesNotFollowOutside() {
     AIDANOS_VAULT_GIT_DEBOUNCE_MS: "60000",
     AIDANOS_VAULT_GIT_SYNC_MS: "0",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     await waitFor(() => fs.existsSync(path.join(vault, "maps", "note.md")), 8000, "clone");
     fs.rmSync(path.join(vault, "maps"), { recursive: true, force: true });
@@ -599,17 +604,17 @@ async function httpPaths() {
   const outsideDay = "OUTSIDE_DAY\n";
   fs.writeFileSync(path.join(outside, "2026-01-05.md"), outsideDay);
   fs.writeFileSync(path.join(outside, "2026-01-06.md"), "- [ ] OUTSIDE_TASK_SENTINEL\n");
-  const port = 30000 + Math.floor(Math.random() * 2000);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     fs.mkdirSync(path.join(vault, "notes"));
     const saved = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/plain.md"), {
@@ -738,19 +743,19 @@ async function planAndSkinDoNotServeGit() {
   const sentinel = "GIT_CONFIG_SENTINEL";
   const config = path.join(vault, ".git", "config");
   fs.appendFileSync(config, "\n# " + sentinel + "\n");
-  const port = 34000 + Math.floor(Math.random() * 2000);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   const skinPath = path.join(vault, "aidanos", "skin.css");
   const planPath = path.join(vault, "aidanos", "active-horse.md");
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     fs.mkdirSync(path.join(vault, "aidanos"));
     fs.symlinkSync(config, skinPath);
@@ -791,17 +796,17 @@ async function readErrorStaysUp() {
   fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
   const note = path.join(vault, "notes", "secret.md");
   fs.writeFileSync(note, "NOTE_BODY_SECRET\n");
-  const port = 33000 + Math.floor(Math.random() * 2000);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     fs.chmodSync(note, 0);
     const loggedBefore = child._log().length;
@@ -812,7 +817,7 @@ async function readErrorStaysUp() {
     assert(!text.includes("NOTE_BODY_SECRET"), "read response included the note");
     assert(!text.includes(vault) && !text.includes(tmp), "read response included a path");
     await new Promise((r) => setTimeout(r, 200));
-    assert(child.exitCode == null, "server exited after a failed read");
+    assert(child.exitCode == null, "server exited after a failed read\n" + child._log());
     const health = await fetch(base + "/api/health");
     assert(health.status === 200, "server was not up after the failed read");
     const logged = child._log().slice(loggedBefore);
@@ -834,18 +839,18 @@ async function writeErrorStops() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-ro-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault);
-  const port = 32000 + Math.floor(Math.random() * 2000);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   const ro = path.join(vault, "ro");
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     fs.mkdirSync(ro);
     fs.chmodSync(ro, 0o555);
@@ -899,17 +904,17 @@ async function nestedAndFileSymlinks() {
   await refusesNamed(() => worktreePath("notes/box/gone/note.md", vault), "notes/box/gone");
   assert(fs.readFileSync(path.join(outside, "secret.md"), "utf8") === "NESTED_SECRET\n", "nested link was followed");
 
-  const port = 35000 + Math.floor(Math.random() * 2000);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const file = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/box/alias.md"));
     const fileText = await file.text();
@@ -938,9 +943,8 @@ async function symlinkedVaultRootRefused() {
   fs.mkdirSync(real);
   fs.writeFileSync(path.join(real, "note.md"), "ROOT_SECRET\n");
   fs.symlinkSync(real, link);
-  const port = 36000 + Math.floor(Math.random() * 2000);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: link,
     AIDANOS_VAULT_GIT_URL: "",
@@ -956,7 +960,9 @@ async function symlinkedVaultRootRefused() {
     assert(!log.includes("ROOT_SECRET"), "startup read the linked vault");
     let served = false;
     try {
-      const res = await fetch("http://127.0.0.1:" + port + "/api/health", { signal: AbortSignal.timeout(400) });
+      const match = log.match(/open:\s+http:\/\/127\.0\.0\.1:(\d+)/);
+      if (!match) throw new Error("no bind");
+      const res = await fetch("http://127.0.0.1:" + match[1] + "/api/health", { signal: AbortSignal.timeout(400) });
       if (res.ok) served = true;
     } catch { /* not listening */ }
     assert(!served, "symlinked vault served traffic");
@@ -1007,21 +1013,22 @@ async function abortAndLongNameStayUp() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-len-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
-  const port = 37000 + Math.floor(Math.random() * 2000);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    const bound = await boundBase(child);
+    base = bound.base;
     await waitHealth(base, child);
-    await cutOffUpload(port, "notes/cut.md");
+    await cutOffUpload(bound.port, "notes/cut.md");
     await new Promise((r) => setTimeout(r, 200));
-    assert(child.exitCode == null, "server exited after a cut-off upload");
+    assert(child.exitCode == null, "server exited after a cut-off upload\n" + child._log());
     const health = await fetch(base + "/api/health");
     assert(health.status === 200, "health failed after a cut-off upload");
     assert(!fs.existsSync(path.join(vault, "notes", "cut.md")), "cut-off upload was stored");
@@ -1051,7 +1058,7 @@ async function abortAndLongNameStayUp() {
       body: JSON.stringify({ markdown: "too wide\n" }),
     });
     assert(wideRes.status === 400, "250-character name got " + wideRes.status);
-    assert(child.exitCode == null, "server exited after a long name");
+    assert(child.exitCode == null, "server exited after a long name\n" + child._log());
     const again = await fetch(base + "/api/health");
     assert(again.status === 200, "health failed after a long name");
     assert(!fs.existsSync(path.join(vault, "notes", wide)), "long name was written");
@@ -1090,10 +1097,9 @@ async function syncRequestStops() {
   gitQuiet(tmp, ["init", "-b", "main", vault]);
   gitQuiet(vault, ["config", "user.email", "t@local"]);
   gitQuiet(vault, ["config", "user.name", "t"]);
-  const port = 37200 + Math.floor(Math.random() * 200);
   const token = "TOKEN_SENTINEL_sync";
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: bare,
@@ -1101,8 +1107,9 @@ async function syncRequestStops() {
     GITHUB_TOKEN: "",
     AIDANOS_VAULT_GIT_SYNC_MS: "0",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     fs.chmodSync(vault, 0);
     const loggedBefore = child._log().length;
@@ -1148,10 +1155,9 @@ async function backgroundSyncPauses() {
   gitQuiet(tmp, ["init", "-b", "main", vault]);
   gitQuiet(vault, ["config", "user.email", "t@local"]);
   gitQuiet(vault, ["config", "user.name", "t"]);
-  const port = 37400 + Math.floor(Math.random() * 200);
   const token = "TOKEN_SENTINEL_bg";
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: bare,
@@ -1159,8 +1165,9 @@ async function backgroundSyncPauses() {
     GITHUB_TOKEN: "",
     AIDANOS_VAULT_GIT_SYNC_MS: "400",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const loggedBefore = child._log().length;
     fs.chmodSync(vault, 0);
@@ -1171,7 +1178,7 @@ async function backgroundSyncPauses() {
       if (logged.includes("sync paused:")) break;
       await new Promise((r) => setTimeout(r, 50));
     }
-    assert(child.exitCode == null, "background sync exited the server");
+    assert(child.exitCode == null, "background sync exited the server\n" + child._log());
     assert(logged.includes("sync paused: git EACCES"), "background sync did not pause: " + logged);
     quietLines(logged, token, bare, vault);
     const health = await fetch(base + "/api/health");
@@ -1179,7 +1186,7 @@ async function backgroundSyncPauses() {
     assert(health.status === 200, "health failed while sync is paused");
     assert(body.git && body.git.error === "sync paused", "health did not mark git paused");
     await new Promise((r) => setTimeout(r, 500));
-    assert(child.exitCode == null, "a later sync exited the server");
+    assert(child.exitCode == null, "a later sync exited the server\n" + child._log());
   } finally {
     try { fs.chmodSync(vault, 0o755); } catch {}
     await stop(child);
@@ -1198,10 +1205,9 @@ async function bootSyncPauses() {
   fs.mkdirSync(vault);
   gitQuiet(tmp, ["init", "--bare", "-b", "main", bare]);
   fs.chmodSync(vault, 0);
-  const port = 37600 + Math.floor(Math.random() * 200);
   const token = "TOKEN_SENTINEL_boot";
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: bare,
@@ -1209,10 +1215,11 @@ async function bootSyncPauses() {
     GITHUB_TOKEN: "",
     AIDANOS_VAULT_GIT_SYNC_MS: "0",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
-    assert(child.exitCode == null, "boot filesystem error exited");
+    assert(child.exitCode == null, "boot filesystem error exited\n" + child._log());
     const health = await fetch(base + "/api/health");
     const body = await health.json();
     assert(health.status === 200 && body.git && body.git.error === "sync paused", "boot did not mark git paused");
@@ -1234,9 +1241,8 @@ async function rejectedPushStaysUp() {
   gitQuiet(tmp, ["init", "-b", "main", vault]);
   gitQuiet(vault, ["config", "user.email", "t@local"]);
   gitQuiet(vault, ["config", "user.name", "t"]);
-  const port = 37800 + Math.floor(Math.random() * 200);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: bare,
@@ -1244,8 +1250,9 @@ async function rejectedPushStaysUp() {
     GITHUB_TOKEN: "",
     AIDANOS_VAULT_GIT_SYNC_MS: "0",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     gitQuiet(vault, ["remote", "set-url", "origin", path.join(tmp, "missing")]);
     const res = await fetch(base + "/api/sync", {
@@ -1255,7 +1262,7 @@ async function rejectedPushStaysUp() {
     });
     const text = await res.text();
     assert(res.status === 409, "rejected push got " + res.status + " " + text);
-    assert(child.exitCode == null, "rejected push exited the server");
+    assert(child.exitCode == null, "rejected push exited the server\n" + child._log());
     const health = await fetch(base + "/api/health");
     assert(health.status === 200, "health failed after a rejected push");
     assert(!child._log().includes("stopped:"), "rejected push stopped the process");
@@ -1282,9 +1289,8 @@ async function gitSafetyAndIndexLink() {
   gitQuiet(src, ["add", "target.md", "link.md", "log/day-target.md", "log/2026-04-01.md"]);
   gitQuiet(src, ["commit", "-m", "link"]);
   gitQuiet(src, ["push", "origin", "HEAD"]);
-  const port = 38000 + Math.floor(Math.random() * 200);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: bare,
@@ -1292,8 +1298,9 @@ async function gitSafetyAndIndexLink() {
     GITHUB_TOKEN: "",
     AIDANOS_VAULT_GIT_SYNC_MS: "0",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     assert(localConfig(vault, "core.symlinks") === "", "core.symlinks was written into the repo");
     assert(localConfig(vault, "core.hooksPath") === "", "hooksPath was written into the repo");
@@ -1365,22 +1372,22 @@ async function aggregateSkipsLinks() {
   fs.symlinkSync(path.join(outside, "box"), path.join(vault, "log", "box"));
   fs.symlinkSync(path.join(outside, "secret.md"), path.join(vault, "aidanos", "active-horse.md"));
   fs.symlinkSync(path.join(outside, "secret.md"), path.join(vault, "aidanos", "skin.css"));
-  const port = 38200 + Math.floor(Math.random() * 200);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   const secrets = ["SKIP_FILE_SECRET", "SKIP_DAY_SECRET", "SKIP_TASK_SECRET", "SKIP_DIR_SECRET"];
   function noSecrets(text, label) {
     for (const secret of secrets) assert(!text.includes(secret), label + " included " + secret);
     assert(!text.includes(outside) && !text.includes(tmp), label + " included a full path");
   }
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const search = await fetch(base + "/api/search?q=" + encodeURIComponent("kept"));
     const searchText = await search.text();
@@ -1451,7 +1458,7 @@ async function aggregateSkipsLinks() {
       assert(!line.includes(outside) && !line.includes(vault) && !line.includes(tmp), "skip log included a full path: " + line);
     }
     const health = await fetch(base + "/api/health");
-    assert(health.status === 200 && child.exitCode == null, "server stopped after skip-and-report");
+    assert(health.status === 200 && child.exitCode == null, "server stopped after skip-and-report\n" + child._log());
   } finally {
     await stop(child);
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -1466,17 +1473,17 @@ async function parentSymlinkIsNotFollowed() {
   fs.mkdirSync(outside);
   fs.writeFileSync(path.join(outside, "marker.md"), "unchanged\n");
   fs.symlinkSync(outside, path.join(vault, "linked"));
-  const port = 38400 + Math.floor(Math.random() * 200);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const res = await fetch(base + "/api/file?path=" + encodeURIComponent("linked/note.md"), {
       method: "PUT",
@@ -1489,7 +1496,7 @@ async function parentSymlinkIsNotFollowed() {
     assert(fs.readdirSync(outside).join(",") === "marker.md", "mkdir followed the linked parent");
     assert(fs.readFileSync(path.join(outside, "marker.md"), "utf8") === "unchanged\n", "outside file changed");
     const health = await fetch(base + "/api/health");
-    assert(health.status === 200 && child.exitCode == null, "server stopped after the linked parent");
+    assert(health.status === 200 && child.exitCode == null, "server stopped after the linked parent\n" + child._log());
   } finally {
     await stop(child);
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -1500,18 +1507,18 @@ async function pngDirectoryDoesNotStop() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-pngdir-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault);
-  const port = 38600 + Math.floor(Math.random() * 200);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const nested = await fetch(base + "/api/file?path=" + encodeURIComponent("family-room-to-office/plan.png/x.md"), {
       method: "PUT",
@@ -1532,7 +1539,7 @@ async function pngDirectoryDoesNotStop() {
     assert(put.status === 400, "png onto a folder got " + put.status + " " + putText);
     assert(putText === JSON.stringify({ error: "not a file" }), "png onto a folder said " + putText);
     assert(fs.lstatSync(planDir).isDirectory(), "png save replaced the folder");
-    assert(child.exitCode == null, "png onto a folder exited");
+    assert(child.exitCode == null, "png onto a folder exited\n" + child._log());
     assert(!child._log().includes("stopped:"), "png onto a folder stopped: " + child._log());
     const health = await fetch(base + "/api/health");
     assert(health.status === 200, "health failed after a png folder");
@@ -1609,7 +1616,7 @@ async function pauseClearsOnlyAfterSuccess() {
       await new Promise((r) => setTimeout(r, 40));
     }
     fs.chmodSync(vault, 0o755);
-    assert(child.exitCode == null, "pause exited the server");
+    assert(child.exitCode == null, "pause exited the server\n" + child._log());
     assert(logged.includes("sync paused:"), "sync did not pause: " + logged);
   }
   async function putNote(rel, markdown) {
@@ -1697,7 +1704,7 @@ async function pauseClearsOnlyAfterSuccess() {
     const laterBody = await later.json();
     assert(laterBody.git && laterBody.git.paused === true && laterBody.git.error === "sync paused", "the pause cleared itself");
     assert(showBare("notes/stuck.md") == null, "a failed sync pushed the paused note");
-    assert(child.exitCode == null, "failed sync exited the server");
+    assert(child.exitCode == null, "failed sync exited the server\n" + child._log());
   } finally {
     try { fs.chmodSync(vault, 0o755); } catch {}
     await stop(child);
@@ -1729,11 +1736,10 @@ async function swappedParentWritesNothing() {
   fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
   fs.mkdirSync(outside);
   fs.writeFileSync(path.join(outside, "marker.md"), "unchanged\n");
-  const port = 39000 + Math.floor(Math.random() * 200);
   const note = Buffer.from("0123456789abcd");
   assert(note.length === 14, "note is not 14 bytes");
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
@@ -1742,8 +1748,9 @@ async function swappedParentWritesNothing() {
     NODE_ENV: "test",
     AIDANOS_TEST_HOLD_WRITE: hold,
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const put = fetch(base + "/api/file?path=" + encodeURIComponent("notes/out.md"), {
       method: "PUT",
@@ -1791,16 +1798,15 @@ async function folderTargetsStayUp() {
   fs.mkdirSync(dayDir, { recursive: true });
   fs.mkdirSync(noteDir, { recursive: true });
   fs.mkdirSync(pngDir, { recursive: true });
-  const port = 39200 + Math.floor(Math.random() * 200);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
   async function put(url, body) {
     const res = await fetch(base + url, {
@@ -1813,6 +1819,7 @@ async function folderTargetsStayUp() {
     assert(text === JSON.stringify({ error: "not a file" }), url + " said " + text);
   }
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     await put("/api/day?date=2026-04-02", { markdown: "DAY_FOLDER_SECRET\n" });
     await put("/api/file?path=" + encodeURIComponent("notes/page.md"), { markdown: "NOTE_FOLDER_SECRET\n" });
@@ -1822,7 +1829,7 @@ async function folderTargetsStayUp() {
     assert(fs.lstatSync(pngDir).isDirectory(), "png save replaced the folder");
     assert(!containsBytes(vault, Buffer.from("DAY_FOLDER_SECRET")), "day folder stored the note");
     assert(!containsBytes(vault, Buffer.from("NOTE_FOLDER_SECRET")), "note folder stored the note");
-    assert(child.exitCode == null, "a folder target exited the server");
+    assert(child.exitCode == null, "a folder target exited the server\n" + child._log());
     assert(!child._log().includes("stopped:"), "a folder target stopped: " + child._log());
     const health = await fetch(base + "/api/health");
     assert(health.status === 200, "health failed after a folder target");
@@ -1838,9 +1845,8 @@ async function folderAppearsDuringWriteStops() {
   const hold = path.join(tmp, "hold");
   const dayDir = path.join(vault, "log", "2026-04-03.md");
   fs.mkdirSync(path.join(vault, "log"), { recursive: true });
-  const port = 39100 + Math.floor(Math.random() * 100);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
@@ -1849,8 +1855,9 @@ async function folderAppearsDuringWriteStops() {
     NODE_ENV: "test",
     AIDANOS_TEST_HOLD_RENAME: hold,
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const put = fetch(base + "/api/day?date=2026-04-03", {
       method: "PUT",
@@ -1900,9 +1907,8 @@ async function renameFailureStops() {
   const hold = path.join(tmp, "hold");
   fs.mkdirSync(notes, { recursive: true });
   fs.writeFileSync(path.join(notes, "page.md"), "old\n");
-  const port = 39300 + Math.floor(Math.random() * 100);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
@@ -1911,8 +1917,9 @@ async function renameFailureStops() {
     NODE_ENV: "test",
     AIDANOS_TEST_HOLD_RENAME: hold,
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const put = fetch(base + "/api/file?path=" + encodeURIComponent("notes/page.md"), {
       method: "PUT",
@@ -1973,9 +1980,8 @@ async function ownGitConfigIsLeftAlone() {
   gitQuiet(vault, ["config", "protocol.allow", "never"]);
   gitQuiet(vault, ["config", "core.hooksPath", ownHooks]);
   gitQuiet(vault, ["config", "credential.helper", "SECRET_HELPER_VALUE"]);
-  const port = 39500 + Math.floor(Math.random() * 100);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: bare,
@@ -1983,8 +1989,9 @@ async function ownGitConfigIsLeftAlone() {
     GITHUB_TOKEN: "",
     AIDANOS_VAULT_GIT_SYNC_MS: "0",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const deadline = Date.now() + 4000;
     while (Date.now() < deadline && !child._log().includes("vault git config:")) {
@@ -1996,7 +2003,7 @@ async function ownGitConfigIsLeftAlone() {
     assert(localConfig(vault, "core.fsmonitor") === "false", "own core.fsmonitor was removed");
     assert(localConfig(vault, "protocol.allow") === "never", "own protocol.allow was removed");
     assert(localConfig(vault, "core.hooksPath") === ownHooks, "own hooksPath was removed");
-    assert(child.exitCode == null, "own git config refused startup");
+    assert(child.exitCode == null, "own git config refused startup\n" + child._log());
   } finally {
     await stop(child);
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -2028,9 +2035,8 @@ async function oldSafetyKeysAreRemoved() {
   gitQuiet(vault, ["config", "core.editor", "vim"]);
   gitQuiet(vault, ["config", "credential.helper", "SECRET_HELPER_VALUE"]);
   gitQuiet(vault, ["config", "http.extraheader", "SECRET_HEADER_VALUE"]);
-  const port = 39400 + Math.floor(Math.random() * 200);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: bare,
@@ -2038,8 +2044,9 @@ async function oldSafetyKeysAreRemoved() {
     GITHUB_TOKEN: "",
     AIDANOS_VAULT_GIT_SYNC_MS: "0",
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const deadline = Date.now() + 4000;
     while (Date.now() < deadline && (localConfig(vault, "core.symlinks") !== "" || localConfig(vault, "core.hooksPath") !== "")) {
@@ -2063,7 +2070,7 @@ async function oldSafetyKeysAreRemoved() {
     assert(logged.includes("vault git config: "), "risky git keys were not named");
     assert(logged.includes("credential.helper") && logged.includes("http.extraheader"), "risky git keys were missing: " + logged);
     assert(!logged.includes("SECRET_HELPER_VALUE") && !logged.includes("SECRET_HEADER_VALUE"), "git config warning included a value");
-    assert(child.exitCode == null, "a risky git key refused startup");
+    assert(child.exitCode == null, "a risky git key refused startup\n" + child._log());
   } finally {
     await stop(child);
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -2071,9 +2078,8 @@ async function oldSafetyKeysAreRemoved() {
 }
 
 async function pausedSentenceFor(vault, bare, extra) {
-  const port = 39600 + Math.floor(Math.random() * 200);
   const child = spawnServer({
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: bare,
@@ -2083,8 +2089,9 @@ async function pausedSentenceFor(vault, bare, extra) {
     K_SERVICE: "",
     ...extra,
   });
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const loggedBefore = child._log().length;
     fs.chmodSync(vault, 0);
@@ -2096,7 +2103,7 @@ async function pausedSentenceFor(vault, bare, extra) {
       await new Promise((r) => setTimeout(r, 40));
     }
     fs.chmodSync(vault, 0o755);
-    assert(child.exitCode == null, "pause exited the server");
+    assert(child.exitCode == null, "pause exited the server\n" + child._log());
     assert(logged.includes("sync paused:"), "sync did not pause: " + logged);
     const health = await fetch(base + "/api/health");
     const body = await health.json();
@@ -2153,9 +2160,9 @@ async function pausedWordingFollowsTheVault() {
   }
 }
 
-function childEnv(port, vault, extra) {
+function childEnv(vault, extra) {
   return {
-    PORT: String(port),
+    PORT: "0",
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
     AIDANOS_VAULT_GIT_URL: "",
@@ -2197,11 +2204,11 @@ async function refusedSavesStayUp(kind) {
   execFileSync("mkfifo", [path.join(vault, "log", "2026-04-04.md")]);
   fs.mkdirSync(path.join(vault, "notes", "folder.md"));
   fs.mkdirSync(path.join(vault, "log", "2026-04-05.md"));
-  const port = 39500 + Math.floor(Math.random() * 200);
-  const child = spawnServer(childEnv(port, vault, kind ? { AIDANOS_VAULT_KIND: kind } : {}));
-  const base = "http://127.0.0.1:" + port;
+  const child = spawnServer(childEnv(vault, kind ? { AIDANOS_VAULT_KIND: kind } : {}));
+  let base = "";
   const label = kind || "swap-in";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     if (kind === "noteplan") {
       const saved = await putMarkdown(base, "/api/file?path=" + encodeURIComponent("notes/page.md"), "saved text\n");
@@ -2263,14 +2270,14 @@ async function inPlaceSwappedParentKeepsText() {
   const note = path.join(vault, "notes", "page.md");
   fs.writeFileSync(note, "original text\n");
   const inode = fs.statSync(note).ino;
-  const port = 39720 + Math.floor(Math.random() * 80);
-  const child = spawnServer(childEnv(port, vault, {
+  const child = spawnServer(childEnv(vault, {
     AIDANOS_VAULT_KIND: "noteplan",
     NODE_ENV: "test",
     AIDANOS_TEST_HOLD_WRITE: hold,
   }));
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const put = putMarkdown(base, "/api/file?path=" + encodeURIComponent("notes/page.md"), "SWAPPED_SECRET\n");
     const holdFile = path.join(hold, "hold");
@@ -2318,14 +2325,14 @@ async function inPlaceWriteFailureExits() {
   fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
   const note = path.join(vault, "notes", "page.md");
   fs.writeFileSync(note, "original text\n");
-  const port = 39820 + Math.floor(Math.random() * 80);
-  const child = spawnServer(childEnv(port, vault, {
+  const child = spawnServer(childEnv(vault, {
     AIDANOS_VAULT_KIND: "noteplan",
     NODE_ENV: "test",
     AIDANOS_TEST_HOLD_WRITE: hold,
   }));
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const put = putMarkdown(base, "/api/file?path=" + encodeURIComponent("notes/page.md"), "FAILED_WRITE\n");
     const holdFile = path.join(hold, "hold");
@@ -2418,11 +2425,11 @@ async function refusedPictureSavesStayUp(kind) {
   fs.writeFileSync(other, pngBytes);
   fs.linkSync(other, plan);
   execFileSync("mkfifo", [walk]);
-  const port = 39920 + Math.floor(Math.random() * 70);
-  const child = spawnServer(childEnv(port, vault, kind ? { AIDANOS_VAULT_KIND: kind } : {}));
-  const base = "http://127.0.0.1:" + port;
+  const child = spawnServer(childEnv(vault, kind ? { AIDANOS_VAULT_KIND: kind } : {}));
+  let base = "";
   const label = kind || "swap-in";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const hard = await putPng(base, "family-room-to-office/plan.png", png);
     assert(hard.status === 400, label + " picture hard link got " + hard.status + " " + hard.text);
@@ -2460,14 +2467,14 @@ async function inPlaceCreateLeavesNothingOutside() {
   fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
   fs.mkdirSync(outside);
   fs.writeFileSync(path.join(outside, "marker.md"), "unchanged\n");
-  const port = 39640 + Math.floor(Math.random() * 70);
-  const child = spawnServer(childEnv(port, vault, {
+  const child = spawnServer(childEnv(vault, {
     AIDANOS_VAULT_KIND: "noteplan",
     NODE_ENV: "test",
     AIDANOS_TEST_HOLD_WRITE: hold,
   }));
-  const base = "http://127.0.0.1:" + port;
+  let base = "";
   try {
+    ({ base } = await boundBase(child));
     await waitHealth(base, child);
     const put = putMarkdown(base, "/api/file?path=" + encodeURIComponent("notes/page.md"), "NEW_OUTSIDE\n");
     const holdFile = path.join(hold, "hold");

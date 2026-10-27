@@ -631,40 +631,258 @@ function enqueueVaultWork(fn) {
   return run;
 }
 
-const staleGitLocks = new Set();
+// Only this file, inside the vault's real .git. No other lock name is removed.
+const GIT_INDEX_LOCK = "index.lock";
+// A lock we did not record is removed only when it is at least this old and
+// no live process still has it open.
+export const GIT_LOCK_STALE_MS = 15 * 60 * 1000;
+// Printed once per vault when index.lock is still there and we cannot prove
+// it is the inode our git recorded or that it is old and unused. No path.
+export const GIT_LOCK_KEPT_LINE = "git index lock kept";
+const MAX_GIT_DIR_LINKS = 8;
+const GIT_DIR_GROUP_WRITE = 0o022;
+const GIT_DIR_STICKY = 0o1000;
+// vault path -> { dev, ino } of the index.lock our own git failed to unlink.
+const staleGitLocks = new Map();
+const gitLockKeptLogged = new Set();
 
-function rememberUnlinkLock(errText) {
-  const re = /unable to unlink '([^']+\.lock)'/g;
-  let match;
-  while ((match = re.exec(String(errText || "")))) staleGitLocks.add(match[1]);
+function reportGitLockKept(key) {
+  if (gitLockKeptLogged.has(key)) return;
+  gitLockKeptLogged.add(key);
+  console.error(GIT_LOCK_KEPT_LINE);
 }
 
-// A vault that was closed while git still held index.lock keeps the lock,
-// because git cannot unlink it. The next sync, once the vault is open again,
-// drops that regular file. A symlink is left alone.
-function releaseRememberedGitLock() {
-  const paths = [...staleGitLocks];
-  staleGitLocks.clear();
-  const root = path.resolve(VAULT);
-  for (const remembered of paths) {
-    const abs = path.isAbsolute(remembered) ? path.resolve(remembered) : path.resolve(root, remembered);
-    const rel = path.relative(root, abs);
-    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) continue;
+function clearGitLockKept(key) {
+  gitLockKeptLogged.delete(key);
+}
+
+function vaultKey(vault) {
+  return path.resolve(String(vault || ""));
+}
+
+// Walk vault/.git. A root-owned symlink (macOS /var, /tmp) is followed.
+// Any other symlink, including .git itself, is refused.
+function resolveGitDir(vault) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (typeof uid !== "number") return null;
+  let abs = path.resolve(vault, ".git");
+  const seen = new Set();
+  for (let hop = 0; hop <= MAX_GIT_DIR_LINKS; hop += 1) {
+    const step = walkGitDir(abs, uid, seen);
+    if (!step) return null;
+    if (step.done) return step.done;
+    abs = step.next;
+  }
+  return null;
+}
+
+function walkGitDir(abs, uid, seen) {
+  const chain = [];
+  let cursor = abs;
+  for (;;) {
+    chain.push(cursor);
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  chain.reverse();
+  let stat = null;
+  for (const dir of chain) {
     let st;
     try {
-      st = fsSync.lstatSync(abs);
+      st = fsSync.lstatSync(dir);
+    } catch {
+      return null;
+    }
+    if (st.isSymbolicLink()) {
+      if (st.uid !== 0 || seen.has(dir)) return null;
+      seen.add(dir);
+      let target;
+      try {
+        target = fsSync.readlinkSync(dir);
+      } catch {
+        return null;
+      }
+      const linked = path.resolve(path.dirname(dir), target);
+      const rest = path.relative(dir, abs);
+      const next = !rest || rest.startsWith("..") || path.isAbsolute(rest)
+        ? linked
+        : path.resolve(linked, rest);
+      return { next };
+    }
+    if (!st.isDirectory()) return null;
+    const writable = (st.mode & GIT_DIR_GROUP_WRITE) !== 0;
+    const stickyRoot = (st.mode & GIT_DIR_STICKY) !== 0 && st.uid === 0;
+    if (writable && !stickyRoot) return null;
+    if (st.uid !== 0 && st.uid !== uid) return null;
+    stat = st;
+  }
+  if (!stat) return null;
+  return { done: { dir: abs, dev: stat.dev, ino: stat.ino } };
+}
+
+function namedIndexLock(named, vault) {
+  const text = String(named || "");
+  if (!text || text.includes("\0")) return null;
+  const abs = path.isAbsolute(text) ? path.resolve(text) : path.resolve(vault, text);
+  if (path.basename(abs) !== GIT_INDEX_LOCK) return null;
+  const gitParent = path.dirname(abs);
+  if (path.basename(gitParent) !== ".git") return null;
+  const namedGit = resolveGitDir(path.dirname(gitParent));
+  const ownGit = resolveGitDir(vault);
+  if (!namedGit || !ownGit) return null;
+  if (namedGit.dev !== ownGit.dev || namedGit.ino !== ownGit.ino || namedGit.dir !== ownGit.dir) return null;
+  return ownGit;
+}
+
+function processHoldsLock(file, dev, ino) {
+  if (process.platform === "linux") return linuxProcessHolds(dev, ino);
+  return lsofHolds(file);
+}
+
+function linuxProcessHolds(dev, ino) {
+  let pids;
+  try {
+    pids = fsSync.readdirSync("/proc");
+  } catch {
+    return true;
+  }
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
+    const fdDir = "/proc/" + pid + "/fd";
+    let fds;
+    try {
+      fds = fsSync.readdirSync(fdDir);
+    } catch {
+      continue;
+    }
+    for (const fd of fds) {
+      try {
+        const st = fsSync.statSync(path.join(fdDir, fd));
+        if (st.dev === dev && st.ino === ino) return true;
+      } catch { /* the descriptor closed */ }
+    }
+  }
+  return false;
+}
+
+function lsofHolds(file) {
+  const result = spawnSync("lsof", ["-t", "--", file], { encoding: "utf8", timeout: 2000 });
+  if (result.error || result.status == null) return true;
+  if (result.status !== 0 && result.status !== 1) return true;
+  return String(result.stdout || "")
+    .split(/\s+/)
+    .some((pid) => pid && Number(pid) !== process.pid);
+}
+
+function unlinkRecordedLock(lockPath, dev, ino) {
+  let fd = -1;
+  try {
+    fd = fsSync.openSync(lockPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+    const opened = fsSync.fstatSync(fd);
+    if (!opened.isFile() || opened.isSymbolicLink() || opened.dev !== dev || opened.ino !== ino) return;
+  } catch {
+    return;
+  } finally {
+    if (fd >= 0) {
+      try { fsSync.closeSync(fd); } catch { /* the unlink still decides */ }
+    }
+  }
+  try { fsSync.unlinkSync(lockPath); } catch { /* the next git reports the lock */ }
+}
+
+// Git's "unable to unlink" text is not a path we may delete. The only
+// accepted file is <walked real .git>/index.lock, and only when that walk
+// refused every symlink that this user owns.
+export function rememberUnlinkLock(errText, vault = VAULT) {
+  const key = vaultKey(vault);
+  const re = /unable to unlink '([^']+)'/g;
+  let match;
+  let recorded = null;
+  while ((match = re.exec(String(errText || "")))) {
+    const git = namedIndexLock(match[1], vault);
+    if (!git) continue;
+    const lockPath = path.join(git.dir, GIT_INDEX_LOCK);
+    let st;
+    try {
+      st = fsSync.lstatSync(lockPath);
     } catch {
       continue;
     }
     if (st.isSymbolicLink() || !st.isFile()) continue;
-    try { fsSync.unlinkSync(abs); } catch { /* the next git reports the lock */ }
+    let parent;
+    try {
+      parent = fsSync.lstatSync(git.dir);
+    } catch {
+      continue;
+    }
+    if (parent.isSymbolicLink() || !parent.isDirectory() || parent.dev !== git.dev || parent.ino !== git.ino) continue;
+    recorded = { dev: st.dev, ino: st.ino };
   }
+  if (recorded) staleGitLocks.set(key, recorded);
+}
+
+// Drop index.lock only when it is still the inode our failed git recorded,
+// or it is old and no live process has it open. A symlink on the way to
+// .git, a lock outside .git, and a lock a live git still holds stay put.
+// A lock that is neither ours nor stale is left in place, and that fact is
+// logged once per vault with no path.
+export function releaseRememberedGitLock(vault = VAULT) {
+  const key = vaultKey(vault);
+  const recorded = staleGitLocks.get(key) || null;
+  const git = resolveGitDir(vault);
+  if (!git) {
+    staleGitLocks.delete(key);
+    clearGitLockKept(key);
+    return;
+  }
+  const lockPath = path.join(git.dir, GIT_INDEX_LOCK);
+  let st;
+  try {
+    st = fsSync.lstatSync(lockPath);
+  } catch {
+    staleGitLocks.delete(key);
+    clearGitLockKept(key);
+    return;
+  }
+  if (st.isSymbolicLink() || !st.isFile()) {
+    staleGitLocks.delete(key);
+    clearGitLockKept(key);
+    return;
+  }
+  let parent;
+  try {
+    parent = fsSync.lstatSync(git.dir);
+  } catch {
+    staleGitLocks.delete(key);
+    clearGitLockKept(key);
+    return;
+  }
+  if (parent.isSymbolicLink() || !parent.isDirectory() || parent.dev !== git.dev || parent.ino !== git.ino) {
+    staleGitLocks.delete(key);
+    clearGitLockKept(key);
+    return;
+  }
+  const same = recorded && recorded.dev === st.dev && recorded.ino === st.ino;
+  const stale = Date.now() - st.mtimeMs >= GIT_LOCK_STALE_MS;
+  if (processHoldsLock(lockPath, st.dev, st.ino)) {
+    if (!same && !stale) reportGitLockKept(key);
+    return;
+  }
+  staleGitLocks.delete(key);
+  if (!same && !stale) {
+    reportGitLockKept(key);
+    return;
+  }
+  clearGitLockKept(key);
+  unlinkRecordedLock(lockPath, st.dev, st.ino);
 }
 
 // Tests set AIDANOS_TEST_GIT_TURN to a file outside the vault. Git work holds
 // it for the whole job, so a test can close the vault only while no git is
-// inside it. Unset, this is a no-op.
-async function acquireGitTurn() {
+// inside it. Off unless this process is a test, and unset it is a no-op.
+export async function acquireGitTurn() {
+  if (process.env.NODE_ENV !== "test") return "";
   const file = String(process.env.AIDANOS_TEST_GIT_TURN || "");
   if (!file) return "";
   for (;;) {
@@ -679,7 +897,7 @@ async function acquireGitTurn() {
   }
 }
 
-function releaseGitTurn(file) {
+export function releaseGitTurn(file) {
   if (!file) return;
   try { fsSync.unlinkSync(file); } catch { /* the holder already released it */ }
 }

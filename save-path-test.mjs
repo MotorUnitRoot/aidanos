@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isNotePlanFolder, noteSaveStyle, reportRecoveryFiles, writeNoteText } from "./editor/note-save.mjs";
-import { ancestorFault, createExclusive, directoryBackend, groupWritableHelperMessage, installFaultText, openCheckedDirectory, unlinkIfSame, unlinkOpenedFile } from "./editor/dirfd.mjs";
+import { aclListingFault, ancestorFault, createExclusive, directoryBackend, groupWritableHelperMessage, installFaultText, openCheckedDirectory, unlinkIfSame, unlinkOpenedFile } from "./editor/dirfd.mjs";
 import { ensureRecoverExcluded, isRecoverPath } from "./editor/vault-exclude.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -1109,6 +1109,68 @@ await check("startup reports a group-writable helper and refuses a bad install l
   assert(boot.includes("refused: bad install location: "), "startup does not name a bad install location");
   const helperSrc = fs.readFileSync(path.join(root, "editor", "dirfd.mjs"), "utf8");
   assert(helperSrc.includes("TODO: once Developer ID signing exists"), "the code-signature TODO is missing");
+});
+
+await check("a write ACL for another principal is refused", async () => {
+  const clean = [
+    "drwxr-xr-x  2 501  20  64 Oct 27 03:00 /private/tmp/aidanos",
+    "",
+  ].join("\n");
+  const ownerAllow = [
+    "drwxr-xr-x+ 2 501  20  64 Oct 27 03:00 /private/tmp/aidanos",
+    " 0: user:501 allow write,append,delete",
+    "",
+  ].join("\n");
+  const otherAllow = [
+    "drwxr-xr-x+ 2 501  20  64 Oct 27 03:00 /private/tmp/aidanos",
+    " 0: user:0 allow write,append,delete,delete_child",
+    "",
+  ].join("\n");
+  const namedOther = [
+    "drwxr-xr-x+ 2 501  20  64 Oct 27 03:00 /private/tmp/aidanos",
+    " 0: user:root allow writeattr,writesecurity,chown",
+    "",
+  ].join("\n");
+  const readOnly = [
+    "drwxr-xr-x+ 2 501  20  64 Oct 27 03:00 /private/tmp/aidanos",
+    " 0: group:20 allow read,readattr",
+    " 1: user:0 deny write",
+    "",
+  ].join("\n");
+  const unknown = [
+    "drwxr-xr-x+ 2 501  20  64 Oct 27 03:00 /private/tmp/aidanos",
+    " not an acl entry",
+    "",
+  ].join("\n");
+  assert(aclListingFault(clean, 501, "me") === "", "a directory with no ACL was refused");
+  assert(aclListingFault(ownerAllow, 501, "me") === "", "the owner's write ACL was refused");
+  assert(aclListingFault(otherAllow, 501, "me") === "acl", "a write ACL for another uid was allowed");
+  assert(aclListingFault(namedOther, 501, "me") === "acl", "a named write ACL for someone else was allowed");
+  assert(aclListingFault(readOnly, 501, "me") === "", "a read ACL or a deny was refused");
+  assert(aclListingFault(unknown, 501, "me") === "acl", "an unreadable ACL line was allowed");
+  assert(installFaultText("ancestor-acl") === "an ACL grants write to someone other than the owner", installFaultText("ancestor-acl"));
+  if (process.platform !== "darwin") {
+    console.log("skip  live write ACL: not macOS");
+    return;
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-acl-"));
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bin);
+  const tool = path.join(bin, "dirfd-tool");
+  fs.copyFileSync(shippedHelper(), tool);
+  fs.chmodSync(tool, 0o755);
+  fs.chmodSync(bin, 0o755);
+  fs.chmodSync(dir, 0o755);
+  const before = ancestorFault(bin);
+  assert(before === "", "the temp path was already refused: " + before);
+  const added = spawnSync("chmod", ["+a", "user:0 allow write,append,delete,delete_child", dir], { encoding: "utf8" });
+  assert(added.status === 0, "chmod +a failed: " + (added.stderr || added.error));
+  try {
+    assert(ancestorFault(bin) === "ancestor-acl", ancestorFault(bin) || "a write ACL for another principal was allowed");
+  } finally {
+    spawnSync("chmod", ["-N", dir], { encoding: "utf8" });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 if (process.exitCode) process.exit(process.exitCode);

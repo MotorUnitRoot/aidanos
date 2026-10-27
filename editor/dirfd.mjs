@@ -14,8 +14,11 @@
 // must be owned by root or the current user, and must not be group or world
 // writable unless it is sticky and owned by root. A root-owned symlink,
 // such as macOS /tmp or /var, is followed. Any other symlink is refused.
+// On macOS the same walk reads each folder's ACL, and the helper file's ACL,
+// with /bin/ls -lde. A write grant for anyone but the owner is refused.
+// The helper does not do that check: it would be reporting on itself.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
 import fsSync, { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
@@ -146,6 +149,7 @@ function walkAncestors(abs, uid, seenLinks) {
     const stickyRoot = (st.mode & STICKY) !== 0 && st.uid === 0;
     if (writable && !stickyRoot) return { fault: "ancestor-writable" };
     if (st.uid !== 0 && st.uid !== uid) return { fault: "ancestor-owner" };
+    if (foreignAcl(dir, st.uid)) return { fault: "ancestor-acl" };
   }
   return {};
 }
@@ -153,7 +157,94 @@ function walkAncestors(abs, uid, seenLinks) {
 export function installFaultText(fault) {
   if (fault === "ancestor-writable") return "group-writable ancestor";
   if (fault === "ancestor-owner") return "ancestor owned by another user";
+  if (fault === "ancestor-acl") return "an ACL grants write to someone other than the owner";
   return "bad ancestor";
+}
+
+const WRITE_ACL = new Set([
+  "write",
+  "append",
+  "delete",
+  "delete_child",
+  "writeattr",
+  "writeextattr",
+  "writesecurity",
+  "chown",
+]);
+
+// text is the stdout of `/bin/ls -lde -n`. An allow entry that grants one of
+// the write rights to anyone but the owner is a fault. Anything the parser
+// does not recognise is a fault too. An empty string means the listing is clean.
+export function aclListingFault(text, ownerUid, ownerName = "") {
+  const lines = String(text || "").split(/\r?\n/);
+  while (lines.length && lines[lines.length - 1] === "") lines.pop();
+  if (!lines.length) return "acl";
+  const mode = lines[0].split(/\s+/)[0] || "";
+  if (!/^[-dlcbps]/.test(mode) || mode.length < 10) return "acl";
+  for (const line of lines.slice(1)) {
+    if (!line.trim()) continue;
+    const match = line.match(/^\s*\d+:\s+(.+?)\s+(?:inherited\s+)?(allow|deny)\s+(\S.*?)\s*$/);
+    if (!match) return "acl";
+    if (match[2] !== "allow") continue;
+    const perms = match[3].split(",").map((item) => item.trim()).filter(Boolean);
+    if (!perms.some((item) => WRITE_ACL.has(item))) continue;
+    if (aclPrincipalIsOwner(match[1].trim(), ownerUid, ownerName)) continue;
+    return "acl";
+  }
+  return "";
+}
+
+function aclPrincipalIsOwner(principal, ownerUid, ownerName) {
+  const numeric = principal.match(/^user:(\d+)$/);
+  if (numeric) return Number(numeric[1]) === ownerUid;
+  const named = principal.match(/^user:(.+)$/);
+  return !!(named && ownerName && named[1] === ownerName);
+}
+
+function trustedLs() {
+  let file = "/bin/ls";
+  for (let hop = 0; hop < 2; hop++) {
+    let st;
+    try {
+      st = fsSync.lstatSync(file);
+    } catch {
+      return "";
+    }
+    if (st.isSymbolicLink()) {
+      if (st.uid !== 0) return "";
+      let target;
+      try {
+        target = fsSync.readlinkSync(file);
+      } catch {
+        return "";
+      }
+      file = path.resolve(path.dirname(file), target);
+      continue;
+    }
+    if (!st.isFile() || st.uid !== 0 || (st.mode & GROUP_OR_OTHER_WRITE) !== 0) return "";
+    return file;
+  }
+  return "";
+}
+
+function foreignAcl(filePath, ownerUid) {
+  if (process.platform !== "darwin") return "";
+  const ls = trustedLs();
+  if (!ls) return "acl";
+  const listed = spawnSync(ls, ["-lde", "-n", filePath], {
+    encoding: "utf8",
+    env: { LC_ALL: "C", PATH: "/bin:/usr/bin" },
+    timeout: 5000,
+  });
+  if (!listed || listed.error || listed.status !== 0) return "acl";
+  let ownerName = "";
+  const id = spawnSync("/usr/bin/id", ["-un", String(ownerUid)], {
+    encoding: "utf8",
+    env: { LC_ALL: "C", PATH: "/bin:/usr/bin" },
+    timeout: 5000,
+  });
+  if (id && id.status === 0) ownerName = String(id.stdout || "").trim();
+  return aclListingFault(listed.stdout, ownerUid, ownerName);
 }
 
 // A umask 002 checkout leaves the helper group-writable. Saves keep refusing
@@ -265,6 +356,7 @@ async function openTrustedHelper(env = process.env) {
     if (again.dev !== st.dev || again.ino !== st.ino) throw helperUnavailable("race");
     if (!ownedAndPrivate(again, uid) || !ownedAndPrivate(parentAgain, uid)) throw helperUnavailable("owner");
     if (parentAgain.dev !== parentStat.dev || parentAgain.ino !== parentStat.ino) throw helperUnavailable("race");
+    if (foreignAcl(filePath, again.uid)) throw helperUnavailable("helper-acl");
     return { handle: file, path: filePath };
   } catch (error) {
     if (file) await file.close();
@@ -295,6 +387,10 @@ function callHelper(dirHandle, args, body, borrowed) {
     const fault = ancestorFault(path.dirname(tool.path));
     if (fault) {
       rejectClosed(helperUnavailable(fault));
+      return;
+    }
+    if (foreignAcl(tool.path, typeof process.getuid === "function" ? process.getuid() : null)) {
+      rejectClosed(helperUnavailable("helper-acl"));
       return;
     }
     // macOS will not execute /dev/fd. Recheck the path, then execute that path.

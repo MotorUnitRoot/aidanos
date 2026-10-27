@@ -2172,7 +2172,7 @@ async function refusedSavesStayUp(kind) {
     await waitHealth(base, child);
     if (kind === "noteplan") {
       const saved = await putMarkdown(base, "/api/file?path=" + encodeURIComponent("notes/page.md"), "saved text\n");
-      assert(saved.status === 200, label + " save got " + saved.status + " " + saved.text);
+      assert(saved.status === 200, label + " save got " + saved.status + " " + saved.text + "\n" + child._log());
       assert(fs.readFileSync(note, "utf8") === "saved text\n", label + " did not keep the new text");
       assert(fs.statSync(note).ino === inode, label + " replaced the note");
     }

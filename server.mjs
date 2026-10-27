@@ -3672,7 +3672,7 @@ const server = http.createServer(async (req, res) => {
     return sendFile(res, full, types[ext] || "application/octet-stream");
   } catch (err) {
     if (err && err.code === "DIRFD") {
-      console.error("refused: directory helper unavailable");
+      console.error("refused: directory helper unavailable" + (err.reason ? " " + err.reason : ""));
       if (res.headersSent) return;
       return json(res, 503, { error: "directory helper unavailable" });
     }

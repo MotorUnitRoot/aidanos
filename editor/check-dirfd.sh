@@ -15,7 +15,10 @@
 #   ZERO_AR_DATE=1
 #   MACOSX_DEPLOYMENT_TARGET=12.0
 #   cc -O2 -fno-ident -ffile-prefix-map=$ROOT=srcroot -frandom-seed=aidanos-dirfd \
-#       -Wl,-no_uuid -Wl,-no_adhoc_codesign -o OUT editor/dirfd-tool.c
+#       -Wl,-no_uuid -o OUT editor/dirfd-tool.c
+# -Wl,-no_adhoc_codesign was tried. The two builds matched, and macOS then
+# abort-trapped the unsigned binary (signal 6) before main. The linker signs
+# the binary instead. Those two signed builds still have to match.
 #
 # CFLAGS, CXXFLAGS, CPPFLAGS, LDFLAGS, and CC are ignored. The helper source
 # must not call getenv, and the rebuild must not reference getenv or environ.
@@ -54,7 +57,7 @@ if [ "$osname" = linux ]; then
 else
   compiler=cc
   export MACOSX_DEPLOYMENT_TARGET=12.0
-  flags="-O2 -fno-ident -ffile-prefix-map=$root=srcroot -frandom-seed=aidanos-dirfd -Wl,-no_uuid -Wl,-no_adhoc_codesign"
+  flags="-O2 -fno-ident -ffile-prefix-map=$root=srcroot -frandom-seed=aidanos-dirfd -Wl,-no_uuid"
 fi
 
 echo "uname: $(uname -s) $(uname -m) $(uname -r)"
@@ -144,6 +147,40 @@ expect_status 2 unlink name 1 2 extra
 expect_status 2 unlink-self name
 expect_status 2 nope name
 
+# The rebuilt binary must perform a directory-fd stat. On macOS this also
+# prints whether /dev/fd can be executed. The server does not use that path.
+node --input-type=module - "$work/tool" << 'EOF'
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const tool = process.argv[2];
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dirfd-probe-"));
+const dirFd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+const toolFd = fs.openSync(tool, fs.constants.O_RDONLY);
+function run(execPath) {
+  const result = spawnSync(execPath, ["stat", "missing-name"], {
+    stdio: ["ignore", "pipe", "pipe", dirFd, toolFd],
+    env: {},
+    encoding: "utf8",
+  });
+  return {
+    status: result.status,
+    error: result.error && result.error.code,
+    stdout: String(result.stdout || "").trim(),
+    stderr: String(result.stderr || "").trim(),
+  };
+}
+const byPath = run(tool);
+console.log("exec-path " + JSON.stringify(byPath));
+if (process.platform === "darwin") console.log("exec-devfd " + JSON.stringify(run("/dev/fd/4")));
+fs.closeSync(toolFd);
+fs.closeSync(dirFd);
+fs.rmSync(dir, { recursive: true, force: true });
+if (byPath.status !== 0 || byPath.stdout !== "missing") process.exit(1);
+EOF
+
 pinned_hash=$(hash_file "$pinned")
 echo "pinned $pinned_hash"
 if [ "$first" != "$pinned_hash" ]; then
@@ -159,4 +196,5 @@ if [ "$first" != "$pinned_hash" ]; then
   exit 1
 fi
 
+chmod 755 "$root/editor" "$root/editor/bin" "$pinned"
 echo "pinned helper matches"

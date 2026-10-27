@@ -8,10 +8,13 @@
 // swapped for a symlink and can create the file outside the checked folder.
 // Seeing the mismatch afterwards is already too late. Linux keeps the proc
 // backend, which is openat. Every other platform runs the pinned helper.
+// Linux executes the verified descriptor through /proc/self/fd. macOS will
+// not execute /dev/fd, so it executes the path that was just checked. The
+// directory is owned by this user and is not group or world writable.
 
 import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import fsSync, { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,9 +42,10 @@ function badPath() {
   return error;
 }
 
-function helperUnavailable() {
+function helperUnavailable(reason) {
   const error = new Error("directory helper unavailable");
   error.code = "DIRFD";
+  if (reason) error.reason = reason;
   return error;
 }
 
@@ -100,14 +104,14 @@ function ownedAndPrivate(st, uid) {
 // Check the helper again on every call. Nothing here is cached: a rejected
 // check must not make the next save fail without looking.
 async function openTrustedHelper(env = process.env) {
-  if (typeof process.getuid !== "function") throw helperUnavailable();
+  if (typeof process.getuid !== "function") throw helperUnavailable("uid");
   const uid = process.getuid();
   const key = helperKey();
   const pin = key ? HELPER_SHA256[key] : "";
   const filePath = helperFile(env);
-  if (!pin || !filePath) throw helperUnavailable();
+  if (!pin || !filePath) throw helperUnavailable("pin");
   const base = path.basename(filePath);
-  if (!base || base === "." || base === ".." || base.includes("/") || base.includes("\\")) throw helperUnavailable();
+  if (!base || base === "." || base === ".." || base.includes("/") || base.includes("\\")) throw helperUnavailable("pin");
   const parentPath = path.dirname(filePath);
   let listed;
   let parentListed;
@@ -115,69 +119,90 @@ async function openTrustedHelper(env = process.env) {
     listed = await fs.lstat(filePath);
     parentListed = await fs.lstat(parentPath);
   } catch {
-    throw helperUnavailable();
+    throw helperUnavailable("stat");
   }
-  if (listed.isSymbolicLink() || parentListed.isSymbolicLink() || !parentListed.isDirectory()) throw helperUnavailable();
-  if (!ownedAndPrivate(parentListed, uid)) throw helperUnavailable();
+  if (listed.isSymbolicLink() || parentListed.isSymbolicLink() || !parentListed.isDirectory()) throw helperUnavailable("symlink");
+  if (!ownedAndPrivate(parentListed, uid)) throw helperUnavailable("owner");
 
   let parent;
   try {
     parent = await fs.open(parentPath, DIR_FLAGS);
   } catch {
-    throw helperUnavailable();
+    throw helperUnavailable("open");
   }
   let file;
   try {
     const parentStat = await parent.stat();
     if (!parentStat.isDirectory() || parentStat.dev !== parentListed.dev || parentStat.ino !== parentListed.ino) {
-      throw helperUnavailable();
+      throw helperUnavailable("race");
     }
-    if (!ownedAndPrivate(parentStat, uid)) throw helperUnavailable();
+    if (!ownedAndPrivate(parentStat, uid)) throw helperUnavailable("owner");
     const openedPath = process.platform === "linux"
       ? "/proc/self/fd/" + parent.fd + "/" + base
       : filePath;
     try {
       file = await fs.open(openedPath, READ_FLAGS);
     } catch {
-      throw helperUnavailable();
+      throw helperUnavailable("open");
     }
     const st = await file.stat();
-    if (!st.isFile()) throw helperUnavailable();
-    if (!ownedAndPrivate(st, uid)) throw helperUnavailable();
+    if (!st.isFile()) throw helperUnavailable("type");
+    if (!ownedAndPrivate(st, uid)) throw helperUnavailable("owner");
     const digest = await hashFd(file);
-    if (!sameBytes(digest, pin)) throw helperUnavailable();
+    if (!sameBytes(digest, pin)) throw helperUnavailable("hash");
     const again = await file.stat();
     const parentAgain = await parent.stat();
-    if (again.dev !== st.dev || again.ino !== st.ino) throw helperUnavailable();
-    if (!ownedAndPrivate(again, uid) || !ownedAndPrivate(parentAgain, uid)) throw helperUnavailable();
-    if (parentAgain.dev !== parentStat.dev || parentAgain.ino !== parentStat.ino) throw helperUnavailable();
-    return file;
+    if (again.dev !== st.dev || again.ino !== st.ino) throw helperUnavailable("race");
+    if (!ownedAndPrivate(again, uid) || !ownedAndPrivate(parentAgain, uid)) throw helperUnavailable("owner");
+    if (parentAgain.dev !== parentStat.dev || parentAgain.ino !== parentStat.ino) throw helperUnavailable("race");
+    return { handle: file, path: filePath };
   } catch (error) {
     if (file) await file.close();
     if (error && error.code === "DIRFD") throw error;
-    throw helperUnavailable();
+    throw helperUnavailable("open");
   } finally {
     await parent.close();
   }
 }
 
+function sameInode(listed, opened) {
+  return !!listed && !!opened && listed.dev === opened.dev && listed.ino === opened.ino && listed.isFile() && !listed.isSymbolicLink();
+}
+
 function callHelper(dirHandle, args, body) {
   return openTrustedHelper().then((tool) => new Promise((resolve, reject) => {
-    const execPath = process.platform === "darwin" ? "/dev/fd/4" : "/proc/self/fd/4";
+    // macOS will not execute /dev/fd. Recheck the path, then execute that path.
+    // Linux executes the descriptor that was hashed, through /proc/self/fd.
+    let execPath = "/proc/self/fd/4";
+    if (process.platform === "darwin") {
+      let listed;
+      let opened;
+      try {
+        listed = fsSync.lstatSync(tool.path);
+        opened = fsSync.fstatSync(tool.handle.fd);
+      } catch {
+        listed = null;
+      }
+      if (!sameInode(listed, opened) || !ownedAndPrivate(listed, process.getuid())) {
+        Promise.resolve(tool.handle.close()).then(() => reject(helperUnavailable("race")), () => reject(helperUnavailable("race")));
+        return;
+      }
+      execPath = tool.path;
+    }
     let settled = false;
     function finish(fn) {
       if (settled) return;
       settled = true;
-      Promise.resolve(tool.close()).then(fn, fn);
+      Promise.resolve(tool.handle.close()).then(fn, fn);
     }
     let child;
     try {
       child = spawn(execPath, args, {
-        stdio: ["pipe", "pipe", "pipe", dirHandle.fd, tool.fd],
+        stdio: ["pipe", "pipe", "pipe", dirHandle.fd, tool.handle.fd],
         env: {},
       });
     } catch {
-      finish(() => reject(helperUnavailable()));
+      finish(() => reject(helperUnavailable("spawn")));
       return;
     }
     const out = [];
@@ -185,7 +210,7 @@ function callHelper(dirHandle, args, body) {
     child.stdout.on("data", (chunk) => out.push(chunk));
     child.stderr.on("data", (chunk) => err.push(chunk));
     child.stdin.on("error", () => {});
-    child.on("error", () => finish(() => reject(helperUnavailable())));
+    child.on("error", () => finish(() => reject(helperUnavailable("spawn"))));
     child.on("close", (code) => {
       finish(() => {
         if (code === 0) {

@@ -623,6 +623,9 @@ await check("the directory helper reads no environment and only its arguments", 
   assert(!/\benviron\b/.test(c), "the helper reads environ");
   const js = fs.readFileSync(path.join(root, "editor", "dirfd.mjs"), "utf8");
   assert(js.includes("env: {}"), "the helper inherits the process environment");
+  assert(!js.includes('"/dev/fd/4"'), "macOS still executes /dev/fd");
+  assert(js.includes('"/proc/self/fd/4"'), "Linux does not execute the checked descriptor");
+  assert(js.includes("tool.path"), "macOS does not recheck the helper path");
   const shipped = shippedHelper();
   const symbols = execFileSync("nm", ["-u", shipped], { encoding: "utf8" });
   assert(!symbols.includes("getenv"), "the shipped helper references getenv");

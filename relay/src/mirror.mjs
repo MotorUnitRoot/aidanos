@@ -876,7 +876,8 @@ async function closeQuietDir(handle) {
 
 // Temp in the checked folder, fsync, then renameat on that folder's descriptor.
 // A crash before the rename leaves the previous note and a sibling temp.
-// The manifest line is fsynced before the temp exists.
+// The manifest line is fsynced before the temp exists. The temp is created
+// at 0600 and the note stays that mode.
 export async function replaceNoteAtomic(file, text, options = {}) {
   const vault = options.vault || "";
   const stateDir = options.stateDir || "";
@@ -976,7 +977,8 @@ async function noteSiblingFault(file) {
 // exist. That record is two fsyncs: the new manifest file, then the state
 // directory after the rename onto note-temps. A refused manifest still saves
 // the note and logs the doc id. That temp is not tracked, so a later sweep
-// cannot delete a file the manifest does not name.
+// cannot delete a file the manifest does not name. The note directory is
+// fsynced after the rename. The temp is mode 0600 and the note stays that mode.
 export async function saveNoteBatch(entries, options = {}) {
   const vault = options.vault || "";
   const stateDir = options.stateDir || "";

@@ -83,8 +83,9 @@ function runGit(args, cwd, secrets, timeoutMs = 20000, extraEnv = {}) {
   });
 }
 
-// The relay's own mark. A rule is removed only when this exact comment
-// introduces that exact line. A user's `.*.tmp` has no mark and stays.
+// 938d78a appended the bare line `.*.tmp`. That exact line is removed only
+// when the cleanup comment introduces it. A user's own `.*.tmp` has no
+// mark and stays, so a user-ignored `.cache.tmp` stays ignored.
 const RELAY_GITIGNORE_COMMENT = "# aidanos-relay";
 const RELAY_OLD_WIDE_COMMENT = "# aidanos: drop the old wide temp rule";
 const RELAY_OLD_WIDE_RULE = ".*.tmp";

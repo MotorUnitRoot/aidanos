@@ -1272,6 +1272,12 @@ test("a node frame is kept only when it stays inside node", () => {
   assert.equal(lowered.includes("vault"), false, lowered);
   assert.equal(lowered.includes("page"), false, lowered);
   assert.equal(lowered.includes("node:users"), false, lowered);
+  const medical = "node:internal/users/colby/notes/medical";
+  const maskedMedical = redact("see " + medical + " at " + medical + ":1:2", []);
+  assert.equal(maskedMedical.includes(medical), false, maskedMedical);
+  assert.equal(maskedMedical.includes("colby"), false, maskedMedical);
+  assert.equal(maskedMedical.includes("medical"), false, maskedMedical);
+  assert.equal(maskedMedical.includes("notes"), false, maskedMedical);
 });
 
 test("a log line does not glue a cut bracket to the truncation mark", () => {
@@ -1340,6 +1346,25 @@ test("a secret past 2 MB is masked before the 64 KB cut", () => {
   assert.equal(spacedCleaned.includes("value"), false, spacedCleaned.slice(-120));
   assert.equal(spacedCleaned.includes(spaced), false);
   assert.equal(spacedCleaned.includes("***"), true, spacedCleaned.slice(-120));
+});
+
+test("256 non-break characters before a secret do not leak past 2 MB", () => {
+  const secret = "Zk7" + "Q".repeat(93);
+  const nobreak = "b".repeat(256);
+  const head = 10;
+  const start = REDACT_INPUT_CAP - head;
+  const padTo = start - nobreak.length;
+  let pad = "";
+  while (Buffer.byteLength(pad) + 2 <= padTo) pad += "b\n";
+  pad += "b".repeat(padTo - Buffer.byteLength(pad));
+  assert.equal(Buffer.byteLength(pad), padTo);
+  const input = pad + nobreak + secret + "\n" + "b".repeat(2 * 1024 * 1024);
+  assert.ok(Buffer.byteLength(input) > 2 * 1024 * 1024);
+  const cleaned = redact(input, [secret]);
+  assert.equal(cleaned.includes(secret), false, cleaned.slice(-160));
+  assert.equal(cleaned.includes("Zk7"), false, cleaned.slice(-160));
+  assert.equal(cleaned.includes("Q"), false, cleaned.slice(-160));
+  assert.equal(cleaned.includes("***"), true, cleaned.slice(-160));
 });
 
 test("twenty thousand stack frames restore in one pass", () => {
@@ -1423,6 +1448,13 @@ test("a location scrub is linear on adversarial input", () => {
   assert.ok(performance.now() - hugeStarted < 100, "1 MB scrub");
   assert.equal(hugeCleaned.includes("TAILTOKEN-99999"), false);
   assert.equal(hugeCleaned.includes("Secret"), false);
+  const huge2 = fill(2 * 1024 * 1024);
+  const huge2Started = performance.now();
+  const huge2Cleaned = redact(huge2, []);
+  assert.ok(performance.now() - huge2Started < 100, "2 MB scrub");
+  assert.equal(huge2Cleaned.includes("(a/"), false);
+  assert.equal(huge2Cleaned.includes("Secret"), false);
+  assert.equal(huge2Cleaned.includes("Users"), false);
 });
 
 test("a note path is prepared from the claimed root, not a fresh realpath", async () => {

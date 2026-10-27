@@ -762,68 +762,94 @@ async function processHoldsLock(file, dev, ino) {
     if (forced === "unknown") return "unknown";
     return forced ? "held" : "free";
   }
-  if (process.platform === "linux") return linuxProcessHolds(dev, ino);
+  if (process.platform === "linux") return linuxProcessHolds(file, dev, ino);
   return lsofHolds(file);
 }
 
-// "held", "free", or "unknown". A holder of index.lock has to be able to
-// write the vault, so a process owned by another user is skipped. pid 1
-// is root and its descriptor directory is unreadable; that is not a failed
-// read of a process we own. ssh-agent and gpg-agent are the same user and
-// refuse a listing of their descriptors. Git does not. Skipping a process
-// we cannot list is the same as another user: a permanent unknown would
-// keep every index.lock. A descriptor we did list and cannot stat stays
-// unknown, and the lock stays.
-// On Linux, deleting index.lock and creating it again can reuse the inode
-// and report the same ctime, birthtime, and size. All four identity fields
-// can match a file this relay did not record.
-function linuxProcessHolds(dev, ino) {
+function procGone(error) {
+  return Boolean(error && (error.code === "ENOENT" || error.code === "ESRCH"));
+}
+
+function procDenied(error) {
+  return Boolean(error && (error.code === "EACCES" || error.code === "EPERM"));
+}
+
+// "held", "free", or "unknown". Reads are async so the scan does not sit
+// on the event loop. A holder has to be able to write the vault, so
+// another uid is skipped. pid 1 is root. Its descriptor directory is not
+// a failed read of a process we own.
+// EACCES or EPERM on a same-uid process is not a live holder. ptrace_scope
+// hides siblings on the GitHub runner, and stat of one descriptor can fail
+// when the path walk is denied. A recorded lock whose identity still
+// matches is removed when no inspectable process of our uid has the inode
+// open. A read error that is not permission or a gone process, on a
+// descriptor directory we own, stays unknown and the lock stays.
+// Same-account gap: a process we cannot ptrace can hold index.lock and
+// this scan will not see it. On Linux, deleting index.lock and creating
+// it again can reuse the inode and match ctime, birthtime, and size, so
+// all four identity fields can match a file this relay did not record.
+async function linuxProcessHolds(file, dev, ino) {
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   if (typeof uid !== "number") return "unknown";
   let pids;
   try {
-    pids = fsSync.readdirSync("/proc");
+    pids = await fs.readdir("/proc");
   } catch {
     return "unknown";
   }
+  const lockPath = path.resolve(file);
   for (const pid of pids) {
     if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
     const procDir = "/proc/" + pid;
     let owner;
     try {
-      owner = fsSync.statSync(procDir).uid;
+      owner = (await fs.stat(procDir)).uid;
     } catch {
       continue;
     }
     if (owner !== uid) continue;
-    const fdDir = procDir + "/fd";
-    let fdOwner;
-    try {
-      fdOwner = fsSync.statSync(fdDir).uid;
-    } catch (error) {
-      if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
-      return "unknown";
-    }
-    if (fdOwner !== uid) continue;
-    let fds;
-    try {
-      fds = fsSync.readdirSync(fdDir);
-    } catch (error) {
-      if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
-      if (error && (error.code === "EACCES" || error.code === "EPERM")) continue;
-      return "unknown";
-    }
-    for (const fd of fds) {
-      try {
-        const st = fsSync.statSync(path.join(fdDir, fd));
-        if (st.dev === dev && st.ino === ino) return "held";
-      } catch (error) {
-        if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
-        if (error && (error.code === "EACCES" || error.code === "EPERM")) return "unknown";
-      }
-    }
+    const found = await descriptorsHold(procDir + "/fd", uid, dev, ino, lockPath);
+    if (found === "held" || found === "unknown") return found;
   }
   return "free";
+}
+
+async function descriptorsHold(fdDir, uid, dev, ino, lockPath) {
+  let fdOwner;
+  try {
+    fdOwner = (await fs.stat(fdDir)).uid;
+  } catch (error) {
+    if (procGone(error) || procDenied(error)) return "skip";
+    return "unknown";
+  }
+  if (fdOwner !== uid) return "skip";
+  let fds;
+  try {
+    fds = await fs.readdir(fdDir);
+  } catch (error) {
+    if (procGone(error) || procDenied(error)) return "skip";
+    return "unknown";
+  }
+  for (const fd of fds) {
+    if (await descriptorHolds(fdDir + "/" + fd, dev, ino, lockPath)) return "held";
+  }
+  return "skip";
+}
+
+async function descriptorHolds(fdPath, dev, ino, lockPath) {
+  try {
+    const st = await fs.stat(fdPath);
+    if (st.dev === dev && st.ino === ino) return true;
+    return false;
+  } catch (error) {
+    if (!procDenied(error)) return false;
+  }
+  try {
+    const link = await fs.readlink(fdPath);
+    return link === lockPath;
+  } catch {
+    return false;
+  }
 }
 
 function lsofHolds(file) {

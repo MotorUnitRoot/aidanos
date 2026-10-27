@@ -23,7 +23,7 @@ import {
 import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import { installIndexTrace, noteGitWork } from "./index-trace.mjs";
-import { saveNoteFile } from "./mirror.mjs";
+import { discardOpenNoteTemps, saveNoteFile, sweepStaleNoteTemps } from "./mirror.mjs";
 import {
   flushFileLog,
   installFileLog,
@@ -591,6 +591,7 @@ export async function startRelay(options = {}) {
   await assertNotClientVault(vault);
   // A symlink is refused before any marker is written through it.
   await refuseSymlinkedStorage(dataDir);
+  await sweepStaleNoteTemps(vault);
   await claimRelayFolders(vault, dataDir);
   if (storageFolderFault(dataDir)) throw new Error("storage folder failed the owner walk");
   const guessLimit = Number(options.guessLimit ?? 5);
@@ -1295,21 +1296,20 @@ export async function startRelay(options = {}) {
       const asked = session && session.mirror && typeof session.mirror.finishSaves === "function"
         ? session.mirror.finishSaves().then(() => "settled", () => "settled")
         : Promise.resolve("settled");
-      let timed = false;
       const timeout = new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          timed = true;
-          resolve("timeout");
-        }, bound);
+        const timer = setTimeout(() => resolve("timeout"), bound);
         asked.then(() => clearTimeout(timer), () => clearTimeout(timer));
       });
       const [workerResult, localResult] = await Promise.all([
         Promise.race([asked, timeout]),
         waitForInflightSaves(bound),
       ]);
-      if (workerResult === "timeout" || localResult === "timeout" || timed) {
+      const result = workerResult === "timeout" || localResult === "timeout" ? "timeout" : "settled";
+      if (result === "timeout") {
         logSafe(secrets, SAVE_WAIT_TIMEOUT_LINE);
+        await discardOpenNoteTemps();
       }
+      return result;
     },
   };
   if (env.NODE_ENV === "test") {
@@ -1410,18 +1410,24 @@ async function main() {
       } catch { /* exit still runs */ }
       process.exit(code);
     };
+    let saveWaitTimedOut = false;
     giveUp = () => exitWith(1, SHUTDOWN_TIMEOUT_LINE);
     const beginClose = () => {
       if (settled) return;
       // The 5s close deadline starts only after in-flight saves settle,
-      // or after the 12s save bound has already been logged.
+      // or after the 12s save bound has already been logged. A save wait
+      // that hit that bound still closes, then exits 1.
       deadlineTimer = setTimeout(() => giveUp(), shutdownDeadline());
+      const code = saveWaitTimedOut ? 1 : 0;
       Promise.resolve(relay.close()).then(
-        () => exitWith(0, "relay log closed"),
-        () => exitWith(0, "relay log closed"),
+        () => exitWith(code, "relay log closed"),
+        () => exitWith(code, "relay log closed"),
       );
     };
-    Promise.resolve(relay.stopAcceptingAndDrainSaves()).then(beginClose, beginClose);
+    Promise.resolve(relay.stopAcceptingAndDrainSaves()).then((result) => {
+      saveWaitTimedOut = result === "timeout";
+      beginClose();
+    }, beginClose);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

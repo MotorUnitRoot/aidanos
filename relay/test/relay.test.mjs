@@ -14,8 +14,8 @@ import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
-import { FATAL_FALLBACK_NAME, FILE_LOG_CAP, flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, redact, stampLine } from "../src/redact.mjs";
-import { emptyLateState, installIndexTrace, nextLoopLateLine } from "../src/index-trace.mjs";
+import { FATAL_FALLBACK_NAME, FILE_LOG_CAP, LOG_LINE_CAP, flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, redact, stampLine } from "../src/redact.mjs";
+import { INDEX_TRACE_ENTRY_CAP, beginIndexRequest, emptyLateState, finishIndexReply, installIndexTrace, nextLoopLateLine, noteGitWork, noteMirror } from "../src/index-trace.mjs";
 import { cbor } from "@automerge/automerge-repo";
 import { describeSyncFrame, logSyncFrame } from "../src/sync-log.mjs";
 import {
@@ -849,10 +849,12 @@ test("a save that outlasts the shutdown bound is logged before close", { timeout
   } catch (error) {
     if (!error || error.code !== "ENOENT") throw error;
   }
-  assert.equal(code, 0, text);
+  assert.equal(code, 1, text);
   assert.match(text, new RegExp(SAVE_WAIT_TIMEOUT_LINE));
   assert.match(text, /relay log closed/);
   assert.notEqual(note, body);
+  const names = await fs.readdir(started.vault);
+  assert.equal(names.some((name) => name.endsWith(".tmp")), false, names.join(","));
   assert.ok(elapsed < 1500, "waited out the save in " + elapsed + "ms");
 });
 
@@ -892,6 +894,25 @@ test("a second signal during the save wait exits immediately", { timeout: 20000 
   assert.equal(text.includes("relay log closed"), false, text);
   assert.notEqual(note, body);
   assert.ok(elapsed < 2000, "second signal waited " + elapsed + "ms");
+});
+
+test("an index trace window drops the oldest entries past the cap", async () => {
+  assert.equal(INDEX_TRACE_ENTRY_CAP, 10000);
+  finishIndexReply();
+  const lines = [];
+  await installIndexTrace((line) => lines.push(line));
+  beginIndexRequest({ handles: {} });
+  try {
+    for (let i = 0; i < 30; i += 1) noteGitWork(0);
+    for (let i = 0; i < INDEX_TRACE_ENTRY_CAP; i += 1) noteMirror(0);
+    finishIndexReply();
+  } finally {
+    finishIndexReply();
+  }
+  const steps = lines.filter((line) => line.startsWith("index steps"));
+  assert.equal(steps.length, 1);
+  assert.match(steps[0], /git=0x\/0\.0ms/);
+  assert.match(steps[0], new RegExp("mirror=" + INDEX_TRACE_ENTRY_CAP + "x/"));
 });
 
 test("index trace turns off when automerge internals are missing", async () => {
@@ -989,6 +1010,75 @@ test("redact removes the token and the git url", () => {
   assert.equal(locations.includes("secret-plan.md"), false);
   assert.equal(locations.includes("shopping-list.md"), false);
   assert.equal(locations.includes("01abc234-def0-4567-8901-23456789abcd"), true);
+});
+
+test("note names with spaces, unicode, and quotes are scrubbed", () => {
+  const spaced = redact("wrote Secret Plan.md today", []);
+  assert.equal(spaced.includes("Secret"), false, spaced);
+  assert.equal(spaced.includes("Plan.md"), false, spaced);
+  assert.equal(spaced.includes(".md"), false, spaced);
+  const quoted = redact("see 'Secret Plan.md' now", []);
+  assert.equal(quoted, "see '[note]' now");
+  const double = redact('open "Café Notes.md" next', []);
+  assert.equal(double, 'open "[note]" next');
+  const unicode = redact("保存 計画.md", []);
+  assert.equal(unicode.includes("計画"), false, unicode);
+  assert.equal(unicode.includes("保存"), false, unicode);
+  assert.equal(unicode, "[note]");
+  const upper = redact("left Shopping List.MD here", []);
+  assert.equal(upper.includes("Shopping"), false, upper);
+  assert.equal(upper.includes(".MD"), false, upper);
+});
+
+test("path prefixes and relative paths are scrubbed", () => {
+  const equals = redact("path=/Users/ada/Vault/notes", []);
+  assert.equal(equals.includes("/Users"), false, equals);
+  assert.equal(equals.includes("ada"), false, equals);
+  assert.equal(equals, "path=[path]");
+  const vault = redact("vault:/Users/ada/Vault", []);
+  assert.equal(vault.includes("/Users"), false, vault);
+  assert.equal(vault, "vault:[path]");
+  const bracket = redact("see [/Users/ada/Vault/notes]", []);
+  assert.equal(bracket.includes("/Users"), false, bracket);
+  assert.equal(bracket, "see [[path]]");
+  const relative = redact("read notes/draft.txt next", []);
+  assert.equal(relative.includes("notes/draft.txt"), false, relative);
+  assert.equal(relative.includes("draft"), false, relative);
+  assert.equal(relative, "read [path] next");
+  const upperPath = redact("open Notes/File.MD", []);
+  assert.equal(upperPath.includes("Notes"), false, upperPath);
+  assert.equal(upperPath.includes("File"), false, upperPath);
+  assert.equal(upperPath, "open [path]");
+});
+
+test("a log line is capped at 8 KB before it is scrubbed", () => {
+  assert.equal(LOG_LINE_CAP, 8 * 1024);
+  const secret = "/Users/ada/Vault/secret-plan.md";
+  const over = "a".repeat(LOG_LINE_CAP) + secret;
+  const capped = redact(over, []);
+  assert.equal(capped.includes(secret), false, capped);
+  assert.equal(capped.includes("/Users"), false, capped);
+  assert.equal(capped.endsWith("[truncated]"), true);
+  assert.ok(Buffer.byteLength(capped) <= LOG_LINE_CAP + Buffer.byteLength("[truncated]"));
+  const prefix = "path=/Users/ada/Vault/notes " + "b".repeat(LOG_LINE_CAP);
+  const scrubbed = redact(prefix, []);
+  assert.equal(scrubbed.includes("/Users"), false, scrubbed);
+  assert.equal(scrubbed.includes("[path]"), true, scrubbed);
+  assert.equal(scrubbed.includes("[truncated]"), true, scrubbed);
+});
+
+test("a location scrub is linear on adversarial input", () => {
+  const piece = "(a/".repeat(400) + "a/a/a/".repeat(200) + " ".repeat(1500);
+  assert.ok(piece.length < LOG_LINE_CAP, piece.length);
+  let input = "";
+  while (Buffer.byteLength(input) < 1024 * 1024) input += piece + "\n";
+  assert.ok(Buffer.byteLength(input) >= 1024 * 1024);
+  const started = performance.now();
+  const cleaned = redact(input, []);
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 100, "scrubbed in " + elapsed + "ms");
+  assert.equal(cleaned.includes("(a/"), false);
+  assert.equal(cleaned.includes("a/a/a/"), false);
 });
 
 test("relay rejects a bad token and accepts the real one", async () => {
@@ -1127,6 +1217,7 @@ test("a fresh backup pushes to an empty repo", async () => {
   try {
     await fs.writeFile(path.join(vault, "day.md"), "today\n");
     await fs.writeFile(path.join(vault, "day.md.leftover.recover"), "secret\n");
+    await fs.writeFile(path.join(vault, ".day.md.99999.tmp"), "secret-temp\n");
     const result = await relay.backupNow();
     assert.equal(result.pushed, true);
     const listed = await git(["--git-dir", bare, "log", "--oneline", "main"]);
@@ -1134,12 +1225,82 @@ test("a fresh backup pushes to an empty repo", async () => {
     const ignore = await fs.readFile(path.join(vault, ".gitignore"), "utf8");
     assert.match(ignore, /\.aidanos\//);
     assert.match(ignore, /^\*\.recover$/m);
+    assert.match(ignore, /^\.\*\.tmp$/m);
     const exclude = await fs.readFile(path.join(vault, ".git", "info", "exclude"), "utf8");
     assert.match(exclude, /^\*\.recover$/m);
     const tree = await git(["--git-dir", bare, "ls-tree", "-r", "--name-only", "main"]);
     assert.doesNotMatch(tree.stdout, /\.recover/);
+    assert.doesNotMatch(tree.stdout, /\.tmp/);
   } finally {
     await relay.close();
+  }
+});
+
+function deadPid() {
+  for (let pid = 1 << 22; pid < (1 << 22) + 2000; pid += 1) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error && error.code === "ESRCH") return pid;
+    }
+  }
+  return 0;
+}
+
+test("a stale note temp is removed at startup and a live one stays", async () => {
+  const dead = deadPid();
+  assert.ok(dead > 1);
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await fs.mkdir(vault);
+  const stale = path.join(vault, `.secret-plan.md.${dead}.tmp`);
+  await fs.writeFile(stale, "whole note\n");
+  const first = await startRelay({ token: TOKEN, vault, data, port: 0, gitUrl: "" });
+  await first.close();
+  await assert.rejects(fs.lstat(stale), (error) => error && error.code === "ENOENT");
+
+  const notes = path.join(vault, "notes");
+  const outside = path.join(dir, "outside");
+  await fs.mkdir(notes);
+  await fs.mkdir(outside);
+  const nested = path.join(notes, `.plan.md.${dead}.tmp`);
+  const live = path.join(vault, `.held-note.md.${process.pid}.tmp`);
+  const other = path.join(vault, "keep.md.tmp");
+  const plain = path.join(vault, ".note.tmp");
+  const linked = path.join(vault, "real-secret.md");
+  const link = path.join(vault, `.linked.md.${dead}.tmp`);
+  const outsideTemp = path.join(outside, `.secret.md.${dead}.tmp`);
+  await fs.writeFile(nested, "nested note\n");
+  await fs.writeFile(live, "still writing\n");
+  await fs.writeFile(other, "not our pattern\n");
+  await fs.writeFile(plain, "no pid\n");
+  await fs.writeFile(linked, "do not follow\n");
+  await fs.symlink(linked, link);
+  await fs.writeFile(outsideTemp, "outside note\n");
+  await fs.symlink(outside, path.join(vault, "linked-dir"));
+  let foreign = "";
+  try {
+    foreign = path.join(vault, `.foreign.md.${dead}.tmp`);
+    await fs.writeFile(foreign, "other-user\n");
+    await fs.chown(foreign, 65534, 65534);
+  } catch {
+    if (foreign) await fs.rm(foreign, { force: true });
+    foreign = "";
+  }
+
+  const again = await startRelay({ token: TOKEN, vault, data, port: 0, gitUrl: "" });
+  try {
+    await assert.rejects(fs.lstat(nested), (error) => error && error.code === "ENOENT");
+    assert.equal(await fs.readFile(live, "utf8"), "still writing\n");
+    assert.equal(await fs.readFile(other, "utf8"), "not our pattern\n");
+    assert.equal(await fs.readFile(plain, "utf8"), "no pid\n");
+    assert.equal(await fs.readFile(linked, "utf8"), "do not follow\n");
+    assert.equal((await fs.lstat(link)).isSymbolicLink(), true);
+    assert.equal(await fs.readFile(outsideTemp, "utf8"), "outside note\n");
+    if (foreign) assert.equal(await fs.readFile(foreign, "utf8"), "other-user\n");
+  } finally {
+    await again.close();
   }
 });
 

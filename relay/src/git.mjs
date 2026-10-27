@@ -95,6 +95,9 @@ async function ensureGitignore(vault) {
   const missing = [];
   if (!lines.includes(".aidanos/")) missing.push(".aidanos/");
   if (!lines.includes("*.recover")) missing.push("*.recover");
+  // Relay note temps are `.{name}.{pid}.tmp`. The leading dot keeps ordinary
+  // `*.tmp` names, which are not this pattern, out of the rule.
+  if (!lines.includes(".*.tmp")) missing.push(".*.tmp");
   if (missing.length) {
     const prefix = text.length > 0 && !text.endsWith("\n") ? text + "\n" : text;
     await fs.writeFile(file, prefix + missing.join("\n") + "\n");

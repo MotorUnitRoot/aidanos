@@ -22,9 +22,11 @@ import {
   workerExecArgv,
   workerTestHook,
 } from "../src/channel.mjs";
+import { LOG_LINE_CAP } from "../src/redact.mjs";
 import { planBudget } from "../src/budget.mjs";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import { startRelay } from "../src/server.mjs";
+import { createWorkerHost } from "../src/worker-host.mjs";
 import { writeStorageBytes } from "../src/storage-safe.mjs";
 
 // node --test does not set this. Hooks exist only while it is "test".
@@ -151,6 +153,38 @@ test("a copied frame keeps its bytes when the pool is reused", () => {
   assert.equal(new Uint8Array(copyA)[31], 1);
   assert.notEqual(copyA, shared);
   assert.notEqual(copyB, shared);
+});
+
+test("worker log lines are scrubbed and capped before they are forwarded", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await fs.mkdir(vault);
+  await fs.mkdir(data);
+  const raw = "vault=/Users/ada/Vault/notes/secret.md " + "z".repeat(LOG_LINE_CAP);
+  const lines = [];
+  const host = createWorkerHost({
+    vault,
+    dataDir: data,
+    peerId: "aidanos-relay",
+    mirrorDebounceMs: 60_000,
+    test: { testLogLine: raw },
+    onLog(line) {
+      lines.push(line);
+    },
+  });
+  try {
+    await host.start();
+    const forwarded = lines.find((line) => line.includes("[truncated]"));
+    assert.ok(forwarded, lines.join("\n"));
+    assert.equal(forwarded.includes("/Users/ada"), false, forwarded);
+    assert.equal(forwarded.includes("secret.md"), false, forwarded);
+    assert.match(forwarded, /\[path\]/);
+    assert.ok(Buffer.byteLength(forwarded) <= LOG_LINE_CAP + Buffer.byteLength("[truncated]"));
+    assert.equal(workerTestHook({ testLogLine: raw }, { NODE_ENV: "production" }), null);
+  } finally {
+    await host.stop();
+  }
 });
 
 test("worker log forwarding counts only bytes the parent has not taken", () => {

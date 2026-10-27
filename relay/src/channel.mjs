@@ -201,5 +201,8 @@ export function workerTestHook(options, env = process.env) {
   if (options.testBadChannel === true) hook.badChannel = true;
   const saveHold = Number(options.testSaveHoldMs);
   if (Number.isFinite(saveHold) && saveHold > 0) hook.saveHoldMs = saveHold;
+  if (typeof options.testLogLine === "string" && options.testLogLine) {
+    hook.logLine = options.testLogLine.slice(0, 64 * 1024);
+  }
   return Object.keys(hook).length ? hook : null;
 }

@@ -18,7 +18,7 @@ import {
   traceStorage,
 } from "./index-trace.mjs";
 import { createMirror } from "./mirror.mjs";
-import { logSafe } from "./redact.mjs";
+import { logSafe, redact } from "./redact.mjs";
 import { SafeStorage, refuseSymlinkedStorage, storageFolderFault } from "./storage-safe.mjs";
 
 const INDEX_TYPES = new Set(["request", "sync", "doc-unavailable"]);
@@ -205,7 +205,9 @@ async function run() {
     if (readyForWork) drain();
   });
   console.error = (...args) => {
-    const line = formatWithOptions({ colors: false }, ...args);
+    // Same scrubber and 8 KB line cap as the accept thread, before the line
+    // is counted against the unacked-byte budget.
+    const line = redact(formatWithOptions({ colors: false }, ...args), []);
     const accepted = logBudget.take(line);
     if (!accepted) return;
     try {
@@ -214,6 +216,7 @@ async function run() {
       logBudget.unsent(accepted);
     }
   };
+  if (test && typeof test.logLine === "string") console.error(test.logLine);
   for (const key of Object.keys(process.env)) {
     if (key.startsWith("AIDANOS_")) {
       logSafe([], "worker saw AIDANOS_ env");

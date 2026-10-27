@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // The note writer refuses a link. Nothing is written through it.
 // These checks call the writer directly, in both save modes.
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -579,6 +580,236 @@ await check("the server passes beforeRename into the save", async () => {
   assert(place.includes("restoreOpened"), "a failed write does not put the previous text back");
   assert(place.includes("expectFile"), "the opened file is not compared with the vault file");
   assert(fn.includes("parents: seen"), "the server passes the parent chain into the save");
+});
+
+function shippedHelper() {
+  const osName = process.platform === "linux" ? "linux" : process.platform === "darwin" ? "darwin" : "";
+  const arch = process.arch === "x64" || process.arch === "arm64" ? process.arch : "";
+  return path.join(root, "editor", "bin", "dirfd-tool-" + osName + "-" + arch);
+}
+
+async function withHelperEnv(extra, run) {
+  const keys = ["AIDANOS_DIRFD_TOOL", "AIDANOS_DIRFD_BACKEND", "AIDANOS_DIRFD_FAIL_AFTER"];
+  const prev = {};
+  for (const key of keys) prev[key] = process.env[key];
+  for (const key of keys) delete process.env[key];
+  Object.assign(process.env, extra);
+  try {
+    return await run();
+  } finally {
+    for (const key of keys) {
+      if (prev[key] === undefined) delete process.env[key];
+      else process.env[key] = prev[key];
+    }
+  }
+}
+
+await check("the directory helper is pinned and is not built at runtime", async () => {
+  const src = fs.readFileSync(path.join(root, "editor", "dirfd.mjs"), "utf8");
+  assert(!src.includes("compileHelper"), "the server still compiles a helper");
+  assert(!src.includes('spawn("cc"'), "the server still runs cc");
+  assert(!src.includes("tmpdir"), "the server still caches a helper in the temp directory");
+  const shipped = shippedHelper();
+  assert(fs.existsSync(shipped), "the pinned helper is missing: " + path.basename(shipped));
+  const digest = createHash("sha256").update(fs.readFileSync(shipped)).digest("hex");
+  assert(src.includes(digest), "the source pin does not match the shipped helper");
+  const mode = fs.statSync(shipped).mode & 0o777;
+  assert((mode & 0o022) === 0, "the shipped helper is group or world writable");
+});
+
+await check("a planted, replaced, or writable helper is refused", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-tool-"));
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-tool-vault-"));
+  const marker = path.join(dir, "marker");
+  const planted = path.join(dir, "planted");
+  fs.writeFileSync(planted, "#!/bin/sh\nprintf pwned > '" + marker + "'\n");
+  fs.chmodSync(planted, 0o755);
+  const folder = await openCheckedDirectory(vault);
+  try {
+    const plantedError = await withHelperEnv({ AIDANOS_DIRFD_TOOL: planted, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => createExclusive(folder, "planted.recover", Buffer.from("x\n"), "helper")));
+    assert(plantedError.code === "DIRFD", plantedError.code + " " + plantedError.message);
+    assert(plantedError.message === "directory helper unavailable", plantedError.message);
+    assert(!fs.existsSync(marker), "a planted helper ran");
+    assert(!fs.existsSync(path.join(vault, "planted.recover")), "a planted helper created a file");
+
+    const copy = path.join(dir, "copy");
+    fs.copyFileSync(shippedHelper(), copy);
+    fs.chmodSync(copy, 0o755);
+    await withHelperEnv({ AIDANOS_DIRFD_TOOL: copy, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      createExclusive(folder, "ok.recover", Buffer.from("ok\n"), "helper"));
+    assert(fs.readFileSync(path.join(vault, "ok.recover"), "utf8") === "ok\n", "a trusted copy did not run");
+    fs.rmSync(path.join(vault, "ok.recover"));
+    fs.rmSync(copy);
+    fs.symlinkSync(planted, copy);
+    const linked = await withHelperEnv({ AIDANOS_DIRFD_TOOL: copy, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => createExclusive(folder, "linked.recover", Buffer.from("x\n"), "helper")));
+    assert(linked.code === "DIRFD", linked.code);
+    assert(!fs.existsSync(marker), "a replaced symlink helper ran");
+    assert(!fs.existsSync(path.join(vault, "linked.recover")), "a symlink helper created a file");
+    fs.unlinkSync(copy);
+
+    fs.copyFileSync(shippedHelper(), copy);
+    fs.chmodSync(copy, 0o666);
+    const writableFile = await withHelperEnv({ AIDANOS_DIRFD_TOOL: copy, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => createExclusive(folder, "mode.recover", Buffer.from("x\n"), "helper")));
+    assert(writableFile.code === "DIRFD", writableFile.code);
+    assert(!fs.existsSync(path.join(vault, "mode.recover")), "a group-writable helper ran");
+
+    fs.chmodSync(copy, 0o755);
+    fs.chmodSync(dir, 0o777);
+    const writableDir = await withHelperEnv({ AIDANOS_DIRFD_TOOL: copy, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => createExclusive(folder, "dir.recover", Buffer.from("x\n"), "helper")));
+    assert(writableDir.code === "DIRFD", writableDir.code);
+    assert(!fs.existsSync(path.join(vault, "dir.recover")), "a helper in a writable folder ran");
+    fs.chmodSync(dir, 0o700);
+
+    const again = await withHelperEnv({ AIDANOS_DIRFD_TOOL: copy, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      createExclusive(folder, "again.recover", Buffer.from("again\n"), "helper"));
+    assert(again && fs.readFileSync(path.join(vault, "again.recover"), "utf8") === "again\n", "a refused helper stayed refused");
+  } finally {
+    await folder.close();
+  }
+});
+
+await check("a helper EEXIST or ELOOP is a bad path and leaves the file", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-eexist-"));
+  const outside = path.join(dir, "outside.txt");
+  fs.writeFileSync(outside, "outside-secret\n");
+  const folder = await openCheckedDirectory(dir);
+  try {
+    const created = await createExclusive(folder, "note.recover", Buffer.from("kept\n"), "helper");
+    const again = await rejects(() => createExclusive(folder, "note.recover", Buffer.from("other\n"), "helper"));
+    assert(again.code === "BAD_PATH" && again.message === "bad path", again.code + " " + again.message);
+    assert(fs.readFileSync(path.join(dir, "note.recover"), "utf8") === "kept\n", "the second create replaced the file");
+    assert(created.ino === String(fs.statSync(path.join(dir, "note.recover")).ino), "the original inode was replaced");
+    fs.symlinkSync(outside, path.join(dir, "link.recover"));
+    const loop = await rejects(() => createExclusive(folder, "link.recover", Buffer.from("pwned\n"), "helper"));
+    assert(loop.code === "BAD_PATH" && loop.message === "bad path", loop.code + " " + loop.message);
+    assert(fs.readFileSync(outside, "utf8") === "outside-secret\n", "a symlink create wrote the target");
+    assert(fs.lstatSync(path.join(dir, "link.recover")).isSymbolicLink(), "the symlink was replaced");
+  } finally {
+    await folder.close();
+  }
+});
+
+await check("a partial recovery file is removed", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-partial-helper-"));
+  const folder = await openCheckedDirectory(dir);
+  try {
+    const empty = await rejects(() => createExclusive(folder, "empty.recover", Buffer.from("hello\n"), "helper", { failAfterBytes: 0 }));
+    assert(empty.code === "EIO", empty.code);
+    assert(!fs.existsSync(path.join(dir, "empty.recover")), "a create that failed immediately left a file");
+    const mid = await rejects(() => createExclusive(folder, "mid.recover", Buffer.from("hello\n"), "helper", { failAfterBytes: 2 }));
+    assert(mid.code === "EIO", mid.code);
+    assert(!fs.existsSync(path.join(dir, "mid.recover")), "a short write left a recovery file");
+    process.env.AIDANOS_DIRFD_FAIL_AFTER = "0";
+    try {
+      const created = await createExclusive(folder, "kept.recover", Buffer.from("safe\n"), "helper");
+      assert(fs.readFileSync(path.join(dir, "kept.recover"), "utf8") === "safe\n", "an inherited fail-after broke the save");
+      await unlinkIfSame(folder, "kept.recover", created, "helper");
+    } finally {
+      delete process.env.AIDANOS_DIRFD_FAIL_AFTER;
+    }
+  } finally {
+    await folder.close();
+  }
+});
+
+await check("a failure after the recovery file removes that file", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-after-"));
+  const vault = path.join(dir, "vault");
+  const notes = path.join(vault, "notes");
+  fs.mkdirSync(notes, { recursive: true });
+  const note = path.join(notes, "day.md");
+  const backends = process.platform === "linux" ? [undefined, "helper"] : ["helper"];
+  for (const backend of backends) {
+    await writeNoteText(note, "original-text\n", { swapInRequested: false, vaultRoot: vault });
+    const error = await withHelperEnv(backend ? { AIDANOS_DIRFD_BACKEND: backend } : {}, () => rejects(() => writeNoteText(note, "NEW\n", {
+      swapInRequested: false,
+      vaultRoot: vault,
+      afterRecovery() {
+        throw new Error("after recovery");
+      },
+    })));
+    assert(error.message === "after recovery", error.message);
+    assert(!fs.readdirSync(notes).some((entry) => entry.endsWith(".recover")), backend + " left a recovery file");
+    assert(fs.readFileSync(note, "utf8") === "original-text\n", backend + " changed the note");
+  }
+});
+
+await check("an untrusted helper answers 503 and the server stays up", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-http-helper-"));
+  const vault = path.join(dir, "vault");
+  const notes = path.join(vault, "notes");
+  fs.mkdirSync(notes, { recursive: true });
+  const note = path.join(notes, "day.md");
+  fs.writeFileSync(note, "original-text\n");
+  const marker = path.join(dir, "marker");
+  const planted = path.join(dir, "planted-tool");
+  fs.writeFileSync(planted, "#!/bin/sh\nprintf pwned > '" + marker + "'\n");
+  fs.chmodSync(planted, 0o755);
+  const port = 33000 + Math.floor(Math.random() * 2000);
+  const child = spawn(process.execPath, ["server.mjs"], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      AIDANOS_HOST: "127.0.0.1",
+      AIDANOS_VAULT: vault,
+      AIDANOS_VAULT_KIND: "noteplan",
+      AIDANOS_VAULT_GIT_URL: "",
+      AIDANOS_VAULT_GIT_TOKEN: "",
+      AIDANOS_VAULT_GIT_RETRY_MS: "0",
+      AIDANOS_DIRFD_BACKEND: "helper",
+      AIDANOS_DIRFD_TOOL: planted,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let log = "";
+  child.stdout.on("data", (buf) => { log += String(buf); });
+  child.stderr.on("data", (buf) => { log += String(buf); });
+  const base = "http://127.0.0.1:" + port;
+  try {
+    const deadline = Date.now() + 12000;
+    let up = false;
+    while (Date.now() < deadline) {
+      if (child.exitCode != null) throw new Error("server exited " + child.exitCode + " " + log);
+      try {
+        const health = await fetch(base + "/api/health");
+        if (health.ok) { up = true; break; }
+      } catch { /* not listening yet */ }
+      await new Promise((r) => setTimeout(r, 80));
+    }
+    assert(up, "health did not come up " + log);
+    const saved = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/day.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "pwned\n" }),
+    });
+    const body = await saved.json();
+    assert(saved.status === 503, "status " + saved.status + " " + JSON.stringify(body) + " " + log);
+    assert(body.error === "directory helper unavailable", JSON.stringify(body));
+    assert(child.exitCode == null, "the server exited after a refused helper");
+    assert(fs.readFileSync(note, "utf8") === "original-text\n", "the refused save changed the note");
+    assert(!fs.existsSync(marker), "the planted helper ran");
+    assert(!fs.readdirSync(notes).some((entry) => entry.endsWith(".recover")), "a refused save left a recovery file");
+    const again = await fetch(base + "/api/file?path=" + encodeURIComponent("notes/day.md"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: "pwned-again\n" }),
+    });
+    assert(again.status === 503, "the second save did not check the helper again");
+    const health = await fetch(base + "/api/health");
+    assert(health.status === 200, "health failed after the refusal");
+    assert(child.exitCode == null, "the server exited after the second refusal");
+    assert(!log.includes(planted), "the refusal logged the helper path");
+  } finally {
+    try { child.kill("SIGTERM"); } catch { /* already gone */ }
+    const stopBy = Date.now() + 2000;
+    while (child.exitCode == null && Date.now() < stopBy) await new Promise((r) => setTimeout(r, 40));
+    try { child.kill("SIGKILL"); } catch { /* already gone */ }
+  }
 });
 
 if (process.exitCode) process.exit(process.exitCode);

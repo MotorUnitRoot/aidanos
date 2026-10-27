@@ -2559,6 +2559,7 @@ async function atomicWriteFile(filePath, markdown, beforeRename) {
       });
     } catch (e) {
       throwIfStop(e);
+      if (e && e.code === "DIRFD") throw e;
       if (clientRefusal(e)) throw e;
       const code = e && e.code;
       if ((code === "EISDIR" || code === "ENOTDIR") && !e.aidanosStop) {
@@ -2606,6 +2607,7 @@ async function atomicWriteFile(filePath, markdown, beforeRename) {
       throw err;
     }
     throwIfStop(e);
+    if (e && e.code === "DIRFD") throw e;
     if (clientRefusal(e)) throw e;
     throw tagStop(e, "write");
   }
@@ -2646,8 +2648,9 @@ function isPngBuffer(buf) {
 }
 
 function refusalMessage(err) {
-  if (err && err.code === "BAD_PATH") return "bad path";
+  if (err && (err.code === "BAD_PATH" || err.code === "EEXIST" || err.code === "ELOOP")) return "bad path";
   const msg = err && err.message;
+  if (msg === "EEXIST" || msg === "ELOOP") return "bad path";
   if (msg === "bad path" || msg === "path escapes vault" || msg === "bad png" || msg === "not a file") return msg;
   if (typeof msg === "string" && msg.startsWith("symlink: ")) {
     const named = msg.slice("symlink: ".length);
@@ -3668,6 +3671,11 @@ const server = http.createServer(async (req, res) => {
     };
     return sendFile(res, full, types[ext] || "application/octet-stream");
   } catch (err) {
+    if (err && err.code === "DIRFD") {
+      console.error("refused: directory helper unavailable");
+      if (res.headersSent) return;
+      return json(res, 503, { error: "directory helper unavailable" });
+    }
     if (err && err.code === "BODY_TOO_LARGE") {
       if (!res.headersSent) return json(res, 413, { error: "too large" });
       return;

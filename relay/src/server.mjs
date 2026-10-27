@@ -21,9 +21,9 @@ import { describeSyncFrame } from "./sync-log.mjs";
 const DEFAULT_PORT = 3750;
 const MIN_TOKEN_LENGTH = 32;
 // A note's first sync is its whole history. 1 MB was small enough to reject that
-// and leave the device retrying forever. The app uses this same 32 MB cap and
+// and leave the device retrying forever. The app uses this same 8 MB cap and
 // refuses an oversized note on its own, so the socket stays up for every other note.
-export const MAX_PAYLOAD = 32 * 1024 * 1024;
+export const MAX_PAYLOAD = 8 * 1024 * 1024;
 const FAILURE_CAP = 1024;
 export const LAN_WARNING =
   "WARNING: --lan sends notes across your home network with no encryption. The token is the only protection.";
@@ -584,6 +584,23 @@ export async function startRelay(options = {}) {
     }
   }
 
+  async function activateSession(session) {
+    let published = false;
+    try {
+      const warmStarted = Date.now();
+      warmSyncEngine();
+      logSafe(secrets, "sync engine warm in " + seconds(Date.now() - warmStarted));
+      if (api) api.repo = session.repo;
+      bootedAt = new Date().toISOString();
+      live = session;
+      published = true;
+    } finally {
+      if (!published) {
+        try { await disposeSession(session); } catch { /* keep the warm error */ }
+      }
+    }
+  }
+
   async function rotate() {
     const started = Date.now();
     const markerId = await ownedMarkerId(vault, dataDir);
@@ -612,13 +629,8 @@ export async function startRelay(options = {}) {
         // A device waiting on /health then connects to an engine that already
         // answered one index round trip, instead of paying for it while the
         // other device's handshake sits unread.
-        const warmStarted = Date.now();
-        warmSyncEngine();
-        logSafe(secrets, "sync engine warm in " + seconds(Date.now() - warmStarted));
-        live = session;
-        bootedAt = new Date().toISOString();
+        await activateSession(session);
         resetGeneration += 1;
-        if (api) api.repo = live.repo;
         logSafe(secrets, "reset complete");
         logSafe(secrets, "reset ready in " + seconds(Date.now() - started));
         if (typeof options.onReset === "function") options.onReset();
@@ -794,12 +806,15 @@ export async function startRelay(options = {}) {
     servers.push(entry);
   }
 
-  live = await openSession();
-
   let boundPort = port;
   for (const entry of servers) {
     boundPort = await listen(entry.httpServer, entry.host, port);
   }
+
+  // /health stays 503 until this warm-up finishes. The port is already open,
+  // so a start script can wait on it instead of racing a closed socket.
+  const session = await openSession();
+  await activateSession(session);
 
   const interval = gitInterval(options.gitIntervalMs, env);
   let gitTimer = null;

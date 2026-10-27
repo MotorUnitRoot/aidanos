@@ -25,6 +25,8 @@ jobs:
         with:
           chrome-version: "156.0.8078.47"
           install-dependencies: true
+      - name: Directory helper
+        run: bash editor/build-dirfd.sh
       - name: npm test
         env:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
@@ -48,6 +50,8 @@ jobs:
         with:
           chrome-version: "156.0.8078.47"
           install-dependencies: true
+      - name: Directory helper
+        run: bash editor/build-dirfd.sh
       - name: npm test
         env:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}

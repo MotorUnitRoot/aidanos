@@ -513,8 +513,8 @@ test("an outside edit keeps a device change that arrived in the same moment", as
   }
 });
 
-test("the relay message cap is 32 MB", async () => {
-  assert.equal(MAX_PAYLOAD, 32 * 1024 * 1024);
+test("the relay message cap is 8 MB", async () => {
+  assert.equal(MAX_PAYLOAD, 8 * 1024 * 1024);
   const dir = await tempDir();
   const relay = await startRelay({
     token: TOKEN,
@@ -651,13 +651,23 @@ test("reset is off unless a supervisor asked for it", async () => {
 test("a reset warms the sync engine before devices are told it is ready", async () => {
   warmSyncEngine();
   const source = await fs.readFile(new URL("../src/server.mjs", import.meta.url), "utf8");
+  const activate = source.slice(source.indexOf("async function activateSession"), source.indexOf("async function rotate"));
+  const warm = activate.indexOf("warmSyncEngine()");
+  const published = activate.indexOf("live = session");
+  assert.ok(warm > 0 && published > warm);
+  assert.match(activate, /finally/);
+  assert.match(activate, /disposeSession\(session\)/);
+  assert.match(activate, /sync engine warm in /);
   const rotate = source.slice(source.indexOf("async function rotate"), source.indexOf("function scheduleReset"));
-  const warm = rotate.indexOf("warmSyncEngine()");
-  const published = rotate.indexOf("live = session");
+  const call = rotate.indexOf("await activateSession(");
   const generation = rotate.indexOf("resetGeneration += 1");
-  assert.ok(warm > 0 && published > warm && generation > published);
-  assert.match(rotate, /sync engine warm in /);
+  assert.ok(call > 0 && generation > call);
+  assert.equal(rotate.includes("warmSyncEngine()"), false);
   assert.match(rotate, /reset ready in /);
+  const start = source.slice(source.indexOf("export async function startRelay"));
+  const listenAt = start.indexOf("await listen(");
+  const activateAt = start.indexOf("await activateSession(", listenAt);
+  assert.ok(listenAt > 0 && activateAt > listenAt);
   assert.match(source, /join answered in /);
   assert.match(source, /index request/);
   assert.match(source, /index reply in /);
@@ -1108,7 +1118,7 @@ test("a token with spaces is refused before the relay listens", async () => {
   await assert.rejects(fs.stat(path.join(dir, "vault")));
 });
 
-test("zero or a nonsense payload cap stays at 32 MB", () => {
+test("zero or a nonsense payload cap stays at 8 MB", () => {
   assert.equal(payloadLimit(0), MAX_PAYLOAD);
   assert.equal(payloadLimit("0"), MAX_PAYLOAD);
   assert.equal(payloadLimit("nope"), MAX_PAYLOAD);

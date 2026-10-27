@@ -2,12 +2,17 @@
 // checked. Node has no openat or unlinkat. On Linux, /proc/self/fd/<dirfd>/name
 // is that operation. On macOS a small helper calls openat, fstatat, and
 // unlinkat on the inherited descriptor.
+//
+// A pure Node walk is weaker than that helper. O_NOFOLLOW applies only to the
+// last component, so opening vault/notes/file follows a parent that was
+// swapped for a symlink and can create the file outside the checked folder.
+// Seeing the mismatch afterwards is already too late. Linux keeps the proc
+// backend, which is openat. Every other platform runs the pinned helper.
 
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,10 +22,24 @@ const CREATE_FLAGS = fsConstants.O_WRONLY
   | fsConstants.O_EXCL
   | fsConstants.O_NOFOLLOW
   | fsConstants.O_NONBLOCK;
+const READ_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
+const GROUP_OR_OTHER_WRITE = 0o022;
+
+// Content pin for the helper shipped in editor/bin. A rebuilt binary does not
+// run until this constant is updated to its SHA-256.
+const HELPER_SHA256 = {
+  "linux-x64": "3b83002b3b4aa2ac91d5bc0622e95c470631050e1074ccf4024a96fcaeacd294",
+};
 
 function badPath() {
   const error = new Error("bad path");
   error.code = "BAD_PATH";
+  return error;
+}
+
+function helperUnavailable() {
+  const error = new Error("directory helper unavailable");
+  error.code = "DIRFD";
   return error;
 }
 
@@ -32,111 +51,167 @@ function plainName(name) {
   return text;
 }
 
-export function directoryBackend() {
+function helperKey() {
+  const osName = process.platform === "linux" ? "linux" : process.platform === "darwin" ? "darwin" : "";
+  const arch = process.arch === "x64" || process.arch === "arm64" ? process.arch : "";
+  if (!osName || !arch) return "";
+  return osName + "-" + arch;
+}
+
+export function directoryBackend(env = process.env) {
+  const requested = env && env.AIDANOS_DIRFD_BACKEND;
+  if (requested === "helper" || requested === "proc") return requested;
   return process.platform === "linux" ? "proc" : "helper";
 }
 
-export async function openCheckedDirectory(dirPath, expected) {
-  let handle;
-  try {
-    handle = await fs.open(dirPath, DIR_FLAGS);
-  } catch (e) {
-    if (e.code === "ELOOP" || e.code === "ENOTDIR" || e.code === "ENOENT" || e.code === "ENXIO") throw badPath();
-    throw e;
+function helperFile(env = process.env) {
+  if (env && env.AIDANOS_DIRFD_TOOL) return path.resolve(String(env.AIDANOS_DIRFD_TOOL));
+  const key = helperKey();
+  if (!key) return "";
+  return fileURLToPath(new URL("./bin/dirfd-tool-" + key, import.meta.url));
+}
+
+function sameBytes(actual, expectedHex) {
+  if (!/^[0-9a-f]{64}$/.test(expectedHex || "")) return false;
+  const expected = Buffer.from(expectedHex, "hex");
+  if (actual.length !== expected.length) return false;
+  return timingSafeEqual(actual, expected);
+}
+
+async function hashFd(handle) {
+  const hash = createHash("sha256");
+  const buf = Buffer.alloc(64 * 1024);
+  let pos = 0;
+  for (;;) {
+    const { bytesRead } = await handle.read(buf, 0, buf.length, pos);
+    if (!bytesRead) break;
+    hash.update(buf.subarray(0, bytesRead));
+    pos += bytesRead;
   }
+  return hash.digest();
+}
+
+function ownedAndPrivate(st, uid) {
+  return !!st && st.uid === uid && (st.mode & GROUP_OR_OTHER_WRITE) === 0;
+}
+
+// Check the helper again on every call. Nothing here is cached: a rejected
+// check must not make the next save fail without looking.
+async function openTrustedHelper(env = process.env) {
+  if (typeof process.getuid !== "function") throw helperUnavailable();
+  const uid = process.getuid();
+  const key = helperKey();
+  const pin = key ? HELPER_SHA256[key] : "";
+  const filePath = helperFile(env);
+  if (!pin || !filePath) throw helperUnavailable();
+  const base = path.basename(filePath);
+  if (!base || base === "." || base === ".." || base.includes("/") || base.includes("\\")) throw helperUnavailable();
+  const parentPath = path.dirname(filePath);
+  let listed;
+  let parentListed;
   try {
-    const st = await handle.stat();
-    if (!st.isDirectory()) throw badPath();
-    if (expected && (st.dev !== expected.dev || st.ino !== expected.ino)) throw badPath();
-    return handle;
-  } catch (error) {
-    await handle.close();
-    throw error;
-  }
-}
-
-function procEntry(dirfd, name) {
-  return "/proc/self/fd/" + dirfd + "/" + plainName(name);
-}
-
-async function writeAll(handle, payload) {
-  let written = 0;
-  while (written < payload.length) {
-    const result = await handle.write(payload, written, payload.length - written, written);
-    if (!result.bytesWritten) {
-      const error = new Error("write failed");
-      error.code = "EIO";
-      throw error;
-    }
-    written += result.bytesWritten;
-  }
-}
-
-let helperBinary = null;
-
-function helperPath() {
-  if (!helperBinary) helperBinary = compileHelper();
-  return helperBinary;
-}
-
-async function compileHelper() {
-  const source = fileURLToPath(new URL("./dirfd-tool.c", import.meta.url));
-  const src = await fs.readFile(source);
-  const digest = createHash("sha256").update(src).digest("hex");
-  const uid = typeof process.getuid === "function" ? process.getuid() : "user";
-  const dir = path.join(os.tmpdir(), "aidanos-dirfd-" + uid);
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const bin = path.join(dir, "dirfd-tool");
-  const stamp = path.join(dir, "stamp");
-  try {
-    const prev = await fs.readFile(stamp, "utf8");
-    await fs.access(bin, fsConstants.X_OK);
-    if (prev.trim() === digest) return bin;
+    listed = await fs.lstat(filePath);
+    parentListed = await fs.lstat(parentPath);
   } catch {
-    /* rebuild */
+    throw helperUnavailable();
   }
-  const tmpBin = bin + "." + process.pid + "." + Math.random().toString(16).slice(2);
-  await new Promise((resolve, reject) => {
-    const child = spawn("cc", ["-O2", "-o", tmpBin, source], { stdio: ["ignore", "pipe", "pipe"] });
-    let err = "";
-    child.stderr.on("data", (chunk) => { err += chunk; });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(err.trim() || "cc failed"));
-    });
-  });
-  await fs.chmod(tmpBin, 0o700);
-  await fs.rename(tmpBin, bin);
-  await fs.writeFile(stamp, digest + "\n");
-  return bin;
+  if (listed.isSymbolicLink() || parentListed.isSymbolicLink() || !parentListed.isDirectory()) throw helperUnavailable();
+  if (!ownedAndPrivate(parentListed, uid)) throw helperUnavailable();
+
+  let parent;
+  try {
+    parent = await fs.open(parentPath, DIR_FLAGS);
+  } catch {
+    throw helperUnavailable();
+  }
+  let file;
+  try {
+    const parentStat = await parent.stat();
+    if (!parentStat.isDirectory() || parentStat.dev !== parentListed.dev || parentStat.ino !== parentListed.ino) {
+      throw helperUnavailable();
+    }
+    if (!ownedAndPrivate(parentStat, uid)) throw helperUnavailable();
+    const openedPath = process.platform === "linux"
+      ? "/proc/self/fd/" + parent.fd + "/" + base
+      : filePath;
+    try {
+      file = await fs.open(openedPath, READ_FLAGS);
+    } catch {
+      throw helperUnavailable();
+    }
+    const st = await file.stat();
+    if (!st.isFile()) throw helperUnavailable();
+    if (!ownedAndPrivate(st, uid)) throw helperUnavailable();
+    const digest = await hashFd(file);
+    if (!sameBytes(digest, pin)) throw helperUnavailable();
+    const again = await file.stat();
+    const parentAgain = await parent.stat();
+    if (again.dev !== st.dev || again.ino !== st.ino) throw helperUnavailable();
+    if (!ownedAndPrivate(again, uid) || !ownedAndPrivate(parentAgain, uid)) throw helperUnavailable();
+    if (parentAgain.dev !== parentStat.dev || parentAgain.ino !== parentStat.ino) throw helperUnavailable();
+    return file;
+  } catch (error) {
+    if (file) await file.close();
+    if (error && error.code === "DIRFD") throw error;
+    throw helperUnavailable();
+  } finally {
+    await parent.close();
+  }
 }
 
-function callHelper(dirHandle, args, body) {
-  return new Promise((resolve, reject) => {
-    helperPath().then((bin) => {
-      const child = spawn(bin, args, {
-        stdio: ["pipe", "pipe", "pipe", dirHandle.fd],
+function helperEnv(options) {
+  const env = { ...process.env };
+  delete env.AIDANOS_DIRFD_FAIL_AFTER;
+  if (options && Number.isInteger(options.failAfterBytes) && options.failAfterBytes >= 0) {
+    env.AIDANOS_DIRFD_FAIL_AFTER = String(options.failAfterBytes);
+  }
+  return env;
+}
+
+function callHelper(dirHandle, args, body, options) {
+  return openTrustedHelper().then((tool) => new Promise((resolve, reject) => {
+    const execPath = process.platform === "darwin" ? "/dev/fd/4" : "/proc/self/fd/4";
+    let settled = false;
+    function finish(fn) {
+      if (settled) return;
+      settled = true;
+      Promise.resolve(tool.close()).then(fn, fn);
+    }
+    let child;
+    try {
+      child = spawn(execPath, args, {
+        stdio: ["pipe", "pipe", "pipe", dirHandle.fd, tool.fd],
+        env: helperEnv(options),
       });
-      const out = [];
-      const err = [];
-      child.stdout.on("data", (chunk) => out.push(chunk));
-      child.stderr.on("data", (chunk) => err.push(chunk));
-      child.on("error", reject);
-      child.on("close", (code) => {
+    } catch {
+      finish(() => reject(helperUnavailable()));
+      return;
+    }
+    const out = [];
+    const err = [];
+    child.stdout.on("data", (chunk) => out.push(chunk));
+    child.stderr.on("data", (chunk) => err.push(chunk));
+    child.stdin.on("error", () => {});
+    child.on("error", () => finish(() => reject(helperUnavailable())));
+    child.on("close", (code) => {
+      finish(() => {
         if (code === 0) {
           resolve(Buffer.concat(out).toString("utf8"));
           return;
         }
         const name = Buffer.concat(err).toString("utf8").trim().split("\n").filter(Boolean).pop() || "EIO";
+        if (name === "EEXIST" || name === "ELOOP") {
+          reject(badPath());
+          return;
+        }
         const failed = new Error(name);
         failed.code = name;
         reject(failed);
       });
-      if (body && body.length) child.stdin.write(body);
-      child.stdin.end();
-    }, reject);
-  });
+    });
+    if (body && body.length) child.stdin.write(body);
+    child.stdin.end();
+  }));
 }
 
 function parseIdentity(text) {
@@ -156,8 +231,8 @@ function parseIdentity(text) {
   };
 }
 
-async function createWithHelper(dirHandle, name, payload) {
-  const id = parseIdentity(await callHelper(dirHandle, ["creat", plainName(name)], payload));
+async function createWithHelper(dirHandle, name, payload, options) {
+  const id = parseIdentity(await callHelper(dirHandle, ["creat", plainName(name)], payload, options));
   if (!id || !id.regular) throw badPath();
   return { dev: id.dev, ino: id.ino };
 }
@@ -174,7 +249,7 @@ async function unlinkWithHelper(dirHandle, name, id) {
   return String(text || "").trim().split("\n")[0] === "ok";
 }
 
-async function createWithProc(dirHandle, name, payload) {
+async function createWithProc(dirHandle, name, payload, options) {
   let handle;
   try {
     handle = await fs.open(procEntry(dirHandle.fd, name), CREATE_FLAGS, 0o644);
@@ -186,6 +261,13 @@ async function createWithProc(dirHandle, name, payload) {
   try {
     const opened = await handle.stat();
     id = { dev: opened.dev, ino: opened.ino };
+    if (options && Number.isInteger(options.failAfterBytes)) {
+      const count = Math.max(0, Math.min(options.failAfterBytes, payload.length));
+      if (count > 0) await writeAll(handle, payload.subarray(0, count));
+      const error = new Error("EIO");
+      error.code = "EIO";
+      throw error;
+    }
     if (payload.length) await writeAll(handle, payload);
     await handle.sync();
     return id;
@@ -217,10 +299,46 @@ async function unlinkWithProc(dirHandle, name, id) {
   return true;
 }
 
-export async function createExclusive(dirHandle, name, payload, backend = directoryBackend()) {
+function procEntry(dirfd, name) {
+  return "/proc/self/fd/" + dirfd + "/" + plainName(name);
+}
+
+async function writeAll(handle, payload) {
+  let written = 0;
+  while (written < payload.length) {
+    const result = await handle.write(payload, written, payload.length - written, written);
+    if (!result.bytesWritten) {
+      const error = new Error("write failed");
+      error.code = "EIO";
+      throw error;
+    }
+    written += result.bytesWritten;
+  }
+}
+
+export async function openCheckedDirectory(dirPath, expected) {
+  let handle;
+  try {
+    handle = await fs.open(dirPath, DIR_FLAGS);
+  } catch (e) {
+    if (e.code === "ELOOP" || e.code === "ENOTDIR" || e.code === "ENOENT" || e.code === "ENXIO") throw badPath();
+    throw e;
+  }
+  try {
+    const st = await handle.stat();
+    if (!st.isDirectory()) throw badPath();
+    if (expected && (st.dev !== expected.dev || st.ino !== expected.ino)) throw badPath();
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+export async function createExclusive(dirHandle, name, payload, backend = directoryBackend(), options = {}) {
   const bytes = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
-  if (backend === "helper") return createWithHelper(dirHandle, name, bytes);
-  return createWithProc(dirHandle, name, bytes);
+  if (backend === "helper") return createWithHelper(dirHandle, name, bytes, options);
+  return createWithProc(dirHandle, name, bytes, options);
 }
 
 export async function statEntry(dirHandle, name, backend = directoryBackend()) {

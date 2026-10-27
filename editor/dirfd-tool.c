@@ -64,6 +64,31 @@ static int write_all(int fd, const char *buf, size_t len) {
   return 0;
 }
 
+/* Remove the inode this call created. A later name at the same path is left alone. */
+static void drop_created(int fd, const char *name) {
+  struct stat opened;
+  int have = fstat(fd, &opened) == 0;
+  close(fd);
+  if (!have) return;
+  struct stat listed;
+  if (fstatat(DIR_FD, name, &listed, AT_SYMLINK_NOFOLLOW) != 0) return;
+  if (S_ISLNK(listed.st_mode)) return;
+  if (listed.st_dev != opened.st_dev || listed.st_ino != opened.st_ino) return;
+  unlinkat(DIR_FD, name, 0);
+}
+
+/* Test hook. The Node side sets this only for a deliberate partial write. */
+static int fail_after(long *limit) {
+  const char *text = getenv("AIDANOS_DIRFD_FAIL_AFTER");
+  if (text == NULL || text[0] == '\0') return 0;
+  errno = 0;
+  char *end = NULL;
+  long value = strtol(text, &end, 10);
+  if (end == text || *end != '\0' || errno != 0 || value < 0) return 0;
+  *limit = value;
+  return 1;
+}
+
 static int creat_file(const char *name) {
   int flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW;
 #ifdef O_NONBLOCK
@@ -74,31 +99,47 @@ static int creat_file(const char *name) {
     fail(errno);
     return 1;
   }
+  long limit = 0;
+  int limited = fail_after(&limit);
+  long written = 0;
   char buf[8192];
   for (;;) {
+    if (limited && written >= limit) {
+      fail(EIO);
+      drop_created(fd, name);
+      return 1;
+    }
     ssize_t got = read(STDIN_FILENO, buf, sizeof buf);
     if (got < 0) {
       if (errno == EINTR) continue;
       fail(errno);
-      close(fd);
+      drop_created(fd, name);
       return 1;
     }
     if (got == 0) break;
-    if (write_all(fd, buf, (size_t) got) != 0) {
+    size_t chunk = (size_t) got;
+    if (limited && written + (long) chunk > limit) chunk = (size_t) (limit - written);
+    if (chunk > 0 && write_all(fd, buf, chunk) != 0) {
       fail(errno);
-      close(fd);
+      drop_created(fd, name);
+      return 1;
+    }
+    written += (long) chunk;
+    if (limited && (size_t) got > chunk) {
+      fail(EIO);
+      drop_created(fd, name);
       return 1;
     }
   }
   if (fsync(fd) != 0) {
     fail(errno);
-    close(fd);
+    drop_created(fd, name);
     return 1;
   }
   struct stat st;
   if (fstat(fd, &st) != 0) {
     fail(errno);
-    close(fd);
+    drop_created(fd, name);
     return 1;
   }
   close(fd);

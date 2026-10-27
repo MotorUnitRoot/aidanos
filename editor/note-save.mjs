@@ -25,11 +25,12 @@
 // new byte of the note. A mismatch unlinks the recovery file only when that
 // entry is still the created inode, then the save is refused. If the new
 // write or the truncate fails, those bytes are written back over the same
-// file. The recovery file is removed after a successful save or a successful
-// restore. If the restore itself fails, or the note cannot be synced, the
-// recovery file stays and its path is logged: vault-relative inside the
-// vault, and the absolute path when it is not. Writing the new bytes and
-// truncating afterwards does not by itself keep the previous text.
+// file. The recovery file is removed after a successful save, a successful
+// restore, and every other failure. It stays only when the restore itself
+// fails, or the note cannot be synced. Those two cases log the path:
+// vault-relative inside the vault, and the absolute path when it is not.
+// Writing the new bytes and truncating afterwards does not by itself keep
+// the previous text.
 // The swap-in path still writes a temp file and renames it, and beforeRename
 // runs after that temp file is ready and before the rename.
 
@@ -265,15 +266,15 @@ async function writeInPlace(filePath, body, options) {
     const dir = await openCheckedDirectory(parent.abs, parent);
     const recoveryName = recoveryNameFor(filePath);
     const recoveryPath = path.join(parent.abs, recoveryName);
+    let created = null;
+    let keepRecovery = false;
+    let failed = null;
     try {
-      const created = await createExclusive(dir, recoveryName, previous);
+      created = await createExclusive(dir, recoveryName, previous);
       if (typeof options.afterRecovery === "function") await options.afterRecovery();
       const same = await entryMatches(dir, recoveryName, created);
       const folders = await recheckParents(chain);
-      if (!same || !folders) {
-        await unlinkIfSame(dir, recoveryName, created);
-        throw badPath();
-      }
+      if (!same || !folders) throw badPath();
       const payload = Buffer.from(body, "utf8");
       try {
         if (typeof options.failWrite === "function") await options.failWrite();
@@ -290,8 +291,8 @@ async function writeInPlace(filePath, body, options) {
         try {
           if (typeof options.failRestore === "function") await options.failRestore();
           await restoreOpened(handle, previous);
-          await unlinkIfSame(dir, recoveryName, created);
         } catch {
+          keepRecovery = true;
           logKeptRecovery("restore failed: ", recoveryPath, options);
           throw error;
         }
@@ -301,13 +302,27 @@ async function writeInPlace(filePath, body, options) {
         if (typeof options.failSync === "function") await options.failSync();
         await handle.sync();
       } catch (error) {
+        keepRecovery = true;
         logKeptRecovery("sync failed: ", recoveryPath, options);
         throw error;
       }
-      await unlinkIfSame(dir, recoveryName, created);
+    } catch (error) {
+      failed = error;
     } finally {
-      await dir.close();
+      if (created && !keepRecovery) {
+        try {
+          await unlinkIfSame(dir, recoveryName, created);
+        } catch (unlinkError) {
+          if (!failed) failed = unlinkError;
+        }
+      }
+      try {
+        await dir.close();
+      } catch (closeError) {
+        if (!failed) failed = closeError;
+      }
     }
+    if (failed) throw failed;
   } finally {
     await handle.close();
   }

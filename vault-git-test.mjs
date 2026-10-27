@@ -453,6 +453,37 @@ function lockTmp() {
   return fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "aidanos-lock-"));
 }
 
+// A same-uid process with an unreadable descriptor directory keeps a
+// recorded lock. The no-holder case re-enters as root in a private /proc,
+// where every same-uid process can be inspected and none holds the lock.
+function runLockCase(name) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("sudo", [
+      "-n",
+      "--preserve-env=PATH",
+      "env",
+      "AIDANOS_LOCK_CASE=" + name,
+      "NODE_ENV=" + (process.env.NODE_ENV || ""),
+      "unshare",
+      "--pid",
+      "--mount",
+      "--fork",
+      "--mount-proc",
+      process.execPath,
+      fileURLToPath(import.meta.url),
+    ], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let err = "";
+    child.stderr.on("data", (chunk) => { err += chunk; });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(name + " failed " + code + " " + err.slice(-500)));
+    });
+  });
+}
+
 async function captureErrors(fn) {
   const lines = [];
   const prev = console.error;
@@ -543,6 +574,10 @@ async function gitLockIgnoresPathsOutsideGit() {
 }
 
 async function gitLockRemovesOnlyARecordedLock() {
+  if (process.platform === "linux" && process.env.AIDANOS_LOCK_CASE !== "recorded-free") {
+    await runLockCase("recorded-free");
+    return;
+  }
   const tmp = lockTmp();
   try {
     const vault = path.join(tmp, "vault");
@@ -579,6 +614,65 @@ async function gitLockRemovesOnlyARecordedLock() {
   }
 }
 
+async function gitLockKeepsSameUidScanError() {
+  if (process.platform !== "linux") return;
+  const tmp = lockTmp();
+  const sleeper = spawn("python3", ["-c", [
+    "import ctypes, os, time",
+    "pid = os.fork()",
+    "if pid > 0:",
+    "    os.waitpid(pid, 0)",
+    "    raise SystemExit(0)",
+    "os.setsid()",
+    "pid2 = os.fork()",
+    "if pid2 > 0:",
+    "    raise SystemExit(0)",
+    "ctypes.CDLL(None).prctl(4, 0)",
+    "print(os.getpid(), flush=True)",
+    "time.sleep(60)",
+  ].join("\n")], { stdio: ["ignore", "pipe", "pipe"] });
+  let deniedPid = 0;
+  try {
+    const line = await new Promise((resolve, reject) => {
+      let buf = "";
+      const timer = setTimeout(() => reject(new Error("the same-uid sleeper did not start")), 4000);
+      sleeper.stdout.on("data", (chunk) => {
+        buf += chunk;
+        if (buf.includes("\n")) {
+          clearTimeout(timer);
+          resolve(buf.trim().split(/\s+/).pop());
+        }
+      });
+    });
+    deniedPid = Number(line);
+    const proc = "/proc/" + deniedPid;
+    assert(fs.statSync(proc).uid === process.getuid(), "the unreadable process is not our uid");
+    let denied = false;
+    try {
+      fs.readdirSync(proc + "/fd");
+    } catch (error) {
+      denied = error && (error.code === "EACCES" || error.code === "EPERM");
+    }
+    assert(denied, "a same-uid descriptor directory was readable");
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    fs.writeFileSync(lock, "recorded\n");
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(lock, "utf8") === "recorded\n", "a same-uid scan error removed the lock");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "a same-uid scan error was removed without a message");
+    assert(gitLockBlocksVault(vault), "a scan error did not block sync");
+  } finally {
+    if (deniedPid) {
+      try { process.kill(deniedPid, "SIGKILL"); } catch { /* namespace exit reaps it */ }
+    }
+    try { sleeper.kill("SIGKILL"); } catch { /* already exited */ }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 async function gitLockKeepsAReusedInode() {
   const tmp = lockTmp();
   try {
@@ -600,6 +694,10 @@ async function gitLockKeepsAReusedInode() {
 }
 
 async function gitLockKeepsALockSwappedBeforeUnlink() {
+  if (process.platform === "linux" && process.env.AIDANOS_LOCK_CASE !== "swapped") {
+    await runLockCase("swapped");
+    return;
+  }
   const tmp = lockTmp();
   const prev = process.env.NODE_ENV;
   process.env.NODE_ENV = "test";
@@ -653,10 +751,17 @@ async function gitTurnStaysOffOutsideTests() {
 }
 
 try {
+  const only = process.env.AIDANOS_LOCK_CASE || "";
+  if (only === "recorded-free") {
+    await gitLockRemovesOnlyARecordedLock();
+  } else if (only === "swapped") {
+    await gitLockKeepsALockSwappedBeforeUnlink();
+  } else {
   await gitLockIgnoresASymlinkedGit();
   await gitLockKeepsALiveGitProcess();
   await gitLockIgnoresPathsOutsideGit();
   await gitLockRemovesOnlyARecordedLock();
+  await gitLockKeepsSameUidScanError();
   await gitLockKeepsAReusedInode();
   await gitLockKeepsALockSwappedBeforeUnlink();
   await gitTurnStaysOffOutsideTests();
@@ -668,6 +773,7 @@ try {
   await bundledSeedWhenCloneFails();
   await seededNotesStayUntracked();
   console.log("vault-git-test ok");
+  }
 } catch (err) {
   console.error("FAIL  vault-git-test  " + err.message);
   process.exit(1);

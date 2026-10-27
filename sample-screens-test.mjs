@@ -230,10 +230,8 @@ try {
   async function openAsk(query) {
     await evalJs(`document.getElementById("ask-close").click()`);
     await evalJs(`document.getElementById("ask-open").click()`);
-    // Setting the field and dispatching input waits 140ms, then runAsk clears
-    // the list. The empty search ask-open already started can paint the latch
-    // inside that gap, and the clear lands before the click. Submit runs the
-    // query now and does not schedule that second clear.
+    // Submit runs the search now. An input event would clear the list again
+    // 140ms later. The click waits until this submit has finished rendering.
     await evalJs(`(() => {
       const q = document.getElementById("ask-q");
       q.focus();
@@ -242,29 +240,28 @@ try {
       return true;
     })()`);
     await waitFor(async () => {
-      const found = await evalJs(`(() => {
+      const state = await evalJs(`(() => {
+        const q = document.getElementById("ask-q");
         const hits = document.getElementById("ask-hits");
-        const buttons = hits ? [...hits.querySelectorAll("button")] : [];
-        return buttons.some((button) => (button.textContent || "").toLowerCase().includes(${JSON.stringify(query.toLowerCase())}));
+        if (!q || !hits || q.value !== ${JSON.stringify(query)}) return "query";
+        if (hits.querySelector(".ask-finding")) return "finding";
+        const ready = [...hits.querySelectorAll("button")].some((button) => (button.textContent || "").toLowerCase().includes(${JSON.stringify(query.toLowerCase())}));
+        return ready ? true : "no hit";
       })()`);
-      if (found === true) return true;
-      return await evalJs(`(document.getElementById("ask-hits") && document.getElementById("ask-hits").innerText) || ""`);
+      if (state === true) return true;
+      return state;
     }, 8000, "ask " + query);
   }
 
   async function clickHit(query) {
-    // Find and click in one page turn, and keep trying through a clear.
-    // The 8s budget is the same one the search wait already uses.
-    await waitFor(async () => {
-      const clicked = await evalJs(`(() => {
-        const hits = document.getElementById("ask-hits");
-        const button = hits ? [...hits.querySelectorAll("button")].find((item) => (item.textContent || "").toLowerCase().includes(${JSON.stringify(query.toLowerCase())})) : null;
-        if (!button) return "no hit";
-        button.click();
-        return true;
-      })()`);
-      return clicked === true ? true : clicked;
-    }, 8000, "click " + query);
+    const clicked = await evalJs(`(() => {
+      const hits = document.getElementById("ask-hits");
+      const button = hits ? [...hits.querySelectorAll("button")].find((item) => (item.textContent || "").toLowerCase().includes(${JSON.stringify(query.toLowerCase())})) : null;
+      if (!button) return "no hit";
+      button.click();
+      return true;
+    })()`);
+    assert(clicked === true, "click " + query + " " + clicked);
   }
 
   async function prepareDoor() {

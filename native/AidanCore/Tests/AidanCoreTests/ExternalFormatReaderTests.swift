@@ -781,13 +781,28 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
     }
 
+    /// A long unclosed `@a(` stays a linear scan.
+    /// The simulator's wall clock missed 5s on this same linear read
+    /// (run 40429234247 recorded 7.199s). That clock is not the bound there.
+    /// The step count is: twice the mentions stay within 3x.
     func testUnclosedMentionParenStaysWithinTheTimeBound() {
+        let half = String(repeating: "@a(", count: 175_000)
         let line = String(repeating: "@a(", count: 350_000)
+        let halfWork = scanWork(half)
+        let fullWork = scanWork(line)
+        XCTAssertGreaterThan(halfWork, 0)
+        XCTAssertLessThanOrEqual(
+            fullWork,
+            halfWork * 3,
+            "reading 350,000 mentions took \(fullWork) steps after \(halfWork)"
+        )
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing mention-bound \(elapsed)")
+        #if !targetEnvironment(simulator)
         XCTAssertLessThan(elapsed, 5)
+        #endif
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertFalse(note.lines[0].mentions.isEmpty)
     }

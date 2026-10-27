@@ -770,13 +770,29 @@ final class ExternalFormatReaderTests: XCTestCase {
         XCTAssertEqual(characters.tags, line.tags)
     }
 
+    /// A long rejected `[[#` line stays a linear scan.
+    /// The simulator's wall clock missed 5s on this same linear read
+    /// (run 40451323920 recorded 8.383s). That clock is not the bound there.
+    /// The step count is: twice the openers stay within 3x.
     func testRejectedWikiLineStaysWithinTheTimeBound() {
+        let half = String(repeating: "[[#", count: 175_000) + "]]"
         let line = String(repeating: "[[#", count: 350_000) + "]]"
+        let halfWork = scanWork(half)
+        let fullWork = scanWork(line)
+        print("reader-work wiki-bound \(halfWork) \(fullWork)")
+        XCTAssertGreaterThan(halfWork, 0)
+        XCTAssertLessThanOrEqual(
+            fullWork,
+            halfWork * 3,
+            "reading 350,000 rejected wiki openers took \(fullWork) steps after \(halfWork)"
+        )
         let started = Date()
         let note = ExternalFormatReader.read(line, in: .project)
         let elapsed = Date().timeIntervalSince(started)
         print("reader-timing wiki-bound \(elapsed)")
+        #if !targetEnvironment(simulator)
         XCTAssertLessThan(elapsed, 5)
+        #endif
         XCTAssertEqual(note.lines.count, 1)
         XCTAssertTrue(note.lines[0].wikiLinks.isEmpty)
     }

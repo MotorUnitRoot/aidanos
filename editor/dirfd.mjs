@@ -43,7 +43,7 @@ const STICKY = 0o1000;
 const HELPER_SHA256 = {
   "linux-x64": "a11fa3f5c70468692bcba1bc1fb30a47151c351100cacf98d830e3f621ef7e2c",
   "darwin-arm64": "605a6f8d353fe2a1f4b0c97de9bb9a942d6f8b00b6ed7d1c0950c521968131e4",
-  "darwin-x64": "381a4c24358f62aed38f2377e2e5e084b6eab9cbb66d3b92c5cab2281c336bee",
+  "darwin-x64": "7c3d7c2e2fb15e500b6559b26b851a54b2a7c6e9cdb6c634df164458d45b8a31",
 };
 
 function badPath() {

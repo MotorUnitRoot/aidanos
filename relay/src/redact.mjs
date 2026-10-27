@@ -19,8 +19,10 @@ const SHIELD = "\uE000";
 // Measuring it after [path] replacement skips the cut when a path
 // collapses, and a secret sliced at the first edge stays in plain text.
 // Scrubbing after the cut leaves a spaced note name that crossed 64 KB
-// as a fragment. A partial token still on the cut is trimmed back to
-// the last break, and the kept text is scrubbed again.
+// as a fragment. A note name over 255 bytes is trimmed back to the start
+// of the name. A space is inside the name, so the last space would keep
+// the words ahead of it. Any other partial token is trimmed back to the
+// last break, and the kept text is scrubbed again.
 export const REDACT_INPUT_CAP = 64 * 1024;
 // How far a cut walks back to finish a token. A line with no break in this
 // window keeps the character boundary instead of collapsing to the marker.
@@ -189,8 +191,9 @@ export function redact(text, secrets) {
   // paths and note names on that window. Then cut at the raw 64 KB point
   // and drop a listed prefix the cut still sliced. Collapsing a path to
   // [path] must not pull a sliced secret back under 64 KB and skip the cut.
-  // The kept text is scrubbed again, and a partial token on the cut is
-  // trimmed back to the last break.
+  // The kept text is scrubbed again. A note name over 255 bytes is
+  // trimmed back to the start of the name. Any other partial token on
+  // the cut is trimmed back to the last break.
   const list = [];
   for (const secret of secrets || []) {
     const value = String(secret || "").trim();
@@ -236,9 +239,11 @@ export function redact(text, secrets) {
   if (cut < raw.length) {
     // The window scrub already replaced a name whose extension was in
     // the margin. This pass catches a name that is whole in the kept
-    // text, then drops a sliced token the raw cut still ends on.
+    // text. A spaced name over 255 bytes, whose extension is still past
+    // the window, is trimmed back to the start of that name. A sliced
+    // token the raw cut still ends on is then dropped.
     out = scrubLocations(out, kept);
-    out = trimPartialLocation(out);
+    out = trimPartialLocation(out, state.text, state.cutAt);
     out = dropSecretTail(out, state.tails);
   }
   // Same scrub for stderr and fatal.log. A vault path or a note file name
@@ -262,17 +267,51 @@ function trackPiece(state, start, end, replacement, keepWhole) {
   else if (start < state.cutAt) state.mapped = keepWhole ? state.outLen : before + (state.cutAt - start);
 }
 
-// The raw cut can end in the middle of a token. Drop that token back to
-// the last break so a sliced path or note name does not keep a fragment.
-// No break in the last 256 bytes keeps the character boundary. A trailing
-// *** is a masked secret and stays.
-function trimPartialLocation(text) {
-  let end = text.length;
+// A quote, colon, slash, newline, or a masked star ends a note name.
+// A space does not.
+function isNoteEdge(code) {
+  return code === 10 || code === 34 || code === 39 || code === 42 || code === 47 || code === 58 || code === 96;
+}
+
+// The run that crosses the cut, from its left edge through the margin.
+// The cut is unchanged when it is not inside a spaced name longer than
+// 255 bytes.
+function crossingNoteStart(text, cutAt) {
+  if (cutAt <= 0 || cutAt > text.length) return cutAt;
+  let start = cutAt;
+  while (start > 0 && !isNoteEdge(text.charCodeAt(start - 1))) start -= 1;
+  let end = cutAt;
+  while (end < text.length && !isNoteEdge(text.charCodeAt(end))) end += 1;
+  if (start >= cutAt) return cutAt;
+  const run = text.slice(start, end);
+  let spaced = false;
+  for (let i = 0; i < run.length; i += 1) {
+    if (run.charCodeAt(i) <= 32) {
+      spaced = true;
+      break;
+    }
+  }
+  if (!spaced || utf8ByteLength(run) <= 255 || run.includes("*")) return cutAt;
+  return start;
+}
+
+// The raw cut can end in the middle of a token. A spaced note name longer
+// than 255 bytes is dropped back to the start of the name. The last space
+// would keep the words ahead of it. Any other token is dropped back to the
+// last break. No break in the last 256 bytes keeps the character boundary.
+// A trailing *** is a masked secret and stays.
+function trimPartialLocation(text, windowText, windowCut) {
+  let kept = text;
+  if (typeof windowText === "string" && windowText.slice(0, windowCut) === text) {
+    const nameAt = crossingNoteStart(windowText, windowCut);
+    if (nameAt < windowCut) kept = text.slice(0, nameAt);
+  }
+  let end = kept.length;
   const floor = Math.max(0, end - CAP_BREAK_WINDOW);
-  while (end > floor && !isBreak(text.charCodeAt(end - 1))) end -= 1;
-  if (end === text.length || end <= floor) return text;
-  if (text.slice(end).includes("*")) return text;
-  return text.slice(0, end);
+  while (end > floor && !isBreak(kept.charCodeAt(end - 1))) end -= 1;
+  if (end === kept.length || end <= floor) return kept;
+  if (kept.slice(end).includes("*")) return kept;
+  return kept.slice(0, end);
 }
 
 // One log line, then the marker. The cut is applied to text that is already

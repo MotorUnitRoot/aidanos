@@ -39,6 +39,8 @@ When a GCP project is authorized:
 
 ```bash
 # from the aidanos repo root (after live Door files are on main)
+# The hosted image is the production target. The test stage is not deployed.
+docker build --target production -t aidanos .
 # Also set AIDANOS_VAULT_GIT_URL and a token secret (AIDANOS_VAULT_GIT_TOKEN or GITHUB_TOKEN).
 gcloud run deploy aidanos \
   --source . \

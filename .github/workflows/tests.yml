@@ -75,7 +75,10 @@ jobs:
           set -eu
           docker build --target production -t aidanos-hosted .
           docker build --target test -t aidanos-hosted-test .
-          docker run --rm --entrypoint sh aidanos-hosted -c 'if command -v python3 >/dev/null 2>&1; then echo "production image contains python3"; exit 1; fi'
+          docker run --rm --user root --entrypoint sh aidanos-hosted -c 'set -eu
+            if command -v python3 >/dev/null 2>&1; then echo "production image contains python3"; exit 1; fi
+            hits=$(find / \( -path "/usr/bin/python3*" -o -path "/usr/local/bin/python3*" \))
+            if [ -n "$hits" ]; then echo "production image contains python3"; printf "%s\n" "$hits"; exit 1; fi'
           log=$(docker run --rm --user node -e NODE_ENV=test \
             -v "$PWD/vault-git-test.mjs:/app/vault-git-test.mjs:ro" \
             aidanos-hosted-test node vault-git-test.mjs)

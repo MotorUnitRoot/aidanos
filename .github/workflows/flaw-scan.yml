@@ -34,7 +34,7 @@ jobs:
         run: node .github/flaw-scan.mjs --self-test
 
       - name: Build the hosted image
-        run: docker build -t aidanos-flaw-scan:local .
+        run: docker build --target production -t aidanos-flaw-scan:local .
 
       - name: Read the image runtime
         shell: bash

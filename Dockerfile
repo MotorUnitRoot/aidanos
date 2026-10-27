@@ -28,5 +28,6 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 USER node
 
-# Default target. No python3.
+# Default target. No python3. Deploy and the hosted-image scan build
+# this stage by name: docker build --target production
 FROM base AS production

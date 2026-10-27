@@ -1437,6 +1437,27 @@ test("secrets swept across the 64 KB cut leak no characters", () => {
   const jwt = "eyJ" + "Q".repeat(366);
   const note = "My Therapy Notes about the long Tuesday afternoon session with Jordan.md";
   const userPath = "/Users/colby/notes/medical/private/therapy-folder/session-notes";
+  function spacedNote(bytes) {
+    const ext = ".md";
+    const bodyLen = bytes - ext.length;
+    let body = "Therapy";
+    let n = 0;
+    while (body.length + 1 < bodyLen) {
+      const word = "w" + n.toString(36);
+      if (body.length + 1 + word.length > bodyLen) break;
+      body += " " + word;
+      n += 1;
+    }
+    if (body.length < bodyLen) body += " " + "x".repeat(bodyLen - body.length - 1);
+    const name = body + ext;
+    assert.equal(Buffer.byteLength(name), bytes);
+    assert.equal(name.includes(" "), true);
+    assert.equal(redact(name, []).includes("Therapy"), false, "a whole " + bytes + " byte name was kept");
+    return name;
+  }
+  const note256 = spacedNote(256);
+  const note400 = spacedNote(400);
+  const note1000 = spacedNote(1000);
   assert.equal(relay.length, 64);
   assert.equal(pat.length, 82);
   assert.equal(jwt.length, 369);
@@ -1450,6 +1471,9 @@ test("secrets swept across the 64 KB cut leak no characters", () => {
     { name: "jwt", secret: jwt, listed: true },
     { name: "note", secret: note, listed: false },
     { name: "user-path", secret: userPath, listed: false },
+    { name: "note-256", secret: note256, listed: false },
+    { name: "note-400", secret: note400, listed: false },
+    { name: "note-1000", secret: note1000, listed: false },
   ];
   for (const item of cases) {
     for (const shorten of [true, false]) {

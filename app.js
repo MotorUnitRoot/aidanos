@@ -2383,9 +2383,9 @@ function conflictMineNow() {
 }
 
 const GIT_LOCK_RECOVERY = "It may be from another app or a crash.";
-const GIT_LOCK_PAUSE_OPEN = "Sync is paused: a lock in this vault is still open. Close it, then sync resumes. " + GIT_LOCK_RECOVERY;
-const GIT_LOCK_PAUSE_UNREADABLE = "Sync is paused: a lock in this vault could not be read. " + GIT_LOCK_RECOVERY;
-const GIT_LOCK_PAUSE_OVERSIZE = "Sync is paused: a lock in this vault is over 1 MB. " + GIT_LOCK_RECOVERY;
+const GIT_LOCK_PAUSE_OPEN = "Sync is paused: a lock in this vault is still open. Close it, then sync resumes. If this vault is on an exFAT drive or a network drive, copy the vault onto a drive on this computer, then sync resumes. " + GIT_LOCK_RECOVERY;
+const GIT_LOCK_PAUSE_UNREADABLE = "Sync is paused: a lock in this vault could not be read. Close the other app that uses this vault, then sync resumes. " + GIT_LOCK_RECOVERY;
+const GIT_LOCK_PAUSE_OVERSIZE = "Sync is paused: a lock in this vault is over 1 MB. Wait until the other write is finished, then sync resumes. " + GIT_LOCK_RECOVERY;
 
 function gitLockPauseText(reason) {
   if (reason === "unreadable") return GIT_LOCK_PAUSE_UNREADABLE;

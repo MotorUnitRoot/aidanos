@@ -36,7 +36,10 @@ async function waitHealth(base, child) {
   const deadline = Date.now() + 12000;
   let last = "";
   while (Date.now() < deadline) {
-    if (child.exitCode != null) throw new Error("server exited " + child.exitCode + " " + last);
+    if (child.exitCode != null) {
+      const tail = child._log ? child._log().slice(-500) : "";
+      throw new Error("server exited " + child.exitCode + " " + last + " " + tail);
+    }
     try {
       const res = await fetch(base + "/api/health");
       if (res.ok) return res;

@@ -789,6 +789,14 @@ function procDenied(error) {
 // it again can reuse the inode and match ctime, birthtime, and size, so
 // all four identity fields can match a file this relay did not record.
 async function linuxProcessHolds(file, dev, ino) {
+  try {
+    return await scanLinuxHolders(file, dev, ino);
+  } catch {
+    return "unknown";
+  }
+}
+
+async function scanLinuxHolders(file, dev, ino) {
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   if (typeof uid !== "number") return "unknown";
   let pids;
@@ -4195,6 +4203,11 @@ async function boot() {
   await ensureRecoverExcluded(VAULT);
   startLogWatch();
   startVaultSyncLoop();
+  server.on("error", (err) => {
+    const code = err && err.code ? String(err.code) : "ERROR";
+    logSafe([], "listen failed", code);
+    process.exit(1);
+  });
   server.listen(PORT, HOST, () => {
     const bound = server.address();
     const openPort = bound && typeof bound === "object" ? bound.port : PORT;
@@ -4227,7 +4240,8 @@ if (isMainModule()) {
     logSafe("unhandled rejection", err);
   });
   boot().catch((err) => {
-    logSafe(err);
+    const code = err && err.code ? String(err.code) : "";
+    logSafe([], "startup failed", code || (err instanceof Error ? err.message : "error"));
     process.exit(1);
   });
 }

@@ -86,11 +86,11 @@ final class RelayLink {
             } catch {
                 return
             }
-            SyncLog.write("sync out \(outgoing.type) doc=\(docId) heads=\(outgoing.heads)")
+            SyncLog.write("sync out \(outgoing.type) doc=\(SyncLog.escapedId(docId)) heads=\(outgoing.heads)")
             sent += 1
         }
         if sent == 16 {
-            SyncLog.write("sync cap 16 doc=\(docId)")
+            SyncLog.write("sync cap 16 doc=\(SyncLog.escapedId(docId))")
         }
         if sent == 0 {
             host.settled(docId: docId)
@@ -166,11 +166,11 @@ final class RelayLink {
             guard let docId = message["documentId"]?.textValue, let bytes = message["data"]?.bytesValue else { return }
             try host?.applyIncoming(docId: docId, bytes: bytes)
             let heads = host?.syncHeads(docId: docId) ?? ""
-            SyncLog.write("sync in \(type) doc=\(docId) heads=\(heads)")
+            SyncLog.write("sync in \(type) doc=\(SyncLog.escapedId(docId)) heads=\(heads)")
             pump(docId)
         case "doc-unavailable":
             if let docId = message["documentId"]?.textValue {
-                SyncLog.write("sync in doc-unavailable doc=\(docId)")
+                SyncLog.write("sync in doc-unavailable doc=\(SyncLog.escapedId(docId))")
                 host?.markUnavailable(docId: docId)
                 pump(docId)
             }
@@ -306,7 +306,7 @@ final class RelayLink {
             if opcode == 0x2 || opcode == 0x0 {
                 let docId = try oversizedDocumentId(count: length, masked: masked, mask: mask)
                 if let docId, !docId.isEmpty {
-                    SyncLog.write("sync drop oversized doc=\(docId)")
+                    SyncLog.write("sync drop oversized doc=\(SyncLog.escapedId(docId))")
                     host?.noteTooLarge(docId: docId)
                 } else {
                     SyncLog.write("sync drop oversized")
@@ -460,7 +460,7 @@ private final class OversizedFrame {
     func documentId() throws -> String? {
         let (major, info) = try head()
         guard major == 5, info != 31 else {
-            try skipBody(major, info)
+            try skipBody(major, info, depth: 0)
             return nil
         }
         let pairs = try argument(info)
@@ -471,7 +471,7 @@ private final class OversizedFrame {
             if key == "documentId" {
                 found = try readText(limit: 256)
             } else {
-                try skipValue()
+                try skipValue(depth: 1)
             }
         }
         return found
@@ -505,7 +505,7 @@ private final class OversizedFrame {
     private func readText(limit: Int) throws -> String? {
         let (major, info) = try head()
         guard major == 3, info != 31 else {
-            try skipBody(major, info)
+            try skipBody(major, info, depth: 1)
             return nil
         }
         let count = try argument(info)
@@ -517,12 +517,15 @@ private final class OversizedFrame {
         return String(data: data, encoding: .utf8)
     }
 
-    private func skipValue() throws {
+    private func skipValue(depth: Int) throws {
+        if depth >= CBORNesting.limit {
+            throw AidanError.protocol("The relay sent a message nested too deep.")
+        }
         let (major, info) = try head()
-        try skipBody(major, info)
+        try skipBody(major, info, depth: depth)
     }
 
-    private func skipBody(_ major: UInt8, _ info: UInt8) throws {
+    private func skipBody(_ major: UInt8, _ info: UInt8, depth: Int) throws {
         if info == 31 { throw AidanError.protocol("The relay message used an unsupported length.") }
         switch major {
         case 0, 1:
@@ -532,17 +535,17 @@ private final class OversizedFrame {
         case 4:
             let count = try argument(info)
             guard count <= 100_000 else { throw AidanError.protocol("The relay sent a huge list.") }
-            for _ in 0..<count { try skipValue() }
+            for _ in 0..<count { try skipValue(depth: depth + 1) }
         case 5:
             let count = try argument(info)
             guard count <= 100_000 else { throw AidanError.protocol("The relay sent a huge map.") }
             for _ in 0..<count {
-                try skipValue()
-                try skipValue()
+                try skipValue(depth: depth + 1)
+                try skipValue(depth: depth + 1)
             }
         case 6:
             _ = try argument(info)
-            try skipValue()
+            try skipValue(depth: depth + 1)
         case 7:
             if info >= 24 { _ = try argument(info) }
         default:

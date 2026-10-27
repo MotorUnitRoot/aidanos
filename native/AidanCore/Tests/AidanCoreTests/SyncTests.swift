@@ -313,6 +313,32 @@ final class SyncTests: XCTestCase {
         XCTAssertEqual(blocked.wait(timeout: .now() + 5), .success)
     }
 
+    func testCborRejectsDeepNesting() throws {
+        func nested(_ depth: Int) -> Data {
+            var data = Data(repeating: 0x81, count: depth)
+            data.append(0x00)
+            return data
+        }
+        _ = try CBOR.decode(nested(CBORNesting.limit - 1))
+        XCTAssertThrowsError(try CBOR.decode(nested(CBORNesting.limit))) { error in
+            guard case AidanError.protocol(let text) = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+            XCTAssertTrue(text.contains("nested too deep"))
+        }
+    }
+
+    func testRelaySuppliedIdIsEscapedBeforeLogging() {
+        let escaped = SyncLog.escapedId("note\nid\\x")
+        XCTAssertFalse(escaped.contains("\n"))
+        XCTAssertFalse(escaped.contains("\\x") && escaped.contains("\n"))
+        XCTAssertTrue(escaped.contains("\\x0a"))
+        XCTAssertTrue(escaped.contains("\\\\"))
+        let line = SyncLog.format("sync drop oversized doc=\(escaped)", at: Date(timeIntervalSince1970: 1_761_091_323))
+        XCTAssertEqual(line.filter { $0 == "\n" }.count, 1)
+        XCTAssertTrue(line.hasSuffix("\n"))
+    }
+
     func testSyncLogNamesHeadsAndTime() {
         let line = SyncLog.format("sync out request doc=abc heads=aa,bb", at: Date(timeIntervalSince1970: 1_761_091_323))
         let pattern = #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z sync out request doc=abc heads=aa,bb\n$"#

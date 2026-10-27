@@ -8,10 +8,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isNotePlanFolder, noteSaveStyle, reportRecoveryFiles, writeNoteText } from "./editor/note-save.mjs";
-import { createExclusive, openCheckedDirectory, unlinkIfSame, unlinkOpenedFile } from "./editor/dirfd.mjs";
+import { ancestorFault, createExclusive, directoryBackend, groupWritableHelperMessage, installFaultText, openCheckedDirectory, unlinkIfSame, unlinkOpenedFile } from "./editor/dirfd.mjs";
 import { ensureRecoverExcluded, isRecoverPath } from "./editor/vault-exclude.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
+if (!process.env.NODE_ENV) process.env.NODE_ENV = "test";
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
@@ -574,7 +575,10 @@ await check("the server passes beforeRename into the save", async () => {
   const checkedAt = place.indexOf("afterOpen");
   const writeAt = place.indexOf("writeOpened");
   const recoveryAt = place.indexOf("createExclusive");
+  const helperAt = place.indexOf("openDirectoryHelper");
+  const openAt = place.indexOf("fs.open");
   const recheckAt = place.indexOf("recheckParents");
+  assert(helperAt !== -1 && openAt !== -1 && helperAt < openAt, "the helper is not checked before the note is created");
   assert(checkedAt !== -1 && writeAt !== -1 && checkedAt < writeAt, "the opened file is checked before the first byte");
   assert(recoveryAt !== -1 && recheckAt > recoveryAt && recheckAt < writeAt, "parents are rechecked after the recovery file and before the first byte");
   assert(place.includes("restoreOpened"), "a failed write does not put the previous text back");
@@ -835,6 +839,240 @@ await check("an untrusted helper answers 503 and the server stays up", async () 
     while (child.exitCode == null && Date.now() < stopBy) await new Promise((r) => setTimeout(r, 40));
     try { child.kill("SIGKILL"); } catch { /* already gone */ }
   }
+});
+
+function chownTo(user, target) {
+  if (spawnSync("chown", [String(user), target], { encoding: "utf8" }).status === 0) return true;
+  return spawnSync("sudo", ["-n", "chown", String(user), target], { encoding: "utf8" }).status === 0;
+}
+
+function chownOther(target) {
+  return chownTo("nobody", target);
+}
+
+await check("a helper under a bad ancestor is refused, and /tmp is allowed", async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-ancestor-"));
+  const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-ancestor-vault-"));
+  const folder = await openCheckedDirectory(vault);
+  const writable = path.join(base, "group");
+  const writableBin = path.join(writable, "bin");
+  fs.mkdirSync(writableBin, { recursive: true });
+  const writableTool = path.join(writableBin, "dirfd-tool");
+  fs.copyFileSync(shippedHelper(), writableTool);
+  fs.chmodSync(writableTool, 0o755);
+  fs.chmodSync(writableBin, 0o755);
+  fs.chmodSync(writable, 0o775);
+  const owned = path.join(base, "owned");
+  const ownedBin = path.join(owned, "bin");
+  fs.mkdirSync(ownedBin, { recursive: true });
+  const ownedTool = path.join(ownedBin, "dirfd-tool");
+  fs.copyFileSync(shippedHelper(), ownedTool);
+  fs.chmodSync(ownedTool, 0o755);
+  fs.chmodSync(ownedBin, 0o755);
+  fs.chmodSync(owned, 0o755);
+  const gave = chownOther(owned);
+  try {
+    assert(ancestorFault(writable) === "ancestor-writable", ancestorFault(writable));
+    assert(installFaultText("ancestor-writable") === "group-writable ancestor", installFaultText("ancestor-writable"));
+    const writableError = await withHelperEnv({ AIDANOS_DIRFD_TOOL: writableTool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => createExclusive(folder, "group.recover", Buffer.from("x\n"), "helper")));
+    assert(writableError.code === "DIRFD" && writableError.reason === "ancestor-writable", writableError.reason || writableError.code);
+    assert(!fs.existsSync(path.join(vault, "group.recover")), "a group-writable ancestor ran the helper");
+
+    assert(gave, "could not give an ancestor to another user");
+    assert(ancestorFault(owned) === "ancestor-owner", ancestorFault(owned));
+    const ownedError = await withHelperEnv({ AIDANOS_DIRFD_TOOL: ownedTool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      rejects(() => createExclusive(folder, "owned.recover", Buffer.from("x\n"), "helper")));
+    assert(ownedError.code === "DIRFD" && ownedError.reason === "ancestor-owner", ownedError.reason || ownedError.code);
+    assert(!fs.existsSync(path.join(vault, "owned.recover")), "an ancestor owned by another user ran the helper");
+
+    const sticky = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sticky-"));
+    const stickyTool = path.join(sticky, "dirfd-tool");
+    fs.copyFileSync(shippedHelper(), stickyTool);
+    fs.chmodSync(stickyTool, 0o755);
+    const tmpStat = fs.lstatSync(os.tmpdir());
+    assert(tmpStat.uid === 0 && (tmpStat.mode & 0o1000) !== 0, "the temp directory is not a sticky root directory");
+    assert(ancestorFault(sticky) === "", ancestorFault(sticky) || "sticky ancestor was refused");
+    await withHelperEnv({ AIDANOS_DIRFD_TOOL: stickyTool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+      createExclusive(folder, "sticky.recover", Buffer.from("ok\n"), "helper"));
+    assert(fs.readFileSync(path.join(vault, "sticky.recover"), "utf8") === "ok\n", "a sticky root ancestor was refused");
+  } finally {
+    await folder.close();
+    if (gave) chownTo(process.getuid(), owned);
+    fs.chmodSync(writable, 0o755);
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+await check("a refused helper does not leave a new note", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-empty-note-"));
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bin);
+  const planted = path.join(bin, "planted");
+  fs.writeFileSync(planted, "#!/bin/sh\nprintf pwned\n");
+  fs.chmodSync(planted, 0o755);
+  const cases = [];
+  cases.push(["planted", planted, () => {}]);
+  const linked = path.join(bin, "linked");
+  fs.symlinkSync(planted, linked);
+  cases.push(["symlink", linked, () => {}]);
+  const mode = path.join(bin, "mode");
+  fs.copyFileSync(shippedHelper(), mode);
+  fs.chmodSync(mode, 0o666);
+  cases.push(["writable-file", mode, () => {}]);
+  const wide = path.join(dir, "wide");
+  fs.mkdirSync(wide);
+  const wideTool = path.join(wide, "tool");
+  fs.copyFileSync(shippedHelper(), wideTool);
+  fs.chmodSync(wideTool, 0o755);
+  fs.chmodSync(wide, 0o777);
+  cases.push(["writable-dir", wideTool, () => fs.chmodSync(wide, 0o755)]);
+  cases.push(["missing", path.join(bin, "missing"), () => {}]);
+  const ancestor = path.join(dir, "ancestor");
+  const ancestorBin = path.join(ancestor, "bin");
+  fs.mkdirSync(ancestorBin, { recursive: true });
+  const ancestorTool = path.join(ancestorBin, "tool");
+  fs.copyFileSync(shippedHelper(), ancestorTool);
+  fs.chmodSync(ancestorTool, 0o755);
+  fs.chmodSync(ancestorBin, 0o755);
+  fs.chmodSync(ancestor, 0o775);
+  cases.push(["ancestor", ancestorTool, () => fs.chmodSync(ancestor, 0o755)]);
+  const foreign = path.join(dir, "foreign");
+  fs.mkdirSync(foreign);
+  const foreignTool = path.join(foreign, "tool");
+  fs.copyFileSync(shippedHelper(), foreignTool);
+  fs.chmodSync(foreignTool, 0o755);
+  const foreignOk = chownOther(foreignTool);
+  if (foreignOk) cases.push(["owner", foreignTool, () => {}]);
+  assert(cases.length === 7, "refusal cases were " + cases.length);
+  try {
+    for (const [name, tool, cleanup] of cases) {
+      const note = path.join(dir, name + ".md");
+      const error = await withHelperEnv({ AIDANOS_DIRFD_TOOL: tool, AIDANOS_DIRFD_BACKEND: "helper" }, () =>
+        rejects(() => writeNoteText(note, "NEW\n", { swapInRequested: false })));
+      assert(error.code === "DIRFD", name + " " + error.code + " " + (error.reason || ""));
+      assert(!fs.existsSync(note), name + " left a note");
+      cleanup();
+    }
+  } finally {
+    if (foreignOk) chownTo(process.getuid(), foreignTool);
+    fs.chmodSync(wide, 0o755);
+    fs.chmodSync(ancestor, 0o755);
+  }
+});
+
+await check("a cleanup miss logs the recovery file and the save still succeeds", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-cleanup-"));
+  const vault = path.join(dir, "vault");
+  const notes = path.join(vault, "notes");
+  fs.mkdirSync(notes, { recursive: true });
+  const note = path.join(notes, "day.md");
+  await writeNoteText(note, "original-text\n", { swapInRequested: false, vaultRoot: vault });
+  const logged = [];
+  const previous = console.error;
+  console.error = (...args) => logged.push(args.join(" "));
+  try {
+    await writeNoteText(note, "NEW-TEXT\n", {
+      swapInRequested: false,
+      vaultRoot: vault,
+      beforeCleanup() {
+        const name = fs.readdirSync(notes).find((entry) => entry.endsWith(".recover"));
+        fs.renameSync(path.join(notes, name), path.join(notes, name + ".kept"));
+        fs.writeFileSync(path.join(notes, name), "other\n");
+      },
+    });
+  } finally {
+    console.error = previous;
+  }
+  assert(fs.readFileSync(note, "utf8") === "NEW-TEXT\n", "the saved note was rolled back");
+  const kept = fs.readdirSync(notes).filter((entry) => entry.endsWith(".recover.kept"));
+  assert(kept.length === 1, "the old recovery text was removed: " + fs.readdirSync(notes).join(","));
+  assert(fs.readFileSync(path.join(notes, kept[0]), "utf8") === "original-text\n", "the kept file is not the old text");
+  const line = logged.find((entry) => entry.startsWith("cleanup failed: "));
+  const recovery = kept[0].slice(0, -".kept".length);
+  assert(line === "cleanup failed: notes/" + recovery, "cleanup log was " + logged.join(" | "));
+  assert(!line.includes(dir), "cleanup log included a filesystem path");
+
+  fs.rmSync(path.join(notes, recovery));
+  fs.rmSync(path.join(notes, kept[0]));
+  await writeNoteText(note, "original-text\n", { swapInRequested: false, vaultRoot: vault });
+  const loggedThrow = [];
+  console.error = (...args) => loggedThrow.push(args.join(" "));
+  try {
+    fs.chmodSync(notes, 0o755);
+    await writeNoteText(note, "AFTER\n", {
+      swapInRequested: false,
+      vaultRoot: vault,
+      beforeCleanup() {
+        fs.chmodSync(notes, 0o555);
+      },
+    });
+  } finally {
+    fs.chmodSync(notes, 0o755);
+    console.error = previous;
+  }
+  assert(fs.readFileSync(note, "utf8") === "AFTER\n", "a cleanup error failed the save");
+  const left = fs.readdirSync(notes).filter((entry) => entry.endsWith(".recover"));
+  assert(left.length === 1, "a helper cleanup error removed the recovery file");
+  assert(fs.readFileSync(path.join(notes, left[0]), "utf8") === "original-text\n", "the kept recovery file is not the old text");
+  const thrown = loggedThrow.find((entry) => entry.startsWith("cleanup failed: "));
+  assert(thrown === "cleanup failed: notes/" + left[0], "throwing cleanup log was " + loggedThrow.join(" | "));
+  assert(!thrown.includes(dir), "throwing cleanup log included a filesystem path");
+});
+
+await check("directory helper overrides are ignored outside tests", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-env-helper-"));
+  const marker = path.join(dir, "marker");
+  const planted = path.join(dir, "planted");
+  fs.writeFileSync(planted, "#!/bin/sh\nprintf pwned > '" + marker + "'\n");
+  fs.chmodSync(planted, 0o755);
+  const note = path.join(dir, "day.md");
+  await writeNoteText(note, "one\n", { swapInRequested: false });
+  const previousNode = process.env.NODE_ENV;
+  const previousTool = process.env.AIDANOS_DIRFD_TOOL;
+  const previousBackend = process.env.AIDANOS_DIRFD_BACKEND;
+  process.env.NODE_ENV = "production";
+  process.env.AIDANOS_DIRFD_TOOL = planted;
+  process.env.AIDANOS_DIRFD_BACKEND = "helper";
+  try {
+    assert(directoryBackend() === (process.platform === "linux" ? "proc" : "helper"), directoryBackend());
+    await writeNoteText(note, "two\n", { swapInRequested: false });
+  } finally {
+    if (previousNode === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNode;
+    if (previousTool === undefined) delete process.env.AIDANOS_DIRFD_TOOL;
+    else process.env.AIDANOS_DIRFD_TOOL = previousTool;
+    if (previousBackend === undefined) delete process.env.AIDANOS_DIRFD_BACKEND;
+    else process.env.AIDANOS_DIRFD_BACKEND = previousBackend;
+  }
+  assert(!fs.existsSync(marker), "a planted helper ran outside tests");
+  assert(fs.readFileSync(note, "utf8") === "two\n", "the real save did not run");
+  assert(directoryBackend({ NODE_ENV: "test", AIDANOS_DIRFD_BACKEND: "proc" }) === "proc", "a test override was ignored");
+  assert(directoryBackend({ NODE_ENV: "production", AIDANOS_DIRFD_BACKEND: "helper" }) === (process.platform === "linux" ? "proc" : "helper"), "production honored the override");
+});
+
+await check("startup reports a group-writable helper and refuses a bad install location", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-mode-msg-"));
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "dirfd-tool-test"), "");
+  fs.chmodSync(bin, 0o755);
+  fs.chmodSync(path.join(bin, "dirfd-tool-test"), 0o664);
+  assert(groupWritableHelperMessage(bin) === "chmod go-w editor/bin editor/bin/dirfd-tool-*", groupWritableHelperMessage(bin));
+  fs.chmodSync(path.join(bin, "dirfd-tool-test"), 0o755);
+  assert(groupWritableHelperMessage(bin) === "", "a private helper asked for chmod");
+  fs.chmodSync(bin, 0o775);
+  assert(groupWritableHelperMessage(bin) === "chmod go-w editor/bin editor/bin/dirfd-tool-*", "a group-writable bin was quiet");
+  const src = fs.readFileSync(path.join(root, "server.mjs"), "utf8");
+  const boot = src.slice(src.indexOf("async function boot"), src.indexOf("function isMainModule"));
+  const faultAt = boot.indexOf("ancestorFault");
+  const listenAt = boot.indexOf("server.listen");
+  assert(faultAt !== -1 && listenAt !== -1 && faultAt < listenAt, "startup checks the install location after listen");
+  assert(boot.includes("groupWritableHelperMessage"), "startup does not check the helper mode");
+  assert(boot.includes("console.error(helperMode)"), "startup does not log the helper mode fix");
+  assert(boot.includes("refused: bad install location: "), "startup does not name a bad install location");
+  const helperSrc = fs.readFileSync(path.join(root, "editor", "dirfd.mjs"), "utf8");
+  assert(helperSrc.includes("TODO: once Developer ID signing exists"), "the code-signature TODO is missing");
 });
 
 if (process.exitCode) process.exit(process.exitCode);

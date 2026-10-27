@@ -9,8 +9,10 @@
 // Seeing the mismatch afterwards is already too late. Linux keeps the proc
 // backend, which is openat. Every other platform runs the pinned helper.
 // Linux executes the verified descriptor through /proc/self/fd. macOS will
-// not execute /dev/fd, so it executes the path that was just checked. The
-// directory is owned by this user and is not group or world writable.
+// not execute /dev/fd, so it executes the path that was just checked. Before
+// that exec, every folder from / down to the helper is lstat'd. Each one
+// must be owned by root or the current user, and must not be group or world
+// writable unless it is sticky and owned by root.
 
 import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -27,6 +29,7 @@ const CREATE_FLAGS = fsConstants.O_WRONLY
   | fsConstants.O_NONBLOCK;
 const READ_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
 const GROUP_OR_OTHER_WRITE = 0o022;
+const STICKY = 0o1000;
 
 // Content pin for the helper shipped in editor/bin. editor/check-dirfd.sh
 // rebuilds that file from dirfd-tool.c and fails unless this SHA-256 matches.
@@ -64,17 +67,89 @@ function helperKey() {
   return osName + "-" + arch;
 }
 
+function overridesAllowed(env) {
+  return !!(env && env.NODE_ENV === "test");
+}
+
 export function directoryBackend(env = process.env) {
-  const requested = env && env.AIDANOS_DIRFD_BACKEND;
-  if (requested === "helper" || requested === "proc") return requested;
+  if (overridesAllowed(env)) {
+    const requested = env.AIDANOS_DIRFD_BACKEND;
+    if (requested === "helper" || requested === "proc") return requested;
+  }
   return process.platform === "linux" ? "proc" : "helper";
 }
 
 function helperFile(env = process.env) {
-  if (env && env.AIDANOS_DIRFD_TOOL) return path.resolve(String(env.AIDANOS_DIRFD_TOOL));
+  if (overridesAllowed(env) && env.AIDANOS_DIRFD_TOOL) return path.resolve(String(env.AIDANOS_DIRFD_TOOL));
   const key = helperKey();
   if (!key) return "";
   return fileURLToPath(new URL("./bin/dirfd-tool-" + key, import.meta.url));
+}
+
+// Folders from / down to leafDir. A group or other write bit is allowed only
+// on a sticky directory owned by root, which is the /tmp case. A symlink, a
+// missing folder, or an owner who is neither root nor this user is refused.
+export function ancestorFault(leafDir, uid = typeof process.getuid === "function" ? process.getuid() : null) {
+  if (typeof uid !== "number") return "ancestor";
+  const abs = path.resolve(String(leafDir || ""));
+  const chain = [];
+  let cursor = abs;
+  for (;;) {
+    chain.push(cursor);
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  chain.reverse();
+  for (const dir of chain) {
+    let st;
+    try {
+      st = fsSync.lstatSync(dir);
+    } catch {
+      return "ancestor";
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) return "ancestor";
+    const writable = (st.mode & GROUP_OR_OTHER_WRITE) !== 0;
+    const stickyRoot = (st.mode & STICKY) !== 0 && st.uid === 0;
+    if (writable && !stickyRoot) return "ancestor-writable";
+    if (st.uid !== 0 && st.uid !== uid) return "ancestor-owner";
+  }
+  return "";
+}
+
+export function installFaultText(fault) {
+  if (fault === "ancestor-writable") return "group-writable ancestor";
+  if (fault === "ancestor-owner") return "ancestor owned by another user";
+  return "bad ancestor";
+}
+
+// A umask 002 checkout leaves the helper group-writable. Saves keep refusing
+// it. Startup prints this exact command so the mode can be fixed in place.
+export function groupWritableHelperMessage(binDir) {
+  let bad = false;
+  let listed;
+  try {
+    listed = fsSync.lstatSync(binDir);
+  } catch {
+    return "";
+  }
+  if (!listed.isSymbolicLink() && listed.isDirectory() && (listed.mode & GROUP_OR_OTHER_WRITE) !== 0) bad = true;
+  let names = [];
+  try {
+    names = fsSync.readdirSync(binDir);
+  } catch {
+    names = [];
+  }
+  for (const name of names) {
+    if (!name.startsWith("dirfd-tool-")) continue;
+    try {
+      const file = fsSync.lstatSync(path.join(binDir, name));
+      if ((file.mode & GROUP_OR_OTHER_WRITE) !== 0) bad = true;
+    } catch {
+      // A missing helper is refused when a save needs it.
+    }
+  }
+  return bad ? "chmod go-w editor/bin editor/bin/dirfd-tool-*" : "";
 }
 
 function sameBytes(actual, expectedHex) {
@@ -113,6 +188,8 @@ async function openTrustedHelper(env = process.env) {
   const base = path.basename(filePath);
   if (!base || base === "." || base === ".." || base.includes("/") || base.includes("\\")) throw helperUnavailable("pin");
   const parentPath = path.dirname(filePath);
+  const fault = ancestorFault(parentPath, uid);
+  if (fault) throw helperUnavailable(fault);
   let listed;
   let parentListed;
   try {
@@ -169,10 +246,28 @@ function sameInode(listed, opened) {
   return !!listed && !!opened && listed.dev === opened.dev && listed.ino === opened.ino && listed.isFile() && !listed.isSymbolicLink();
 }
 
-function callHelper(dirHandle, args, body) {
-  return openTrustedHelper().then((tool) => new Promise((resolve, reject) => {
+function callHelper(dirHandle, args, body, borrowed) {
+  const ready = borrowed ? Promise.resolve(borrowed) : openTrustedHelper();
+  return ready.then((tool) => new Promise((resolve, reject) => {
+    function rejectClosed(error) {
+      if (borrowed) {
+        reject(error);
+        return;
+      }
+      Promise.resolve(tool.handle.close()).then(() => reject(error), () => reject(error));
+    }
+    // The same checked descriptor is reused for every call in one save.
+    // The folder walk still runs before each exec: a parent can change
+    // without the open file descriptor changing.
+    const fault = ancestorFault(path.dirname(tool.path));
+    if (fault) {
+      rejectClosed(helperUnavailable(fault));
+      return;
+    }
     // macOS will not execute /dev/fd. Recheck the path, then execute that path.
     // Linux executes the descriptor that was hashed, through /proc/self/fd.
+    // TODO: once Developer ID signing exists, check the helper's code
+    // signature before this exec. The owner walk is the check until then.
     let execPath = "/proc/self/fd/4";
     if (process.platform === "darwin") {
       let listed;
@@ -184,7 +279,7 @@ function callHelper(dirHandle, args, body) {
         listed = null;
       }
       if (!sameInode(listed, opened) || !ownedAndPrivate(listed, process.getuid())) {
-        Promise.resolve(tool.handle.close()).then(() => reject(helperUnavailable("race")), () => reject(helperUnavailable("race")));
+        rejectClosed(helperUnavailable("race"));
         return;
       }
       execPath = tool.path;
@@ -193,6 +288,10 @@ function callHelper(dirHandle, args, body) {
     function finish(fn) {
       if (settled) return;
       settled = true;
+      if (borrowed) {
+        fn();
+        return;
+      }
       Promise.resolve(tool.handle.close()).then(fn, fn);
     }
     let child;
@@ -254,20 +353,20 @@ async function createWithHelper(dirHandle, name, payload, options) {
   if (options && Number.isInteger(options.failAfterBytes) && options.failAfterBytes >= 0) {
     args.push(String(options.failAfterBytes));
   }
-  const id = parseIdentity(await callHelper(dirHandle, args, payload));
+  const id = parseIdentity(await callHelper(dirHandle, args, payload, options && options.tool));
   if (!id || !id.regular) throw badPath();
   return { dev: id.dev, ino: id.ino };
 }
 
-async function statWithHelper(dirHandle, name) {
-  const id = parseIdentity(await callHelper(dirHandle, ["stat", plainName(name)]));
+async function statWithHelper(dirHandle, name, tool) {
+  const id = parseIdentity(await callHelper(dirHandle, ["stat", plainName(name)], null, tool));
   if (!id) return null;
   return { dev: id.dev, ino: id.ino, symlink: id.symlink, regular: id.regular };
 }
 
-async function unlinkWithHelper(dirHandle, name, id) {
+async function unlinkWithHelper(dirHandle, name, id, tool) {
   if (!id) return false;
-  const text = await callHelper(dirHandle, ["unlink", plainName(name), String(id.dev), String(id.ino)]);
+  const text = await callHelper(dirHandle, ["unlink", plainName(name), String(id.dev), String(id.ino)], null, tool);
   return String(text || "").trim().split("\n")[0] === "ok";
 }
 
@@ -357,28 +456,33 @@ export async function openCheckedDirectory(dirPath, expected) {
   }
 }
 
+export async function openDirectoryHelper(env = process.env) {
+  if (directoryBackend(env) !== "helper") return null;
+  return openTrustedHelper(env);
+}
+
 export async function createExclusive(dirHandle, name, payload, backend = directoryBackend(), options = {}) {
   const bytes = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
   if (backend === "helper") return createWithHelper(dirHandle, name, bytes, options);
   return createWithProc(dirHandle, name, bytes, options);
 }
 
-export async function statEntry(dirHandle, name, backend = directoryBackend()) {
-  if (backend === "helper") return statWithHelper(dirHandle, name);
+export async function statEntry(dirHandle, name, backend = directoryBackend(), tool = null) {
+  if (backend === "helper") return statWithHelper(dirHandle, name, tool);
   return statWithProc(dirHandle, name);
 }
 
-export async function unlinkIfSame(dirHandle, name, id, backend = directoryBackend()) {
-  if (backend === "helper") return unlinkWithHelper(dirHandle, name, id);
+export async function unlinkIfSame(dirHandle, name, id, backend = directoryBackend(), tool = null) {
+  if (backend === "helper") return unlinkWithHelper(dirHandle, name, id, tool);
   return unlinkWithProc(dirHandle, name, id);
 }
 
 // A file this call just created may sit outside the vault when a parent was
 // swapped before the open. Unlink it only when the directory entry is still
 // the inode on this descriptor, so a second swap cannot delete something else.
-export async function unlinkOpenedFile(fileHandle, backend = process.platform === "linux" ? "proc" : "helper") {
+export async function unlinkOpenedFile(fileHandle, backend = directoryBackend(), tool = null) {
   if (backend === "helper") {
-    const text = await callHelper(fileHandle, ["unlink-self", "-"]);
+    const text = await callHelper(fileHandle, ["unlink-self", "-"], null, tool);
     return String(text || "").trim().split("\n")[0] === "ok";
   }
   const opened = await fileHandle.stat();

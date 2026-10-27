@@ -27,6 +27,7 @@ import os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { noteSaveStyle, reportRecoveryFiles, writeNoteText } from "./editor/note-save.mjs";
+import { ancestorFault, groupWritableHelperMessage, installFaultText } from "./editor/dirfd.mjs";
 import { ensureRecoverExcluded, isRecoverPath } from "./editor/vault-exclude.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -3731,6 +3732,13 @@ function refuseSymlinkedVaultRoot() {
 
 async function boot() {
   refuseSymlinkedVaultRoot();
+  const helperMode = groupWritableHelperMessage(path.join(__dirname, "editor", "bin"));
+  if (helperMode) console.error(helperMode);
+  const fault = ancestorFault(__dirname);
+  if (fault) {
+    console.error("refused: bad install location: " + installFaultText(fault));
+    process.exit(1);
+  }
   await reportRecoveryFiles(VAULT);
   await initVaultGit();
   await ensureRecoverExcluded(VAULT);

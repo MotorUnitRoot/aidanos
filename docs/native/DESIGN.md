@@ -140,7 +140,7 @@ The shared pieces are already fixed, independent of Apple:
 - The vault layout and the `.aidanos` cache.
 - The index id recipe and the note id recipe.
 - The blank opening of a note.
-- The automerge-repo sync protocol over a WebSocket: a join message, a peer reply, then request and sync messages whose payload is an Automerge sync blob. The Node relay speaks that protocol. So does the Swift core. One sync message may be up to 8 MB on both sides. A note larger than that stops syncing by itself and the app shows an error; other notes keep syncing.
+- The automerge-repo sync protocol over a WebSocket: a join message, a peer reply, then request and sync messages whose payload is an Automerge sync blob. The Node relay speaks that protocol. So does the Swift core. One sync message may be up to 8 MB on both sides. That cap was checked against synthetic notes, not a copied vault: a fresh 2 MB note's largest sync frame was about 300 KB, high-entropy 2 MB text about 1.1 MB, and an index of 1,000 paths about 31 KB. The relay does not sync .txt. Twice the largest realistic frame sits under 4 MB, so the cap stays 8 MB. A note larger than that stops syncing by itself and the app shows an error; other notes keep syncing.
 - The token in the connection header.
 - Markdown as the note, git as backup only.
 

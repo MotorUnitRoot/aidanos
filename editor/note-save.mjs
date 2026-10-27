@@ -26,18 +26,21 @@
 // entry is still the created inode, then the save is refused. If the new
 // write or the truncate fails, those bytes are written back over the same
 // file. The recovery file is removed after a successful save, a successful
-// restore, and every other failure. It stays only when the restore itself
-// fails, or the note cannot be synced. Those two cases log the path:
-// vault-relative inside the vault, and the absolute path when it is not.
-// Writing the new bytes and truncating afterwards does not by itself keep
-// the previous text.
+// restore, and every other failure. It stays when the restore itself fails,
+// the note cannot be synced, or removing it would delete a different file.
+// Each of those logs the vault-relative path inside the vault, and the
+// absolute path when it is not. A cleanup miss after the note is saved is
+// logged and the save still succeeds. Writing the new bytes and truncating
+// afterwards does not by itself keep the previous text.
+// The directory helper is opened before a new note is created, and that
+// same checked handle is used for every helper call in the save.
 // The swap-in path still writes a temp file and renames it, and beforeRename
 // runs after that temp file is ready and before the rename.
 
 import { constants as fsConstants, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { createExclusive, openCheckedDirectory, statEntry, unlinkIfSame, unlinkOpenedFile } from "./dirfd.mjs";
+import { createExclusive, directoryBackend, openCheckedDirectory, openDirectoryHelper, statEntry, unlinkIfSame, unlinkOpenedFile } from "./dirfd.mjs";
 
 const NOTEPLAN_PREFIXES = ["icloud~co~noteplan~", "co.noteplan."];
 
@@ -186,8 +189,8 @@ async function recheckParents(chain) {
   return true;
 }
 
-async function entryMatches(dir, name, id) {
-  const listed = await statEntry(dir, name);
+async function entryMatches(dir, name, id, backend, tool) {
+  const listed = await statEntry(dir, name, backend, tool);
   return !!listed && !listed.symlink && listed.dev === id.dev && listed.ino === id.ino;
 }
 
@@ -223,6 +226,13 @@ export async function reportRecoveryFiles(vaultRoot, log = (line) => console.err
 }
 
 async function writeInPlace(filePath, body, options) {
+  const env = environment(options);
+  const backend = directoryBackend(env);
+  // Open the helper before creating a note. A refusal must not leave a new
+  // 0-byte file behind. One checked handle is reused for the whole save.
+  const tool = await openDirectoryHelper(env);
+  let handle;
+  try {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const chain = await parentChain(filePath, options.parents);
   const before = await lstatOrMissing(filePath);
@@ -237,7 +247,6 @@ async function writeInPlace(filePath, body, options) {
     | fsConstants.O_NOFOLLOW
     | fsConstants.O_NONBLOCK
     | (creating ? (fsConstants.O_CREAT | fsConstants.O_EXCL) : 0);
-  let handle;
   try {
     handle = await fs.open(filePath, flags, 0o644);
   } catch (e) {
@@ -258,7 +267,7 @@ async function writeInPlace(filePath, body, options) {
       if (typeof options.afterOpen === "function") await options.afterOpen(opened);
       if (raced) throw mismatchedFile();
     } catch (error) {
-      if (creating) await unlinkOpenedFile(handle);
+      if (creating) await unlinkOpenedFile(handle, backend, tool);
       throw error;
     }
     const previous = before ? await readOpened(handle, opened.size) : Buffer.alloc(0);
@@ -269,10 +278,11 @@ async function writeInPlace(filePath, body, options) {
     let created = null;
     let keepRecovery = false;
     let failed = null;
+    let wrote = false;
     try {
-      created = await createExclusive(dir, recoveryName, previous);
+      created = await createExclusive(dir, recoveryName, previous, backend, { tool });
       if (typeof options.afterRecovery === "function") await options.afterRecovery();
-      const same = await entryMatches(dir, recoveryName, created);
+      const same = await entryMatches(dir, recoveryName, created, backend, tool);
       const folders = await recheckParents(chain);
       if (!same || !folders) throw badPath();
       const payload = Buffer.from(body, "utf8");
@@ -287,6 +297,7 @@ async function writeInPlace(filePath, body, options) {
         }
         await writeOpened(handle, payload);
         await handle.truncate(payload.length);
+        wrote = true;
       } catch (error) {
         try {
           if (typeof options.failRestore === "function") await options.failRestore();
@@ -310,11 +321,16 @@ async function writeInPlace(filePath, body, options) {
       failed = error;
     } finally {
       if (created && !keepRecovery) {
-        try {
-          await unlinkIfSame(dir, recoveryName, created);
-        } catch (unlinkError) {
-          if (!failed) failed = unlinkError;
+        if (typeof options.beforeCleanup === "function") {
+          try { await options.beforeCleanup(); } catch { /* the cleanup still runs */ }
         }
+        let removed = false;
+        try {
+          removed = await unlinkIfSame(dir, recoveryName, created, backend, tool);
+        } catch {
+          removed = false;
+        }
+        if (!removed) logKeptRecovery("cleanup failed: ", recoveryPath, options);
       }
       try {
         await dir.close();
@@ -322,9 +338,19 @@ async function writeInPlace(filePath, body, options) {
         if (!failed) failed = closeError;
       }
     }
-    if (failed) throw failed;
+    if (failed) {
+      if (creating && !wrote) {
+        try { await unlinkOpenedFile(handle, backend, tool); } catch { /* the refusal still stands */ }
+      }
+      throw failed;
+    }
   } finally {
-    await handle.close();
+    if (handle) await handle.close();
+  }
+  } finally {
+    if (tool) {
+      try { await tool.handle.close(); } catch { /* the save already finished */ }
+    }
   }
 }
 

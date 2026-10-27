@@ -673,6 +673,125 @@ test("a reset warms the sync engine before devices are told it is ready", async 
   assert.match(source, /index reply in /);
 });
 
+test("a failed warm-up closes the session", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await assert.rejects(
+    () => startRelay({
+      token: TOKEN,
+      vault,
+      data,
+      port: 0,
+      gitUrl: "",
+      warm() {
+        throw new Error("warm failed");
+      },
+    }),
+    /warm failed/,
+  );
+  const relay = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+  });
+  try {
+    const health = await fetch(relay.healthURL);
+    assert.equal(health.status, 200);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("a warm-up timeout closes the session instead of leaving health down", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await assert.rejects(
+    () => startRelay({
+      token: TOKEN,
+      vault,
+      data,
+      port: 0,
+      gitUrl: "",
+      sessionTimeoutMs: 200,
+      beforeOpenReady() {
+        return new Promise(() => {});
+      },
+    }),
+    (error) => error && error.code === "WARM_TIMEOUT",
+  );
+  const relay = await startRelay({
+    token: TOKEN,
+    vault,
+    data,
+    port: 0,
+    gitUrl: "",
+  });
+  try {
+    const health = await fetch(relay.healthURL);
+    assert.equal(health.status, 200);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("a reset warm-up timeout keeps the old generation", async () => {
+  const dir = await tempDir();
+  let opens = 0;
+  const seen = [];
+  const write = console.error;
+  console.error = (...args) => {
+    seen.push(args.join(" "));
+    write(...args);
+  };
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    allowReset: true,
+    sessionTimeoutMs: 200,
+    beforeOpenReady() {
+      opens += 1;
+      if (opens > 1 && opens <= 4) return new Promise(() => {});
+    },
+  });
+  try {
+    const first = await fetch(relay.healthURL);
+    const body = await first.json();
+    assert.equal(first.status, 200);
+    assert.equal(body.resetGeneration, 0);
+    const accepted = await fetch(relay.healthURL.replace("/health", "/reset"), {
+      method: "POST",
+      headers: { Authorization: "Bearer " + TOKEN },
+    });
+    assert.equal(accepted.status, 200);
+    const deadline = Date.now() + 5000;
+    let again = null;
+    let status = 0;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const response = await fetch(relay.healthURL + "?n=" + Date.now());
+      status = response.status;
+      if (status !== 200) continue;
+      again = await response.json();
+      if (seen.some((line) => line.includes("kept generation"))) break;
+    }
+    assert.equal(status, 200);
+    assert.equal(again.ok, true);
+    assert.equal(again.resetGeneration, 0);
+    assert.equal(seen.some((line) => line.includes("sync warm-up timed out")), true);
+    assert.equal(seen.some((line) => line.includes("kept generation 0")), true);
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+});
+
 test("an allowed reset checks the token and empties the folder", async () => {
   const dir = await tempDir();
   const vault = path.join(dir, "vault");

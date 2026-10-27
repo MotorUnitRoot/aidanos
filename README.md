@@ -18,7 +18,7 @@ The vault is the `vault/` folder next to the app, or the folder named in `AIDANO
 
 The durable disk is a private git repo of markdown. The intended remote is `MotorUnitRoot/aidanos-vault`. This app repo does not create that remote.
 
-On a Mac, the launchd agent in `launchd/com.aidanos.plist` starts the app from `~/Grok/motorunit/dashboard` and sets `AIDANOS_VAULT` to `~/Grok/motorunit`. That parent folder is the vault. The private remote is still `MotorUnitRoot/aidanos-vault`. The phone uses the hosted app; the server reads and writes these files.
+On a Mac, the launchd agent in `launchd/com.aidanos.plist` starts the app from `~/Grok/motorunit/dashboard` and sets `AIDANOS_VAULT` to `~/Grok/motorunit`. That parent folder is the vault. The private remote is still `MotorUnitRoot/aidanos-vault`. The phone uses the hosted app; the server reads and writes these files. Before loading the agent, clear group and other write from the directory helper: `chmod go-w editor/bin editor/bin/dirfd-tool-*`. `launchd/install.sh` sets those modes.
 
 Cloud Run (and any host) can clone that repo when these are set:
 

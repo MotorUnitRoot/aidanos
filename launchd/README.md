@@ -20,9 +20,12 @@ launchd does not inherit a login PATH, so ProgramArguments must be absolute.
 
 ```sh
 mkdir -p ~/Library/Logs/aidanos
+chmod go-w editor/bin editor/bin/dirfd-tool-*
 cp /Users/colbynricker/Grok/motorunit/dashboard/launchd/com.aidanos.plist ~/Library/LaunchAgents/com.aidanos.plist
 launchctl load ~/Library/LaunchAgents/com.aidanos.plist
 ```
+
+A checkout made with umask 002 leaves `editor/bin` and the directory helper group-writable. The server still refuses to run that helper. Run the chmod above from the dashboard directory before loading the agent. `launchd/install.sh` sets the same modes.
 
 Then open http://127.0.0.1:3847
 

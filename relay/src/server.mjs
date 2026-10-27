@@ -20,9 +20,19 @@ import { describeSyncFrame } from "./sync-log.mjs";
 
 const DEFAULT_PORT = 3750;
 const MIN_TOKEN_LENGTH = 32;
+// openSession loads stored notes before /health can say the engine is up.
+// A hang there used to leave the port open and /health at 503. This bound
+// is separate from the 15s handshake.
+const SESSION_TIMEOUT_MS = 30_000;
 // A note's first sync is its whole history. 1 MB was small enough to reject that
-// and leave the device retrying forever. The app uses this same 8 MB cap and
-// refuses an oversized note on its own, so the socket stays up for every other note.
+// and leave the device retrying forever. Measured with Automerge 3.2.6 on
+// synthetic text, the largest CBOR sync frame was 306,331 bytes for a fresh
+// 2 MB note, 1,191,807 bytes for 2 MB of high-entropy text, 919,964 bytes for
+// 6 MB of note-like text, and 31,575 bytes for an index of 1,000 paths. The
+// relay syncs .md only, so a .txt file is not one of those frames. Twice the
+// largest realistic frame is about 2.3 MB, below the 4 MB floor, so the cap
+// stays 8 MB. The app uses this same cap and refuses an oversized note on its
+// own, so the socket stays up for every other note.
 export const MAX_PAYLOAD = 8 * 1024 * 1024;
 const FAILURE_CAP = 1024;
 export const LAN_WARNING =
@@ -560,7 +570,8 @@ export async function startRelay(options = {}) {
   }
 
   async function disposeSession(session) {
-    if (!session) return;
+    if (!session || session.closed) return;
+    session.closed = true;
     session.mirror.stop();
     for (const entry of servers) {
       for (const ws of [...entry.wss.clients]) ws.terminate();
@@ -584,11 +595,67 @@ export async function startRelay(options = {}) {
     }
   }
 
+  function warmTimeout() {
+    const error = new Error("sync warm-up timed out");
+    error.code = "WARM_TIMEOUT";
+    return error;
+  }
+
+  async function openSessionWithinTimeout() {
+    const ms = Number(options.sessionTimeoutMs) > 0 ? Number(options.sessionTimeoutMs) : SESSION_TIMEOUT_MS;
+    let settled = false;
+    let opened = null;
+    let timer;
+    const work = (async () => {
+      if (typeof options.beforeOpenReady === "function") await options.beforeOpenReady();
+      const session = await openSession();
+      opened = session;
+      if (settled) {
+        await disposeSession(session);
+        throw warmTimeout();
+      }
+      return session;
+    })();
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        settled = true;
+        reject(warmTimeout());
+      }, ms);
+    });
+    try {
+      return await Promise.race([work, timeout]);
+    } catch (error) {
+      settled = true;
+      if (opened) await disposeSession(opened);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function closeListening() {
+    for (const entry of servers) {
+      for (const ws of [...entry.wss.clients]) ws.terminate();
+      entry.wss.close();
+      if (typeof entry.httpServer.closeAllConnections === "function") entry.httpServer.closeAllConnections();
+    }
+    await Promise.all(
+      servers.map(
+        (entry) =>
+          new Promise((resolve) => {
+            entry.httpServer.close(() => resolve());
+          }),
+      ),
+    );
+    for (const entry of servers) entry.wss.emit("close");
+  }
+
   async function activateSession(session) {
     let published = false;
     try {
       const warmStarted = Date.now();
-      warmSyncEngine();
+      if (typeof options.warm === "function") options.warm();
+      else warmSyncEngine();
       logSafe(secrets, "sync engine warm in " + seconds(Date.now() - warmStarted));
       if (api) api.repo = session.repo;
       bootedAt = new Date().toISOString();
@@ -624,7 +691,7 @@ export async function startRelay(options = {}) {
         await writeMarkerFile(path.join(vault, ".aidanos", "relay-folder"), marker);
         await writeMarkerFile(path.join(dataDir, "relay-folder"), marker);
         if (typeof options.beforeReopen === "function") await options.beforeReopen();
-        const session = await openSession();
+        const session = await openSessionWithinTimeout();
         // The new generation stays hidden until the first sync has run.
         // A device waiting on /health then connects to an engine that already
         // answered one index round trip, instead of paying for it while the
@@ -638,6 +705,18 @@ export async function startRelay(options = {}) {
       } catch (error) {
         lastError = error;
         logSafe(secrets, "reset attempt failed:", error instanceof Error ? error.message : error);
+      }
+    }
+    logSafe(secrets, "reset failed: kept generation " + resetGeneration);
+    // A timed-out open is closed above. One more open, still on the old
+    // generation, so /health does not stay 503 after the wait has ended.
+    // Any other reset failure leaves sync down.
+    if (lastError && lastError.code === "WARM_TIMEOUT") {
+      try {
+        const session = await openSessionWithinTimeout();
+        await activateSession(session);
+      } catch (error) {
+        logSafe(secrets, "reset failed:", error instanceof Error ? error.message : error);
       }
     }
     throw lastError;
@@ -813,8 +892,15 @@ export async function startRelay(options = {}) {
 
   // /health stays 503 until this warm-up finishes. The port is already open,
   // so a start script can wait on it instead of racing a closed socket.
-  const session = await openSession();
-  await activateSession(session);
+  let session = null;
+  try {
+    session = await openSessionWithinTimeout();
+    await activateSession(session);
+  } catch (error) {
+    try { await disposeSession(session); } catch { /* the warm error is the one that stops startup */ }
+    await closeListening();
+    throw error;
+  }
 
   const interval = gitInterval(options.gitIntervalMs, env);
   let gitTimer = null;

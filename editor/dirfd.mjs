@@ -29,6 +29,7 @@ const GROUP_OR_OTHER_WRITE = 0o022;
 // run until this constant is updated to its SHA-256.
 const HELPER_SHA256 = {
   "linux-x64": "3b83002b3b4aa2ac91d5bc0622e95c470631050e1074ccf4024a96fcaeacd294",
+  "darwin-arm64": "44d21f908defa2a055e7fcfbafdcd4caf4c7bb7d7ebf0eed9ce8015f4b686342",
 };
 
 function badPath() {

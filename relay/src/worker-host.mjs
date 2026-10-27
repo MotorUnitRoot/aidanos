@@ -267,12 +267,12 @@ export function createWorkerHost(options = {}) {
     worker = child;
     port = child;
     host.warm = false;
-    child.on("message", (msg) => onMessage(msg));
+    child.on("message", (msg) => onMessage(msg, child));
     child.on("error", () => onExit(child, 1));
     child.on("exit", (code) => onExit(child, code));
   }
 
-  function onMessage(msg) {
+  function onMessage(msg, child) {
     const kind = acceptWorkerMessage(msg, (conn) => options.isOpen ? options.isOpen(conn) : true);
     if (kind === "drop") return;
     if (kind === "socket") {
@@ -280,7 +280,17 @@ export function createWorkerHost(options = {}) {
       return;
     }
     if (msg.kind === "log") {
-      if (typeof msg.line === "string" && msg.line) onLog(msg.line);
+      const line = typeof msg.line === "string" ? msg.line : "";
+      try {
+        if (line) onLog(line);
+      } finally {
+        // The worker counts this line until we have taken it. The file log
+        // on this thread holds its own unwritten bytes, capped at 1 MiB.
+        if (line && child) {
+          try { child.postMessage({ v: 1, kind: "log-ack", bytes: Buffer.byteLength(line) }); }
+          catch { /* the worker is already gone */ }
+        }
+      }
       return;
     }
     if (msg.kind === "pong") {

@@ -15,7 +15,9 @@ import {
   PAUSE_BYTES,
   PAUSE_LIMIT_MS,
   acceptWorkerMessage,
+  createLogBudget,
   frameToTransfer,
+  LOG_FORWARD_CAP,
   trimmedWorkerEnv,
   workerExecArgv,
   workerTestHook,
@@ -149,6 +151,33 @@ test("a copied frame keeps its bytes when the pool is reused", () => {
   assert.equal(new Uint8Array(copyA)[31], 1);
   assert.notEqual(copyA, shared);
   assert.notEqual(copyB, shared);
+});
+
+test("worker log forwarding counts only bytes the parent has not taken", () => {
+  assert.equal(LOG_FORWARD_CAP, 1024 * 1024);
+  const budget = createLogBudget(100);
+  const line = "y".repeat(60);
+  assert.equal(budget.take(line), line);
+  assert.equal(budget.pending, 60);
+  assert.equal(budget.take(line), null);
+  assert.equal(budget.dropped, 1);
+  assert.equal(budget.pending, 60);
+  const notice = budget.ack(60);
+  assert.equal(notice, "1 lines dropped");
+  assert.equal(budget.pending, Buffer.byteLength(notice));
+  assert.equal(budget.take(line), line);
+  assert.equal(budget.pending, Buffer.byteLength(notice) + 60);
+  assert.equal(budget.take(line), null);
+  assert.equal(budget.ack(60), null);
+  const again = budget.take(line);
+  assert.equal(again, line);
+  assert.equal(budget.pending, Buffer.byteLength(notice) + 60);
+  budget.unsent(again);
+  assert.equal(budget.pending, Buffer.byteLength(notice));
+  const huge = createLogBudget(10);
+  assert.equal(huge.take("0123456789ABC"), null);
+  assert.equal(huge.pending, 0);
+  assert.equal(huge.dropped, 1);
 });
 
 test("worker messages with a bad id, kind, or close code are dropped", () => {

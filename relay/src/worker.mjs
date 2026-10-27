@@ -7,7 +7,7 @@ import { next as AutomergeNext } from "@automerge/automerge/slim";
 import { Repo, NetworkAdapter } from "@automerge/automerge-repo";
 import { decode, encode } from "@automerge/automerge-repo/helpers/cbor.js";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
-import { frameToTransfer, writeSlot } from "./channel.mjs";
+import { createLogBudget, frameToTransfer, writeSlot } from "./channel.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import {
   beginFrame,
@@ -182,9 +182,23 @@ async function run() {
   let readyForWork = false;
   // Attach this before anything is posted. The parent can send as soon as it
   // sees "ready", and a message that arrives earlier must not be dropped.
+  const logBudget = createLogBudget();
   parentPort.on("message", (msg) => {
     if (msg && msg.kind === "ping") {
       post({ v: 1, kind: "pong" });
+      return;
+    }
+    // Acknowledgements have to land while sync work is queued. Otherwise a
+    // busy worker would keep counting lines the parent has already taken.
+    if (msg && msg.kind === "log-ack") {
+      const notice = logBudget.ack(msg.bytes);
+      if (notice) {
+        try {
+          post({ v: 1, kind: "log", line: notice });
+        } catch {
+          logBudget.unsent(notice);
+        }
+      }
       return;
     }
     queue.push(msg);
@@ -192,10 +206,12 @@ async function run() {
   });
   console.error = (...args) => {
     const line = formatWithOptions({ colors: false }, ...args);
+    const accepted = logBudget.take(line);
+    if (!accepted) return;
     try {
-      post({ v: 1, kind: "log", line });
+      post({ v: 1, kind: "log", line: accepted });
     } catch {
-      // The parent is already gone.
+      logBudget.unsent(accepted);
     }
   };
   for (const key of Object.keys(process.env)) {

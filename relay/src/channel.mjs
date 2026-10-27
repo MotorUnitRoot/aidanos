@@ -24,6 +24,56 @@ export const HEALTH_SYNC_DOWN = "sync down";
 export const SLOT_BYTES = 512;
 export const SLOT_ID_OFFSET = 16;
 export const SLOT_ID_MAX = 400;
+// Same cap as the accept thread's file log. The worker forwards each line
+// to that log. This counts only bytes the parent has not taken yet.
+export const LOG_FORWARD_CAP = 1024 * 1024;
+const LOG_NOTICE_RESERVE = 96;
+
+// Bytes of log lines posted to the parent and not yet acknowledged.
+// A line that would push that total over the cap is dropped. One notice
+// is forwarded once an acknowledgement leaves room for it.
+export function createLogBudget(cap = LOG_FORWARD_CAP) {
+  let pending = 0;
+  let dropped = 0;
+  let announced = false;
+  const limit = Number(cap) > 0 ? Number(cap) : LOG_FORWARD_CAP;
+
+  return {
+    get pending() {
+      return pending;
+    },
+    get dropped() {
+      return dropped;
+    },
+    take(line) {
+      const text = String(line ?? "");
+      const size = Buffer.byteLength(text);
+      if (size === 0) return null;
+      const reserve = announced || dropped === 0 ? 0 : LOG_NOTICE_RESERVE;
+      if (pending + size + reserve > limit) {
+        dropped += 1;
+        return null;
+      }
+      pending += size;
+      return text;
+    },
+    unsent(line) {
+      const size = Buffer.byteLength(String(line ?? ""));
+      pending = Math.max(0, pending - size);
+    },
+    ack(bytes) {
+      const size = Number(bytes);
+      if (Number.isFinite(size) && size > 0) pending = Math.max(0, pending - size);
+      if (announced || dropped === 0) return null;
+      const text = dropped + " lines dropped";
+      const notice = Buffer.byteLength(text);
+      if (pending + notice > limit) return null;
+      announced = true;
+      pending += notice;
+      return text;
+    },
+  };
+}
 
 export function createSlot() {
   return new SharedArrayBuffer(SLOT_BYTES);

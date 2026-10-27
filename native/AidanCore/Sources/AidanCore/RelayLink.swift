@@ -315,7 +315,7 @@ final class RelayLink {
         return payload
     }
 
-    /// A frame bigger than this is refused. The relay's cap is the same 8 MB.
+    /// A frame bigger than this is refused. The relay's cap is the same 4 MB.
     private static let maxFrame = SyncLimits.maxMessageBytes
 
     private func closeError(_ payload: Data) -> AidanError {

@@ -513,8 +513,8 @@ test("an outside edit keeps a device change that arrived in the same moment", as
   }
 });
 
-test("the relay message cap is 8 MB", async () => {
-  assert.equal(MAX_PAYLOAD, 8 * 1024 * 1024);
+test("the relay message cap is 4 MB", async () => {
+  assert.equal(MAX_PAYLOAD, 4 * 1024 * 1024);
   const dir = await tempDir();
   const relay = await startRelay({
     token: TOKEN,
@@ -524,21 +524,33 @@ test("the relay message cap is 8 MB", async () => {
     gitUrl: "",
     mirrorDebounceMs: 1000,
   });
-  try {
-    const result = await new Promise((resolve) => {
+  function sendFrame(bytes, waitMs) {
+    return new Promise((resolve) => {
       const ws = new WebSocket(relay.url, { headers: { Authorization: "Bearer " + TOKEN } });
+      let settled = false;
+      const finish = (code) => {
+        if (settled) return;
+        settled = true;
+        resolve({ code });
+      };
       ws.on("open", () => {
-        ws.send(Buffer.alloc(2_000_000, 7));
+        ws.send(bytes);
       });
-      ws.on("close", (code) => resolve({ code }));
+      ws.on("close", (code) => finish(code));
       ws.on("error", () => {});
       setTimeout(() => {
         const open = ws.readyState === WebSocket.OPEN;
-        ws.close();
-        resolve({ code: open ? 0 : ws.readyState });
-      }, 800);
+        if (open) ws.close();
+        finish(open ? 0 : -1);
+      }, waitMs);
     });
-    assert.notEqual(result.code, 1009);
+  }
+  try {
+    // Larger than the measured 1.19 MB frame, and still under the cap.
+    const under = await sendFrame(Buffer.alloc(2_000_000, 7), 800);
+    assert.notEqual(under.code, 1009);
+    const over = await sendFrame(Buffer.alloc(MAX_PAYLOAD + 1, 9), 2000);
+    assert.equal(over.code, 1009);
     const health = await fetch(relay.healthURL);
     assert.equal(health.status, 200);
   } finally {
@@ -1237,7 +1249,7 @@ test("a token with spaces is refused before the relay listens", async () => {
   await assert.rejects(fs.stat(path.join(dir, "vault")));
 });
 
-test("zero or a nonsense payload cap stays at 8 MB", () => {
+test("zero or a nonsense payload cap stays at 4 MB", () => {
   assert.equal(payloadLimit(0), MAX_PAYLOAD);
   assert.equal(payloadLimit("0"), MAX_PAYLOAD);
   assert.equal(payloadLimit("nope"), MAX_PAYLOAD);

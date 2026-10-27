@@ -29,11 +29,12 @@ const SESSION_TIMEOUT_MS = 30_000;
 // synthetic text, the largest CBOR sync frame was 306,331 bytes for a fresh
 // 2 MB note, 1,191,807 bytes for 2 MB of high-entropy text, 919,964 bytes for
 // 6 MB of note-like text, and 31,575 bytes for an index of 1,000 paths. The
-// relay syncs .md only, so a .txt file is not one of those frames. Twice the
-// largest realistic frame is about 2.3 MB, below the 4 MB floor, so the cap
-// stays 8 MB. The app uses this same cap and refuses an oversized note on its
-// own, so the socket stays up for every other note.
-export const MAX_PAYLOAD = 8 * 1024 * 1024;
+// relay syncs .md only, so a .txt file is not one of those frames. The largest
+// realistic frame is about 1.19 MB. Twice that is about 2.3 MB, below the
+// 4–8 MB range, so the cap is the bottom of that range. The app uses this
+// same cap and refuses an oversized note on its own, so the socket stays up
+// for every other note.
+export const MAX_PAYLOAD = 4 * 1024 * 1024;
 const FAILURE_CAP = 1024;
 export const LAN_WARNING =
   "WARNING: --lan sends notes across your home network with no encryption. The token is the only protection.";

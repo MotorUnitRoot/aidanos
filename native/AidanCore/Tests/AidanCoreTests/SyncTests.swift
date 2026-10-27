@@ -510,7 +510,7 @@ final class SyncTests: XCTestCase {
     }
 
     func testOversizedNoteStopsOnlyThatNote() throws {
-        XCTAssertEqual(SyncLimits.maxMessageBytes, 8 * 1024 * 1024)
+        XCTAssertEqual(SyncLimits.maxMessageBytes, 4 * 1024 * 1024)
         let relay = try TestRelay.start()
         defer { relay.stop() }
         let phone = try AidanSession(vault: try temporaryVault())

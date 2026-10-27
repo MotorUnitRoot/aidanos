@@ -42,7 +42,7 @@ public final class AidanSession: SyncHost {
     public var onError: ((String) -> Void)?
     /// Fires after a relay message raises or updates a conflict. The screen shows the choice on its next turn.
     public var onConflict: (() -> Void)?
-    /// One sync message larger than this is not sent. Defaults to 8 MB, the relay's cap.
+    /// One sync message larger than this is not sent. Defaults to 4 MB, the relay's cap.
     public var maxSyncBytes: Int {
         get {
             lock.lock()

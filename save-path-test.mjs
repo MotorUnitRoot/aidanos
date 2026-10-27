@@ -579,6 +579,15 @@ await check("the server passes beforeRename into the save", async () => {
   const openAt = place.indexOf("fs.open");
   const recheckAt = place.indexOf("recheckParents");
   assert(helperAt !== -1 && openAt !== -1 && helperAt < openAt, "the helper is not checked before the note is created");
+  assert((place.match(/openDirectoryHelper/g) || []).length === 1, "the helper is opened more than once per save");
+  assert(place.includes("{ tool }"), "the recovery file does not reuse the checked handle");
+  assert((place.match(/, tool\)/g) || []).length >= 3, "later helper calls do not reuse the checked handle");
+  const helperSrc = fs.readFileSync(path.join(root, "editor", "dirfd.mjs"), "utf8");
+  const callStart = helperSrc.indexOf("function callHelper");
+  const callEnd = helperSrc.indexOf("async function createWithHelper");
+  const call = helperSrc.slice(callStart, callEnd);
+  assert(call.includes("borrowed ? Promise.resolve(borrowed) : openTrustedHelper()"), "a borrowed handle is opened again");
+  assert(call.includes("if (borrowed)"), "a borrowed handle is closed after one call");
   assert(checkedAt !== -1 && writeAt !== -1 && checkedAt < writeAt, "the opened file is checked before the first byte");
   assert(recoveryAt !== -1 && recheckAt > recoveryAt && recheckAt < writeAt, "parents are rechecked after the recovery file and before the first byte");
   assert(place.includes("restoreOpened"), "a failed write does not put the previous text back");

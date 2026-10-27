@@ -15,15 +15,17 @@ RUN npm ci --omit=dev --omit=optional \
   && chown -R node:node /app
 COPY --chown=node:node relay/src ./src
 COPY --chown=node:node relay/Acknowledgements.txt ./
-COPY --chown=node:node editor /editor
-
+# The runtime user can read and execute the helper. It cannot replace it.
 # linux-arm64 has no pinned directory helper. Fail the image build instead of
 # shipping a relay that cannot open a checked folder on that platform.
+COPY editor /editor
 ARG TARGETARCH
 RUN if [ "$TARGETARCH" = "arm64" ] && [ ! -f /editor/bin/dirfd-tool-linux-arm64 ]; then \
       echo "linux-arm64 directory helper is not shipped (editor/bin/dirfd-tool-linux-arm64). Refusing to build this image." >&2; \
       exit 1; \
-    fi
+    fi \
+    && chown -R root:root /editor \
+    && chmod -R a-w /editor
 
 ENV AIDANOS_RELAY_PORT=3750
 EXPOSE 3750

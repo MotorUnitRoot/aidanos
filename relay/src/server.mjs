@@ -21,9 +21,10 @@ import {
   frameToTransfer,
 } from "./channel.mjs";
 import { backupOnce } from "./git.mjs";
+import { peekFrameHeader } from "./frame-header.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import { installIndexTrace, noteGitWork } from "./index-trace.mjs";
-import { discardOpenNoteTemps, rememberVaultRoot, saveNoteFile, sweepStaleNoteTemps } from "./mirror.mjs";
+import { discardOpenNoteTemps, logToken, rememberVaultRoot, saveNoteFile, sweepStaleNoteTemps } from "./mirror.mjs";
 import {
   flushFileLog,
   installFileLog,
@@ -196,20 +197,41 @@ function sameDeviceToken(left, right) {
   return timingSafeEqual(Buffer.from(left), Buffer.from(right));
 }
 
-function frameMessage(data) {
-  let raw = data;
-  if (raw == null) return null;
-  if (ArrayBuffer.isView(raw)) raw = Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
-  else if (raw instanceof ArrayBuffer) raw = Buffer.from(raw);
-  else if (typeof raw === "string") raw = Buffer.from(raw);
-  else if (!Buffer.isBuffer(raw)) return null;
+const JOIN_DECODE_LIMIT = 64 * 1024;
+
+function frameBytes(data) {
+  if (data == null) return null;
+  if (typeof data === "string") return Buffer.from(data);
+  if (Buffer.isBuffer(data)) return data;
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  return null;
+}
+
+function decodeFrameMessage(raw) {
   try {
     const message = decode(raw);
-    if (!message || typeof message !== "object") return null;
+    if (!message || typeof message !== "object" || Array.isArray(message)) return null;
     return message;
   } catch {
     return null;
   }
+}
+
+// Sync frames carry the note bytes. The accept thread reads the header and
+// forwards the original buffer. A join is small, so it is decoded in full
+// for the handshake fields the header walk does not keep.
+function frameMessage(data) {
+  const raw = frameBytes(data);
+  if (!raw) return null;
+  const header = peekFrameHeader(raw);
+  if (header && header.type === "join") {
+    if (raw.length > JOIN_DECODE_LIMIT) return null;
+    return decodeFrameMessage(raw);
+  }
+  if (header) return header;
+  if (raw.length > JOIN_DECODE_LIMIT) return null;
+  return decodeFrameMessage(raw);
 }
 
 function rejectUpgrade(socket) {
@@ -586,7 +608,7 @@ export async function startRelay(options = {}) {
     if (Number.isFinite(holdNote) && holdNote > 0) options.testHoldNoteMs = holdNote;
     if (env.AIDANOS_RELAY_TEST_CRASH_MID_WRITE === "1") options.testCrashMidWrite = true;
   }
-  await installIndexTrace((line) => logSafe(secrets, line), { thread: "main" });
+  await installIndexTrace((line) => logSafe(secrets, line), { thread: "main", timersOnly: true });
   await assertNotClientVault(vault);
   // A symlink is refused before any marker is written through it.
   // The temp sweep runs only after the folder is claimed, and only for
@@ -1152,7 +1174,7 @@ export async function startRelay(options = {}) {
           }
           const docId = typeof message.documentId === "string" ? message.documentId : "";
           if (docId && host.refused.has(docId)) {
-            logSafe(secrets, "poison document");
+            logSafe(secrets, "poison document " + logToken(docId));
             closeConn(conn, 1008);
             return;
           }

@@ -296,6 +296,7 @@ export function workerTestHook(options, env = process.env) {
     hook.crashBusy = options.testCrashBusy;
   }
   if (options.testCrashMidWrite === true) hook.crashMidWrite = true;
+  if (options.testCrashNoteWrite === true) hook.crashNoteWrite = true;
   if (options.testHang === true) hook.hang = true;
   if (options.testWasmOom === true) hook.wasmOom = true;
   const headroom = Number(options.testRssHeadroom);

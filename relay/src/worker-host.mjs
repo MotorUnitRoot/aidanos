@@ -28,6 +28,8 @@ import {
   workerExecArgv,
   workerTestHook,
 } from "./channel.mjs";
+import { INDEX_ID } from "./ids.mjs";
+import { logToken } from "./mirror.mjs";
 import { stampLine } from "./redact.mjs";
 
 function toUint8(binary) {
@@ -372,17 +374,19 @@ export function createWorkerHost(options = {}) {
     const ids = new Set(readInflight(inflightBuf));
     const info = readSlot(slot);
     if (info.docId) ids.add(info.docId);
-    let poisoned = false;
     for (const docId of ids) {
+      // The index is shared by every note. A crash while one note was in
+      // flight must not refuse the index, or the next sync of an unrelated
+      // note. Only the document that was actually in flight is charged.
+      if (!docId || docId === INDEX_ID) continue;
       const list = (docCrashes.get(docId) || []).filter((at) => now - at < CRASH_WINDOW_MS);
       list.push(now);
       docCrashes.set(docId, list);
       if (list.length >= DOC_CRASH_LIMIT && !refused.has(docId)) {
         refused.add(docId);
-        poisoned = true;
+        say("poison document " + logToken(docId));
       }
     }
-    if (poisoned) say("poison document");
     return crashes.length >= CRASH_LOOP_LIMIT;
   }
 
@@ -437,12 +441,18 @@ export function createWorkerHost(options = {}) {
         : WORKER_RSS_BYTES;
       if (!rssTripped && process.memoryUsage().rss > rssLimit) {
         rssTripped = true;
+        // Health reads these flags. Clear them before terminate() so a caller
+        // cannot observe 200 in the gap between this log and the exit event.
+        host.warm = false;
+        host.lastPong = 0;
         say("worker rss");
         try { port.terminate(); } catch { /* the worker is already gone */ }
         return;
       }
       if (!heartbeatStop && sawReady && host.lastPong && Date.now() - host.lastPong > HUNG_RESTART_MS) {
         heartbeatStop = true;
+        host.warm = false;
+        host.lastPong = 0;
         say("worker heartbeat");
         try { port.terminate(); } catch { /* the worker is already gone */ }
         return;

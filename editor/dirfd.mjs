@@ -117,32 +117,52 @@ function selfIds() {
   return { uid, gid };
 }
 
-// filePath is included in the same listing as the directories. A fault on
-// that file is "helper-acl"; a fault on a directory is "ancestor-acl".
-export function ancestorFault(leafDir, uid = typeof process.getuid === "function" ? process.getuid() : null, filePath = "") {
-  if (typeof uid !== "number") return "ancestor";
+function walkToEnd(leafDir, uid) {
+  if (typeof uid !== "number") return { kind: "fault", fault: "ancestor", dirs: [] };
   let abs = path.resolve(String(leafDir || ""));
   const seenLinks = new Set();
   const dirs = [];
   for (let hop = 0; hop <= MAX_ANCESTOR_LINKS; hop++) {
     const step = walkAncestors(abs, uid, seenLinks);
     if (step.dirs) dirs.push(...step.dirs);
-    if (step.fault) {
-      const acl = aclFaultFor(dirs.map((dir) => ({ path: dir.path, uid: dir.uid, file: false })));
-      if (acl) return "ancestor-acl";
-      return step.fault;
-    }
-    if (!step.next) {
-      const entries = dirs.map((dir) => ({ path: dir.path, uid: dir.uid, file: false }));
-      if (filePath) entries.push({ path: path.resolve(String(filePath)), uid, file: true });
-      const acl = aclFaultFor(entries);
-      if (acl === "file") return "helper-acl";
-      if (acl) return "ancestor-acl";
-      return "";
-    }
+    if (step.fault) return { kind: "fault", fault: step.fault, dirs };
+    if (!step.next) return { kind: "done", dirs };
     abs = step.next;
   }
-  return "ancestor";
+  return { kind: "limit", dirs };
+}
+
+function aclEntries(result, filePath, uid) {
+  const entries = result.dirs.map((dir) => ({ path: dir.path, uid: dir.uid, file: false }));
+  if (result.kind === "done" && filePath) {
+    entries.push({ path: path.resolve(String(filePath)), uid, file: true });
+  }
+  return entries;
+}
+
+function applyAncestorAcl(result, acl) {
+  if (result.kind === "limit") return "ancestor";
+  if (result.kind === "fault") {
+    if (acl) return "ancestor-acl";
+    return result.fault;
+  }
+  if (acl === "file") return "helper-acl";
+  if (acl) return "ancestor-acl";
+  return "";
+}
+
+// filePath is included in the same listing as the directories. A fault on
+// that file is "helper-acl"; a fault on a directory is "ancestor-acl".
+export function ancestorFault(leafDir, uid = typeof process.getuid === "function" ? process.getuid() : null, filePath = "") {
+  const result = walkToEnd(leafDir, uid);
+  if (result.kind === "limit") return "ancestor";
+  return applyAncestorAcl(result, aclFaultFor(aclEntries(result, filePath, uid)));
+}
+
+export async function ancestorFaultAsync(leafDir, uid = typeof process.getuid === "function" ? process.getuid() : null, filePath = "") {
+  const result = walkToEnd(leafDir, uid);
+  if (result.kind === "limit") return "ancestor";
+  return applyAncestorAcl(result, await aclFaultForAsync(aclEntries(result, filePath, uid)));
 }
 
 function walkAncestors(abs, uid, seenLinks) {
@@ -405,44 +425,99 @@ function trustedLs() {
 }
 
 // "" is clean. "file" means the helper file's entry. "acl" means a directory.
-function aclFaultFor(entries) {
-  if (process.platform !== "darwin" || !entries.length) return "";
+function aclRequest(entries) {
+  if (process.platform !== "darwin" || !entries.length) return { done: "" };
   const self = selfIds();
-  if (!self || self.gid < 0) return "acl";
+  if (!self || self.gid < 0) return { done: "acl" };
   const ls = trustedLs();
-  if (!ls) return "acl";
+  if (!ls) return { done: "acl" };
   const paths = [];
   const seen = new Set();
   const unique = [];
   for (const entry of entries) {
     const filePath = String(entry.path);
-    if (filePath.includes("\n") || filePath.includes("\r")) return "acl";
+    if (filePath.includes("\n") || filePath.includes("\r")) return { done: "acl" };
     paths.push(filePath);
     if (seen.has(filePath)) continue;
     seen.add(filePath);
     unique.push(filePath);
   }
   unique.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
-  aclSpawns += 1;
-  const listed = spawnSync(ls, ["-lde", "-n", ...unique], {
-    encoding: "utf8",
-    env: { LC_ALL: "C", PATH: "/bin:/usr/bin" },
-    timeout: 5000,
-  });
+  return { self, ls, paths, unique, entries };
+}
+
+function aclFromListing(request, listed) {
   if (!listed || listed.error || listed.status !== 0) return "acl";
-  const blocks = splitAclListing(listed.stdout, paths);
+  const blocks = splitAclListing(listed.stdout, request.paths);
   if (!blocks) return "acl";
-  for (let i = 0; i < entries.length; i += 1) {
-    const ownerUid = typeof entries[i].uid === "number" ? entries[i].uid : self.uid;
+  for (let i = 0; i < request.entries.length; i += 1) {
+    const ownerUid = typeof request.entries[i].uid === "number" ? request.entries[i].uid : request.self.uid;
     if (aclListingFault(blocks[i].join("\n"), ownerUid, "")) {
-      return entries[i].file ? "file" : "acl";
+      return request.entries[i].file ? "file" : "acl";
     }
   }
   return "";
 }
 
+function aclFaultFor(entries) {
+  const request = aclRequest(entries);
+  if (request.done !== undefined) return request.done;
+  aclSpawns += 1;
+  const listed = spawnSync(request.ls, ["-lde", "-n", ...request.unique], {
+    encoding: "utf8",
+    env: { LC_ALL: "C", PATH: "/bin:/usr/bin" },
+    timeout: 5000,
+  });
+  return aclFromListing(request, listed);
+}
+
+// Same check as aclFaultFor. spawnSync froze the worker for the whole `ls`,
+// which showed up as a multi-second event-loop gap during a mirror pass.
+// Nothing is cached: the next save lists the paths again.
+function captureSpawn(cmd, args) {
+  return new Promise((resolve) => {
+    let settled = false;
+    function finish(result) {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    }
+    let child;
+    try {
+      child = spawn(cmd, args, {
+        env: { LC_ALL: "C", PATH: "/bin:/usr/bin" },
+        timeout: 5000,
+        killSignal: "SIGKILL",
+      });
+    } catch (error) {
+      finish({ error, status: null, stdout: "" });
+      return;
+    }
+    const out = [];
+    if (child.stdout) child.stdout.on("data", (chunk) => out.push(chunk));
+    if (child.stderr) child.stderr.on("data", () => {});
+    child.on("error", (error) => finish({ error, status: null, stdout: "" }));
+    child.on("close", (status) => {
+      finish({ error: null, status, stdout: Buffer.concat(out).toString("utf8") });
+    });
+  });
+}
+
+async function aclFaultForAsync(entries) {
+  const request = aclRequest(entries);
+  if (request.done !== undefined) return request.done;
+  aclSpawns += 1;
+  const listed = await captureSpawn(request.ls, ["-lde", "-n", ...request.unique]);
+  return aclFromListing(request, listed);
+}
+
 function foreignAcl(filePath, ownerUid) {
   return aclFaultFor([{ path: filePath, uid: ownerUid, file: true }]) ? "acl" : "";
+}
+
+async function foreignAclAsync(filePath, ownerUid) {
+  const fault = await aclFaultForAsync([{ path: filePath, uid: ownerUid, file: true }]);
+  return fault ? "acl" : "";
 }
 
 // A umask 002 checkout leaves the helper group-writable. Saves keep refusing
@@ -517,7 +592,7 @@ async function openTrustedHelper(env = process.env) {
   const base = path.basename(filePath);
   if (!base || base === "." || base === ".." || base.includes("/") || base.includes("\\")) throw helperUnavailable("pin");
   const parentPath = path.dirname(filePath);
-  const fault = ancestorFault(parentPath, uid);
+  const fault = await ancestorFaultAsync(parentPath, uid);
   if (fault) throw helperUnavailable(fault);
   let listed;
   let parentListed;
@@ -564,7 +639,7 @@ async function openTrustedHelper(env = process.env) {
     if (!ownedAndPrivate(again, uid)) throw helperUnavailable("owner");
     if (!ownedByAcceptableParent(parentAgain, uid)) throw helperUnavailable("race");
     if (parentAgain.dev !== parentStat.dev || parentAgain.ino !== parentStat.ino) throw helperUnavailable("race");
-    if (foreignAcl(filePath, again.uid)) throw helperUnavailable("helper-acl");
+    if (await foreignAclAsync(filePath, again.uid)) throw helperUnavailable("helper-acl");
     return { handle: file, path: filePath };
   } catch (error) {
     if (file) await file.close();
@@ -581,22 +656,26 @@ function sameInode(listed, opened) {
 
 function callHelper(dirHandle, args, body, borrowed) {
   const ready = borrowed ? Promise.resolve(borrowed) : openTrustedHelper();
-  return ready.then((tool) => new Promise((resolve, reject) => {
+  return ready.then(async (tool) => {
+    // The same checked descriptor is reused for every call in one save.
+    // The folder walk still runs before each exec: a parent can change
+    // without the open file descriptor changing. The listing is async so
+    // the walk does not freeze the caller while `ls` runs.
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    const fault = await ancestorFaultAsync(path.dirname(tool.path), uid, tool.path);
+    if (fault) {
+      if (!borrowed) {
+        try { await tool.handle.close(); } catch { /* already closed */ }
+      }
+      throw helperUnavailable(fault);
+    }
+    return new Promise((resolve, reject) => {
     function rejectClosed(error) {
       if (borrowed) {
         reject(error);
         return;
       }
       Promise.resolve(tool.handle.close()).then(() => reject(error), () => reject(error));
-    }
-    // The same checked descriptor is reused for every call in one save.
-    // The folder walk still runs before each exec: a parent can change
-    // without the open file descriptor changing.
-    const uid = typeof process.getuid === "function" ? process.getuid() : null;
-    const fault = ancestorFault(path.dirname(tool.path), uid, tool.path);
-    if (fault) {
-      rejectClosed(helperUnavailable(fault));
-      return;
     }
     // macOS will not execute /dev/fd. Recheck the path, then execute that path.
     // Linux executes the descriptor that was hashed, through /proc/self/fd.
@@ -662,7 +741,8 @@ function callHelper(dirHandle, args, body, borrowed) {
     });
     if (body && body.length) child.stdin.write(body);
     child.stdin.end();
-  }));
+    });
+  });
 }
 
 function parseIdentity(text) {

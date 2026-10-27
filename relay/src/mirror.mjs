@@ -13,7 +13,6 @@ import {
   statEntry,
   unlinkIfSame,
 } from "../../editor/dirfd.mjs";
-import { INDEX_ID } from "./ids.mjs";
 import { noteMirror } from "./index-trace.mjs";
 import { logSafe } from "./redact.mjs";
 import { prepareNoteFile, safeNotePath } from "./paths.mjs";
@@ -22,19 +21,10 @@ function yieldNow() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-function plainDoc(doc) {
-  try {
-    return JSON.parse(JSON.stringify(doc));
-  } catch {
-    return null;
-  }
-}
-
 function noteText(doc) {
-  const plain = plainDoc(doc);
-  if (!plain || plain.kind !== "note") return null;
-  if (typeof plain.text === "string") return plain.text;
-  if (plain.text == null) return "";
+  if (!doc || doc.kind !== "note") return null;
+  if (typeof doc.text === "string") return doc.text;
+  if (doc.text == null) return "";
   return null;
 }
 
@@ -735,20 +725,30 @@ export async function replaceNoteAtomic(file, text, options = {}) {
   }
 }
 
-async function noteBlockedBySibling(file) {
+function siblingError(code) {
+  const error = new Error(code === "RECOVER" ? "recovery sibling" : "outside edit unchecked");
+  error.code = code;
+  return error;
+}
+
+// null when the note may be written. An error when a temp or .recover file
+// is sitting next to it, or the directory cannot be listed. A failed check
+// refuses the write: skipping the check and writing the note drops the edit.
+async function noteSiblingFault(file) {
   const dir = path.dirname(file);
   const base = path.basename(file);
   let names;
   try {
     names = await fs.readdir(dir);
-  } catch {
-    return false;
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    return error && error.code ? error : siblingError("EREAD");
   }
   for (const name of names) {
-    if (name.startsWith("." + base + ".") && name.endsWith(".tmp")) return true;
-    if (name.startsWith(base + ".") && name.endsWith(".recover")) return true;
+    if (name.startsWith("." + base + ".") && name.endsWith(".tmp")) return siblingError("RECOVER");
+    if (name.startsWith(base + ".") && name.endsWith(".recover")) return siblingError("RECOVER");
   }
-  return false;
+  return null;
 }
 
 // Write each note beside its final name, then rename it into place through
@@ -765,7 +765,14 @@ export async function saveNoteBatch(entries, options = {}) {
     const tmp = noteTempPath(entry.file);
     try {
       const rel = vault && stateDir ? tempRelative(vault, tmp) : "";
-      prepared.push({ file: entry.file, text: entry.text, beforeRename: entry.beforeRename, tmp, rel });
+      prepared.push({
+        file: entry.file,
+        text: entry.text,
+        beforeRename: entry.beforeRename,
+        tmp,
+        rel,
+        docId: entry.docId,
+      });
     } catch (error) {
       errors.push({ error, file: entry.file });
     }
@@ -776,6 +783,11 @@ export async function saveNoteBatch(entries, options = {}) {
   if (typeof options.afterManifest === "function") await options.afterManifest(prepared);
   for (const entry of prepared) {
     await yieldNow();
+    let release = () => {};
+    if (typeof options.around === "function") {
+      const out = options.around(entry);
+      if (typeof out === "function") release = out;
+    }
     try {
       await replaceNoteAtomic(entry.file, entry.text, {
         vault,
@@ -787,6 +799,8 @@ export async function saveNoteBatch(entries, options = {}) {
       });
     } catch (error) {
       errors.push({ error, file: entry.file });
+    } finally {
+      release();
     }
   }
   return errors;
@@ -862,43 +876,50 @@ export function createMirror({
     await replaceNoteAtomic(recordFile, body, { vault, recordManifest: false });
   }
 
-  function indexPaths() {
+  async function indexPaths() {
     const paths = {};
     for (const handle of Object.values(repo.handles)) {
+      await yieldNow();
       let doc;
       try {
         doc = handle.doc();
       } catch {
         continue;
       }
-      const plain = plainDoc(doc);
-      if (!plain || plain.kind !== "index" || !plain.paths || typeof plain.paths !== "object") continue;
-      for (const [notePath, docId] of Object.entries(plain.paths)) {
+      if (!doc || doc.kind !== "index" || !doc.paths || typeof doc.paths !== "object") continue;
+      for (const [notePath, docId] of Object.entries(doc.paths)) {
         if (typeof docId === "string" && safeNotePath(notePath)) paths[notePath] = docId;
       }
     }
     return paths;
   }
 
+  function blockNote(blocked, notePath, docId, error) {
+    blocked.set(notePath, { docId, error });
+    logSafe(secrets, foldInFailureLine(docId, error));
+  }
+
   async function foldOutside() {
+    const blocked = new Map();
     const known = await hashes();
-    const paths = indexPaths();
+    const paths = await indexPaths();
     for (const [notePath, docId] of Object.entries(paths)) {
       await yieldNow();
       const handle = repo.handles[docId];
       if (!handle) continue;
       const file = await prepareNoteFile(vault, notePath);
       if (!file) continue;
-      if (await noteBlockedBySibling(file)) {
-        const error = new Error("recovery sibling");
-        error.code = "RECOVER";
-        logSafe(secrets, foldInFailureLine(docId, error));
+      const sibling = await noteSiblingFault(file);
+      if (sibling) {
+        blockNote(blocked, notePath, docId, sibling);
         continue;
       }
       let fileText;
       try {
         fileText = await fs.readFile(file, "utf8");
-      } catch {
+      } catch (error) {
+        if (error && error.code === "ENOENT") continue;
+        blockNote(blocked, notePath, docId, error && error.code ? error : siblingError("EREAD"));
         continue;
       }
       const fileHash = digest(fileText);
@@ -943,15 +964,16 @@ export function createMirror({
         lastWritten.set(notePath, merged);
         incorporated.set(notePath, fileHash);
       } catch (error) {
-        logSafe(secrets, foldInFailureLine(docId, error));
+        blockNote(blocked, notePath, docId, error && error.code ? error : siblingError("EREAD"));
       }
       await yieldNow();
     }
+    return blocked;
   }
 
-  async function writeNotes() {
+  async function writeNotes(blocked) {
     const known = await hashes();
-    const paths = indexPaths();
+    const paths = await indexPaths();
     let changed = false;
     const batch = [];
     for (const [notePath, docId] of Object.entries(paths)) {
@@ -966,6 +988,10 @@ export function createMirror({
       }
       if (text == null) continue;
       const file = await prepareNoteFile(vault, notePath);
+      if (blocked && blocked.has(notePath)) {
+        await yieldNow();
+        continue;
+      }
       if (!file) {
         const candidate = path.join(vault, ...notePath.split("/"));
         try {
@@ -981,10 +1007,21 @@ export function createMirror({
         await yieldNow();
         continue;
       }
+      const sibling = await noteSiblingFault(file);
+      if (sibling) {
+        logSafe(secrets, mirrorNoteFailureLine(docId, sibling));
+        await yieldNow();
+        continue;
+      }
       let existing = null;
       try {
         existing = await fs.readFile(file, "utf8");
-      } catch {
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") {
+          logSafe(secrets, mirrorNoteFailureLine(docId, error && error.code ? error : siblingError("EREAD")));
+          await yieldNow();
+          continue;
+        }
         existing = null;
       }
       if (existing === text) {
@@ -999,14 +1036,18 @@ export function createMirror({
       batch.push({ file, text, notePath, docId });
     }
     if (batch.length) {
-      const releases = batch.map((entry) => held(entry.docId));
+      batch.sort((a, b) => (a.notePath < b.notePath ? -1 : a.notePath > b.notePath ? 1 : 0));
       let errors;
       try {
-        errors = await saveNoteBatch(batch, { vault, stateDir });
+        errors = await saveNoteBatch(batch, {
+          vault,
+          stateDir,
+          around(entry) {
+            return held(entry.docId);
+          },
+        });
       } catch (error) {
         errors = batch.map((entry) => ({ error, file: entry.file }));
-      } finally {
-        for (const release of releases) release();
       }
       const failed = new Set(errors.map((item) => item.file));
       for (const item of errors) {
@@ -1026,12 +1067,10 @@ export function createMirror({
   async function syncDisk() {
     chain = chain.then(() => track(async () => {
       const started = performance.now();
-      const releaseIndex = held(INDEX_ID);
       try {
-        await foldOutside();
-        await writeNotes();
+        const blocked = await foldOutside();
+        await writeNotes(blocked);
       } finally {
-        releaseIndex();
         noteMirror(performance.now() - started);
       }
     })).catch((error) => {

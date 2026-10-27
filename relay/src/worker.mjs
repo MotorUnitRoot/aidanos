@@ -124,14 +124,16 @@ class ParentAdapter extends NetworkAdapter {
     this.emit("peer-candidate", { peerId, peerMetadata: metadata || null });
   }
 
-  inbound(conn, data) {
+  inbound(conn, data, parsed) {
     const peerId = this.byConn.get(conn);
     if (!peerId) return;
-    let message;
-    try {
-      message = decode(Buffer.from(data));
-    } catch {
-      return;
+    let message = parsed;
+    if (message === undefined) {
+      try {
+        message = decode(new Uint8Array(data));
+      } catch {
+        return;
+      }
     }
     if (!message || typeof message !== "object") return;
     if (message.senderId && message.senderId !== peerId) return;
@@ -289,6 +291,7 @@ async function run() {
   let crashBusySaveUsed = false;
   let crashDelayUsed = false;
   let crashBusyRequestUsed = false;
+  let crashNoteWriteUsed = false;
   const saveTasks = new Set();
   function trackSave(work) {
     const id = saveSeq;
@@ -351,6 +354,16 @@ async function run() {
     stateDir: data.dataDir,
     hold(docId) {
       enter(docId);
+      if (
+        readyForWork &&
+        test &&
+        test.crashNoteWrite &&
+        !crashNoteWriteUsed &&
+        crashDocMatches(docId)
+      ) {
+        crashNoteWriteUsed = true;
+        die();
+      }
       return () => leave(docId);
     },
   });
@@ -553,7 +566,8 @@ async function run() {
       return;
     }
     if (msg.kind === "msg") {
-      const docId = documentIdOf(msg.data);
+      const message = decodeFrame(msg.data);
+      const docId = message && typeof message.documentId === "string" ? message.documentId : "";
       enter(docId);
       writeSlot(slot, msg.conn, docId);
       if (test && test.badChannel && !badUsed) {
@@ -583,7 +597,10 @@ async function run() {
         }
         if (docId) holdBusy();
         if (docId) runOom();
-        adapter.inbound(msg.conn, msg.data);
+        // Decode already ran. Yield before Automerge so that work is not one
+        // gap with the receive that follows it.
+        await new Promise((resolve) => setImmediate(resolve));
+        adapter.inbound(msg.conn, msg.data, message);
       } finally {
         if (!keepSlot) {
           const size = msg.data instanceof ArrayBuffer ? msg.data.byteLength : 0;
@@ -612,14 +629,17 @@ async function run() {
 
 }
 
-function documentIdOf(data) {
-  if (!(data instanceof ArrayBuffer)) return "";
+function decodeFrame(data) {
+  let bytes = null;
+  if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+  else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  if (!bytes) return null;
   try {
-    const message = decode(Buffer.from(data));
-    if (!message || typeof message !== "object") return "";
-    return typeof message.documentId === "string" ? message.documentId : "";
+    const message = decode(bytes);
+    if (!message || typeof message !== "object") return null;
+    return message;
   } catch {
-    return "";
+    return null;
   }
 }
 

@@ -2306,6 +2306,7 @@ test("a reset warms the sync engine before devices are told it is ready", async 
   const activate = source.slice(source.indexOf("async function activateSession"), source.indexOf("async function rotate"));
   const published = activate.indexOf("live = session");
   assert.equal(activate.includes("warmSyncEngine()"), false);
+  assert.match(source, /timersOnly:\s*true/);
   assert.ok(published > 0);
   const warmAt = workerSource.indexOf("const warmMs = performance.now() - warmStarted");
   const readyAt = workerSource.indexOf('kind: "ready"');

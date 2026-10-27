@@ -467,9 +467,11 @@ test("two crashes on one document refuse later frames for it", async () => {
     assert.equal(health.status, 200);
     assert.equal(body.status, "ok");
     assert.equal(relay.refusedDocs().includes(id), true);
+    assert.equal(relay.refusedDocs().includes(INDEX_ID), false);
     const poison = seen.filter((line) => line.includes("poison document"));
     assert.ok(poison.length >= 1, seen.join("\n"));
-    assert.equal(poison.some((line) => line.includes(id)), false, poison.join("\n"));
+    assert.equal(poison.some((line) => line.includes(id)), true, poison.join("\n"));
+    assert.equal(poison.some((line) => line.includes(INDEX_ID)), false, poison.join("\n"));
   } finally {
     console.error = write;
     await relay.close();
@@ -1049,9 +1051,11 @@ async function crashRequest(relay, sender, id) {
 async function assertKeptAndOtherSyncs(relay, seen, id) {
   await waitReady(relay);
   assert.equal(relay.refusedDocs().includes(id), true);
+  assert.equal(relay.refusedDocs().includes(INDEX_ID), false);
   const poison = seen.filter((line) => line.includes("poison document"));
   assert.ok(poison.length >= 1, seen.join("\n"));
-  assert.equal(poison.some((line) => line.includes(id)), false);
+  assert.equal(poison.some((line) => line.includes(id)), true, poison.join("\n"));
+  assert.equal(poison.some((line) => line.includes(INDEX_ID)), false, poison.join("\n"));
   const health = await fetch(relay.healthURL);
   const body = await health.json();
   assert.equal(health.status, 200);
@@ -1082,6 +1086,71 @@ async function assertKeptAndOtherSyncs(relay, seen, id) {
   assert.equal(againBody.status, "ok");
   ws.close();
 }
+
+test("a crash refuses only the note in flight, not the index or another note", async () => {
+  const dir = await tempDir();
+  const seen = [];
+  const write = console.error;
+  console.error = (text) => seen.push(String(text));
+  const id = noteId("notes/z-only.md");
+  const other = noteId("notes/a-other.md");
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+    mirrorDebounceMs: 60_000,
+    testCrashNoteWrite: true,
+    testCrashDoc: id,
+  });
+  try {
+    await relay.repo.import(Automerge.save(Automerge.from({
+      kind: "index",
+      paths: { "notes/a-other.md": other, "notes/z-only.md": id },
+    })), { docId: INDEX_ID });
+    await relay.repo.import(Automerge.save(Automerge.from({ kind: "note", text: "other-v1" })), { docId: other });
+    await relay.repo.import(Automerge.save(Automerge.from({ kind: "note", text: "only-v1" })), { docId: id });
+    await relay.repo.flush();
+    try {
+      await relay.mirrorNow();
+    } catch {
+      // The worker exits while that note is the one in flight.
+    }
+    await waitDown(relay);
+    await waitReady(relay);
+    const otherHandle = await relay.repo.find(other);
+    otherHandle.change((doc) => {
+      doc.text = "other-v2";
+    });
+    await otherHandle;
+    const onlyHandle = await relay.repo.find(id);
+    onlyHandle.change((doc) => {
+      doc.text = "only-v2";
+    });
+    await onlyHandle;
+    await relay.repo.flush();
+    try {
+      await relay.mirrorNow();
+    } catch {
+      // Second crash of the same note.
+    }
+    await waitDown(relay);
+    await waitReady(relay);
+    const refused = relay.refusedDocs();
+    assert.equal(refused.includes(id), true, refused.join(","));
+    assert.equal(refused.includes(other), false, refused.join(","));
+    assert.equal(refused.includes(INDEX_ID), false, refused.join(","));
+    const poison = seen.filter((line) => line.includes("poison document"));
+    assert.ok(poison.length >= 1, seen.join("\n"));
+    assert.equal(poison.some((line) => line.includes(id)), true, poison.join("\n"));
+    assert.equal(poison.some((line) => line.includes(other)), false, poison.join("\n"));
+    assert.equal(poison.some((line) => line.includes(INDEX_ID)), false, poison.join("\n"));
+  } finally {
+    console.error = write;
+    await relay.close();
+  }
+});
 
 test("a crash on the next tick refuses that document and leaves another syncing", async () => {
   const dir = await tempDir();
@@ -1376,6 +1445,11 @@ test("a recovery sibling is not folded into the shared note", async () => {
   try {
     const handle = await second.repo.find(id);
     assert.equal(handle.doc().text, full);
+    assert.equal(await fs.readFile(file, "utf8"), "torn");
+    await second.mirrorNow();
+    const again = await second.repo.find(id);
+    assert.equal(again.doc().text, full);
+    assert.equal(await fs.readFile(file, "utf8"), "torn");
     assert.equal(seen.some((line) => line.includes("fold-in failed for " + id + " RECOVER")), true, seen.join("\n"));
     assert.equal(seen.some((line) => line.includes("keep.md")), false, seen.join("\n"));
   } finally {

@@ -285,6 +285,10 @@ export async function installIndexTrace(log, options = {}) {
   if (options.thread === "worker" || options.thread === "main") threadName = options.thread;
   else threadName = isMainThread ? "main" : "worker";
   startLagTimer();
+  // The accept thread only needs the lag timer. Loading the Automerge wasm
+  // wrappers here put that work, and its garbage, on the thread that accepts
+  // sync connections.
+  if (options.timersOnly) return;
   const custom = typeof options.load === "function";
   try {
     if (custom) {

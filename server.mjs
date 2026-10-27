@@ -672,6 +672,20 @@ function sameLock(recorded, live) {
   return true;
 }
 
+// rename(2) keeps the inode and the bytes, and it updates ctime. The check
+// after the quarantine rename still requires the same device, inode, size,
+// birthtime when both sides have one, and content hash. ctime may move
+// forward. A ctime that goes backwards is not the file we just renamed.
+function sameMovedLock(recorded, live) {
+  if (!recorded || !live) return false;
+  if (recorded.dev !== live.dev || recorded.ino !== live.ino) return false;
+  if (recorded.size !== live.size) return false;
+  if (recorded.birthtimeMs != null && live.birthtimeMs != null && recorded.birthtimeMs !== live.birthtimeMs) return false;
+  if (!recorded.hash || !live.hash || recorded.hash !== live.hash) return false;
+  if (typeof live.ctimeMs !== "number" || live.ctimeMs < recorded.ctimeMs) return false;
+  return true;
+}
+
 // A planted lock bigger than this is not hashed and therefore not deleted.
 const LOCK_HASH_MAX = 1024 * 1024;
 
@@ -817,9 +831,11 @@ function procDenied(error) {
 // when every same-uid process was inspected and none has the inode open.
 // The recorded identity includes a sha256 of the bytes. A same-size file
 // created again does not match that hash, so it is kept. Removal renames
-// the lock to a unique quarantine name, then checks the identity, the
-// hash, and the holder on that renamed file before unlink. A failed
-// re-check renames it back, or leaves it and reports the pause.
+// the lock to a unique quarantine name, then checks the inode, the hash,
+// and the holder on that renamed file before unlink. rename updates
+// ctime, so that check allows ctime to move forward and rejects a ctime
+// that goes backwards. A failed re-check renames it back, or leaves it
+// and reports the pause.
 // Same-account gap: an unreadable same-uid process keeps the lock even
 // when it does not hold it.
 async function linuxProcessHolds(dev, ino) {
@@ -930,10 +946,10 @@ function restoreQuarantine(quarantine, lockPath) {
 }
 
 // True when this call removed the recorded lock. False leaves a lock in place.
-// The file is renamed to a unique quarantine name first. Identity, content
-// hash, and the holder are checked again on that renamed file. A failed
-// re-check renames it back when index.lock is free, and otherwise leaves
-// the quarantine file. Neither path prints the file name.
+// The file is renamed to a unique quarantine name first. The renamed file
+// must still be that inode and hash, with ctime equal or newer, and no
+// holder. A failed re-check renames it back when index.lock is free, and
+// otherwise leaves the quarantine file. Neither path prints the file name.
 async function quarantineRecordedLock(vault, identity) {
   if (process.env.NODE_ENV === "test" && gitLockBeforeUnlinkForTest) {
     const fn = gitLockBeforeUnlinkForTest;
@@ -962,7 +978,7 @@ async function quarantineRecordedLock(vault, identity) {
   }
   const moved = readLockFile(quarantine);
   const movedIdentity = moved ? lockIdentity(moved.st, moved.hash) : null;
-  const stillSame = Boolean(movedIdentity && sameLock(identity, movedIdentity));
+  const stillSame = Boolean(movedIdentity && sameMovedLock(identity, movedIdentity));
   const holders = stillSame ? await processHoldsLock(quarantine, moved.st.dev, moved.st.ino) : "unknown";
   if (stillSame && holders === "free") {
     try {
@@ -1013,8 +1029,9 @@ export function rememberUnlinkLock(errText, vault = VAULT) {
 // Drop index.lock only when it is still the file our failed git recorded
 // (device, inode, size, ctime, birthtime where both sides have one, and
 // the sha256 of the bytes) and no live process has it open. Removal
-// renames that file aside and requires the same identity, hash, and a
-// free holder on the renamed file before unlink. A lock this relay did
+// renames that file aside. The renamed file must still be that inode and
+// hash, with ctime equal or newer, and a free holder, before unlink. A
+// lock this relay did
 // not record stays, however old it is. A symlink on the way to .git, a
 // lock outside .git, and a lock a live git still holds stay put. A lock
 // we leave in place is logged once per vault with no path.

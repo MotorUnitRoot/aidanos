@@ -24,10 +24,141 @@ export function redact(text, secrets) {
   out = out.replace(/file:\/\/[^\s]+/gi, "[url]");
   // Same scrub for stderr and fatal.log. A vault path or a note file name
   // must not land in either. Document ids have neither a slash nor a .md suffix.
-  out = out.replace(/(^|[\s"'`(])(?:\/|~\/)[^\s"'`)]+/g, "$1[path]");
-  out = out.replace(/(^|[\s"'`(])[^\s"'`)]+\/[^\s"'`)]+\.md\b/g, "$1[path]");
-  out = out.replace(/(^|[\s"'`(=:])[^\s"'`)/]+\.md\b/g, "$1[note]");
-  return out;
+  return scrubLocations(out);
+}
+
+// One log line, then the marker. The scanner never sees more than this.
+export const LOG_LINE_CAP = 8 * 1024;
+
+function capLine(line) {
+  // A code unit at or below 127 is one UTF-8 byte, so the byte length is the
+  // string length. Wider lines are measured and cut on a code-point boundary.
+  if (line.length <= LOG_LINE_CAP) {
+    let ascii = true;
+    for (let i = 0; i < line.length; i += 1) {
+      if (line.charCodeAt(i) > 127) {
+        ascii = false;
+        break;
+      }
+    }
+    if (ascii) return line;
+  }
+  const buf = Buffer.from(line);
+  if (buf.length <= LOG_LINE_CAP) return line;
+  let end = LOG_LINE_CAP;
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end -= 1;
+  return buf.toString("utf8", 0, end) + "[truncated]";
+}
+
+// Token boundaries. A slash stays inside the token so /a/b and a/b are one path.
+function isBreak(code) {
+  return code <= 32 || code === 34 || code === 39 || code === 40 || code === 41
+    || code === 58 || code === 60 || code === 61 || code === 62 || code === 91
+    || code === 93 || code === 96;
+}
+
+// Index lines record a step as 3x/1.2ms. That slash is not a vault path.
+function isDurationCount(token) {
+  let i = 0;
+  const n = token.length;
+  if (n < 6 || token.charCodeAt(0) < 48 || token.charCodeAt(0) > 57) return false;
+  while (i < n && token.charCodeAt(i) >= 48 && token.charCodeAt(i) <= 57) i += 1;
+  if (i + 1 >= n || token.charCodeAt(i) !== 120 || token.charCodeAt(i + 1) !== 47) return false;
+  i += 2;
+  if (i >= n || token.charCodeAt(i) < 48 || token.charCodeAt(i) > 57) return false;
+  while (i < n && token.charCodeAt(i) >= 48 && token.charCodeAt(i) <= 57) i += 1;
+  if (i < n && token.charCodeAt(i) === 46) {
+    i += 1;
+    if (i >= n || token.charCodeAt(i) < 48 || token.charCodeAt(i) > 57) return false;
+    while (i < n && token.charCodeAt(i) >= 48 && token.charCodeAt(i) <= 57) i += 1;
+  }
+  return token.charCodeAt(i) === 109 && token.charCodeAt(i + 1) === 115 && i + 2 === n;
+}
+
+// One forward pass. Each character is copied or skipped once, so a line of
+// '(a/' or 'a/a/a/' cannot blow up the way a nested quantifier did.
+function scrubPaths(line) {
+  const n = line.length;
+  const parts = [];
+  let i = 0;
+  while (i < n) {
+    const start = i;
+    while (i < n && isBreak(line.charCodeAt(i))) i += 1;
+    if (i > start) parts.push(line.slice(start, i));
+    if (i >= n) break;
+    const tokenStart = i;
+    let slash = false;
+    while (i < n && !isBreak(line.charCodeAt(i))) {
+      if (line.charCodeAt(i) === 47) slash = true;
+      i += 1;
+    }
+    const token = line.slice(tokenStart, i);
+    parts.push(slash && !isDurationCount(token) ? "[path]" : token);
+  }
+  return parts.join("");
+}
+
+function matchNoteExt(line, i) {
+  if (i + 3 > line.length || line.charCodeAt(i) !== 46) return 0;
+  const a = line.charCodeAt(i + 1);
+  const b = line.charCodeAt(i + 2);
+  const m = a === 77 || a === 109;
+  const d = b === 68 || b === 100;
+  if (!m || !d) return 0;
+  const after = i + 3;
+  if (after < line.length) {
+    const c = line.charCodeAt(after);
+    const word = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
+    if (word) return 0;
+  }
+  return after;
+}
+
+// A note name may contain spaces. The left edge is the line start, a quote,
+// a colon, or a slash. Walking stops at a span already claimed, so the pass
+// stays linear. .md and .MD are the same suffix.
+function scrubNotes(line) {
+  const n = line.length;
+  const drop = new Uint8Array(n);
+  let i = 0;
+  while (i < n) {
+    const ext = matchNoteExt(line, i);
+    if (!ext) {
+      i += 1;
+      continue;
+    }
+    let start = i;
+    while (start > 0 && !drop[start - 1]) {
+      const c = line.charCodeAt(start - 1);
+      if (c === 39 || c === 34 || c === 96 || c === 58 || c === 47 || c === 10) break;
+      start -= 1;
+    }
+    for (let k = start; k < ext; k += 1) drop[k] = 1;
+    i = ext;
+  }
+  const parts = [];
+  let k = 0;
+  while (k < n) {
+    if (!drop[k]) {
+      const start = k;
+      while (k < n && !drop[k]) k += 1;
+      parts.push(line.slice(start, k));
+      continue;
+    }
+    while (k < n && drop[k]) k += 1;
+    parts.push("[note]");
+  }
+  return parts.join("");
+}
+
+function scrubLine(line) {
+  return scrubNotes(scrubPaths(line));
+}
+
+function scrubLocations(text) {
+  const lines = String(text).split("\n");
+  for (let i = 0; i < lines.length; i += 1) lines[i] = scrubLine(capLine(lines[i]));
+  return lines.join("\n");
 }
 
 export function stampLine(line, now = new Date()) {
@@ -200,7 +331,7 @@ const FATAL_RESTART_LINE = "fatal log restarted\n";
 // is refused even when root owns it. Other owner rules match the helper walk:
 // root or this user, and group or other write only on a sticky root directory.
 function stateDirAllowed(dir, uid) {
-  if (typeof uid !== "number") return false;
+  if (typeof uid !== "number") return null;
   const abs = path.resolve(dir);
   const parts = abs.split(path.sep).filter(Boolean);
   let cursor = path.parse(abs).root;
@@ -216,20 +347,25 @@ function stateDirAllowed(dir, uid) {
   try {
     rootStat = lstatSync(cursor);
   } catch {
-    return false;
+    return null;
   }
-  if (!check(rootStat)) return false;
+  if (!check(rootStat)) return null;
+  // The leaf's dev+ino is the one the open must match. A later lstat can
+  // name a different directory than the one this walk accepted.
+  let recorded = rootStat;
   for (const part of parts) {
     cursor = path.join(cursor, part);
     let st;
     try {
       st = lstatSync(cursor);
     } catch {
-      return false;
+      return null;
     }
-    if (!check(st)) return false;
+    if (!check(st)) return null;
+    recorded = st;
   }
-  return cursor === abs;
+  if (cursor !== abs) return null;
+  return { dev: recorded.dev, ino: recorded.ino };
 }
 
 function refuseFatalFallback(stderrFd, bytes) {
@@ -262,18 +398,18 @@ function appendFatalFallback(bytes, stderrFd) {
   const directory = fsConstants.O_DIRECTORY;
   if (typeof nofollow !== "number" || typeof directory !== "number") return refuseFatalFallback(stderrFd, bytes);
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
-  if (!stateDirAllowed(fatalFallbackDir, uid)) return refuseFatalFallback(stderrFd, bytes);
+  const recorded = stateDirAllowed(fatalFallbackDir, uid);
+  if (!recorded) return refuseFatalFallback(stderrFd, bytes);
   let dirfd = -1;
   let fd = -1;
   try {
     dirfd = openSync(fatalFallbackDir, fsConstants.O_RDONLY | directory | nofollow);
     const openedDir = fstatSync(dirfd);
-    const listedDir = lstatSync(fatalFallbackDir);
     if (
       !openedDir.isDirectory() ||
       openedDir.isSymbolicLink() ||
-      openedDir.dev !== listedDir.dev ||
-      openedDir.ino !== listedDir.ino
+      openedDir.dev !== recorded.dev ||
+      openedDir.ino !== recorded.ino
     ) {
       return refuseFatalFallback(stderrFd, bytes);
     }

@@ -23,7 +23,7 @@ import {
   traceStorage,
   watchRepo,
 } from "./index-trace.mjs";
-import { createMirror, saveNoteFile } from "./mirror.mjs";
+import { createMirror, discardOpenNoteTemps, saveNoteFile, sweepStaleNoteTemps } from "./mirror.mjs";
 import { flushFileLog, installFileLog, logFatal, logSafe, pauseFileLog, setFatalFallbackDir, stampLine } from "./redact.mjs";
 import { describeSyncFrame } from "./sync-log.mjs";
 
@@ -586,6 +586,7 @@ export async function startRelay(options = {}) {
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
   await installIndexTrace((line) => logSafe(secrets, line));
   await assertNotClientVault(vault);
+  await sweepStaleNoteTemps(vault);
   await claimRelayFolders(vault, dataDir);
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);
@@ -1170,7 +1171,11 @@ export async function startRelay(options = {}) {
         } catch { /* close() stops the rest */ }
       }
       const result = await waitForInflightSaves(saveWaitBound(env));
-      if (result === "timeout") logSafe(secrets, SAVE_WAIT_TIMEOUT_LINE);
+      if (result === "timeout") {
+        logSafe(secrets, SAVE_WAIT_TIMEOUT_LINE);
+        await discardOpenNoteTemps();
+      }
+      return result;
     },
   };
   if (env.NODE_ENV === "test" && env.AIDANOS_RELAY_TEST_SLOW_SAVE === "1") {
@@ -1279,18 +1284,24 @@ async function main() {
       } catch { /* exit still runs */ }
       process.exit(code);
     };
+    let saveWaitTimedOut = false;
     giveUp = () => exitWith(1, SHUTDOWN_TIMEOUT_LINE);
     const beginClose = () => {
       if (settled) return;
       // The 5s close deadline starts only after in-flight saves settle,
-      // or after the 12s save bound has already been logged.
+      // or after the 12s save bound has already been logged. A save wait
+      // that hit that bound still closes, then exits 1.
       deadlineTimer = setTimeout(() => giveUp(), shutdownDeadline());
+      const code = saveWaitTimedOut ? 1 : 0;
       Promise.resolve(relay.close()).then(
-        () => exitWith(0, "relay log closed"),
-        () => exitWith(0, "relay log closed"),
+        () => exitWith(code, "relay log closed"),
+        () => exitWith(code, "relay log closed"),
       );
     };
-    Promise.resolve(relay.stopAcceptingAndDrainSaves()).then(beginClose, beginClose);
+    Promise.resolve(relay.stopAcceptingAndDrainSaves()).then((result) => {
+      saveWaitTimedOut = result === "timeout";
+      beginClose();
+    }, beginClose);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

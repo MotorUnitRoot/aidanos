@@ -11,6 +11,7 @@ import { INDEX_ID } from "./ids.mjs";
 
 const require = createRequire(import.meta.url);
 const SLOW_MS = 20;
+export const INDEX_TRACE_ENTRY_CAP = 10_000;
 const LAG_LOG_MS = 200;
 const LAG_COUNT_MS = 100;
 const LAG_INTERVAL_MS = 100;
@@ -86,7 +87,11 @@ function formatHeads(heads) {
 function keep(entry) {
   recent.push(entry);
   if (recent.length > 400) recent.shift();
-  if (window) window.entries.push(entry);
+  if (window) {
+    window.entries.push(entry);
+    const extra = window.entries.length - INDEX_TRACE_ENTRY_CAP;
+    if (extra > 0) window.entries.splice(0, extra);
+  }
   if (entry.ms >= SLOW_MS) {
     queueMicrotask(() => {
       if (entry.logged) return;

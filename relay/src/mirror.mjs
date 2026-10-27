@@ -106,13 +106,91 @@ function digest(text) {
   return crypto.createHash("sha256").update(String(text), "utf8").digest("hex");
 }
 
+// `.{note}.{pid}.tmp` beside the note. The pid is the relay's, so a later
+// start can tell a crashed write from one this process still holds.
+const NOTE_TEMP_NAME = /^\.(.+)\.(\d+)\.tmp$/;
+const openNoteTemps = new Set();
+
+function noteTempPath(file, pid = process.pid) {
+  return path.join(path.dirname(file), `.${path.basename(file)}.${pid}.tmp`);
+}
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !error || error.code !== "ESRCH";
+  }
+}
+
+async function removeOwnedRegular(file) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (typeof uid !== "number") return;
+  let st;
+  try {
+    st = await fs.lstat(file);
+  } catch {
+    return;
+  }
+  if (st.isSymbolicLink() || !st.isFile() || st.uid !== uid) return;
+  try {
+    await fs.unlink(file);
+  } catch { /* already gone, or it changed under us */ }
+}
+
+// Temps this process has written and not yet renamed. Called when the save
+// wait gives up, so the whole note does not stay in the vault under a dot name.
+export async function discardOpenNoteTemps() {
+  const pending = [...openNoteTemps];
+  await Promise.all(pending.map((file) => removeOwnedRegular(file)));
+}
+
+// Dead pids only. A symlink is left alone, including one that points at a
+// directory, and a file we do not own is left alone. lstat, never stat.
+export async function sweepStaleNoteTemps(root) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (typeof uid !== "number") return;
+  await sweepNoteTempDir(root);
+}
+
+async function sweepNoteTempDir(dir) {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === ".git") continue;
+      await sweepNoteTempDir(full);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    const match = NOTE_TEMP_NAME.exec(entry.name);
+    if (!match) continue;
+    const pid = Number(match[2]);
+    if (!Number.isSafeInteger(pid) || pidAlive(pid)) continue;
+    await removeOwnedRegular(full);
+  }
+}
+
 // Write the note beside its final name, then rename it into place. A reader
 // sees the previous file or the whole new file.
 export async function saveNoteFile(file, text, beforeRename) {
-  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
-  await fs.writeFile(tmp, text);
-  if (typeof beforeRename === "function") await beforeRename();
-  await fs.rename(tmp, file);
+  const tmp = noteTempPath(file);
+  openNoteTemps.add(tmp);
+  try {
+    await fs.writeFile(tmp, text);
+    if (typeof beforeRename === "function") await beforeRename();
+    await fs.rename(tmp, file);
+  } finally {
+    openNoteTemps.delete(tmp);
+  }
 }
 
 export function createMirror({ repo, vault, debounceMs = 400, secrets = [], track = (work) => work() }) {

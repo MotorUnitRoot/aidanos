@@ -299,9 +299,10 @@ final class SyncTests: XCTestCase {
             try? session.connect(relayURL: stall.url, token: testToken)
             blocked.signal()
         }
-        XCTAssertTrue(try waitUntil(seconds: 3) {
-            session.connection == .connecting || session.connection == .reconnecting
-        })
+        // .connecting is set before the TCP handshake. Stop only once the stall
+        // holds the accepted socket, so close wakes the handshake read instead of
+        // racing an unaccepted connect that can sit out this 5s bound.
+        XCTAssertTrue(try waitUntil(seconds: 3) { stall.hasClient() })
         let free = DispatchSemaphore(value: 0)
         let started = Date()
         DispatchQueue.global(qos: .userInitiated).async {
@@ -1190,6 +1191,7 @@ private final class StallServer {
     private var listenFd: Int32
     private let lock = NSLock()
     private var clients: [Int32] = []
+    private var stopped = false
 
     init() throws {
         let bound = try Loopback.listen()
@@ -1200,13 +1202,27 @@ private final class StallServer {
         }
     }
 
+    func hasClient() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !clients.isEmpty
+    }
+
     private func acceptLoop() {
         while true {
-            let client = acceptSocket(listenFd)
+            let client = acceptSocket(currentListen())
             if client < 0 { return }
             lock.lock()
-            clients.append(client)
+            // stop() may already have snapshotted clients. Closing only that
+            // snapshot leaves this socket open, and the handshake read waits
+            // out its 15s deadline.
+            let drop = stopped
+            if !drop { clients.append(client) }
             lock.unlock()
+            if drop {
+                _ = closeSocket(client)
+                return
+            }
             DispatchQueue.global().async {
                 var buffer = [UInt8](repeating: 0, count: 1024)
                 while true {
@@ -1220,8 +1236,15 @@ private final class StallServer {
         }
     }
 
+    private func currentListen() -> Int32 {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopped ? -1 : listenFd
+    }
+
     func stop() {
         lock.lock()
+        stopped = true
         let open = clients
         clients = []
         let listen = listenFd

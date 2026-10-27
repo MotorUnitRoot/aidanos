@@ -222,6 +222,10 @@ function authUrlShaping() {
     const both = redactSecrets(long, { token, url, vault: "/tmp/vault" });
     assert(!both.includes(token), "AIDANOS token redacted");
     assert(!both.includes(other), "GITHUB_TOKEN redacted even when it differs");
+    const bare = "ghp_" + "a".repeat(36);
+    const bareClean = redactSecrets("token " + bare, { token, url, vault: "/tmp/vault" });
+    assert(!bareClean.includes(bare), "an unlisted ghp_ token is masked");
+    assert(!bareClean.includes("ghp_"), "an unlisted ghp_ prefix is masked");
     assert(both.length > 180, "log redaction is not capped at the client hint length");
     assert(sanitizeGitError(long, { token, url, vault: "/tmp/vault" }).length <= 180, "client git hint stays compact");
   } finally {
@@ -457,6 +461,10 @@ function lockTmp() {
 // recorded lock. The no-holder case re-enters as root in a private /proc,
 // where every same-uid process can be inspected and none holds the lock.
 function runLockCase(name) {
+  if (process.env.AIDANOS_TEST_ALLOW_SUDO !== "1") {
+    console.log("skip " + name + ": AIDANOS_TEST_ALLOW_SUDO is not 1, so npm test does not run sudo");
+    return Promise.resolve();
+  }
   return new Promise((resolve, reject) => {
     const child = spawn("sudo", [
       "-n",
@@ -673,6 +681,103 @@ async function gitLockKeepsSameUidScanError() {
   }
 }
 
+function linuxSameUidDescriptorsReadable() {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (typeof uid !== "number") return false;
+  let pids;
+  try {
+    pids = fs.readdirSync("/proc");
+  } catch {
+    return false;
+  }
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
+    const procDir = "/proc/" + pid;
+    let st;
+    try {
+      st = fs.statSync(procDir);
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
+      return false;
+    }
+    if (st.uid !== uid) continue;
+    let fds;
+    try {
+      fds = fs.readdirSync(procDir + "/fd");
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
+      return false;
+    }
+    for (const fd of fds) {
+      try {
+        fs.statSync(procDir + "/fd/" + fd);
+      } catch (error) {
+        if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
+        if (error && (error.code === "EACCES" || error.code === "EPERM")) return false;
+      }
+    }
+  }
+  return true;
+}
+
+async function gitLockNormalUserRemovesOwnRecordedLock() {
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    console.log("skip normal-user lock removal: this process is root");
+    return;
+  }
+  if (process.platform !== "linux" && process.platform !== "darwin") {
+    console.log("skip normal-user lock removal: no holder scan on " + process.platform);
+    return;
+  }
+  if (process.platform === "linux" && !linuxSameUidDescriptorsReadable()) {
+    console.log("skip normal-user lock removal: a same-uid process descriptor directory is not readable");
+    return;
+  }
+  const tmp = lockTmp();
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    fs.writeFileSync(lock, "recorded\n");
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    await releaseRememberedGitLock(vault);
+    assert(!fs.existsSync(lock), "a normal user kept its own recorded index.lock");
+    assert(!gitLockBlocksVault(vault), "a normal user's removed lock still blocks sync");
+    fs.writeFileSync(lock, "unrecorded\n");
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(lock, "utf8") === "unrecorded\n", "a normal user removed an unrecorded index.lock");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "a normal user's unrecorded lock was removed without a message");
+    assert(gitLockBlocksVault(vault), "a normal user's kept lock did not block sync");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function gitLockKeepsSameSizeRecreate() {
+  const tmp = lockTmp();
+  try {
+    const vault = path.join(tmp, "vault");
+    fs.mkdirSync(vault);
+    git(["init", "-q", "-b", "main", vault]);
+    const lock = path.join(vault, ".git", "index.lock");
+    const first = "same-size\n";
+    const fresh = "SAME-SIZE\n";
+    assert(Buffer.byteLength(first) === Buffer.byteLength(fresh), "the same-size fixture lengths differ");
+    assert(first !== fresh, "the same-size fixture bytes match");
+    fs.writeFileSync(lock, first);
+    rememberUnlinkLock(gitLockMessage(lock), vault);
+    fs.unlinkSync(lock);
+    fs.writeFileSync(lock, fresh);
+    const kept = await captureErrors(() => releaseRememberedGitLock(vault));
+    assert(fs.readFileSync(lock, "utf8") === fresh, "a same-size recreate was removed");
+    assert(kept.includes(GIT_LOCK_KEPT_LINE), "a same-size recreate was removed without a message");
+    assert(!kept.some((line) => line.includes(tmp) || line.includes("index.lock")), "the kept message named a path");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 async function gitLockKeepsAReusedInode() {
   const tmp = lockTmp();
   try {
@@ -762,6 +867,8 @@ try {
   await gitLockIgnoresPathsOutsideGit();
   await gitLockRemovesOnlyARecordedLock();
   await gitLockKeepsSameUidScanError();
+  await gitLockNormalUserRemovesOwnRecordedLock();
+  await gitLockKeepsSameSizeRecreate();
   await gitLockKeepsAReusedInode();
   await gitLockKeepsALockSwappedBeforeUnlink();
   await gitTurnStaysOffOutsideTests();

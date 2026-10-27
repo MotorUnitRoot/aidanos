@@ -1359,6 +1359,46 @@ test("a location scrub is linear on adversarial input", () => {
   assert.equal(huge2Cleaned.includes("Users"), false);
 });
 
+test("github tokens that are not listed are masked", () => {
+  const ghp = "ghp_" + "a".repeat(36);
+  const gho = "gho_" + "b".repeat(36);
+  const pat = "github_pat_" + "c".repeat(22) + "_" + "d".repeat(59);
+  const cleaned = redact("see " + ghp + " " + gho + " " + pat + " end", []);
+  assert.equal(cleaned.includes(ghp), false, "unlisted ghp_ was kept");
+  assert.equal(cleaned.includes(gho), false, "unlisted gho_ was kept");
+  assert.equal(cleaned.includes(pat), false, "unlisted github_pat_ was kept");
+  assert.equal(cleaned.includes("ghp_"), false, "ghp_ prefix was kept");
+  assert.equal(cleaned.includes("gho_"), false, "gho_ prefix was kept");
+  assert.equal(cleaned.includes("github_pat_"), false, "github_pat_ prefix was kept");
+  assert.equal(cleaned.includes("***"), true, "a listed-shape token was not masked");
+});
+
+test("a 30 MB adversarial line is clipped before it is masked", () => {
+  function padTo(start) {
+    let pad = "";
+    while (Buffer.byteLength(pad) + 2 <= start) pad += "b\n";
+    pad += "b".repeat(start - Buffer.byteLength(pad));
+    return pad;
+  }
+  const pat = "github_pat_" + "c".repeat(22) + "_" + "d".repeat(59);
+  const crossing = redact(padTo(REDACT_INPUT_CAP - 10) + pat + "\n", []);
+  assert.equal(crossing.includes(pat), false, "a token crossing 64 KB was kept");
+  assert.equal(crossing.includes("github_pat_"), false, "a token prefix crossing 64 KB was kept");
+  assert.equal(crossing.includes("***"), true, "a token crossing 64 KB was not masked");
+  const secret = "Zk7" + "Q".repeat(93);
+  const input = padTo(REDACT_INPUT_CAP - 20) + secret + "\n" + "(a/".repeat(10 * 1024 * 1024);
+  assert.ok(input.length >= 30 * 1024 * 1024);
+  const started = performance.now();
+  const cleaned = redact(input, [secret]);
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 100, "30 MB redacted in " + elapsed + "ms");
+  assert.equal(cleaned.includes(secret), false);
+  assert.equal(cleaned.includes("Zk7"), false);
+  assert.equal(cleaned.includes("Q"), false);
+  assert.equal(cleaned.includes("(a/"), false);
+  assert.equal(cleaned.includes("***"), true);
+});
+
 test("relay rejects a bad token and accepts the real one", async () => {
   const dir = await tempDir();
   const relay = await startRelay({

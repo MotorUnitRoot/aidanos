@@ -775,6 +775,7 @@ export async function saveNoteBatch(entries, options = {}) {
   }
   if (typeof options.afterManifest === "function") await options.afterManifest(prepared);
   for (const entry of prepared) {
+    await yieldNow();
     try {
       await replaceNoteAtomic(entry.file, entry.text, {
         vault,
@@ -952,6 +953,7 @@ export function createMirror({
     const known = await hashes();
     const paths = indexPaths();
     let changed = false;
+    const batch = [];
     for (const [notePath, docId] of Object.entries(paths)) {
       await yieldNow();
       const handle = repo.handles[docId];
@@ -994,20 +996,29 @@ export function createMirror({
         await yieldNow();
         continue;
       }
-      const release = held(docId);
+      batch.push({ file, text, notePath, docId });
+    }
+    if (batch.length) {
+      const releases = batch.map((entry) => held(entry.docId));
+      let errors;
       try {
-        await replaceNoteAtomic(file, text, { vault, stateDir });
+        errors = await saveNoteBatch(batch, { vault, stateDir });
       } catch (error) {
-        logSafe(secrets, mirrorNoteFailureLine(docId, error));
-        await yieldNow();
-        continue;
+        errors = batch.map((entry) => ({ error, file: entry.file }));
       } finally {
-        release();
+        for (const release of releases) release();
       }
-      lastWritten.set(notePath, text);
-      known[notePath] = digest(text);
-      changed = true;
-      await yieldNow();
+      const failed = new Set(errors.map((item) => item.file));
+      for (const item of errors) {
+        const entry = batch.find((row) => row.file === item.file);
+        logSafe(secrets, mirrorNoteFailureLine(entry ? entry.docId : "", item.error));
+      }
+      for (const entry of batch) {
+        if (failed.has(entry.file)) continue;
+        lastWritten.set(entry.notePath, entry.text);
+        known[entry.notePath] = digest(entry.text);
+        changed = true;
+      }
     }
     if (changed) await saveHashes();
   }

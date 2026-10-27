@@ -4,16 +4,18 @@ import { closeSync, openSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import net from "node:net";
+import { once } from "node:events";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
 import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
 import { installFileLog, logSafe, redact, stampLine } from "../src/redact.mjs";
-import { emptyLateState, nextLoopLateLine } from "../src/index-trace.mjs";
+import { emptyLateState, installIndexTrace, nextLoopLateLine } from "../src/index-trace.mjs";
 import { cbor } from "@automerge/automerge-repo";
 import { describeSyncFrame, logSyncFrame } from "../src/sync-log.mjs";
 import {
@@ -106,6 +108,92 @@ test("a file log is not a synchronous stderr write", async () => {
   closeSync(fd);
   const text = await fs.readFile(file, "utf8");
   assert.match(text, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z LISTENING 127\.0\.0\.1 3757\n$/);
+});
+
+test("a refusal then exit leaves its reason in the stderr file", async () => {
+  const dir = await tempDir();
+  const file = path.join(dir, "stderr.log");
+  const fd = openSync(file, "w");
+  const server = fileURLToPath(new URL("../src/server.mjs", import.meta.url));
+  const env = { ...process.env, AIDANOS_RELAY_TOKEN: "too-short" };
+  delete env.AIDANOS_RELAY_TOKEN_FILE;
+  const child = spawn(process.execPath, [server], {
+    env,
+    stdio: ["ignore", "ignore", fd],
+  });
+  const [code] = await once(child, "exit");
+  closeSync(fd);
+  assert.equal(code, 1);
+  const text = await fs.readFile(file, "utf8");
+  assert.match(text, /The relay token must be at least 32 characters\./);
+});
+
+test("a stalled log stays under the cap and drops the rest once", async () => {
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const accepted = new Promise((resolve) => server.once("connection", resolve));
+  const writer = net.connect(port, "127.0.0.1");
+  const reader = await accepted;
+  await once(writer, "connect");
+  reader.pause();
+  const fd = writer._handle.fd;
+  const cap = 32 * 1024;
+  const installed = installFileLog(fd, { cap });
+  const chunks = [];
+  reader.on("data", (chunk) => chunks.push(chunk));
+  reader.on("error", () => {});
+  try {
+    const line = "x".repeat(200);
+    for (let i = 0; i < 4000 && installed.dropped === 0; i += 1) logSafe([], line);
+    assert.ok(installed.dropped > 0, "the cap was never hit");
+    for (let i = 0; i < 200; i += 1) logSafe([], line);
+    assert.ok(installed.stream.writableLength <= cap, "buffered " + installed.stream.writableLength);
+    const dropped = installed.dropped;
+    const finished = once(installed.stream, "finish");
+    const ended = once(reader, "end");
+    reader.resume();
+    installed.restore();
+    installed.stream.end();
+    await finished;
+    writer.end();
+    await ended;
+    const text = Buffer.concat(chunks).toString("utf8");
+    const notices = text.split("\n").filter((entry) => entry.endsWith(" lines dropped"));
+    assert.equal(notices.length, 1, text.slice(-400));
+    assert.match(notices[0], new RegExp(dropped + " lines dropped$"));
+  } finally {
+    installed.restore();
+    reader.destroy();
+    writer.destroy();
+    server.close();
+  }
+});
+
+test("index trace turns off when automerge internals are missing", async () => {
+  const lines = [];
+  await installIndexTrace((line) => lines.push(line), {
+    load: async () => ({ wasm: { Automerge: { prototype: {} } }, ApiHandler: {} }),
+  });
+  assert.deepEqual(lines, ["index trace off"]);
+  const dir = await tempDir();
+  const relay = await startRelay({
+    token: TOKEN,
+    vault: path.join(dir, "vault"),
+    data: path.join(dir, "data"),
+    port: 0,
+    gitUrl: "",
+  });
+  try {
+    const health = await fetch(relay.healthURL);
+    assert.equal(health.status, 200);
+    const id = noteId("notes/trace-off.md");
+    await importDoc(relay.repo, id, { kind: "note", text: "still syncing" });
+    const handle = await relay.repo.find(id);
+    assert.equal(handle.doc().text, "still syncing");
+  } finally {
+    await relay.close();
+  }
 });
 
 test("event loop late lines collapse to one per burst", () => {
@@ -989,6 +1077,36 @@ test("a late warm-up disposes only its own session", async () => {
     assert.equal(live && live.resetGeneration, 1);
     assert.equal(live.ok, true);
     assert.equal(live.status, "ok");
+    const join = cbor.encode({
+      type: "join",
+      senderId: "phone-late",
+      supportedProtocolVersions: ["1"],
+      peerMetadata: { storageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", isEphemeral: true },
+    });
+    const held = await new Promise((resolve, reject) => {
+      const ws = new WebSocket(relay.url, { headers: { Authorization: "Bearer " + TOKEN } });
+      const timer = setTimeout(() => {
+        ws.terminate();
+        reject(new Error("the live socket did not get a peer"));
+      }, 2500);
+      ws.on("open", () => ws.send(join));
+      ws.on("message", (data) => {
+        let message;
+        try {
+          message = cbor.decode(data);
+        } catch {
+          return;
+        }
+        if (!message || message.type !== "peer") return;
+        clearTimeout(timer);
+        resolve(ws);
+      });
+      ws.on("error", () => {});
+    });
+    let heldClosed = false;
+    held.on("close", () => {
+      heldClosed = true;
+    });
     releaseLate();
     const gaveUp = Symbol("late");
     const finished = await Promise.race([
@@ -996,12 +1114,17 @@ test("a late warm-up disposes only its own session", async () => {
       new Promise((resolve) => setTimeout(() => resolve(gaveUp), 5000)),
     ]);
     assert.notEqual(finished, gaveUp, "the late warm-up never finished");
-    const join = cbor.encode({
-      type: "join",
-      senderId: "phone-late",
-      supportedProtocolVersions: ["1"],
-      peerMetadata: { storageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", isEphemeral: true },
+    assert.equal(heldClosed, false, "the already-connected socket closed");
+    assert.equal(held.readyState, WebSocket.OPEN);
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("the live socket did not pong")), 2500);
+      held.once("pong", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      held.ping();
     });
+    held.close();
     const peer = await expectPeer(relay.url, join);
     assert.equal(peer.type, "peer");
     const health = await fetch(relay.healthURL + "?after=1");

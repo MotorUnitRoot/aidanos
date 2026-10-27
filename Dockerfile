@@ -2,6 +2,7 @@ FROM node:22.23.4-slim
 WORKDIR /app
 COPY package.json ./
 COPY server.mjs app.js index.html day.css styles.css start.sh ./
+COPY relay/src/github-tokens.mjs ./relay/src/github-tokens.mjs
 COPY editor ./editor
 COPY manifest.webmanifest sw.js ./
 COPY vault ./vault

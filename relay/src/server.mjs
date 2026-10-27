@@ -23,7 +23,7 @@ import {
 import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import { installIndexTrace, noteGitWork } from "./index-trace.mjs";
-import { discardOpenNoteTemps, saveNoteFile, sweepStaleNoteTemps } from "./mirror.mjs";
+import { discardOpenNoteTemps, rememberVaultRoot, saveNoteFile, sweepStaleNoteTemps } from "./mirror.mjs";
 import {
   flushFileLog,
   installFileLog,
@@ -594,6 +594,8 @@ export async function startRelay(options = {}) {
   await refuseSymlinkedStorage(dataDir);
   await claimRelayFolders(vault, dataDir);
   if (storageFolderFault(dataDir)) throw new Error("storage folder failed the owner walk");
+  // One realpath for the life of this process. A save must not call it again.
+  rememberVaultRoot(vault);
   await sweepStaleNoteTemps(vault, dataDir);
   const guessLimit = Number(options.guessLimit ?? 5);
   const guessBlockMs = Number(options.guessBlockMs ?? 60_000);

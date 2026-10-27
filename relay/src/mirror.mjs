@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { closeSync, constants as fsConstants, fstatSync, fsyncSync, openSync, readSync, realpathSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, openSync, readSync, realpathSync, unlinkSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -120,6 +120,29 @@ const RELAY_MARKER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 export const NOTE_TEMP_MANIFEST = "note-temps";
 const openNoteTemps = new Map();
 let manifestChain = Promise.resolve();
+// path.resolve(vault) -> realpath(vault). Filled once at claim. A save must
+// not call realpath again: on macOS that stat walks /var -> /private/var
+// and it blocks the process.
+const vaultRoots = new Map();
+
+export function rememberVaultRoot(vault) {
+  if (!vault) return "";
+  const key = path.resolve(vault);
+  try {
+    const real = realpathSync(key);
+    vaultRoots.set(key, real);
+    return real;
+  } catch {
+    vaultRoots.set(key, key);
+    return key;
+  }
+}
+
+function vaultRoot(vault) {
+  const key = path.resolve(vault);
+  if (vaultRoots.has(key)) return vaultRoots.get(key);
+  return rememberVaultRoot(vault);
+}
 
 function noteTempPath(file, pid = process.pid) {
   return path.join(path.dirname(file), `.${path.basename(file)}.${pid}.tmp`);
@@ -280,16 +303,39 @@ async function unlinkOwnedTemp(vault, rel, uid) {
   return "keep";
 }
 
-function rewriteManifest(stateDir, lines) {
-  const file = manifestFile(stateDir);
-  const body = lines.length ? lines.join("\n") + "\n" : "";
-  const fd = openSync(file, fsConstants.O_WRONLY | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW);
-  try {
-    writeSync(fd, body);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+async function writeAll(handle, text) {
+  const buf = Buffer.from(text);
+  let off = 0;
+  while (off < buf.length) {
+    const { bytesWritten } = await handle.write(buf, off, buf.length - off);
+    if (!bytesWritten) break;
+    off += bytesWritten;
   }
+  if (off !== buf.length) {
+    const error = new Error("manifest write was short");
+    error.code = "EIO";
+    throw error;
+  }
+}
+
+// fsync on the libuv pool. The save waits for it, and the event loop does not.
+async function syncHandle(file, flags, body) {
+  const handle = await fs.open(file, flags, 0o600);
+  try {
+    await writeAll(handle, body);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function rewriteManifest(stateDir, lines) {
+  const body = lines.length ? lines.join("\n") + "\n" : "";
+  await syncHandle(
+    manifestFile(stateDir),
+    fsConstants.O_WRONLY | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW,
+    body,
+  );
 }
 
 // Only paths this relay recorded, and only after the folder markers match.
@@ -315,7 +361,7 @@ export async function sweepStaleNoteTemps(vault, stateDir) {
     }
     if (kept.length === lines.length && kept.every((line, index) => line === lines[index])) return;
     try {
-      rewriteManifest(stateDir, kept);
+      await rewriteManifest(stateDir, kept);
     } catch { /* a replaced manifest is left alone */ }
   });
 }
@@ -328,16 +374,11 @@ function relativeInside(root, file) {
 
 // The note file is under realpath(vault). On macOS that can be /private/var
 // while the configured vault is /var, and path.relative then looks like ../.
+// The real path is the one remembered at claim, not a stat on this save.
 function tempRelative(vault, file) {
   const abs = path.resolve(file);
   let posix = relativeInside(path.resolve(vault), abs);
-  if (!posix) {
-    try {
-      posix = relativeInside(realpathSync(vault), abs);
-    } catch {
-      posix = "";
-    }
-  }
+  if (!posix) posix = relativeInside(vaultRoot(vault), abs);
   if (!posix || !parseManifestLine(posix)) {
     const error = new Error("note temp is outside the vault");
     error.code = "EINVAL";
@@ -346,30 +387,27 @@ function tempRelative(vault, file) {
   return posix;
 }
 
-async function appendManifest(stateDir, rel) {
+async function appendManifest(stateDir, rels) {
+  const lines = (Array.isArray(rels) ? rels : [rels]).filter(Boolean);
+  if (!lines.length) return;
   await fs.mkdir(stateDir, { recursive: true });
   await withManifest(async () => {
-    const fd = openSync(
+    await syncHandle(
       manifestFile(stateDir),
       fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
-      0o600,
+      lines.join("\n") + "\n",
     );
-    try {
-      writeSync(fd, rel + "\n");
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
   });
 }
 
-async function dropManifest(stateDir, rel) {
+async function dropManifest(stateDir, rels) {
+  const drop = new Set(Array.isArray(rels) ? rels : [rels]);
   await withManifest(async () => {
     const text = readRegularFile(manifestFile(stateDir));
     if (text == null) return;
-    const lines = text.split("\n").filter((line) => line.length > 0 && line !== rel);
+    const lines = text.split("\n").filter((line) => line.length > 0 && !drop.has(line));
     try {
-      rewriteManifest(stateDir, lines);
+      await rewriteManifest(stateDir, lines);
     } catch { /* the entry stays until a later sweep can read the manifest */ }
   });
 }
@@ -385,28 +423,56 @@ async function dropManifestIfGone(file, meta) {
   await dropManifest(meta.stateDir, meta.rel);
 }
 
-// Write the note beside its final name, then rename it into place. A reader
-// sees the previous file or the whole new file. The temp's path is recorded
-// and fsynced before the temp exists.
-export async function saveNoteFile(file, text, beforeRename, options = {}) {
-  const tmp = noteTempPath(file);
+// Write each note beside its final name, then rename it into place. A reader
+// sees the previous file or the whole new file. Every temp path in this batch
+// is recorded and fsynced before any of those temps exist. One fsync covers
+// the batch, and it runs on the libuv pool so the event loop stays free.
+export async function saveNoteBatch(entries, options = {}) {
   const vault = options.vault || "";
   const stateDir = options.stateDir || "";
-  let rel = "";
-  if (vault && stateDir) {
-    rel = tempRelative(vault, tmp);
-    await appendManifest(stateDir, rel);
+  const prepared = [];
+  const errors = [];
+  for (const entry of entries) {
+    const tmp = noteTempPath(entry.file);
+    try {
+      const rel = vault && stateDir ? tempRelative(vault, tmp) : "";
+      prepared.push({ file: entry.file, text: entry.text, beforeRename: entry.beforeRename, tmp, rel });
+    } catch (error) {
+      errors.push({ error, file: entry.file });
+    }
   }
-  const meta = { rel, stateDir };
-  openNoteTemps.set(tmp, meta);
-  try {
-    await fs.writeFile(tmp, text);
-    if (typeof beforeRename === "function") await beforeRename();
-    await fs.rename(tmp, file);
-  } finally {
-    openNoteTemps.delete(tmp);
-    await dropManifestIfGone(tmp, meta);
+  if (stateDir && prepared.some((entry) => entry.rel)) {
+    await appendManifest(stateDir, prepared.map((entry) => entry.rel));
   }
+  if (typeof options.afterManifest === "function") await options.afterManifest(prepared);
+  const gone = [];
+  for (const entry of prepared) {
+    const meta = { rel: entry.rel, stateDir };
+    openNoteTemps.set(entry.tmp, meta);
+    try {
+      await fs.writeFile(entry.tmp, entry.text);
+      if (typeof entry.beforeRename === "function") await entry.beforeRename();
+      await fs.rename(entry.tmp, entry.file);
+    } catch (error) {
+      errors.push({ error, file: entry.file });
+    } finally {
+      openNoteTemps.delete(entry.tmp);
+      if (entry.rel) {
+        try {
+          await fs.lstat(entry.tmp);
+        } catch (error) {
+          if (error && error.code === "ENOENT") gone.push(entry.rel);
+        }
+      }
+    }
+  }
+  if (gone.length) await dropManifest(stateDir, gone);
+  return errors;
+}
+
+export async function saveNoteFile(file, text, beforeRename, options = {}) {
+  const errors = await saveNoteBatch([{ file, text, beforeRename }], options);
+  if (errors.length) throw errors[0].error;
 }
 
 // A note name in these lines is what a later scrub would have to guess at.

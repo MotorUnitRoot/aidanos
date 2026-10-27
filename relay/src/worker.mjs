@@ -18,7 +18,7 @@ import {
   watchRepo,
   traceStorage,
 } from "./index-trace.mjs";
-import { createMirror, discardOpenNoteTemps, saveNoteFile } from "./mirror.mjs";
+import { createMirror, discardOpenNoteTemps, rememberVaultRoot, saveNoteFile } from "./mirror.mjs";
 import { logSafe, redact } from "./redact.mjs";
 import { SafeStorage, refuseSymlinkedStorage, storageFolderFault } from "./storage-safe.mjs";
 
@@ -234,6 +234,9 @@ async function run() {
     }
   }
   await installIndexTrace((line) => logSafe([], line), { thread: "worker" });
+  // The accept thread remembered this path at claim. This isolate has its own
+  // copy, so record it once here. A later save must not call realpath again.
+  if (data.vault) rememberVaultRoot(data.vault);
   try {
     await refuseSymlinkedStorage(data.dataDir);
     const fault = storageFolderFault(data.dataDir);

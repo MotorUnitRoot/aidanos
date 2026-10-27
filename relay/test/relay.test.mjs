@@ -18,6 +18,8 @@ import {
   foldInFailureLine,
   mirrorFailureLine,
   mirrorNoteFailureLine,
+  rememberVaultRoot,
+  saveNoteBatch,
   saveNoteFile,
   sweepStaleNoteTemps,
 } from "../src/mirror.mjs";
@@ -1412,6 +1414,89 @@ function deadPid() {
   }
   return 0;
 }
+
+test("a manifest line is durable before its temp exists", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const data = path.join(dir, "data");
+  await fs.mkdir(vault);
+  await fs.mkdir(data);
+  const file = path.join(vault, "day.md");
+  const tmp = path.join(vault, `.day.md.${process.pid}.tmp`);
+  let saw = false;
+  await saveNoteFile(file, "hello\n", undefined, {
+    vault,
+    stateDir: data,
+    async afterManifest(prepared) {
+      saw = true;
+      assert.equal(prepared.length, 1);
+      assert.equal(prepared[0].rel, `.day.md.${process.pid}.tmp`);
+      const manifest = await fs.readFile(path.join(data, NOTE_TEMP_MANIFEST), "utf8");
+      assert.equal(manifest, prepared[0].rel + "\n");
+      await assert.rejects(fs.lstat(tmp), (error) => error && error.code === "ENOENT");
+    },
+  });
+  assert.equal(saw, true);
+  assert.equal(await fs.readFile(file, "utf8"), "hello\n");
+  assert.equal((await fs.readFile(path.join(data, NOTE_TEMP_MANIFEST), "utf8")).trim(), "");
+});
+
+test("one manifest fsync records every temp in a pass before any temp exists", async () => {
+  const dir = await tempDir();
+  const vault = path.join(dir, "vault");
+  const notes = path.join(vault, "notes");
+  const data = path.join(dir, "data");
+  await fs.mkdir(notes, { recursive: true });
+  await fs.mkdir(data);
+  const day = path.join(vault, "day.md");
+  const plan = path.join(notes, "plan.md");
+  const dayTmp = path.join(vault, `.day.md.${process.pid}.tmp`);
+  const planTmp = path.join(notes, `.plan.md.${process.pid}.tmp`);
+  let saw = false;
+  const errors = await saveNoteBatch([
+    { file: day, text: "day\n" },
+    { file: plan, text: "plan\n" },
+  ], {
+    vault,
+    stateDir: data,
+    async afterManifest(prepared) {
+      saw = true;
+      assert.deepEqual(prepared.map((entry) => entry.rel), [
+        `.day.md.${process.pid}.tmp`,
+        `notes/.plan.md.${process.pid}.tmp`,
+      ]);
+      const manifest = await fs.readFile(path.join(data, NOTE_TEMP_MANIFEST), "utf8");
+      assert.equal(manifest, prepared.map((entry) => entry.rel).join("\n") + "\n");
+      await assert.rejects(fs.lstat(dayTmp), (error) => error && error.code === "ENOENT");
+      await assert.rejects(fs.lstat(planTmp), (error) => error && error.code === "ENOENT");
+    },
+  });
+  assert.equal(saw, true);
+  assert.equal(errors.length, 0);
+  assert.equal(await fs.readFile(day, "utf8"), "day\n");
+  assert.equal(await fs.readFile(plan, "utf8"), "plan\n");
+  assert.equal((await fs.readFile(path.join(data, NOTE_TEMP_MANIFEST), "utf8")).trim(), "");
+});
+
+test("a save keeps the vault real path recorded at claim", async () => {
+  const dir = await tempDir();
+  const real = path.join(dir, "real");
+  const link = path.join(dir, "link");
+  const missing = path.join(dir, "missing");
+  const data = path.join(dir, "data");
+  await fs.mkdir(real);
+  await fs.mkdir(data);
+  await fs.symlink(real, link);
+  rememberVaultRoot(link);
+  await fs.unlink(link);
+  await fs.symlink(missing, link);
+  const file = path.join(real, "day.md");
+  await saveNoteFile(file, "hello\n", undefined, { vault: link, stateDir: data });
+  assert.equal(await fs.readFile(file, "utf8"), "hello\n");
+  const manifest = await fs.readFile(path.join(data, NOTE_TEMP_MANIFEST), "utf8");
+  assert.equal(manifest.includes(".."), false, manifest);
+  assert.equal(manifest.trim(), "");
+});
 
 test("a note temp is recorded when the vault path is a symlink", async () => {
   const dir = await tempDir();

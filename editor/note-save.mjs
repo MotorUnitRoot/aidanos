@@ -19,17 +19,24 @@
 // swapped parent does not leave an empty file outside the vault.
 //
 // The previous bytes are then written to a recovery file in the same folder,
-// created with O_EXCL. If the new write or the truncate fails, those bytes
-// are written back over the same file. The recovery file is removed after a
-// successful save or a successful restore. If the restore itself fails, the
-// recovery file stays and its vault-relative name is logged. Writing the new
-// bytes and truncating afterwards does not by itself keep the previous text.
+// created with O_EXCL on the directory descriptor that was just checked.
+// After that file is opened, its directory entry is compared with the inode
+// that was created, and the parent chain is checked again, before the first
+// new byte of the note. A mismatch unlinks the recovery file only when that
+// entry is still the created inode, then the save is refused. If the new
+// write or the truncate fails, those bytes are written back over the same
+// file. The recovery file is removed after a successful save or a successful
+// restore. If the restore itself fails, or the note cannot be synced, the
+// recovery file stays and its path is logged: vault-relative inside the
+// vault, and the absolute path when it is not. Writing the new bytes and
+// truncating afterwards does not by itself keep the previous text.
 // The swap-in path still writes a temp file and renames it, and beforeRename
 // runs after that temp file is ready and before the rename.
 
 import { constants as fsConstants, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createExclusive, openCheckedDirectory, statEntry, unlinkIfSame, unlinkOpenedFile } from "./dirfd.mjs";
 
 const NOTEPLAN_PREFIXES = ["icloud~co~noteplan~", "co.noteplan."];
 
@@ -139,72 +146,84 @@ async function restoreOpened(handle, previous) {
   await handle.truncate(previous.length);
 }
 
-async function removeSameFile(filePath, id) {
-  if (!id) return;
-  let listed;
-  try {
-    listed = await fs.lstat(filePath);
-  } catch (e) {
-    if (e.code === "ENOENT") return;
-    throw e;
-  }
-  if (listed.isSymbolicLink() || listed.dev !== id.dev || listed.ino !== id.ino) return;
-  await fs.unlink(filePath);
-}
-
-async function removeCreatedNote(filePath, handle) {
-  const opened = await handle.stat();
-  await removeSameFile(filePath, opened);
+function recoveryNameFor(notePath) {
+  return path.basename(notePath) + "." + process.pid + "." + Math.random().toString(16).slice(2) + ".recover";
 }
 
 function recoveryRelativeName(recoveryPath, vaultRoot) {
-  if (!vaultRoot) return path.basename(recoveryPath);
-  const rel = path.relative(path.resolve(String(vaultRoot)), recoveryPath);
-  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return path.basename(recoveryPath);
+  const abs = path.resolve(recoveryPath);
+  if (!vaultRoot) return abs;
+  const rel = path.relative(path.resolve(String(vaultRoot)), abs);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return abs;
   return rel.split(path.sep).join("/");
 }
 
-function logRestoreFailure(recoveryPath, options) {
+function logKeptRecovery(prefix, recoveryPath, options) {
   const name = recoveryRelativeName(recoveryPath, options && options.vaultRoot);
-  console.error("restore failed: " + name);
+  console.error(prefix + name);
 }
 
-async function writeRecoveryFile(notePath, previous) {
-  const recoveryPath = path.join(
-    path.dirname(notePath),
-    path.basename(notePath) + "." + process.pid + "." + Math.random().toString(16).slice(2) + ".recover",
-  );
-  const flags = fsConstants.O_WRONLY
-    | fsConstants.O_CREAT
-    | fsConstants.O_EXCL
-    | fsConstants.O_NOFOLLOW
-    | fsConstants.O_NONBLOCK;
-  let handle;
-  try {
-    handle = await fs.open(recoveryPath, flags, 0o644);
-  } catch (e) {
-    if (e.code === "ELOOP" || e.code === "EEXIST" || e.code === "ENXIO") throw badPath();
-    throw e;
+async function parentChain(filePath, given) {
+  if (Array.isArray(given) && given.length) return given;
+  const dirPath = path.dirname(filePath);
+  const st = await fs.lstat(dirPath);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw badPath();
+  return [{ abs: dirPath, dev: st.dev, ino: st.ino }];
+}
+
+async function recheckParents(chain) {
+  for (const item of chain) {
+    let st;
+    try {
+      st = await fs.lstat(item.abs);
+    } catch (e) {
+      if (e.code === "ENOENT" || e.code === "ENOTDIR") return false;
+      throw e;
+    }
+    if (st.isSymbolicLink() || !st.isDirectory() || st.dev !== item.dev || st.ino !== item.ino) return false;
   }
-  let id = null;
-  try {
-    const opened = await handle.stat();
-    id = { dev: opened.dev, ino: opened.ino };
-    await writeOpened(handle, previous);
-    await handle.sync();
-    return { path: recoveryPath, dev: id.dev, ino: id.ino };
-  } catch (error) {
-    await handle.close();
-    handle = null;
-    try { await removeSameFile(recoveryPath, id); } catch { /* the note is still unchanged */ }
-    throw error;
-  } finally {
-    if (handle) await handle.close();
+  return true;
+}
+
+async function entryMatches(dir, name, id) {
+  const listed = await statEntry(dir, name);
+  return !!listed && !listed.symlink && listed.dev === id.dev && listed.ino === id.ino;
+}
+
+export async function listRecoveryFiles(vaultRoot) {
+  const found = [];
+  async function walk(dir, rel) {
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch (e) {
+      if (e.code === "ENOENT" || e.code === "ENOTDIR" || e.code === "EACCES" || e.code === "EPERM") return;
+      throw e;
+    }
+    for (const entry of entries) {
+      if (entry.name === ".git" || entry.isSymbolicLink()) continue;
+      const childRel = rel ? rel + "/" + entry.name : entry.name;
+      if (entry.isDirectory()) {
+        await walk(path.join(dir, entry.name), childRel);
+      } else if (entry.name.endsWith(".recover")) {
+        found.push(childRel);
+      }
+    }
   }
+  if (vaultRoot) await walk(path.resolve(String(vaultRoot)), "");
+  found.sort();
+  return found;
+}
+
+export async function reportRecoveryFiles(vaultRoot, log = (line) => console.error(line)) {
+  const files = await listRecoveryFiles(vaultRoot);
+  for (const rel of files) log("recovery file: " + rel);
+  return files;
 }
 
 async function writeInPlace(filePath, body, options) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const chain = await parentChain(filePath, options.parents);
   const before = await lstatOrMissing(filePath);
   if (before && before.isSymbolicLink()) throw badPath();
   if (before && !isRegularFile(before)) throw badPath();
@@ -238,36 +257,57 @@ async function writeInPlace(filePath, body, options) {
       if (typeof options.afterOpen === "function") await options.afterOpen(opened);
       if (raced) throw mismatchedFile();
     } catch (error) {
-      if (creating) await removeCreatedNote(filePath, handle);
+      if (creating) await unlinkOpenedFile(handle);
       throw error;
     }
     const previous = before ? await readOpened(handle, opened.size) : Buffer.alloc(0);
-    const recovery = await writeRecoveryFile(filePath, previous);
-    const payload = Buffer.from(body, "utf8");
+    const parent = chain[chain.length - 1];
+    const dir = await openCheckedDirectory(parent.abs, parent);
+    const recoveryName = recoveryNameFor(filePath);
+    const recoveryPath = path.join(parent.abs, recoveryName);
     try {
-      if (typeof options.failWrite === "function") await options.failWrite();
-      if (Number.isInteger(options.failAfterBytes)) {
-        const count = Math.max(0, Math.min(options.failAfterBytes, payload.length));
-        if (count > 0) await writeOpened(handle, payload.subarray(0, count));
-        const error = new Error("write failed");
-        error.code = "EIO";
-        throw error;
+      const created = await createExclusive(dir, recoveryName, previous);
+      if (typeof options.afterRecovery === "function") await options.afterRecovery();
+      const same = await entryMatches(dir, recoveryName, created);
+      const folders = await recheckParents(chain);
+      if (!same || !folders) {
+        await unlinkIfSame(dir, recoveryName, created);
+        throw badPath();
       }
-      await writeOpened(handle, payload);
-      await handle.truncate(payload.length);
-    } catch (error) {
+      const payload = Buffer.from(body, "utf8");
       try {
-        if (typeof options.failRestore === "function") await options.failRestore();
-        await restoreOpened(handle, previous);
-        await removeSameFile(recovery.path, recovery);
-      } catch {
-        logRestoreFailure(recovery.path, options);
+        if (typeof options.failWrite === "function") await options.failWrite();
+        if (Number.isInteger(options.failAfterBytes)) {
+          const count = Math.max(0, Math.min(options.failAfterBytes, payload.length));
+          if (count > 0) await writeOpened(handle, payload.subarray(0, count));
+          const error = new Error("write failed");
+          error.code = "EIO";
+          throw error;
+        }
+        await writeOpened(handle, payload);
+        await handle.truncate(payload.length);
+      } catch (error) {
+        try {
+          if (typeof options.failRestore === "function") await options.failRestore();
+          await restoreOpened(handle, previous);
+          await unlinkIfSame(dir, recoveryName, created);
+        } catch {
+          logKeptRecovery("restore failed: ", recoveryPath, options);
+          throw error;
+        }
         throw error;
       }
-      throw error;
+      try {
+        if (typeof options.failSync === "function") await options.failSync();
+        await handle.sync();
+      } catch (error) {
+        logKeptRecovery("sync failed: ", recoveryPath, options);
+        throw error;
+      }
+      await unlinkIfSame(dir, recoveryName, created);
+    } finally {
+      await dir.close();
     }
-    await handle.sync();
-    await removeSameFile(recovery.path, recovery);
   } finally {
     await handle.close();
   }

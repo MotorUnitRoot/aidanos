@@ -276,6 +276,72 @@ final class LiveNoteEditorTests: XCTestCase {
         XCTAssertFalse(logged.contains(root.path))
     }
 
+    func testASwappedParentAfterTheRecoveryFileIsRefused() throws {
+        let root = try makeFolder(named: "vault")
+        let notes = root.appendingPathComponent("notes", isDirectory: true)
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
+        let note = notes.appendingPathComponent("page.md")
+        try Data("original\n".utf8).write(to: note)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let real = root.appendingPathComponent("notes-real")
+        let located = try VaultPaths.locate(vault: root, path: "notes/page.md")
+        XCTAssertThrowsError(try NoteFolderSave.writeInPlace(
+            Data("pwned\n".utf8),
+            to: note,
+            afterRecovery: {
+                try? FileManager.default.moveItem(at: notes, to: real)
+                try? FileManager.default.createSymbolicLink(at: notes, withDestinationURL: outside)
+            },
+            parents: located.parents,
+            vaultRoot: root
+        ))
+        let outsideNames = try FileManager.default.contentsOfDirectory(at: outside, includingPropertiesForKeys: nil)
+        XCTAssertTrue(outsideNames.isEmpty)
+        XCTAssertEqual(try String(contentsOf: real.appendingPathComponent("page.md"), encoding: .utf8), "original\n")
+        let leftovers = try FileManager.default.contentsOfDirectory(at: real, includingPropertiesForKeys: nil)
+        XCTAssertFalse(leftovers.contains { $0.lastPathComponent.hasSuffix(".recover") })
+    }
+
+    func testAFailedSyncKeepsTheRecoveryFile() throws {
+        let root = try makeFolder(named: "vault")
+        let notes = root.appendingPathComponent("notes", isDirectory: true)
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
+        let note = notes.appendingPathComponent("day.md")
+        try NoteFolderSave.writeInPlace(Data("original-text\n".utf8), to: note, vaultRoot: root)
+        var logged = ""
+        let previous = NoteFolderSave.logSyncFailure
+        NoteFolderSave.logSyncFailure = { logged = $0 }
+        defer { NoteFolderSave.logSyncFailure = previous }
+        XCTAssertThrowsError(try NoteFolderSave.writeInPlace(
+            Data("NEW-TEXT\n".utf8),
+            to: note,
+            failSync: true,
+            vaultRoot: root
+        ))
+        let recovery = try FileManager.default.contentsOfDirectory(at: notes, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasSuffix(".recover") }
+        XCTAssertEqual(recovery.count, 1)
+        XCTAssertEqual(try String(contentsOf: recovery[0], encoding: .utf8), "original-text\n")
+        XCTAssertEqual(logged, "notes/\(recovery[0].lastPathComponent)")
+        XCTAssertFalse(logged.contains(root.path))
+    }
+
+    func testStartupReportsALeftoverRecoveryFile() throws {
+        let vault = try makeFolder(named: "vault")
+        let notes = vault.appendingPathComponent("notes", isDirectory: true)
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
+        let recovery = notes.appendingPathComponent("day.md.leftover.recover")
+        try Data("only copy\n".utf8).write(to: recovery)
+        var logged: [String] = []
+        let previous = AidanSession.logRecoveryFile
+        AidanSession.logRecoveryFile = { logged.append($0) }
+        defer { AidanSession.logRecoveryFile = previous }
+        _ = try AidanSession(vault: vault)
+        XCTAssertEqual(logged, ["notes/day.md.leftover.recover"])
+        XCTAssertEqual(try String(contentsOf: recovery, encoding: .utf8), "only copy\n")
+    }
+
     func testTheVaultWalkIsRecheckedFromTheRoot() throws {
         let root = try makeFolder(named: "vault")
         let notes = root.appendingPathComponent("notes", isDirectory: true)

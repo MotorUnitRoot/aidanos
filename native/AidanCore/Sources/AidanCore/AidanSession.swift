@@ -98,6 +98,7 @@ public final class AidanSession: SyncHost {
         self.vault = vault
         try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: vault.appendingPathComponent(".aidanos"), withIntermediateDirectories: true)
+        Self.reportRecoveryFiles(in: vault)
         self.deviceActor = try AidanSession.loadActor(in: vault)
         self.peerId = "aidanos-" + UUID().uuidString.lowercased()
         self.storageId = try AidanSession.loadStorageId(in: vault)
@@ -122,6 +123,16 @@ public final class AidanSession: SyncHost {
         watcher?.cancel()
         reconnectWork?.cancel()
         link?.close()
+    }
+
+    static var logRecoveryFile: (String) -> Void = { name in
+        fputs("recovery file: \(name)\n", stderr)
+    }
+
+    static func reportRecoveryFiles(in vault: URL) {
+        for rel in VaultPaths.recoveryFiles(in: vault) {
+            logRecoveryFile(rel)
+        }
     }
 
     public static func todayPath(on date: Date = Date(), timeZone: TimeZone = .current) -> String {

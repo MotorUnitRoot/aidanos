@@ -638,29 +638,46 @@ try {
   async function prepareEditorLoading() {
     await reloadSample();
     await prepareToday();
-    await evalJs(`showEditorState("loading")`);
-    const quiet = await evalJs(`document.getElementById("editor-note").hidden === true && !(document.getElementById("paper").innerText || "").trim()`);
-    assert(quiet === true, "loading spoke before a second or kept the note");
-    // The notice is a one-second timer. A fixed 1100ms sleep raced that timer
-    // on the macOS runner (run 40416128991): Opening had not been drawn yet.
-    await waitFor(async () => {
-      const ready = await evalJs(`(() => {
+    const started = await evalJs(`(() => {
+      const start = performance.now();
+      showEditorState("loading");
+      const paper = document.getElementById("paper");
+      const note = document.getElementById("editor-note");
+      const quiet = !!paper && !!note && note.hidden === true && !(paper.innerText || "").trim() && note.textContent !== "Opening\u2026";
+      return { start, quiet };
+    })()`);
+    assert(started && started.quiet === true, "loading spoke before a second or kept the note");
+    // Opening is a one-second timer. The page clock has to land between about
+    // 0.9s and 2s; a later poll must not stretch that into several seconds.
+    const deadline = Date.now() + 2200;
+    let shownAt = null;
+    while (Date.now() < deadline) {
+      const now = await evalJs(`(() => {
         const paper = document.getElementById("paper");
         const title = document.getElementById("paper-title");
         const week = document.querySelector(".week-row");
         const note = document.getElementById("editor-note");
+        if (!paper || !title || !week || !note) return null;
         const titleBox = title.getBoundingClientRect();
         const weekBox = week.getBoundingClientRect();
-        return !document.querySelector(".spinner, [aria-busy='true']")
+        const ready = !document.querySelector(".spinner, [aria-busy='true']")
           && !(paper.innerText || "").trim()
           && (title.textContent || "").length > 0
           && week.querySelectorAll(".day-card").length === 7
           && note.hidden === false
           && note.textContent === "Opening\u2026"
           && titleBox.top >= weekBox.bottom - 1;
+        return ready ? performance.now() : null;
       })()`);
-      return ready === true ? true : ready;
-    }, 4000, "loading did not show the week, the title, and Opening");
+      if (typeof now === "number") {
+        shownAt = now;
+        break;
+      }
+      await sleep(80);
+    }
+    assert(typeof shownAt === "number", "loading did not show the week, the title, and Opening");
+    const elapsed = shownAt - started.start;
+    assert(elapsed >= 900 && elapsed <= 2000, "Opening appeared at " + Math.round(elapsed) + "ms");
     const width = await evalJs(`document.documentElement.clientWidth`);
     if (width === 1280 && openedEdge) {
       const loadingEdge = await paperEdge();

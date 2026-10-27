@@ -127,14 +127,20 @@ public enum NoteFolderSave {
         fputs("restore failed: \(name)\n", stderr)
     }
 
+    static var logSyncFailure: (String) -> Void = { name in
+        fputs("sync failed: \(name)\n", stderr)
+    }
+
     static func writeInPlace(
         _ data: Data,
         to url: URL,
         beforeOpen: (() -> Void)? = nil,
         beforeWrite: (() throws -> Void)? = nil,
         afterOpen: (() -> Void)? = nil,
+        afterRecovery: (() -> Void)? = nil,
         failAfterBytes: Int? = nil,
         failRestore: (() throws -> Void)? = nil,
+        failSync: Bool = false,
         parents: [DirectoryIdentity] = [],
         vaultRoot: URL? = nil
     ) throws {
@@ -173,11 +179,21 @@ public enum NoteFolderSave {
             afterOpen?()
             try assertParents(chain, name)
         } catch {
-            if creating { unlinkIfSame(url.path, fd) }
+            if creating { removeCreatedFile(fd) }
             throw error
         }
+        let folder = try openCheckedDirectory(chain, name)
+        defer { _ = close(folder) }
         let previous = before == nil ? Data() : try readAll(fd, Int(opened.st_size), name)
-        let recovery = try writeRecovery(previous, nextTo: url, name: name)
+        let recovery = try writeRecovery(previous, dirfd: folder, noteName: name)
+        let recoveryURL = directory.appendingPathComponent(recovery.name)
+        afterRecovery?()
+        let same = entryMatches(folder, recovery.name, recovery.dev, recovery.ino)
+        let folders = parentsMatch(chain)
+        if !same || !folders {
+            _ = unlinkAtIfSame(folder, recovery.name, recovery.dev, recovery.ino)
+            throw AidanError.io("Could not save \(name).")
+        }
         do {
             try beforeWrite?()
             if let failAfterBytes {
@@ -195,17 +211,25 @@ public enum NoteFolderSave {
             do {
                 try failRestore?()
                 try restore(fd, previous, name)
-                unlinkIfSame(recovery.url.path, recovery.dev, recovery.ino)
+                _ = unlinkAtIfSame(folder, recovery.name, recovery.dev, recovery.ino)
             } catch {
-                logRestoreFailure(recoveryRelativeName(vaultRoot: vaultRoot, file: recovery.url))
+                logRestoreFailure(recoveryRelativeName(vaultRoot: vaultRoot, file: recoveryURL))
                 throw writeError
             }
             throw writeError
         }
-        if fsync(fd) != 0 {
-            throw AidanError.io("Could not save \(name).")
+        do {
+            if failSync {
+                throw AidanError.io("Could not save \(name).")
+            }
+            if fsync(fd) != 0 {
+                throw AidanError.io("Could not save \(name).")
+            }
+        } catch {
+            logSyncFailure(recoveryRelativeName(vaultRoot: vaultRoot, file: recoveryURL))
+            throw error
         }
-        unlinkIfSame(recovery.url.path, recovery.dev, recovery.ino)
+        _ = unlinkAtIfSame(folder, recovery.name, recovery.dev, recovery.ino)
     }
 
     static func isSymbolicLink(_ path: String) -> Bool {
@@ -220,7 +244,7 @@ public enum NoteFolderSave {
     }
 
     private struct RecoveryFile {
-        let url: URL
+        let name: String
         let dev: dev_t
         let ino: ino_t
     }
@@ -234,64 +258,129 @@ public enum NoteFolderSave {
     }
 
     private static func assertParents(_ parents: [DirectoryIdentity], _ name: String) throws {
+        if !parentsMatch(parents) {
+            throw AidanError.io("Could not save \(name).")
+        }
+    }
+
+    private static func parentsMatch(_ parents: [DirectoryIdentity]) -> Bool {
         for parent in parents {
             var info = stat()
             if lstat(parent.path, &info) != 0
                 || (info.st_mode & S_IFMT) != S_IFDIR
                 || info.st_dev != parent.dev
                 || info.st_ino != parent.ino {
-                throw AidanError.io("Could not save \(name).")
+                return false
             }
         }
+        return true
     }
 
-    private static func unlinkIfSame(_ path: String, _ fd: Int32) {
-        var opened = stat()
-        if fstat(fd, &opened) != 0 { return }
-        unlinkIfSame(path, opened.st_dev, opened.st_ino)
-    }
-
-    private static func unlinkIfSame(_ path: String, _ dev: dev_t, _ ino: ino_t) {
-        var listed = stat()
-        if lstat(path, &listed) != 0 { return }
-        if (listed.st_mode & S_IFMT) == S_IFLNK { return }
-        if listed.st_dev != dev || listed.st_ino != ino { return }
-        _ = path.withCString { unlink($0) }
-    }
-
-    private static func writeRecovery(_ previous: Data, nextTo url: URL, name: String) throws -> RecoveryFile {
-        let recovery = url.deletingLastPathComponent()
-            .appendingPathComponent("\(url.lastPathComponent).\(UUID().uuidString).recover")
-        let fd = recovery.path.withCString { open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK, mode_t(0o644)) }
+    private static func openCheckedDirectory(_ chain: [DirectoryIdentity], _ name: String) throws -> Int32 {
+        guard let parent = chain.last else {
+            throw AidanError.io("Could not save \(name).")
+        }
+        let fd = parent.path.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, mode_t(0)) }
         if fd < 0 {
             throw AidanError.io("Could not save \(name).")
+        }
+        var info = stat()
+        if fstat(fd, &info) != 0
+            || (info.st_mode & S_IFMT) != S_IFDIR
+            || info.st_dev != parent.dev
+            || info.st_ino != parent.ino {
+            _ = close(fd)
+            throw AidanError.io("Could not save \(name).")
+        }
+        return fd
+    }
+
+    private static func entryMatches(_ dirfd: Int32, _ name: String, _ dev: dev_t, _ ino: ino_t) -> Bool {
+        var listed = stat()
+        let rc = name.withCString { fstatat(dirfd, $0, &listed, AT_SYMLINK_NOFOLLOW) }
+        if rc != 0 { return false }
+        if (listed.st_mode & S_IFMT) == S_IFLNK { return false }
+        return listed.st_dev == dev && listed.st_ino == ino
+    }
+
+    @discardableResult
+    private static func unlinkAtIfSame(_ dirfd: Int32, _ name: String, _ dev: dev_t, _ ino: ino_t) -> Bool {
+        if !entryMatches(dirfd, name, dev, ino) { return false }
+        let rc = name.withCString { unlinkat(dirfd, $0, 0) }
+        return rc == 0
+    }
+
+    private static func removeCreatedFile(_ fd: Int32) {
+        var opened = stat()
+        if fstat(fd, &opened) != 0 { return }
+        guard let full = pathOfOpenFile(fd) else { return }
+        let dir = (full as NSString).deletingLastPathComponent
+        let base = (full as NSString).lastPathComponent
+        if base.isEmpty || base == "." || base == ".." || base.contains("/") { return }
+        let dirfd = dir.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, mode_t(0)) }
+        if dirfd < 0 { return }
+        defer { _ = close(dirfd) }
+        _ = unlinkAtIfSame(dirfd, base, opened.st_dev, opened.st_ino)
+    }
+
+    private static func pathOfOpenFile(_ fd: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4096)
+#if canImport(Darwin)
+        let rc = buffer.withUnsafeMutableBufferPointer { pointer -> Int32 in
+            guard let base = pointer.baseAddress else { return -1 }
+            return fcntl(fd, F_GETPATH, base)
+        }
+        if rc != 0 { return nil }
+        return String(cString: buffer)
+#else
+        let link = "/proc/self/fd/\(fd)"
+        let n = link.withCString { cLink in
+            buffer.withUnsafeMutableBufferPointer { pointer -> Int in
+                guard let base = pointer.baseAddress else { return -1 }
+                return Int(readlink(cLink, base, 4095))
+            }
+        }
+        if n < 0 { return nil }
+        buffer[Int(n)] = 0
+        var text = String(cString: buffer)
+        let suffix = " (deleted)"
+        if text.hasSuffix(suffix) { text.removeLast(suffix.count) }
+        return text
+#endif
+    }
+
+    private static func writeRecovery(_ previous: Data, dirfd: Int32, noteName: String) throws -> RecoveryFile {
+        let recoveryName = "\(noteName).\(UUID().uuidString).recover"
+        let fd = recoveryName.withCString { openat(dirfd, $0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK, mode_t(0o644)) }
+        if fd < 0 {
+            throw AidanError.io("Could not save \(noteName).")
         }
         defer { _ = close(fd) }
         var opened = stat()
         if fstat(fd, &opened) != 0 {
-            throw AidanError.io("Could not save \(name).")
+            throw AidanError.io("Could not save \(noteName).")
         }
         do {
-            try writeAll(fd, previous, name)
+            try writeAll(fd, previous, noteName)
             if fsync(fd) != 0 {
-                throw AidanError.io("Could not save \(name).")
+                throw AidanError.io("Could not save \(noteName).")
             }
         } catch {
-            unlinkIfSame(recovery.path, fd)
+            _ = unlinkAtIfSame(dirfd, recoveryName, opened.st_dev, opened.st_ino)
             throw error
         }
-        return RecoveryFile(url: recovery, dev: opened.st_dev, ino: opened.st_ino)
+        return RecoveryFile(name: recoveryName, dev: opened.st_dev, ino: opened.st_ino)
     }
 
     private static func recoveryRelativeName(vaultRoot: URL?, file: URL) -> String {
-        guard let root = vaultRoot?.standardizedFileURL.path, !root.isEmpty else {
-            return file.lastPathComponent
-        }
+        let filePath = file.resolvingSymlinksInPath().path
+        guard let rootURL = vaultRoot else { return filePath }
+        let root = rootURL.resolvingSymlinksInPath().path
         let prefix = root.hasSuffix("/") ? root : root + "/"
-        if file.path.hasPrefix(prefix) {
-            return String(file.path.dropFirst(prefix.count))
+        if filePath.hasPrefix(prefix) {
+            return String(filePath.dropFirst(prefix.count))
         }
-        return file.lastPathComponent
+        return filePath
     }
 
     private static func readAll(_ fd: Int32, _ count: Int, _ name: String) throws -> Data {
@@ -466,7 +555,7 @@ enum VaultPaths {
             )
             for item in items {
                 let name = item.lastPathComponent
-                if name.hasPrefix(".") { continue }
+                if name.hasPrefix(".") || name.hasSuffix(".recover") { continue }
                 let relative = prefix.isEmpty ? name : prefix + "/" + name
                 var isDirectory: ObjCBool = false
                 if FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory), isDirectory.boolValue {
@@ -479,6 +568,31 @@ enum VaultPaths {
         if FileManager.default.fileExists(atPath: vault.path) {
             try walk(vault, prefix: "")
         }
+        return found.sorted()
+    }
+
+    static func recoveryFiles(in vault: URL) -> [String] {
+        var found: [String] = []
+        func walk(_ directory: String, prefix: String) {
+            var info = stat()
+            if lstat(directory, &info) != 0 || (info.st_mode & S_IFMT) != S_IFDIR { return }
+            guard let items = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return }
+            for name in items {
+                if name == ".git" || name == "." || name == ".." { continue }
+                let abs = (directory as NSString).appendingPathComponent(name)
+                var listed = stat()
+                if lstat(abs, &listed) != 0 { continue }
+                let kind = listed.st_mode & S_IFMT
+                if kind == S_IFLNK { continue }
+                let relative = prefix.isEmpty ? name : prefix + "/" + name
+                if kind == S_IFDIR {
+                    walk(abs, prefix: relative)
+                } else if name.hasSuffix(".recover") {
+                    found.append(relative)
+                }
+            }
+        }
+        walk(vault.path, prefix: "")
         return found.sorted()
     }
 }

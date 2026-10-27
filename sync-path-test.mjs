@@ -116,9 +116,14 @@ function checkWiring() {
   assert(serverSrc.includes("worktreePath(rel, root = VAULT)"), "worktreePath keeps a two-argument signature");
   assert(serverSrc.includes('throw symlinkError(relSoFar)'), "every path part refuses a symlink");
   assert(serverSrc.includes("Point AIDANOS_VAULT at the real folder."), "startup names the real folder");
+  const dirty = sliceFn("async function dirtySet(", "async function unmergedFiles(");
+  assert(dirty.includes("isRecoverPath") && dirty.includes("ensureRecoverExcluded"), "status skips a recovery file and the vault repo excludes it");
+  const boot = sliceFn("async function boot(", "function isMainModule(");
+  assert(boot.includes("reportRecoveryFiles"), "startup lists leftover recovery files");
   assert(!serverSrc.includes("fs.realpath(logicalRoot)"), "the vault root is not realpath'd open");
   const treeFn = sliceFn("async function listMdTree(", "function dayMarkdownFromBody(");
   assert(treeFn.includes("rememberSkip"), "a listing skips a symlink and remembers it");
+  assert(treeFn.includes('.endsWith(".recover")'), "a listing skips a recovery file");
   assert(!treeFn.includes("symlinkError"), "a listing does not fail the whole view");
   assert(serverSrc.includes("stopAfterResponse"), "a tagged failure stops the process");
   assert(serverSrc.includes("aidanosStop"), "stop is tagged on the step that failed");
@@ -134,6 +139,7 @@ function checkWiring() {
   assert(inPlace.indexOf("assertParents") !== -1 && inPlace.indexOf("assertParents") < inPlace.indexOf("writeNoteText"), "in-place rechecks parents before the write");
   assert(inPlace.indexOf("beforeRename") !== -1 && inPlace.indexOf("beforeRename") < inPlace.indexOf("writeNoteText"), "in-place runs the parent hook before the write");
   assert(inPlace.includes("expectFile") && inPlace.includes("afterOpen"), "in-place checks the opened file before it writes");
+  assert(inPlace.includes("parents: seen"), "in-place passes the parent chain into the save");
   const heldAt = inPlace.lastIndexOf("holdWriteForTest");
   const openAt = inPlace.indexOf("writeNoteText");
   assert(heldAt !== -1 && heldAt < openAt, "the in-place hold is not after the last parent check");

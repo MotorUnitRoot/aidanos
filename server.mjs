@@ -26,7 +26,8 @@ import path from "node:path";
 import os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { noteSaveStyle, writeNoteText } from "./editor/note-save.mjs";
+import { noteSaveStyle, reportRecoveryFiles, writeNoteText } from "./editor/note-save.mjs";
+import { ensureRecoverExcluded, isRecoverPath } from "./editor/vault-exclude.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GIT_URL = String(process.env.AIDANOS_VAULT_GIT_URL || "").trim();
@@ -1216,6 +1217,7 @@ async function listDiff(from, to) {
 }
 
 async function dirtySet() {
+  await ensureRecoverExcluded(VAULT);
   const { out } = await runGit(
     ["-C", VAULT, "status", "--porcelain", "-z", "-uall"],
     { timeoutMs: 8000 },
@@ -1230,11 +1232,11 @@ async function dirtySet() {
     if (xy[0] === "R" || xy[0] === "C" || xy[1] === "R" || xy[1] === "C") {
       const dest = String(parts[i + 1] || "").replace(/\\/g, "/");
       i += 1;
-      if (isSafeRel(file)) set.add(file);
-      if (isSafeRel(dest)) set.add(dest);
+      if (isSafeRel(file) && !isRecoverPath(file)) set.add(file);
+      if (isSafeRel(dest) && !isRecoverPath(dest)) set.add(dest);
       continue;
     }
-    if (isSafeRel(file)) set.add(file);
+    if (isSafeRel(file) && !isRecoverPath(file)) set.add(file);
   }
   return set;
 }
@@ -2362,7 +2364,7 @@ async function listMdTree(dir, vaultRoot, skipped, gitLinks) {
   const entries = await fs.readdir(dir, { withFileTypes: true });
   for (const e of entries) {
     if (e.name.startsWith(".")) continue;
-    if (e.name.endsWith(".tmp")) continue;
+    if (e.name.endsWith(".tmp") || e.name.endsWith(".recover")) continue;
     const p = path.join(dir, e.name);
     const rel = path.relative(vaultRoot, p).split(path.sep).join("/");
     if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) continue;
@@ -2550,6 +2552,7 @@ async function atomicWriteFile(filePath, markdown, beforeRename) {
         swapInRequested: false,
         expectFile: existing,
         vaultRoot: VAULT,
+        parents: seen,
         async afterOpen() {
           await assertParents(seen);
         },
@@ -3720,7 +3723,9 @@ function refuseSymlinkedVaultRoot() {
 
 async function boot() {
   refuseSymlinkedVaultRoot();
+  await reportRecoveryFiles(VAULT);
   await initVaultGit();
+  await ensureRecoverExcluded(VAULT);
   startLogWatch();
   startVaultSyncLoop();
   server.listen(PORT, HOST, () => {

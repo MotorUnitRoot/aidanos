@@ -272,12 +272,18 @@ test("a fresh backup pushes to an empty repo", async () => {
   });
   try {
     await fs.writeFile(path.join(vault, "day.md"), "today\n");
+    await fs.writeFile(path.join(vault, "day.md.leftover.recover"), "secret\n");
     const result = await relay.backupNow();
     assert.equal(result.pushed, true);
     const listed = await git(["--git-dir", bare, "log", "--oneline", "main"]);
     assert.match(listed.stdout, /Backup notes/);
     const ignore = await fs.readFile(path.join(vault, ".gitignore"), "utf8");
     assert.match(ignore, /\.aidanos\//);
+    assert.match(ignore, /^\*\.recover$/m);
+    const exclude = await fs.readFile(path.join(vault, ".git", "info", "exclude"), "utf8");
+    assert.match(exclude, /^\*\.recover$/m);
+    const tree = await git(["--git-dir", bare, "ls-tree", "-r", "--name-only", "main"]);
+    assert.doesNotMatch(tree.stdout, /\.recover/);
   } finally {
     await relay.close();
   }

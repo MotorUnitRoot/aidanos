@@ -6,7 +6,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isNotePlanFolder, noteSaveStyle, writeNoteText } from "./editor/note-save.mjs";
+import { isNotePlanFolder, noteSaveStyle, reportRecoveryFiles, writeNoteText } from "./editor/note-save.mjs";
+import { createExclusive, openCheckedDirectory, unlinkIfSame, unlinkOpenedFile } from "./editor/dirfd.mjs";
+import { ensureRecoverExcluded, isRecoverPath } from "./editor/vault-exclude.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
@@ -350,6 +352,132 @@ await check("a failed restore keeps the recovery file and logs its name", async 
   assert(!line.includes(dir), "restore log included a filesystem path");
 });
 
+await check("a parent swapped after the recovery file is refused", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-recover-swap-"));
+  const vault = path.join(dir, "vault");
+  const notes = path.join(vault, "notes");
+  const outside = path.join(dir, "outside");
+  const real = path.join(dir, "notes-real");
+  fs.mkdirSync(notes, { recursive: true });
+  fs.mkdirSync(outside);
+  const note = path.join(notes, "page.md");
+  await writeNoteText(note, "original\n", { swapInRequested: false, vaultRoot: vault });
+  const error = await rejects(() => writeNoteText(note, "pwned\n", {
+    swapInRequested: false,
+    vaultRoot: vault,
+    afterRecovery() {
+      fs.renameSync(notes, real);
+      fs.symlinkSync(outside, notes);
+    },
+  }));
+  assert(error.code === "BAD_PATH", error.code + " " + error.message);
+  assert(fs.readdirSync(outside).length === 0, "a recovery file was left outside: " + fs.readdirSync(outside).join(","));
+  assert(fs.readFileSync(path.join(real, "page.md"), "utf8") === "original\n", "the note changed");
+  assert(!fs.readdirSync(real).some((entry) => entry.endsWith(".recover")), "the recovery file stayed in the vault");
+});
+
+await check("a failed sync keeps the recovery file and logs its path", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-"));
+  const vault = path.join(dir, "vault");
+  const notes = path.join(vault, "notes");
+  fs.mkdirSync(notes, { recursive: true });
+  const note = path.join(notes, "day.md");
+  await writeNoteText(note, "original-text\n", { swapInRequested: false, vaultRoot: vault });
+  const logged = [];
+  const previous = console.error;
+  console.error = (...args) => logged.push(args.join(" "));
+  try {
+    const error = await rejects(() => writeNoteText(note, "NEW-TEXT\n", {
+      swapInRequested: false,
+      vaultRoot: vault,
+      failSync() {
+        throw new Error("sync failed");
+      },
+    }));
+    assert(error.message === "sync failed", error.message);
+  } finally {
+    console.error = previous;
+  }
+  const recovery = fs.readdirSync(notes).filter((entry) => entry.endsWith(".recover"));
+  assert(recovery.length === 1, "the recovery file was removed: " + recovery.join(","));
+  assert(fs.readFileSync(path.join(notes, recovery[0]), "utf8") === "original-text\n", "the recovery file is not the old text");
+  const line = logged.find((entry) => entry.startsWith("sync failed: "));
+  assert(line === "sync failed: notes/" + recovery[0], "sync log was " + logged.join(" | "));
+  assert(!line.includes(dir), "sync log included a filesystem path");
+});
+
+await check("startup lists a leftover recovery file and leaves it in place", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-startup-"));
+  const vault = path.join(dir, "vault");
+  const notes = path.join(vault, "notes");
+  fs.mkdirSync(notes, { recursive: true });
+  const recovery = path.join(notes, "day.md.leftover.recover");
+  fs.writeFileSync(recovery, "only copy\n");
+  fs.symlinkSync(notes, path.join(vault, "linked"));
+  const logged = [];
+  const found = await reportRecoveryFiles(vault, (line) => logged.push(line));
+  assert(found.length === 1 && found[0] === "notes/day.md.leftover.recover", found.join(","));
+  assert(logged[0] === "recovery file: notes/day.md.leftover.recover", logged.join(" | "));
+  assert(fs.readFileSync(recovery, "utf8") === "only copy\n", "startup removed the only copy");
+});
+
+await check("a recovery name is removed only when it is still the created file", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-unlinkat-"));
+  const folder = await openCheckedDirectory(dir);
+  try {
+    for (const backend of ["proc", "helper"]) {
+      const name = backend + ".recover";
+      const created = await createExclusive(folder, name, Buffer.from("old\n"), backend);
+      const kept = path.join(dir, name + ".kept");
+      fs.renameSync(path.join(dir, name), kept);
+      fs.writeFileSync(path.join(dir, name), "other\n");
+      const removed = await unlinkIfSame(folder, name, created, backend);
+      assert(removed === false, backend + " unlinked a different file");
+      assert(fs.readFileSync(path.join(dir, name), "utf8") === "other\n", backend + " replaced the other file");
+      assert(fs.readFileSync(kept, "utf8") === "old\n", backend + " removed the created file by the new name");
+      const removedKept = await unlinkIfSame(folder, name + ".kept", created, backend);
+      assert(removedKept === true, backend + " left the created file");
+      assert(!fs.existsSync(kept), backend + " did not unlink the created inode");
+    }
+  } finally {
+    await folder.close();
+  }
+});
+
+await check("the vault repo excludes a recovery file from status", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-exclude-"));
+  execFileSync("git", ["init", "-b", "main"], { cwd: dir, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "aidanos@local"], { cwd: dir, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "AidanOS"], { cwd: dir, stdio: "ignore" });
+  fs.writeFileSync(path.join(dir, "day.md"), "today\n");
+  fs.writeFileSync(path.join(dir, "day.md.1.abc.recover"), "secret\n");
+  await ensureRecoverExcluded(dir);
+  const exclude = fs.readFileSync(path.join(dir, ".git", "info", "exclude"), "utf8");
+  assert(exclude.split(/\r?\n/).some((line) => line.trim() === "*.recover"), exclude);
+  const status = execFileSync("git", ["status", "--porcelain", "-uall"], { cwd: dir, encoding: "utf8" });
+  assert(status.includes("day.md"), status);
+  assert(!status.includes(".recover"), status);
+  assert(isRecoverPath("notes/day.md.1.abc.recover") === true);
+  assert(isRecoverPath("notes/day.md") === false);
+});
+
+await check("the opened inode is removed through the directory descriptor", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-opened-"));
+  const file = path.join(dir, "page.md");
+  fs.writeFileSync(file, "created\n");
+  const handle = await fs.promises.open(file, "r+");
+  try {
+    fs.renameSync(file, file + ".kept");
+    fs.writeFileSync(file, "other\n");
+    const removed = await unlinkOpenedFile(handle, "helper");
+    assert(removed === true, "the opened inode was left behind");
+    assert(fs.readFileSync(file, "utf8") === "other\n", "a different file was removed");
+    assert(!fs.existsSync(file + ".kept"), "the opened inode is still linked");
+  } finally {
+    await handle.close();
+  }
+});
+
 await check("an empty env overlay keeps the vault kind", async () => {
   const previous = process.env.AIDANOS_VAULT_KIND;
   process.env.AIDANOS_VAULT_KIND = "noteplan";
@@ -443,9 +571,13 @@ await check("the server passes beforeRename into the save", async () => {
   const place = save.slice(placeStart, placeEnd);
   const checkedAt = place.indexOf("afterOpen");
   const writeAt = place.indexOf("writeOpened");
+  const recoveryAt = place.indexOf("createExclusive");
+  const recheckAt = place.indexOf("recheckParents");
   assert(checkedAt !== -1 && writeAt !== -1 && checkedAt < writeAt, "the opened file is checked before the first byte");
+  assert(recoveryAt !== -1 && recheckAt > recoveryAt && recheckAt < writeAt, "parents are rechecked after the recovery file and before the first byte");
   assert(place.includes("restoreOpened"), "a failed write does not put the previous text back");
   assert(place.includes("expectFile"), "the opened file is not compared with the vault file");
+  assert(fn.includes("parents: seen"), "the server passes the parent chain into the save");
 });
 
 if (process.exitCode) process.exit(process.exitCode);

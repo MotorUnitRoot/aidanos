@@ -92,9 +92,53 @@ async function ensureGitignore(vault) {
     text = "";
   }
   const lines = text.split(/\r?\n/).map((line) => line.trim());
-  if (lines.includes(".aidanos/")) return;
-  const prefix = text.length > 0 && !text.endsWith("\n") ? text + "\n" : text;
-  await fs.writeFile(file, prefix + ".aidanos/\n");
+  const missing = [];
+  if (!lines.includes(".aidanos/")) missing.push(".aidanos/");
+  if (!lines.includes("*.recover")) missing.push("*.recover");
+  if (missing.length) {
+    const prefix = text.length > 0 && !text.endsWith("\n") ? text + "\n" : text;
+    await fs.writeFile(file, prefix + missing.join("\n") + "\n");
+  }
+  await ensureRecoverExcluded(vault);
+}
+
+async function ensureRecoverExcluded(vault) {
+  const gitLink = path.join(vault, ".git");
+  let st;
+  try {
+    st = await fs.lstat(gitLink);
+  } catch {
+    return;
+  }
+  if (st.isSymbolicLink()) return;
+  let gitDir = gitLink;
+  if (st.isFile()) {
+    const text = await fs.readFile(gitLink, "utf8");
+    const match = /^gitdir:\s*(.*)$/m.exec(text);
+    if (!match) return;
+    gitDir = path.resolve(vault, match[1].trim());
+    let listed;
+    try {
+      listed = await fs.lstat(gitDir);
+    } catch {
+      return;
+    }
+    if (listed.isSymbolicLink() || !listed.isDirectory()) return;
+  } else if (!st.isDirectory()) {
+    return;
+  }
+  const info = path.join(gitDir, "info");
+  const exclude = path.join(info, "exclude");
+  let current = "";
+  try {
+    current = await fs.readFile(exclude, "utf8");
+  } catch (e) {
+    if (e.code !== "ENOENT") return;
+  }
+  if (current.split(/\r?\n/).some((line) => line.trim() === "*.recover")) return;
+  await fs.mkdir(info, { recursive: true });
+  const prefix = current.length > 0 && !current.endsWith("\n") ? current + "\n" : current;
+  await fs.writeFile(exclude, prefix + "*.recover\n");
 }
 
 const ASKPASS = `#!/bin/sh
@@ -136,6 +180,7 @@ export async function backupOnce({ vault, gitUrl, gitToken, secrets, env = proce
   } catch {
     await runGit(["init", "-b", "main"], vault, hidden);
   }
+  await ensureRecoverExcluded(vault);
   const name = env.AIDANOS_RELAY_GIT_NAME || "AidanOS";
   const email = env.AIDANOS_RELAY_GIT_EMAIL || "aidanos@local";
   await runGit(["config", "user.name", name], vault, hidden);

@@ -631,22 +631,34 @@ async function gitLockRemovesOnlyARecordedLock() {
   }
 }
 
+function waitChild(child, ms) {
+  return new Promise((resolve) => {
+    if (child.exitCode != null || child.signalCode != null) return resolve();
+    const timer = setTimeout(resolve, ms);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
 async function gitLockKeepsSameUidScanError() {
   if (process.platform !== "linux") return;
   const tmp = lockTmp();
+  // The python we spawn stays the parent and wait()s. A second fork would
+  // orphan the sleeper. The hosted image runs node as pid 1, and pid 1
+  // here does not reap. A non-dumpable zombie still answers EACCES for
+  // its descriptor directory, so the next test would skip.
   const sleeper = spawn("python3", ["-c", [
     "import ctypes, os, time",
     "pid = os.fork()",
-    "if pid > 0:",
-    "    os.waitpid(pid, 0)",
+    "if pid == 0:",
+    "    os.setsid()",
+    "    ctypes.CDLL(None).prctl(4, 0)",
+    "    print(os.getpid(), flush=True)",
+    "    time.sleep(60)",
     "    raise SystemExit(0)",
-    "os.setsid()",
-    "pid2 = os.fork()",
-    "if pid2 > 0:",
-    "    raise SystemExit(0)",
-    "ctypes.CDLL(None).prctl(4, 0)",
-    "print(os.getpid(), flush=True)",
-    "time.sleep(60)",
+    "os.waitpid(pid, 0)",
   ].join("\n")], { stdio: ["ignore", "pipe", "pipe"] });
   let deniedPid = 0;
   try {
@@ -683,10 +695,23 @@ async function gitLockKeepsSameUidScanError() {
     assert(gitLockBlocksVault(vault), "a scan error did not block sync");
   } finally {
     if (deniedPid) {
-      try { process.kill(deniedPid, "SIGKILL"); } catch { /* namespace exit reaps it */ }
+      try { process.kill(deniedPid, "SIGKILL"); } catch { /* already gone */ }
+      await waitChild(sleeper, 4000);
     }
-    try { sleeper.kill("SIGKILL"); } catch { /* already exited */ }
+    if (sleeper.exitCode == null && sleeper.signalCode == null) {
+      try { sleeper.kill("SIGKILL"); } catch { /* already exited */ }
+      await waitChild(sleeper, 4000);
+    }
     fs.rmSync(tmp, { recursive: true, force: true });
+    if (deniedPid) {
+      let gone = false;
+      try {
+        fs.statSync("/proc/" + deniedPid);
+      } catch {
+        gone = true;
+      }
+      if (!gone) throw new Error("the non-dumpable process was not reaped");
+    }
   }
 }
 

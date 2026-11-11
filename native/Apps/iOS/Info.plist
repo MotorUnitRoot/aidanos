@@ -27,7 +27,7 @@
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>AidanOS connects to the relay on your home network so this iPhone and your Mac can share today's note.</string>
+	<string>AidanOS connects to your relay over your trusted Tailscale network so this iPhone and your Mac can share today's note.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

@@ -12,6 +12,7 @@ final class RelayLink {
     private let readQueue = DispatchQueue(label: "aidanos.relay.read")
     private let lock = NSLock()
     private var socket: Int32 = -1
+    private var secureTransport: RelayTLS?
     private var running = false
     private var serverId = ""
     private var peerId = ""
@@ -26,9 +27,21 @@ final class RelayLink {
         self.peerId = peerId
         self.storageId = storageId
         self.host = host
-        let fd = try connectTCP(host: parsed.host, port: parsed.port)
-        socket = fd
-        try upgrade(fd: fd, address: parsed, token: token)
+        guard !token.contains("\r"), !token.contains("\n") else { throw AidanError.authRejected }
+        do {
+            if parsed.secure {
+                let transport = RelayTLS()
+                try transport.connect(address: parsed, token: token)
+                secureTransport = transport
+            } else {
+                let fd = try connectTCP(host: parsed.host, port: parsed.port)
+                socket = fd
+                try upgrade(fd: fd, address: parsed, token: token)
+            }
+        } catch {
+            close()
+            throw error
+        }
         running = true
         let joined = DispatchSemaphore(value: 0)
         var joinError: Error?
@@ -58,7 +71,10 @@ final class RelayLink {
         running = false
         let fd = socket
         socket = -1
+        let transport = secureTransport
+        secureTransport = nil
         lock.unlock()
+        transport?.close()
         if fd >= 0 { _ = shutdown(fd, Int32(SHUT_RDWR)); _ = closeFd(fd) }
     }
 
@@ -112,11 +128,20 @@ final class RelayLink {
     private func readLoop() {
         while true {
             lock.lock()
-            let alive = running && socket >= 0
+            let alive = running && (socket >= 0 || secureTransport != nil)
             lock.unlock()
             if !alive { return }
             do {
-                guard let frame = try readFrame() else { continue }
+                let frame: Data
+                if let transport = secureTransport {
+                    frame = try transport.receive()
+                    guard frame.count <= (host?.maxSyncBytes ?? 32 * 1024 * 1024) else {
+                        throw AidanError.payloadTooLarge
+                    }
+                } else {
+                    guard let rawFrame = try readFrame() else { continue }
+                    frame = rawFrame
+                }
                 let failure = ErrorBox()
                 let done = DispatchSemaphore(value: 0)
                 queue.async { [weak self] in
@@ -181,6 +206,7 @@ final class RelayLink {
     }
 
     private func send(_ data: Data) throws {
+        if let transport = secureTransport { try transport.send(data); return }
         try sendFrame(opcode: 0x2, payload: data)
     }
 
@@ -393,27 +419,63 @@ protocol SyncHost: AnyObject {
 }
 
 struct RelayAddress {
-    var host: String
-    var port: UInt16
-    var path: String
+    let host: String
+    let port: UInt16
+    let path: String
+    let secure: Bool
+    var canonicalURL: String { "\(secure ? "wss" : "ws")://\(host):\(port)\(path)" }
 
-    init(_ raw: String) throws {
-        guard let url = URL(string: raw), let host = url.host, !host.isEmpty else {
-            throw AidanError.protocol("The relay address should look like ws://127.0.0.1:3750")
+    // Release builds can never enable loopback credentials. Debug test bundles
+    // opt in explicitly; ordinary debug apps also refuse loopback by default.
+    static var testLoopback: Bool {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["AIDANOS_CLIENT_TEST_MODE"] == "1"
+        #else
+        return false
+        #endif
+    }
+
+    static func isTailscaleIPv4(_ host: String) -> Bool {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        let bytes = parts.compactMap { UInt8($0) }
+        guard bytes.count == 4, zip(parts, bytes).allSatisfy({ String($0.0) == String($0.1) }) else { return false }
+        return bytes[0] == 100 && bytes[1] >= 64 && bytes[1] <= 127
+    }
+
+    static func isMagicDNS(_ host: String) -> Bool {
+        guard host.hasSuffix(".ts.net"), host.count <= 253 else { return false }
+        return host.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { label in
+            guard !label.isEmpty, label.count <= 63, label.first != "-", label.last != "-" else { return false }
+            return label.utf8.allSatisfy { ($0 >= 97 && $0 <= 122) || ($0 >= 48 && $0 <= 57) || $0 == 45 }
         }
-        if url.scheme == "wss" {
-            throw AidanError.protocol("This cut uses plain ws:// on your home network.")
+    }
+
+    init(_ raw: String, allowTestLoopback: Bool = RelayAddress.testLoopback) throws {
+        guard let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
+              ["ws", "wss"].contains(scheme), let host = url.host?.lowercased(), !host.isEmpty,
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              url.path.isEmpty || url.path == "/" else {
+            throw AidanError.protocol("Use ws://100.x.y.z:3750 or a verified wss://relay.tail.ts.net address.")
+        }
+        let secure = scheme == "wss"
+        let testLocal = allowTestLoopback && host == "127.0.0.1"
+        // MagicDNS requires authenticated TLS, never plaintext DNS + a bearer
+        // token. Direct ws uses a literal CGNAT IP (no DNS/rebinding fallback).
+        guard Self.isTailscaleIPv4(host) || (secure && Self.isMagicDNS(host)) || testLocal else {
+            throw AidanError.protocol("Credentials are sent only to Tailscale IPv4 or verified wss:// .ts.net endpoints.")
         }
         self.host = host
+        self.secure = secure
         if let explicit = url.port {
-            guard let port = UInt16(exactly: explicit) else {
+            guard let port = UInt16(exactly: explicit), port > 0 else {
                 throw AidanError.protocol("The relay port must be between 1 and 65535.")
             }
             self.port = port
         } else {
-            self.port = 80
+            self.port = secure ? 443 : 80
         }
-        self.path = url.path.isEmpty ? "/" : url.path
+        self.path = "/"
     }
 }
 

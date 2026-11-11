@@ -66,7 +66,7 @@ final class TodayModel: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
-        address = defaults.string(forKey: "aidanos.relayAddress") ?? "ws://127.0.0.1:3750"
+        address = defaults.string(forKey: "aidanos.relayAddress") ?? ""
         let stored = RelayTokenStore.load()
         if stored.isEmpty, let old = defaults.string(forKey: "aidanos.relayToken"), !old.isEmpty {
             token = old

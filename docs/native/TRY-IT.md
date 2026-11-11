@@ -73,7 +73,7 @@ Git, if you later point it at a backup repository, only receives a copy of the m
 2. At the top, choose the scheme **AidanOS-macOS** and the destination **My Mac**.
 3. In the left sidebar, select the project, then the **AidanOS-macOS** target, then **Signing & Capabilities**. Choose the team named **Your Name (Personal Team)**. Do this for the Mac target, not only the iPhone target. The project does not pick a team for you.
 4. Press Run. The window opens on today's note, with the cursor at the end. The note text scrolls if it is longer than the window.
-5. In the address field leave `ws://127.0.0.1:3750`. Put the token into the app from the token file, then press Connect. The token is hidden. The status says Connected only while the connection is really up.
+5. For native app sync, enable Tailscale-only `--lan` as described below and enter the printed `ws://100.x.y.z:3750` address, including on the Mac. Normal app builds refuse loopback credentials. Put the token into the app from the token file, then press Connect. The token is hidden. The status says Connected only while the connection is really up.
 
    On the Mac, in a second Terminal window:
 
@@ -110,7 +110,11 @@ A paid developer account is not required for this test. A free Apple ID installs
 
    `--lan` refuses startup unless the running Tailscale daemon reports a local IPv4 in `100.64.0.0/10` and that address exists on this machine's network interfaces. A CGNAT address alone is not enough. `--lan-address 100.x.y.z` can select that verified address explicitly; home/private addresses such as `192.168.x.x` and `10.x.x.x` are refused. If Tailscale is absent or stopped, omit `--lan` for Mac-only use.
 
-   Reset is off by default. Even if `AIDANOS_RELAY_ALLOW_RESET=1` is set for simulator tests, `/reset` is refused on **all** listeners while `--lan` or `--lan-address` is active. Without a network listener it is accepted only on a loopback socket, with authentication and the current relay markers. Forwarding headers cannot change that.
+   Reset is **test-only**, not an operator feature. The simulator harness alone supplies `--test-mode`, `NODE_ENV=test`, an explicit reset opt-in, and a separate dummy admin credential (never the sync token). A normal production relay ignores reset opt-in and offers no reset route. The harness refuses network listeners, proxy hint headers, and detected Tailscale Serve/Funnel config; installed CLI errors fail closed. Never combine reset with Serve/Funnel, an SSH tunnel or any proxy. Do not put test flags/admin authority into launchd, Docker, apps or real-note runs.
+
+   To find the Mac's address independently, run `tailscale ip -4`. Only `100.64.0.0/10` is supported, and the relay verifies it against local interfaces and the running daemon. The native client sends credentials only to a literal Tailscale IPv4 using `ws://`, or a `wss://` Tailscale IPv4 / `.ts.net` name with system TLS certificate/hostname validation. Plain `ws://` names, ordinary LAN/public destinations, unrelated schemes, URL credentials, queries and fragments are refused before sending the token. WSS has no plaintext fallback and needs a separately reviewed private TLS front end plus the relay's exact trusted-Host entry. It is optional; direct IPv4 needs none.
+
+   Follow [PHONE.md's real Mac/iPhone checklist](../../PHONE.md#verify-on-a-real-maciphone-before-real-notes) with dummy notes before real notes. This cannot be verified from the Linux box.
 
 The phone build asks for no capability a free account cannot have. There is no widget and no share sheet in this cut. A paid account (the enrollment that is in progress) will later allow TestFlight, widgets, and the share sheet.
 
@@ -128,3 +132,8 @@ If the two sides cannot be merged safely, the app shows Keep mine, Take theirs, 
 ## What this cut does not do
 
 It does not install over TestFlight. It does not sync through git. It does not run a widget or a share extension. Those wait on the paid account, and git stays a backup even then. A separate token for each device comes before the relay is ever offered as a public or shared relay.
+
+The reset entry point is `relay/test/harness/server.mjs --test-mode`, used only
+by the simulator workflow. The ordinary `relay/src/server.mjs` CLI rejects
+`--test-mode` and never enables reset, even if test/reset environment variables
+are inherited. The test harness is not copied into the relay Docker image.

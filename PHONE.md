@@ -1,70 +1,72 @@
-# AidanOS phone cut (PWA)
+# AidanOS on iPhone — private Tailscale path
 
-Weekend path: Progressive Web App via Safari **Add to Home Screen**. Not App Store. Vault stays markdown (`AIDANOS_VAULT` / sibling `vault/`). One web app on desktop and phone — same Door, same Capture.
+Native sync and the Safari home-screen web app are different paths. These steps
+are for the native Mac/iPhone sync cut. Do not use the old home-Wi-Fi `--lan`,
+wildcard `AIDANOS_HOST=0.0.0.0`, or historical quick-tunnel instructions for notes.
+Nothing here authorizes a deploy or a public relay.
 
-## Live sit URL (tonight)
+## Connect the native iPhone and Mac
 
-https://beach-candy-projects-retained.trycloudflare.com
+1. Install Tailscale on the Mac and iPhone; connect both to the same trusted tailnet.
+   Limit tailnet grants/firewall access to the intended devices and relay port.
+   The Mac needs the `tailscale` CLI on PATH and its daemon running.
+2. Follow [the native setup](docs/native/TRY-IT.md) for Xcode, the two app builds,
+   the separate relay folder, and the sync token file. Start with dummy notes.
+3. On the Mac, `tailscale ip -4` shows its `100.x.y.z` IPv4. The supported range is
+   **100.64.0.0/10** (second octet 64–127), not every `100.x` address. Start the relay:
+   ```sh
+   cd aidanos/relay
+   node src/server.mjs --vault "$HOME/aidanos-relay-notes" --lan
+   ```
+   Keep the token-file environment setting from the setup guide. Do not print it.
+4. The relay prints `PHONE ws://100.x.y.z:3750`. Enter that exact literal address
+   on **both** apps, including the Mac app. Set the port to the printed port if
+   different. A normal native app no longer sends credentials to loopback.
+5. Put the existing sync token only in the masked token field and press Connect.
+   `ws://` to a direct Tailscale IPv4 uses Tailscale encryption, not Wi-Fi plaintext.
+   Do not share, proxy, port-forward or publicly expose this direct relay.
 
-Shop tunnel in front of 3847. Quick tunnel — fine for a sit and overnight while it stays up; not the forever host.
+`--lan` and `--lan-address` refuse home/private/public/wildcard addresses and a
+CGNAT IP not owned by both a local interface and the running Tailscale daemon.
+There is no fallback to home Wi-Fi. Raw IPv6 and plain `ws://` MagicDNS names are
+not supported. With no Tailscale, leave the apps offline; do not weaken the gate.
 
-## Door locks (both surfaces)
+### Optional authenticated TLS path — not yet device-verified
 
-1. **Get to Work** and **Capture thoughts** sit side by side, same hairline.
-2. **Capture thoughts** opens a blank Capture note (empty paper) — no week strip, no day agenda rail.
-3. **Get to Work** opens Today (week chrome). Empty Get to Work opens empty Today paper.
+The Apple client accepts `wss://relay.tail.ts.net` (default port 443) only with
+system certificate-chain and hostname validation. It refuses redirects and never
+falls back to plaintext. Plain `ws://` MagicDNS is refused to avoid DNS rebinding.
+The server itself has no TLS listener: this path needs a separately reviewed,
+private TLS front end, an exact `AIDANOS_RELAY_TRUSTED_HOSTS=relay.tail.ts.net:443`
+allow-list entry, and a trusted tailnet grant. It is not an instruction to set one
+up. Do not use Funnel or any public endpoint. **Reset must never be combined with
+Serve/Funnel or any proxy**, even in tests. Direct `ws://100.x:port` remains the
+smallest iPhone path and needs no TLS front end.
 
-## Add to Home Screen (iPhone)
+## Verify on a real Mac/iPhone before real notes
 
-1. Open the URL above in **Safari** (not Chrome).
-2. Tap **Share** → **Add to Home Screen**.
-3. Name stays **AidanOS**; tap **Add**.
-4. Launch from the home screen icon — runs standalone.
+**Not verified from the Linux box. Use only disposable dummy notes until done.**
 
-## LAN bind (his Mac, his vault) — usable tonight without GCP
+- [ ] Build AidanCore tests and both apps; run the new RelayAddress tests and all
+      simulator tests, including separate-admin reset. Do not change deadlines.
+- [ ] Confirm both devices' Tailscale addresses, narrow grants and Mac firewall;
+      confirm the listener is the Mac's Tailscale IP, not Wi-Fi or every interface.
+- [ ] Connect with `ws://100.x:3750` from the real iPhone and Mac. Check iOS local
+      network prompts/routing; do not assume ATS exceptions make this work.
+- [ ] Edit dummy notes on both, test airplane mode, sleep/wake and reconnect;
+      confirm identical markdown and no lost edits. Check reachability off Wi-Fi.
+- [ ] Reject ordinary LAN/public addresses, bad schemes and `ws://` DNS names
+      before credentials leave the app. For optional WSS, test a good certificate,
+      an invalid/untrusted certificate, mismatched hostname and redirect refusal.
+- [ ] Production `/reset` stays 404 even with its old opt-in variable and sync
+      token. No test flags/admin authority in app, Docker, launchd or real-note use.
+- [ ] Reviewer, CISO and Designer clear this new head; Colby separately authorizes
+      any push/workflow scope, merge or deployment before using real notes.
 
-Default bind is localhost only. For phone on the same Wi‑Fi against `~/Grok/motorunit`:
+## Safari home-screen app (PWA)
 
-```bash
-AIDANOS_HOST=0.0.0.0 AIDANOS_VAULT=~/Grok/motorunit PORT=3847 node server.mjs
-```
-
-Open `http://<mac-lan-ip>:3847` in Safari → Add to Home Screen.
-
-## Cloud Run (ready when Colby says go)
-
-`Dockerfile` already sets `PORT=8080` and `AIDANOS_HOST=0.0.0.0`, and installs `git` so Cloud Run can clone a private vault. The vault is a private git repo of markdown (target `MotorUnitRoot/aidanos-vault`). Not Drive, not a second database. The Mac launchd agent starts the app from `~/Grok/motorunit/dashboard` and sets `AIDANOS_VAULT` to `~/Grok/motorunit`. Cloud Run clones, serves, and commits on write.
-
-When a GCP project is authorized:
-
-```bash
-# from the aidanos repo root (after live Door files are on main)
-# Also set AIDANOS_VAULT_GIT_URL and a token secret (AIDANOS_VAULT_GIT_TOKEN or GITHUB_TOKEN).
-gcloud run deploy aidanos \
-  --source . \
-  --region us-west1 \
-  --allow-unauthenticated \
-  --set-env-vars "AIDANOS_HOST=0.0.0.0,AIDANOS_VAULT_GIT_URL=https://github.com/MotorUnitRoot/aidanos-vault.git" \
-  --port 8080
-```
-
-If the vault remote is not created yet, the service still boots. Local writes succeed; push failures show on `/api/health` as `git.error`. Do not put the token in the command line if you can bind it as a secret.
-
-Then point Safari / Add to Home Screen at the Cloud Run HTTPS URL. Until then: keep the tunnel or use LAN.
-
-## Overnight without waiting on GCP
-
-1. Keep 3847 up and the Cloudflare tunnel pointed at it (shop process).
-2. Or run LAN bind on his Mac with his real vault (best day-to-day disk).
-3. Cloud Run when Aide/Colby unlocks a GCP project — recipe above, no Apple Developer.
-
-## Morning sit (Designer)
-
-1. Safari on iPhone → open the HTTPS URL → Share → Add to Home Screen → launch AidanOS.
-2. Door: buttons side by side, same hairline; Capture → blank note; Get to Work → Today.
-3. Type a line on Today; leave and return — it stays.
-4. Bounce if buttons are stacked, Capture lands on Today week chrome, or a CRM screen shows.
-
-## Note for Aide-de-camp
-
-Overnight cut is a PWA (not TestFlight). Code has LAN bind (`AIDANOS_HOST`), responsive Door/Today, Capture blank note, manifest, service worker, and a Cloud Run Dockerfile. Live sit URL is the Cloudflare quick tunnel above. His MotorUnit vault on the Mac remains the real disk for day-to-day. Not blocked on Apple Developer. Durable public host = Cloud Run when a GCP project is ready; until then tunnel + LAN keep the phone usable.
+A PWA still opens an approved, freshly verified web-app URL in Safari → Share →
+Add to Home Screen. It is not the native `ws://` relay and cannot use that URL as
+a web page. The old quick-tunnel URL is not a current verified service. The same
+Door/Get to Work/Capture UI checks still apply. Hosting or public exposure needs
+its own approval; no Cloud Run or tunnel command is authorized by this runbook.

@@ -121,7 +121,9 @@ By default the relay binds to `127.0.0.1` only. That is this computer, and no ot
 
 For the iPhone, `--lan` now means **Tailscale only**, not the home network. The running local `tailscale status --json` must report the selected address as this node's own address, and that IPv4 must exist on a local interface in `100.64.0.0/10`. The relay binds only that address plus `127.0.0.1`. `--lan-address` goes through the same checks. Missing/stopped Tailscale, an unverified CGNAT address, home-network addresses, public addresses, and wildcard binding are refused. Tailscale provides encryption and device authentication; both devices must be on the same trusted, restricted tailnet. The existing bearer token is still required. There is no application-level TLS or QR pairing in this cut. Never proxy, port-forward, enable Funnel, or publish this relay. A future public relay still needs its own security design and per-device tokens.
 
-`POST /reset` is disabled by default. Opt-in simulator reset additionally requires a loopback-only relay and both the remote and local socket addresses to be loopback. If any network listener is enabled, reset is refused on every listener, including loopback. Neither forwarding headers nor a correct bearer token can bypass that gate. The current matching relay markers remain required before deletion.
+`POST /reset` is absent from normal production behavior. The simulator harness explicitly enables test mode (`--test-mode` plus `NODE_ENV=test`), a reset opt-in, and a separate admin credential that cannot equal the sync credential. It also requires loopback-only sockets and current matching markers. Proxy hint headers refuse reset. Detected Serve/Funnel config refuses startup, CLI errors fail closed, and the check repeats on every reset. Never combine test reset with any proxy or real notes; no production/launchd/Docker path enables it.
+
+The native credential boundary is enforced before connect: plain `ws://` accepts only literal `100.64.0.0/10` IPv4; MagicDNS `.ts.net` requires `wss://` with the system trust store and hostname verification, no redirects and no plaintext fallback. Release clients refuse loopback; debug test bundles explicitly opt in for their disposable relay. The server's optional exact trusted-Host list supports a separately reviewed private TLS front end. Native clients omit Origin; browser Origins are refused. Neither an IP range nor a DNS suffix alone attests tailnet grants or device ownership. Verify narrow grants, routing and firewall rules on the actual Mac/iPhone before real notes.
 
 A dropped socket, sleep, or airplane mode reconnects on its own, waiting a second and then longer, up to 30 seconds. The app shows Connecting, Connected, or Reconnecting. It does not say Connected while the socket is down. A note created after the connection, including the next day's note, syncs on that same connection. The app moves to the new day.
 
@@ -131,7 +133,7 @@ They are a shell. On open they show today's day note as an editable text view, w
 
 The iPhone build in this cut is installed from Xcode on the Mac with a free Apple ID (a personal team, a cable, and a build that expires after seven days). It asks for no capability a free account cannot have: no App Groups, no iCloud, no push notifications, no associated domains, no background modes, no widget, no share extension. The bundle id prefix lives in one xcconfig file so you can change it in one place. Signing is automatic and the team is left for you to pick.
 
-The phone has to be allowed to open a plain `ws://` connection to the Mac. The app allows local networking (App Transport Security's local-networking exception) and includes the local-network usage sentence iOS shows the first time.
+The direct-IP client uses a raw TCP socket over Tailscale; the optional WSS path uses Apple URLSession with normal TLS verification. Existing local-network permission/ATS settings are not evidence that either path works on a device. Do not broaden ATS settings to make a failing connection pass. Real Mac/iPhone routing and certificate tests in PHONE.md are mandatory before real notes.
 
 ## What Linux needs later
 
@@ -160,3 +162,8 @@ automerge-repo-swift, the Swift twin of the relay's library, is not linked in th
 6. Per-device tokens come before the relay ever leaves the house. This cut still uses one shared token, and is restricted to this Mac or the owner's trusted Tailscale devices; it is not a public relay.
 7. Still open: when automerge-repo-swift moves to Automerge 0.7, the Apple apps may switch onto its WebSocket code. The protocol would stay the same.
 8. Still open: a free Apple ID build expires every seven days and has to be reinstalled from Xcode until the paid developer account finishes.
+
+The reset entry point is `relay/test/harness/server.mjs --test-mode`, used only
+by the simulator workflow. The ordinary `relay/src/server.mjs` CLI rejects
+`--test-mode` and never enables reset, even if test/reset environment variables
+are inherited. The test harness is not copied into the relay Docker image.

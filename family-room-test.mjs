@@ -1,3 +1,4 @@
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
 #!/usr/bin/env node
 import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
@@ -394,7 +395,7 @@ async function pngRoundTrip() {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,
@@ -463,7 +464,7 @@ async function pngSymlinkStaysInJob() {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,
@@ -613,7 +614,7 @@ async function pngReadIsOnlyThePicture() {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,

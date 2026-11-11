@@ -1,3 +1,4 @@
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
 #!/usr/bin/env node
 import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
@@ -221,7 +222,7 @@ async function liveSearchAndLand() {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,
@@ -231,8 +232,6 @@ async function liveSearchAndLand() {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let errOut = "";
-  child.stderr.on("data", (buf) => { errOut += String(buf); });
   const base = "http://127.0.0.1:" + port;
   try {
     await waitHealth(base, child);
@@ -312,7 +311,7 @@ async function liveSearchAndLand() {
     }
     try { child.kill("SIGKILL"); } catch (e) {}
     try { fs.rmSync(vault, { recursive: true, force: true }); } catch (e) {}
-    if (errOut && !results.some((r) => r.name && r.name.includes("live"))) {
+    if (child._log() && !results.some((r) => r.name && r.name.includes("live"))) {
       // keep for the failing check
     }
   }

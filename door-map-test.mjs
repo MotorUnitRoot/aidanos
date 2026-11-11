@@ -1,3 +1,4 @@
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
 #!/usr/bin/env node
 import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
@@ -42,7 +43,7 @@ await fs.promises.writeFile(path.join(vault, "log", DATE + ".md"), "", "utf8");
 const child = spawn(process.execPath, [path.join(__dirname, "server.mjs")], {
   cwd: __dirname,
   env: {
-    ...process.env,
+    ...fixtureEnv(),
     PORT: String(PORT),
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,

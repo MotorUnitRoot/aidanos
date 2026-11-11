@@ -1,3 +1,4 @@
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
 #!/usr/bin/env node
 import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
@@ -120,7 +121,7 @@ async function liveVaultAbi() {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,
@@ -130,15 +131,12 @@ async function liveVaultAbi() {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let errOut = "";
-  child.stderr.on("data", (buf) => { errOut += String(buf); });
-  child.stdout.on("data", (buf) => { errOut += String(buf); });
   const base = "http://127.0.0.1:" + port;
   const step = async (name, fn) => {
     try {
       return await fn();
     } catch (e) {
-      throw new Error(name + ": " + (e && e.message || e) + (errOut ? " :: " + errOut.slice(-400) : ""));
+      throw new Error(name + ": " + (e && e.message || e) + (child._log() ? " :: " + child._log().slice(-400) : ""));
     }
   };
   try {

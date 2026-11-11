@@ -1,5 +1,7 @@
+import { spawnWithLog as spawn } from "./test/child-diagnostics.mjs";
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
 #!/usr/bin/env node
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";
 import net from "node:net";
@@ -74,7 +76,7 @@ function spawnServer(port, vault) {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,
@@ -86,18 +88,13 @@ function spawnServer(port, vault) {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let log = "";
-  child.stdout.on("data", (chunk) => { log += chunk; });
-  child.stderr.on("data", (chunk) => { log += chunk; });
-  child.log = () => log;
-  child._log = child.log;
+  child.log = child._log;
   return child;
 }
 
 const childA = spawnServer(portA, vaultA);
 const childB = spawnServer(portB, vaultB);
 const chromeDir = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-chrome-"));
-const chromeLog = [];
 const chrome = spawn(chromeBin(), [
   "--headless=new",
   "--disable-gpu",
@@ -110,9 +107,6 @@ const chrome = spawn(chromeBin(), [
   "--window-size=390,844",
   "about:blank",
 ], { stdio: ["ignore", "pipe", "pipe"] });
-chrome.stdout.on("data", (chunk) => { chromeLog.push(String(chunk)); });
-chrome.stderr.on("data", (chunk) => { chromeLog.push(String(chunk)); });
-chrome._log = () => chromeLog.join("");
 
 function stop() {
   chrome.kill("SIGKILL");

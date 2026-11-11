@@ -1,3 +1,6 @@
+import { runDiagnosticSecurityRegressions } from "./test/child-diagnostics-regressions.mjs";
+import { spawnWithLog as spawn } from "./test/child-diagnostics.mjs";
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
 #!/usr/bin/env node
 // Every symlink under the vault is refused, including one that stays inside.
 // The error names that path. A symlinked vault root refuses to start.
@@ -9,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import net from "node:net";
 import { PassThrough } from "node:stream";
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { gitEnv, readWorktree, vaultRel, worktreePath } from "./server.mjs";
 
@@ -199,13 +202,9 @@ async function pathChecks() {
 function spawnServer(env) {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
-    env: { ...process.env, AIDANOS_VAULT_GIT_RETRY_MS: "0", ...env },
+    env: { ...fixtureEnv(), AIDANOS_VAULT_GIT_RETRY_MS: "0", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let log = "";
-  child.stderr.on("data", (buf) => { log += String(buf); });
-  child.stdout.on("data", (buf) => { log += String(buf); });
-  child._log = () => log;
   return child;
 }
 
@@ -2122,6 +2121,8 @@ assert(startupFailure.message.includes("stdout startup detail") && startupFailur
 assert(childStartupError({ _log: () => "" }, "health timeout").message.includes("no child output captured"), "empty startup output is explicit");
 diagnosticChild.stdout.end();
 diagnosticChild.stderr.end();
+
+await runDiagnosticSecurityRegressions(assert);
 
 checkWiring();
 await pathChecks();

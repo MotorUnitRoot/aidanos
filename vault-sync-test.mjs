@@ -1,10 +1,12 @@
+import { spawnWithLog as spawn } from "./test/child-diagnostics.mjs";
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
 #!/usr/bin/env node
 import { randomTestPort } from "./test/ports.mjs";
 import { childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -24,13 +26,9 @@ function git(args, cwd) {
 function spawnServer(env) {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
-    env: { ...process.env, AIDANOS_VAULT_GIT_RETRY_MS: "0", ...env },
+    env: { ...fixtureEnv(), AIDANOS_VAULT_GIT_RETRY_MS: "0", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let log = "";
-  child.stderr.on("data", (buf) => { log += String(buf); });
-  child.stdout.on("data", (buf) => { log += String(buf); });
-  child._log = () => log;
   return child;
 }
 

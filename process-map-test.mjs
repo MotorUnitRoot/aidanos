@@ -1,3 +1,4 @@
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
 #!/usr/bin/env node
 import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
@@ -276,7 +277,7 @@ async function liveCopyDeleteAndOpen() {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,

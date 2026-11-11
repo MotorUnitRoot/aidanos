@@ -46,6 +46,11 @@ export async function loadRelayTLS({ name, certFile, keyFile, forbidden = [] }) 
           (stat.mode & 0o7777) !== 0o600 || typeof process.getuid !== "function" || stat.uid !== process.getuid() ||
           await fs.realpath(keyFile) !== location) throw new TLSConfigurationError("TLS private key must be a relay-owned regular single-link 0600 file, not a symlink or hardlink.");
       key = await handle.readFile();
+      const after = await handle.stat();
+      if (!after.isFile() || after.nlink !== 1 || after.ino !== before.ino || after.dev !== before.dev ||
+          after.ino !== stat.ino || after.dev !== stat.dev || (after.mode & 0o7777) !== 0o600 || after.uid !== stat.uid) {
+        throw new TLSConfigurationError("TLS private key changed while reading; require the same relay-owned regular single-link 0600 file.");
+      }
     } finally { await handle.close(); }
     await safeLocation(certFile, forbidden);
     const cert = await fs.readFile(certFile);
@@ -62,7 +67,7 @@ export async function loadRelayTLS({ name, certFile, keyFile, forbidden = [] }) 
   } catch (error) {
     // Never embed OpenSSL errors, certificate/key contents, or input paths.
     if (error instanceof TLSConfigurationError) throw error;
-    throw new Error("TLS material refused; check private-key ownership/mode and the exact certificate/name.");
+    throw new Error("TLS material refused; check private-key ownership/mode and the exact certificate/name.", { cause: error });
   }
 }
 export function pairingRecord({ name, port, ip, spki }) {

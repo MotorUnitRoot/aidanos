@@ -61,6 +61,45 @@ test("TLS refuses a hardlinked alias in the forbidden vault and nonregular keys 
   const directory = path.join(fixture.dir, "directory-key"); await fs.mkdir(directory);
   await assert.rejects(loadRelayTLS({ ...config, keyFile: directory }), /regular single-link/);
 });
+test("TLS rechecks the opened key after reading for a new hardlink or changed inode/device", async (t) => {
+  for (const field of ["nlink", "ino", "dev"]) {
+    const alias = path.join(fixture.dir, "post-read-" + field + ".key");
+    const open = fs.open.bind(fs);
+    let readDone = false, postReadStats = 0;
+    const mocked = t.mock.method(fs, "open", async (...args) => {
+      const handle = await open(...args);
+      if (args[0] !== fixture.keyFile) return handle;
+      const readFile = handle.readFile.bind(handle), stat = handle.stat.bind(handle);
+      t.mock.method(handle, "readFile", async (...readArgs) => {
+        const bytes = await readFile(...readArgs);
+        // A real hardlink created precisely after the pre-read fstat; inode/dev
+        // negatives simulate metadata mismatches at the same descriptor boundary.
+        if (field === "nlink") await fs.link(fixture.keyFile, alias);
+        readDone = true;
+        return bytes;
+      });
+      t.mock.method(handle, "stat", async (...statArgs) => {
+        const metadata = await stat(...statArgs);
+        if (readDone) {
+          postReadStats += 1;
+          if (field !== "nlink") metadata[field] += 1;
+        }
+        return metadata;
+      });
+      return handle;
+    });
+    try {
+      await assert.rejects(loadRelayTLS(config), /changed while reading/);
+      assert.equal(readDone, true);
+      assert.equal(postReadStats, 1, "post-read validation must use the open handle");
+    } finally {
+      mocked.mock.restore();
+      if (field === "nlink") await fs.unlink(alias);
+    }
+    assert.equal((await fs.lstat(fixture.keyFile)).nlink, 1);
+    assert((await loadRelayTLS(config)).context, "unchanged key must still be accepted");
+  }
+});
 test("local CA rotation changes the SPKI; pairing data binds exact name, port, IPv4 and pin", async () => {
   const first = await loadRelayTLS(config);
   const second = await loadRelayTLS({ ...config, certFile: path.join(fixture.dir, "rotated.crt"), keyFile: path.join(fixture.dir, "rotated.key") });

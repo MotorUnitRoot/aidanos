@@ -37,7 +37,7 @@ test("direct Node TLS serves sync; default production trust refuses test CA and 
   const relay = await startRelay({ env: f.env, token: "tls-sync-fixture-0123456789abcdef", port: 0, gitUrl: "",
     vault: path.join(f.dir, "vault"), data: path.join(f.dir, "data"), tlsName: fixture.name, tlsCertFile: fixture.certFile, tlsKeyFile: fixture.keyFile });
   const connect = (extra) => new Promise((resolve) => {
-    const ws = new WebSocket(relay.url, { servername: fixture.name, headers: { host: fixture.name + ":" + relay.port,
+    const ws = new WebSocket(relay.url, { agent: false, servername: fixture.name, headers: { host: fixture.name + ":" + relay.port,
       authorization: "Bearer tls-sync-fixture-0123456789abcdef" }, ...extra });
     ws.on("open", () => { ws.terminate(); resolve("open"); });
     ws.on("error", () => resolve("refused"));

@@ -35,13 +35,23 @@ hint headers (`Forwarded`, `X-Forwarded-*`, `Tailscale-*`) are refused, not trus
 A header-stripping proxy with the admin credential would still possess test-only
 admin authority; these guards are not permission to proxy a test relay.
 
-HTTP and WebSocket requests require an exact listener Host with port and no
-browser Origin (native clients omit it). A private TLS front end may use an exact
-`.ts.net:port` authority listed in `AIDANOS_RELAY_TRUSTED_HOSTS`; no wildcards.
-No public endpoint or Funnel is supported. The native client now refuses ordinary
-LAN/public destinations and plain ws DNS names before credentials are sent. WSS
-uses system TLS verification on Apple; no plaintext fallback. See PHONE.md for
-the real-device gate. Swift/ATS/Tailscale routing remain unverified on the box.
+HTTP and WebSocket requests require exact listener/TLS-name Host authority and no
+browser Origin. The native release path uses direct Node TLS plus explicit QR
+pairing of exact address, IPv4 and DER-SPKI. No Serve/Funnel or TLS frontend.
+A .ts.net suffix or CGNAT syntax is not peer/encryption proof. The old direct ws
+path remains debug/disposable only; it is not the release path. See PHONE.md.
+
+TLS files are supplied through --tls-name/--tls-cert-file/--tls-key-file; the private
+key must be a separate relay-owned 0600 non-symlink outside repo/vault/data. Never
+put PEM/key material in env, child processes, logs, QR or Docker image. Only public
+pairing metadata is written by --pairing-file. Actual Tailscale renewal generates
+a fresh key in inspected source: restart and explicitly re-pair from the Mac QR;
+CA validity alone never replaces a pin. HTTPS/CT consent remains pending and a
+neutral machine name is required before the later certificate decision.
+
+Swift/app/ATS/trust/QR/routing checks remain unbuilt and device verification is
+required before real notes. The separate test reset fixture intentionally owns
+its disposable protocol/lifecycle implementation; production never imports it.
 
 ## Tracked, not done yet
 

@@ -1,74 +1,100 @@
-# AidanOS on iPhone — private Tailscale path
+# AidanOS on iPhone — paired direct TLS design, not deployment approval
 
-Native sync and the Safari home-screen web app are different paths. These steps
-are for the native Mac/iPhone sync cut. Do not use the old home-Wi-Fi `--lan`,
-wildcard `AIDANOS_HOST=0.0.0.0`, or historical quick-tunnel instructions for notes.
-Nothing here authorizes a deploy or a public relay. Loopback is not proof of locality;
-a same-machine headerless proxy cannot be identified by a socket address. Production
-refuses forwarding hints and configured/unreadable Serve/Funnel state on every route.
+**Tailnet HTTPS enablement is still Colby's pending decision.** Nothing here
+turns it on, requests a real certificate, provisions a key, deploys a service or
+authorizes real notes. Swift/apps and real-device behavior remain unbuilt/unverified.
 
-## Connect the native iPhone and Mac
+## Release path: direct Node TLS, no Serve/Funnel
 
-1. Install Tailscale on the Mac and iPhone; connect both to the same trusted tailnet.
-   Limit tailnet grants/firewall access to the intended devices and relay port.
-   The Mac needs the `tailscale` CLI on PATH and its daemon running.
-2. Follow [the native setup](docs/native/TRY-IT.md) for Xcode, the two app builds,
-   the separate relay folder, and the sync token file. Start with dummy notes.
-3. On the Mac, `tailscale ip -4` shows its `100.x.y.z` IPv4. The supported range is
-   **100.64.0.0/10** (second octet 64–127), not every `100.x` address. Start the relay:
+Choose a neutral Mac machine name **before** enabling HTTPS or obtaining any cert.
+Certificate Transparency publishes the machine and tailnet DNS names permanently.
+See [Tailscale's CT warning](https://tailscale.com/kb/1153/enabling-https).
+Wait for the explicit HTTPS decision, CISO/Reviewer review, and device checks below.
+
+After those later approvals, the intended operator-controlled setup is:
+1. Both devices join the intended trusted tailnet; restrict grants and Mac firewall
+   to those devices/port. Confirm the Mac's exact MagicDNS name and `tailscale ip -4`.
+   The relay accepts only a local IPv4 in **100.64.0.0/10**, confirmed by the daemon.
+2. The operator obtains that exact name's certificate using `tailscale cert`, never
+   Serve/Funnel. Keep its private key in a separate **relay-user-owned 0600 file**,
+   outside repo, notes vault and relay data. Never paste a key into an env var,
+   token field, QR, log, image or chat. `tailscale cert` issuance/HTTPS enablement
+   has **not** been performed by this task. File-based renewal remains manual.
+3. Node terminates TLS itself. Future command shape (paths/names are placeholders,
+   not instructions to enable HTTPS now):
    ```sh
-   cd aidanos/relay
-   node src/server.mjs --vault "$HOME/aidanos-relay-notes" --lan
+   node src/server.mjs --vault "$HOME/aidanos-relay-notes" --lan \
+     --tls-name relay.example-tail.ts.net \
+     --tls-cert-file "$HOME/.config/aidanos-relay/relay.crt" \
+     --tls-key-file "$HOME/.config/aidanos-relay/relay.key" \
+     --pairing-file "$HOME/.config/aidanos-relay/pairing.json"
    ```
-   Keep the token-file environment setting from the setup guide. Do not print it.
-4. The relay prints `PHONE ws://100.x.y.z:3750`. Enter that exact literal address
-   on **both** apps, including the Mac app. Set the port to the printed port if
-   different. A normal native app no longer sends credentials to loopback.
-5. Put the existing sync token only in the masked token field and press Connect.
-   `ws://` to a direct Tailscale IPv4 uses Tailscale encryption, not Wi-Fi plaintext.
-   Do not share, proxy, port-forward or publicly expose this direct relay.
+   Retain the separate masked sync-token/token-file setup. No bearer is in the QR.
+   The key is checked for owner/mode, symlinks, location and matching cert/name.
+4. In the Mac app, open the **public pairing JSON** generated locally by the relay.
+   Its QR binds the exact `wss://name:port/`, exact Tailscale IPv4, and SHA256 SPKI.
+   On the real iPhone, use **Pair / re-pair from Mac QR**, grant camera permission,
+   and scan the QR physically shown on the approved Mac. Enter the sync token only
+   in its masked field. Pairing is explicit, never learned from a network peer.
+5. Both apps compare the exact approved address. Before connecting, IPv4 DNS answers
+   must equal the stored 100.x address; the socket targets that literal IP to avoid
+   a second DNS lookup. TLS verifies the approved DNS hostname through system trust
+   **and** the stored DER-SPKI pin. A public CA signature alone is never sufficient.
+   Other names/ports, changed/public DNS answers, bad certificates or keys fail closed.
+   No redirects or plaintext fallback. Release raw ws code is compiled out.
 
-`--lan` and `--lan-address` refuse home/private/public/wildcard addresses and a
-CGNAT IP not owned by both a local interface and the running Tailscale daemon.
-There is no fallback to home Wi-Fi. Raw IPv6 and plain `ws://` MagicDNS names are
-not supported. With no Tailscale, leave the apps offline; do not weaken the gate.
+Production refuses missing/erroring/malformed/nonempty `tailscale serve status
+--json` at startup and rechecks on every HTTP/sync request. Forwarded,
+X-Forwarded-* and Tailscale-* hints are rejected, never trusted. Loopback is only
+bind scope: it cannot distinguish a header-stripping same-machine proxy. Authority
+comes from the bearer plus approved encrypted peer, not a claim of locality.
+Production artifacts contain no reset routing, admin authority or deletion code.
+Only the excluded disposable test server has reset; never combine it with a proxy.
 
-### Optional authenticated TLS path — not yet device-verified
+## Renewal and re-pair
 
-The Apple client accepts `wss://relay.tail.ts.net` (default port 443) only with
-system certificate-chain and hostname validation. It refuses redirects and never
-falls back to plaintext. Plain `ws://` MagicDNS is refused to avoid DNS rebinding.
-The server itself has no TLS listener: this path needs a separately reviewed,
-private TLS front end, an exact `AIDANOS_RELAY_TRUSTED_HOSTS=relay.tail.ts.net:443`
-allow-list entry, and a trusted tailnet grant. It is not an instruction to set one
-up. Do not use Funnel or any public endpoint. **Reset must never be combined with
-Serve/Funnel or any proxy**, even in tests. Direct `ws://100.x:port` remains the
-smallest iPhone path and needs no TLS front end.
+The inspected Tailscale issuance source generates a fresh key on actual renewal.
+An unchanged cached `tailscale cert` result is **not** a key-reuse guarantee. Plan
+for **QR re-pair after each actual renewal/key change**. Restart Node with the new
+separate certificate/key files, reload its local public pairing JSON on the Mac,
+and explicitly rescan on the phone. Old pins refuse; nothing silently accepts a
+new key merely because the CA signed it. Full research and scope limits are in
+`/workspace/dev/reports/pr44-tls-design.md` (deployment note, not a repo-local link).
+
+## Existing direct ws path: DEBUG/disposable only, NOT release
+
+The server's existing direct `ws://100.x:port` mode remains unchanged. A CGNAT
+address alone does not prove peer identity or actual protected routing. No new
+trust is assigned to it. It is **not a release-client path**, and must not be used
+for real notes. Explicit debug/simulator fixtures retain their old ws path; release
+contains no loopback or plaintext credential exception. Ordinary home Wi-Fi,
+wildcard binds, public endpoints, Serve/Funnel, reverse proxies and quick tunnels
+are not supported. IPv6 is not used in this cut; there is no Wi-Fi fallback.
 
 ## Verify on a real Mac/iPhone before real notes
 
-**Not verified from the Linux box. Use only disposable dummy notes until done.**
+**None of the Apple/device checks below have run on the Linux box.**
+- [ ] Build AidanCore tests and both apps in Debug AND Release; inspect release
+      absence of raw ws/loopback paths. Run the new pairing, DER-SPKI and trust tests.
+- [ ] Confirm neutral naming, then obtain Colby's separate HTTPS/CT consent before
+      certificate issuance. Confirm grants, own Tailscale IP and firewall scope.
+- [ ] Direct Node WSS works without Serve/Funnel, with a valid exact-name cert.
+      Verify IP-directed URLSession plus explicit DNS hostname validation on-device.
+- [ ] Mac public-JSON QR display and real-iPhone camera pairing/re-pair work. QR and
+      app preferences contain no bearer/private key. Address edits cannot reuse trust.
+- [ ] VPN-off, wrong/public/changed IPv4 DNS answers and wrong authority/port refuse
+      before any credential is sent; no reconnection silently updates pairing.
+- [ ] CA-valid wrong SPKI, expired/untrusted cert, wrong name and redirects refuse.
+      Renew/rotate the key: old phone pin refuses until a new physically approved QR.
+- [ ] Edit only dummy notes; test airplane mode, sleep/wake and reconnect on both
+      devices; verify identical markdown, no lost edits and no unexpected exposure.
+- [ ] Production `/reset` is absent even with arbitrary old flags/env/options;
+      inspect production npm/Docker file sets. No test CA/harness in app/image.
+- [ ] Independent CISO/Reviewer/Designer approval and Colby's separate push/workflow,
+      merge and deployment decisions remain open. Do not use real notes beforehand.
 
-- [ ] Build AidanCore tests and both apps; run the new RelayAddress tests and all
-      simulator tests, including separate-admin reset. Do not change deadlines.
-- [ ] Confirm both devices' Tailscale addresses, narrow grants and Mac firewall;
-      confirm the listener is the Mac's Tailscale IP, not Wi-Fi or every interface.
-- [ ] Connect with `ws://100.x:3750` from the real iPhone and Mac. Check iOS local
-      network prompts/routing; do not assume ATS exceptions make this work.
-- [ ] Edit dummy notes on both, test airplane mode, sleep/wake and reconnect;
-      confirm identical markdown and no lost edits. Check reachability off Wi-Fi.
-- [ ] Reject ordinary LAN/public addresses, bad schemes and `ws://` DNS names
-      before credentials leave the app. For optional WSS, test a good certificate,
-      an invalid/untrusted certificate, mismatched hostname and redirect refusal.
-- [ ] Production `/reset` stays 404 even with its old opt-in variable and sync
-      token. No test flags/admin authority in app, Docker, launchd or real-note use.
-- [ ] Reviewer, CISO and Designer clear this new head; Colby separately authorizes
-      any push/workflow scope, merge or deployment before using real notes.
+## Safari home-screen app
 
-## Safari home-screen app (PWA)
-
-A PWA still opens an approved, freshly verified web-app URL in Safari → Share →
-Add to Home Screen. It is not the native `ws://` relay and cannot use that URL as
-a web page. The old quick-tunnel URL is not a current verified service. The same
-Door/Get to Work/Capture UI checks still apply. Hosting or public exposure needs
-its own approval; no Cloud Run or tunnel command is authorized by this runbook.
+The PWA is a different, separately approved HTTPS web-app URL; it is not this WSS
+relay. Historical quick-tunnel URLs are not verified services. No hosting or public
+exposure is authorized by this runbook.

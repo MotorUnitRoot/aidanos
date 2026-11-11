@@ -32,7 +32,7 @@ import { resetAllowed, startRelay as startResetRelay } from "./harness/reset-rel
 
 import { noServeFixture } from "./harness/fixture-env.mjs";
 const productionFixture = await noServeFixture();
-const startRelay = (options) => startProductionRelay({ env: productionFixture.env, ...options });
+const startRelay = (options) => startProductionRelay({ ...options, env: { ...productionFixture.env, ...options.env } });
 
 const TOKEN = "aidanos-test-token-0123456789abcdef";
 const ADMIN_TOKEN = "aidanos-admin-fixture-9876543210abcdef";
@@ -807,7 +807,7 @@ test("relay ignores the old vault variables and accepts its own marked folder", 
     await relay.close();
   }
   await assert.rejects(
-    startResetRelay({ token: TOKEN, env: { AIDANOS_VAULT: notes }, port: 0, gitUrl: "" }),
+    startRelay({ token: TOKEN, env: { AIDANOS_VAULT: notes }, port: 0, gitUrl: "" }),
     /AIDANOS_RELAY_VAULT/,
   );
 });
@@ -936,7 +936,7 @@ test("the id file beside the notes folder is not followed or overwritten", async
   await fs.writeFile(target, "keep-me\n");
   await fs.symlink(target, relayIdFile(vault));
   await assert.rejects(
-    startResetRelay({ token: TOKEN, vault, data: path.join(dir, "data"), port: 0, gitUrl: "" }),
+    startRelay({ token: TOKEN, vault, data: path.join(dir, "data"), port: 0, gitUrl: "" }),
     /symlink/,
   );
   assert.equal(await fs.readFile(target, "utf8"), "keep-me\n");
@@ -948,7 +948,7 @@ test("the id file beside the notes folder is not followed or overwritten", async
   const occupied = relayIdFile(other);
   await fs.writeFile(occupied, "not a marker\n");
   await assert.rejects(
-    startResetRelay({ token: TOKEN, vault: other, data: path.join(dir, "other-data"), port: 0, gitUrl: "" }),
+    startRelay({ token: TOKEN, vault: other, data: path.join(dir, "other-data"), port: 0, gitUrl: "" }),
     /already exists/,
   );
   assert.equal(await fs.readFile(occupied, "utf8"), "not a marker\n");
@@ -965,7 +965,7 @@ test("the id file beside the notes folder is not followed or overwritten", async
   await fs.symlink(vaultTarget, path.join(marked, ".aidanos", "relay-folder"));
   await fs.symlink(dataTarget, path.join(markedData, "relay-folder"));
   await assert.rejects(
-    startResetRelay({ token: TOKEN, vault: marked, data: markedData, port: 0, gitUrl: "" }),
+    startRelay({ token: TOKEN, vault: marked, data: markedData, port: 0, gitUrl: "" }),
   );
   assert.equal(await fs.readFile(vaultTarget, "utf8"), "vault-keep\n");
   assert.equal(await fs.readFile(dataTarget, "utf8"), "data-keep\n");
@@ -1098,7 +1098,7 @@ test("a token with spaces is refused before the relay listens", async () => {
   await fs.writeFile(file, TOKEN + "\n", { mode: 0o600 });
   assert.equal(await loadToken({ AIDANOS_RELAY_TOKEN_FILE: file }), TOKEN);
   await assert.rejects(
-    startResetRelay({ token: spaced, vault: path.join(dir, "vault"), port: 0, gitUrl: "" }),
+    startRelay({ token: spaced, vault: path.join(dir, "vault"), port: 0, gitUrl: "" }),
     /whitespace/,
   );
   await assert.rejects(fs.stat(path.join(dir, "vault")));

@@ -1,3 +1,9 @@
+> **Superseding release transport:** use [PHONE.md](../../PHONE.md). Release now
+> requires direct Node TLS and explicit Mac-QR pairing of exact name/IP/SPKI;
+> HTTPS/CT enablement is still pending. The historical direct-ws walkthrough below
+> is retained ONLY for DEBUG disposable fixtures, not a release or real-note path.
+> No Serve/Funnel or proxy is supported. Swift and device gates remain open.
+
 # Try the sync
 
 This is enough to see today's note on your Mac and, with a cable and Tailscale, on your iPhone, and to watch an edit made while one of them is offline show up on the other.
@@ -104,7 +110,7 @@ A paid developer account is not required for this test. A free Apple ID installs
 
    The first time, the Mac may show a firewall prompt asking whether to allow incoming connections for `node`. Choose Allow. Without that, the phone cannot reach the Mac.
 
-   The relay listens on `127.0.0.1` and on this Mac's Tailscale address only. It never binds to home Wi-Fi, a public address, or every interface. It prints `PHONE ws://100.x.y.z:3750`; use that exact address in the iPhone app. Tailscale encrypts the network traffic even though the local WebSocket URL says `ws://`. Both devices must remain on the same trusted tailnet. Do not proxy, port-forward, use Tailscale Funnel, or publish this relay. The shared token is still required; Tailscale does not replace it.
+   The relay listens on `127.0.0.1` and on this Mac's Tailscale address only. It never binds to home Wi-Fi, a public address, or every interface. It prints `PHONE ws://100.x.y.z:3750`; use that exact address in the iPhone app. This legacy DEBUG path does not prove client routing or peer identity from IP syntax; it is not the release path. Both devices must remain on the same trusted tailnet. Do not proxy, port-forward, use Tailscale Funnel, or publish this relay. The shared token is still required; Tailscale does not replace it.
 
    Transfer the token only into the app's token field (Universal Clipboard is one option), never into a note or a message; then clear the clipboard. Do not type an untrusted server address: the app sends the token to the address you choose.
 
@@ -112,7 +118,7 @@ A paid developer account is not required for this test. A free Apple ID installs
 
    Reset is **test-only**, not an operator feature. The simulator harness alone supplies `--test-mode`, `NODE_ENV=test`, an explicit reset opt-in, and a separate dummy admin credential (never the sync token). A normal production relay ignores reset opt-in and offers no reset route. The harness refuses network listeners, proxy hint headers, and detected Tailscale Serve/Funnel config; installed CLI errors fail closed. Never combine reset with Serve/Funnel, an SSH tunnel or any proxy. Do not put test flags/admin authority into launchd, Docker, apps or real-note runs.
 
-   To find the Mac's address independently, run `tailscale ip -4`. Only `100.64.0.0/10` is supported, and the relay verifies it against local interfaces and the running daemon. The native client sends credentials only to a literal Tailscale IPv4 using `ws://`, or a `wss://` Tailscale IPv4 / `.ts.net` name with system TLS certificate/hostname validation. Plain `ws://` names, ordinary LAN/public destinations, unrelated schemes, URL credentials, queries and fragments are refused before sending the token. WSS has no plaintext fallback and needs a separately reviewed private TLS front end plus the relay's exact trusted-Host entry. It is optional; direct IPv4 needs none.
+   To find the Mac's address independently, run `tailscale ip -4`. Only `100.64.0.0/10` is supported, and the relay verifies it against local interfaces and the running daemon. The native client sends credentials only to a literal Tailscale IPv4 using `ws://`, or a `wss://` Tailscale IPv4 / `.ts.net` name with system TLS certificate/hostname validation. Plain `ws://` names, ordinary LAN/public destinations, unrelated schemes, URL credentials, queries and fragments are refused before sending the token. WSS has no plaintext fallback and needs a separately reviewed private TLS front end plus the relay's exact trusted-Host entry. This historical optional-frontend description is superseded: release TLS terminates directly in Node, with QR-bound name/IP/SPKI; see PHONE.md.
 
    Follow [PHONE.md's real Mac/iPhone checklist](../../PHONE.md#verify-on-a-real-maciphone-before-real-notes) with dummy notes before real notes. This cannot be verified from the Linux box.
 

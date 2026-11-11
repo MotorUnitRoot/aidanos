@@ -1,9 +1,9 @@
 // The relay has no browser client. Native clients omit Origin. Require an exact
-// listener authority; optional TLS front-end authorities are operator-listed.
-export function relayRequestAllowed(req, hosts, trustedHosts = []) {
+// listener authority. Direct TLS also accepts its one configured certificate name.
+export function relayRequestAllowed(req, hosts, trustedHosts = [], tlsName = "") {
   if (req.headers.origin !== undefined) return false;
   const port = req.socket.localPort;
-  const expected = hosts.map((host) => host + ":" + port).concat(trustedHosts);
+  const expected = hosts.map((host) => host + ":" + port).concat(trustedHosts, tlsName ? [tlsName + ":" + port, ...(port === 443 ? [tlsName] : [])] : []);
   const authority = req.headers.host;
   return typeof authority === "string" && expected.includes(authority.toLowerCase());
 }

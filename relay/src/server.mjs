@@ -1,4 +1,6 @@
 import http from "node:http";
+import https from "node:https";
+import { loadRelayTLS, pairingRecord, writePairingFile } from "./tls.mjs";
 import { constants as fsConstants, writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -128,7 +130,7 @@ function health(gitState, bootedAt, syncUp) {
 }
 
 export function parseArgs(argv) {
-  const out = { lan: false, lanAddress: "", vault: "", data: "", port: null };
+  const out = { lan: false, lanAddress: "", vault: "", data: "", port: null, tlsName: "", tlsCertFile: "", tlsKeyFile: "", pairingFile: "" };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--lan") out.lan = true;
@@ -137,6 +139,10 @@ export function parseArgs(argv) {
         "The token is not read from the command line. Set AIDANOS_RELAY_TOKEN or AIDANOS_RELAY_TOKEN_FILE.",
       );
     } else if (arg === "--lan-address") out.lanAddress = argv[(i += 1)] || "";
+    else if (arg === "--tls-name") out.tlsName = argv[(i += 1)] || "";
+    else if (arg === "--tls-cert-file") out.tlsCertFile = argv[(i += 1)] || "";
+    else if (arg === "--tls-key-file") out.tlsKeyFile = argv[(i += 1)] || "";
+    else if (arg === "--pairing-file") out.pairingFile = argv[(i += 1)] || "";
     else if (arg === "--vault") out.vault = argv[(i += 1)] || "";
     else if (arg === "--data") out.data = argv[(i += 1)] || "";
     else if (arg === "--port") out.port = Number(argv[(i += 1)]);
@@ -174,10 +180,10 @@ export function nodeRequirement(version = process.versions.node) {
   return "Node 22 or newer is needed.";
 }
 
-export function startupLines({ lan, port, phone }) {
+export function startupLines({ lan, port, phone, tlsName }) {
   const lines = ["LISTENING 127.0.0.1 " + port];
   if (lan) lines.push(LAN_WARNING);
-  if (phone) lines.push("PHONE ws://" + phone + ":" + port);
+  if (phone) lines.push("PHONE " + (tlsName ? "wss://" + tlsName : "ws://" + phone) + ":" + port);
   return lines;
 }
 
@@ -404,12 +410,16 @@ export async function startRelay(options = {}) {
   }
   const vault = path.resolve(String(vaultArg));
   const dataDir = path.resolve(options.data || env.AIDANOS_RELAY_DATA || path.join(vault, ".aidanos", "relay"));
+  const tls = await loadRelayTLS({ name: options.tlsName || env.AIDANOS_RELAY_TLS_NAME || "",
+    certFile: options.tlsCertFile || env.AIDANOS_RELAY_TLS_CERT_FILE || "", keyFile: options.tlsKeyFile || env.AIDANOS_RELAY_TLS_KEY_FILE || "",
+    forbidden: [vault, dataDir] });
   const port = options.port == null ? portFromEnv(env) : Number(options.port);
   const { hosts, phone } = listenHosts({
     lan: Boolean(options.lan) || Boolean(options.lanAddress),
     interfaces: options.interfaces,
     choose: options.lanAddress || "",
   });
+  if (options.pairingFile && (!tls || !phone)) throw new Error("Pairing output requires TLS and a daemon-confirmed Tailscale listener.");
   const gitUrl = String(options.gitUrl ?? env.AIDANOS_RELAY_GIT_URL ?? "").trim();
   const gitToken = String(options.gitToken ?? env.AIDANOS_RELAY_GIT_TOKEN ?? "").trim();
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
@@ -499,8 +509,8 @@ export async function startRelay(options = {}) {
   }
 
   for (const host of hosts) {
-    const httpServer = http.createServer((req, res) => {
-      if (hasProxyHints(req.headers) || !relayRequestAllowed(req, hosts, trustedHosts)) {
+    const handler = (req, res) => {
+      if (hasProxyHints(req.headers) || !relayRequestAllowed(req, hosts, trustedHosts, tls?.name)) {
         res.writeHead(403, { "content-length": 0 });
         res.end();
         return;
@@ -522,13 +532,14 @@ export async function startRelay(options = {}) {
       }
       res.writeHead(404, { "content-length": 0 });
       res.end();
-    });
+    };
+    const httpServer = tls ? https.createServer(tls.context, handler) : http.createServer(handler);
     const rawCap = options.maxPayload != null ? options.maxPayload : env.AIDANOS_MAX_PAYLOAD;
     const cap = payloadLimit(rawCap);
     const wss = new WebSocketServer({ noServer: true, maxPayload: cap });
     const entry = { httpServer, host, wss };
     httpServer.on("upgrade", (req, socket, head) => {
-      if (hasProxyHints(req.headers) || !relayRequestAllowed(req, hosts, trustedHosts)) {
+      if (hasProxyHints(req.headers) || !relayRequestAllowed(req, hosts, trustedHosts, tls?.name)) {
         socket.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
       }
@@ -597,6 +608,7 @@ export async function startRelay(options = {}) {
     boundPort = await listen(entry.httpServer, entry.host, port);
   }
 
+  const pairing = tls && phone ? pairingRecord({ name: tls.name, ip: phone, port: boundPort, spki: tls.spki }) : null;
   const interval = gitInterval(options.gitIntervalMs, env);
   let gitTimer = null;
   async function runBackup() {
@@ -621,8 +633,9 @@ export async function startRelay(options = {}) {
 
   api = {
     port: boundPort,
-    url: "ws://" + "127.0.0.1:" + boundPort,
-    phone: phone ? "ws://" + phone + ":" + boundPort : null,
+    url: (tls ? "wss://" : "ws://") + "127.0.0.1:" + boundPort,
+    tlsName: tls?.name || "", pairing,
+    phone: phone ? (tls ? "wss://" + tls.name : "ws://" + phone) + ":" + boundPort : null,
     hosts,
     vault,
     repo: live.repo,
@@ -633,7 +646,7 @@ export async function startRelay(options = {}) {
     async backupNow() {
       return runBackup();
     },
-    healthURL: "http://127.0.0.1:" + boundPort + "/health",
+    healthURL: (tls ? "https://" : "http://") + "127.0.0.1:" + boundPort + "/health",
     async close() {
       const session = live;
       live = null;
@@ -659,6 +672,10 @@ export async function startRelay(options = {}) {
       if (session && typeof session.repo.shutdown === "function") await session.repo.shutdown();
     },
   };
+  if (options.pairingFile) {
+    try { await writePairingFile(options.pairingFile, pairing, [vault, dataDir]); }
+    catch (error) { await api.close(); throw error; }
+  }
   return api;
 }
 
@@ -699,6 +716,7 @@ async function main() {
   let relay;
   try {
     relay = await startRelay({
+      tlsName: args.tlsName, tlsCertFile: args.tlsCertFile, tlsKeyFile: args.tlsKeyFile, pairingFile: args.pairingFile,
       lan: args.lan,
       lanAddress: args.lanAddress,
       vault: args.vault || undefined,
@@ -712,7 +730,7 @@ async function main() {
     );
     process.exit(1);
   }
-  for (const line of startupLines({ lan: args.lan || Boolean(args.lanAddress), port: relay.port, phone: relay.phone })) {
+  for (const line of startupLines({ lan: args.lan || Boolean(args.lanAddress), port: relay.port, phone: relay.phone ? new URL(relay.phone).hostname : null, tlsName: relay.tlsName })) {
     writeSync(line.startsWith("WARNING") ? 2 : 1, stampLine(line) + "\n");
   }
   const shutdown = () => {

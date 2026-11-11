@@ -57,7 +57,7 @@ export function redactChildLog(value, secrets = []) {
 
 export function captureChildLog(child, context) {
   const secrets = Array.isArray(context?.secrets) ? context.secrets : [];
-  const trusted = context?.fixtureOnly === true || secrets.length > 0;
+  const trusted = context?.fixtureOnly === true || (secrets.length > 0 && secrets.every((value) => typeof value === "string" && value.length > 0));
   if (!trusted) {
     // No context is NEVER permission to retain/print arbitrary child body text.
     for (const name of ["stdout", "stderr"]) child[name].on("data", () => {});

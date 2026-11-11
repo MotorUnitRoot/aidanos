@@ -38,6 +38,12 @@ export async function runDiagnosticSecurityRegressions(assert) {
   for (const text of [noContext._log(), omittedError.message, omittedError.stack, String(omittedError)]) {
     assert(!text.includes(unregistered) && !text.includes("unregistered short sentinel"), "default capture exposed unregistered body text");
   }
+  for (const context of [{}, { secrets: [] }, { secrets: [null] }, { secrets: [""] }]) {
+    const malformed = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough() }, context);
+    malformed.stdout.write("unregistered short sentinel");
+    assert(!malformed._log().includes("unregistered short sentinel"), "empty/malformed context must not authorize body text");
+    malformed.stdout.end(); malformed.stderr.end();
+  }
   const patterns = [unregistered, randomBytes(48).toString("base64"), "ghz_SYNTHETIC_UNREGISTERED_ONLY", "github_pat_SYNTHETIC_UNREGISTERED_ONLY", "sk-SYNTHETIC_UNREGISTERED_ONLY", "Bearer SYNTHETIC_BEARER_UNREGISTERED", "https://fixtureuser:fixturepass@example.invalid/"];
   const shaped = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough() }, { fixtureOnly: true });
   for (const value of patterns) {

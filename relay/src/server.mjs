@@ -24,9 +24,17 @@ const MIN_TOKEN_LENGTH = 32;
 export const MAX_PAYLOAD = 32 * 1024 * 1024;
 const FAILURE_CAP = 1024;
 export const LAN_WARNING =
-  "WARNING: --lan sends notes across your home network with no encryption. The token is the only protection.";
+  "WARNING: --lan is Tailscale-only. Both devices must use the same trusted tailnet; never proxy or forward this relay onto a home or public network.";
 
 const CLIENT_MARKERS = ["actor", "storage-id", "index"];
+
+// Do not trust forwarding headers. Reset must arrive on this machine's socket,
+// and is unavailable on every listener whenever a network listener is enabled.
+export function resetAllowed({ enabled, hosts, remoteAddress, localAddress }) {
+  const loopback = (ip) => ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+  return enabled === true && hosts.length > 0 && hosts.every((host) => host === "127.0.0.1") &&
+    loopback(remoteAddress) && loopback(localAddress);
+}
 
 export function tokensMatch(expected, got) {
   const left = Buffer.from(String(expected || ""));
@@ -609,7 +617,8 @@ export async function startRelay(options = {}) {
         return;
       }
       if (req.method === "POST" && pathOnly === "/reset") {
-        if (!allowReset) {
+        if (!resetAllowed({ enabled: allowReset, hosts,
+          remoteAddress: req.socket.remoteAddress, localAddress: req.socket.localAddress })) {
           res.writeHead(404, { "content-length": 0 });
           res.end();
           return;

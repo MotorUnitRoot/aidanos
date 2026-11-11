@@ -1,6 +1,6 @@
 # Try the sync
 
-This is enough to see today's note on your Mac and, with a cable, on your iPhone, and to watch an edit made while one of them is offline show up on the other.
+This is enough to see today's note on your Mac and, with a cable and Tailscale, on your iPhone, and to watch an edit made while one of them is offline show up on the other.
 
 You do not need a paid Apple developer account. You do need Xcode and Node 22 on the Mac.
 
@@ -95,7 +95,7 @@ A paid developer account is not required for this test. A free Apple ID installs
 4. Plug the iPhone into the Mac with a cable. Choose that iPhone as the run destination. Press Run.
 5. On the iPhone, turn on Developer Mode if iOS asks (Settings → Privacy & Security → Developer Mode) and restart if it tells you to.
 6. Trust the developer: Settings → General → VPN & Device Management, tap the Apple Development entry, and choose Trust.
-7. On the Mac, stop the relay if it is still running (click the Terminal window and press Control-C), and start it so the phone can see it. Use the same token file as before, and add `--lan`:
+7. On the Mac, stop the relay if it is still running (click the Terminal window and press Control-C), and start it so the phone can see it. Use the same token file as before, and add `--lan`. First install Tailscale on both devices and connect them to the same trusted tailnet (your private encrypted network). Restrict tailnet access to your own devices. The relay machine needs the `tailscale` CLI on PATH and its daemon running:
 
    ```
    export AIDANOS_RELAY_TOKEN_FILE="$HOME/aidanos-relay-token"
@@ -104,9 +104,13 @@ A paid developer account is not required for this test. A free Apple ID installs
 
    The first time, the Mac may show a firewall prompt asking whether to allow incoming connections for `node`. Choose Allow. Without that, the phone cannot reach the Mac.
 
-   The relay still listens on this Mac only at `127.0.0.1`, and it also listens on this Mac's home-network address. It prefers the home Wi-Fi address over a VPN address. It prints a warning: traffic on the home network is not encrypted, and the token is the only protection. Then it prints a line like `PHONE ws://192.168.1.20:3750`. It does not print the token. Type that address into the iPhone app. For the token, run `pbcopy < "$HOME/aidanos-relay-token"` on the Mac again if you already cleared the clipboard, then use Universal Clipboard, or type the token in. Paste it only into the token field. Do not paste the token into a note or a message. Press Connect. Copy something else afterward so the token is no longer on the clipboard. The first time, iOS asks permission to find devices on the local network. Allow it.
+   The relay listens on `127.0.0.1` and on this Mac's Tailscale address only. It never binds to home Wi-Fi, a public address, or every interface. It prints `PHONE ws://100.x.y.z:3750`; use that exact address in the iPhone app. Tailscale encrypts the network traffic even though the local WebSocket URL says `ws://`. Both devices must remain on the same trusted tailnet. Do not proxy, port-forward, use Tailscale Funnel, or publish this relay. The shared token is still required; Tailscale does not replace it.
 
-   `--lan` refuses to start if the Mac has no private address (an address like `192.168.x.x`). It never listens on every interface. If you need a specific address, add `--lan-address 192.168.1.20`.
+   Transfer the token only into the app's token field (Universal Clipboard is one option), never into a note or a message; then clear the clipboard. Do not type an untrusted server address: the app sends the token to the address you choose.
+
+   `--lan` refuses startup unless the running Tailscale daemon reports a local IPv4 in `100.64.0.0/10` and that address exists on this machine's network interfaces. A CGNAT address alone is not enough. `--lan-address 100.x.y.z` can select that verified address explicitly; home/private addresses such as `192.168.x.x` and `10.x.x.x` are refused. If Tailscale is absent or stopped, omit `--lan` for Mac-only use.
+
+   Reset is off by default. Even if `AIDANOS_RELAY_ALLOW_RESET=1` is set for simulator tests, `/reset` is refused on **all** listeners while `--lan` or `--lan-address` is active. Without a network listener it is accepted only on a loopback socket, with authentication and the current relay markers. Forwarding headers cannot change that.
 
 The phone build asks for no capability a free account cannot have. There is no widget and no share sheet in this cut. A paid account (the enrollment that is in progress) will later allow TestFlight, widgets, and the share sheet.
 
@@ -123,4 +127,4 @@ If the two sides cannot be merged safely, the app shows Keep mine, Take theirs, 
 
 ## What this cut does not do
 
-It does not install over TestFlight. It does not sync through git. It does not run a widget or a share extension. Those wait on the paid account, and git stays a backup even then. A separate token for each device comes before the relay is ever reachable from outside the house.
+It does not install over TestFlight. It does not sync through git. It does not run a widget or a share extension. Those wait on the paid account, and git stays a backup even then. A separate token for each device comes before the relay is ever offered as a public or shared relay.

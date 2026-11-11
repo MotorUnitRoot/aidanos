@@ -1,69 +1,51 @@
 import os from "node:os";
+import { isIPv4 } from "node:net";
+import { execFileSync } from "node:child_process";
 
-export function isPrivateIPv4(ip) {
-  const parts = String(ip).split(".").map((part) => Number(part));
-  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
-    return false;
-  }
-  const a = parts[0];
-  const b = parts[1];
-  if (a === 10) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  return false;
+export function isTailscaleIPv4(ip) {
+  if (!isIPv4(String(ip))) return false;
+  const [a, b] = ip.split(".").map(Number);
+  return a === 100 && b >= 64 && b <= 127;
 }
 
-const VPN_INTERFACE = /^(utun|tun\d|tap|ppp|ipsec|tailscale|wg|vpn|zt)/i;
-
-// Home Wi-Fi (192.168.x.x) comes before other private addresses. VPN tunnels are skipped.
-export function privateIPv4(interfaces = os.networkInterfaces()) {
-  const home = [];
-  const other = [];
-  for (const [name, addrs] of Object.entries(interfaces || {})) {
-    if (VPN_INTERFACE.test(name)) continue;
-    for (const addr of addrs || []) {
-      const family = addr.family;
-      if (family !== "IPv4" && family !== 4) continue;
-      if (addr.internal) continue;
-      if (!isPrivateIPv4(addr.address)) continue;
-      if (String(addr.address).startsWith("192.168.")) home.push(addr.address);
-      else other.push(addr.address);
+// A CGNAT address alone is not proof of encryption. Require the running local
+// Tailscale daemon to identify it as this node's address. Never log its status:
+// it can contain details of other devices on the tailnet.
+export function tailscaleAddresses(readStatus = () => execFileSync("tailscale", ["status", "--json"], {
+  encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024,
+  stdio: ["ignore", "pipe", "pipe"],
+})) {
+  try {
+    const status = JSON.parse(readStatus());
+    if (status.BackendState === "Running" && Array.isArray(status.Self?.TailscaleIPs)) {
+      return status.Self.TailscaleIPs.filter(isTailscaleIPv4);
     }
+  } catch {
+    // Missing CLI, stopped daemon, malformed status: fail closed below.
   }
-  return home.concat(other);
+  return [];
 }
 
-function addressOn(interfaces, chosen) {
-  for (const addrs of Object.values(interfaces || {})) {
-    for (const addr of addrs || []) {
-      if (addr.address === chosen) return true;
-    }
-  }
-  return false;
-}
-
-// Default is this computer only. --lan adds one private home-network address.
-// Never 0.0.0.0. choose is an explicit address, still private, still not every interface.
-export function listenHosts({ lan = false, interfaces, choose } = {}) {
+// Default is loopback only. --lan now means Tailscale only, never home Wi-Fi.
+// Both automatic and explicit selection require a local address AND daemon proof.
+export function listenHosts({ lan = false, interfaces = os.networkInterfaces(), choose,
+  tailscaleIPs } = {}) {
   const hosts = ["127.0.0.1"];
   if (!lan && !choose) return { hosts, phone: null };
-  if (choose) {
-    if (!isPrivateIPv4(choose) || (interfaces && !addressOn(interfaces, choose))) {
-      const error = new Error("The chosen address has to be a private address on this Mac.");
-      error.code = "NO_LAN";
-      throw error;
-    }
-    hosts.push(choose);
-    return { hosts, phone: choose };
-  }
-  const list = privateIPv4(interfaces);
-  if (list.length === 0) {
+  const verified = tailscaleIPs ?? tailscaleAddresses();
+  const local = Object.values(interfaces || {}).flat().filter((addr) =>
+    (addr.family === "IPv4" || addr.family === 4) && !addr.internal &&
+    isTailscaleIPv4(addr.address) && verified.includes(addr.address),
+  ).map((addr) => addr.address);
+  const phone = choose || local[0];
+  if (!phone || !local.includes(phone)) {
     const error = new Error(
-      "No private network address found. --lan needs a home-network address (192.168.x, 10.x, or 172.16-31.x).",
+      "--lan requires a running Tailscale connection and its local 100.64.0.0/10 address. " +
+      "Home-network, public, wildcard, and nonlocal addresses are refused.",
     );
     error.code = "NO_LAN";
     throw error;
   }
-  hosts.push(list[0]);
-  return { hosts, phone: list[0] };
+  hosts.push(phone);
+  return { hosts, phone };
 }

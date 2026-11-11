@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
 import { INDEX_ID, noteId } from "../src/ids.mjs";
-import { isPrivateIPv4, listenHosts } from "../src/bind.mjs";
+import { isTailscaleIPv4, listenHosts, tailscaleAddresses } from "../src/bind.mjs";
 import { logSafe, redact, stampLine } from "../src/redact.mjs";
 import { cbor } from "@automerge/automerge-repo";
 import { describeSyncFrame, logSyncFrame } from "../src/sync-log.mjs";
@@ -24,6 +24,7 @@ import {
   relayIdFile,
   relayMarkerId,
   relayMarkerText,
+  resetAllowed,
   startRelay,
   startupLines,
 } from "../src/server.mjs";
@@ -40,37 +41,64 @@ function git(args, cwd) {
   return exec("git", args, { cwd });
 }
 
-test("listen addresses stay on this computer unless --lan", () => {
+test("listen addresses stay loopback unless verified Tailscale is requested", () => {
   const interfaces = {
     lo: [{ family: "IPv4", internal: true, address: "127.0.0.1" }],
     en0: [{ family: "IPv4", internal: false, address: "192.168.1.20" }],
+    tailscale0: [{ family: "IPv4", internal: false, address: "100.100.1.20" }],
     danger: [{ family: "IPv4", internal: false, address: "203.0.113.8" }],
   };
-  const local = listenHosts({ lan: false, interfaces });
-  assert.deepEqual(local.hosts, ["127.0.0.1"]);
-  assert.equal(local.phone, null);
-  const lan = listenHosts({ lan: true, interfaces });
-  assert.deepEqual(lan.hosts, ["127.0.0.1", "192.168.1.20"]);
-  assert.equal(lan.phone, "192.168.1.20");
+  const tailscaleIPs = ["100.100.1.20"];
+  assert.deepEqual(listenHosts({ interfaces }), { hosts: ["127.0.0.1"], phone: null });
+  const lan = listenHosts({ lan: true, interfaces, tailscaleIPs });
+  assert.deepEqual(lan.hosts, ["127.0.0.1", "100.100.1.20"]);
+  assert.equal(lan.phone, "100.100.1.20");
   assert.equal(lan.hosts.includes("0.0.0.0"), false);
-  assert.equal(isPrivateIPv4("10.1.2.3"), true);
-  assert.equal(isPrivateIPv4("172.16.0.1"), true);
-  assert.equal(isPrivateIPv4("172.32.0.1"), false);
-  assert.throws(() => listenHosts({ lan: true, interfaces: { lo: interfaces.lo } }), /private network address/);
-  const home = listenHosts({
-    lan: true,
-    interfaces: {
-      utun0: [{ family: "IPv4", internal: false, address: "10.8.0.2" }],
-      en0: [{ family: "IPv4", internal: false, address: "192.168.1.20" }],
-    },
-  });
-  assert.equal(home.phone, "192.168.1.20");
-  const chosen = listenHosts({
-    lan: true,
-    choose: "10.8.0.2",
-    interfaces: { utun0: [{ family: "IPv4", internal: false, address: "10.8.0.2" }] },
-  });
-  assert.equal(chosen.phone, "10.8.0.2");
+  for (const ip of ["100.64.0.0", "100.127.255.255"]) assert.equal(isTailscaleIPv4(ip), true);
+  for (const ip of ["100.63.255.255", "100.128.0.0", "10.1.2.3", "172.16.0.1", "172.32.0.1",
+    "192.168.1.20", "0.0.0.0", "100.064.0.1", "100.64.0.256", "::1"]) {
+    assert.equal(isTailscaleIPv4(ip), false, ip);
+    assert.throws(() => listenHosts({ choose: ip, interfaces, tailscaleIPs }), /Tailscale/);
+  }
+  assert.throws(() => listenHosts({ lan: true, interfaces, tailscaleIPs: [] }), /Tailscale/);
+  assert.throws(() => listenHosts({ lan: true, interfaces: { lo: interfaces.lo }, tailscaleIPs }), /Tailscale/);
+  // A real local CGNAT interface without daemon confirmation is not trusted.
+  assert.throws(() => listenHosts({ choose: "100.100.1.20", interfaces, tailscaleIPs: [] }), /Tailscale/);
+  // Nor is a daemon address that is absent from the local interfaces.
+  assert.throws(() => listenHosts({ choose: "100.100.1.21", interfaces,
+    tailscaleIPs: ["100.100.1.21"] }), /Tailscale/);
+  const chosen = listenHosts({ choose: "100.100.1.20", interfaces, tailscaleIPs });
+  assert.equal(chosen.phone, "100.100.1.20");
+  // Mac Tailscale uses utun interfaces; don't filter them out.
+  assert.equal(listenHosts({ lan: true, interfaces: { utun0: interfaces.tailscale0 },
+    tailscaleIPs }).phone, "100.100.1.20");
+});
+
+test("Tailscale proof fails closed on missing, stopped, or malformed daemon status", () => {
+  const self = { TailscaleIPs: ["100.100.1.20", "192.168.1.20", "fd7a:115c:a1e0::1"] };
+  assert.deepEqual(tailscaleAddresses(() => JSON.stringify({ BackendState: "Running", Self: self })),
+    ["100.100.1.20"]);
+  for (const status of [null, {}, { BackendState: "Stopped", Self: self },
+    { BackendState: "NeedsLogin", Self: self }, { BackendState: "Running" },
+    { BackendState: "Running", Self: { TailscaleIPs: "100.100.1.20" } }]) {
+    assert.deepEqual(tailscaleAddresses(() => JSON.stringify(status)), []);
+  }
+  assert.deepEqual(tailscaleAddresses(() => "not JSON"), []);
+  assert.deepEqual(tailscaleAddresses(() => { throw new Error("daemon unavailable"); }), []);
+});
+
+test("reset is loopback-only and unavailable with any network listener", () => {
+  const local = { enabled: true, hosts: ["127.0.0.1"],
+    remoteAddress: "127.0.0.1", localAddress: "127.0.0.1" };
+  assert.equal(resetAllowed(local), true);
+  assert.equal(resetAllowed({ ...local, enabled: false }), false);
+  assert.equal(resetAllowed({ ...local, hosts: [] }), false);
+  assert.equal(resetAllowed({ ...local, hosts: ["127.0.0.1", "100.100.1.20"] }), false);
+  for (const ip of ["100.100.1.20", "192.168.1.20", "203.0.113.8", "", undefined]) {
+    assert.equal(resetAllowed({ ...local, remoteAddress: ip }), false);
+    assert.equal(resetAllowed({ ...local, localAddress: ip }), false);
+  }
+  assert.equal(resetAllowed({ ...local, remoteAddress: "::ffff:127.0.0.1" }), true);
 });
 
 test("every relay log line starts with a timestamp", () => {
@@ -368,10 +396,10 @@ test("token is read from the environment or a 0600 file, never the command line"
   await fs.chmod(file, 0o600);
   assert.equal(await loadToken({ AIDANOS_RELAY_TOKEN_FILE: file }), TOKEN);
   await assert.rejects(loadToken({ AIDANOS_RELAY_TOKEN: "too-short" }), /32/);
-  const lines = startupLines({ lan: true, port: 3750, phone: "ws://192.168.1.20:3750" });
+  const lines = startupLines({ lan: true, port: 3750, phone: "100.100.1.20" });
   assert.equal(lines.includes(LAN_WARNING), true);
-  assert.match(LAN_WARNING, /no encryption/);
-  assert.match(LAN_WARNING, /token is the only protection/);
+  assert.match(LAN_WARNING, /Tailscale-only/);
+  assert.match(LAN_WARNING, /never proxy or forward/);
 });
 
 test("too many bad tokens are refused", async () => {

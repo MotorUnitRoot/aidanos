@@ -15,19 +15,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        # v5.1.0
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-      - name: Set up Node.js
-        # v6.5.0
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: "22"
-      - name: Chrome for the phone width check
-        run: |
-          if ! google-chrome-stable --version >/dev/null 2>&1 && ! google-chrome --version >/dev/null 2>&1; then
-            curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-            sudo apt-get update
-            sudo apt-get install -y /tmp/chrome.deb
-          fi
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: ".nvmrc"
+      - name: Install locked test dependencies
+        run: npm ci
+      - name: Pinned and checksummed Chrome (sets CHROME_PATH, including macOS)
+        run: bash .github/install-chrome.sh
+      - name: npm test
+        run: npm test
+      - name: flaw-scan rules
+        run: node .github/flaw-scan.mjs --self-test
+
+  tests-macos:
+    name: tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: ".nvmrc"
+      - name: Install locked test dependencies
+        run: npm ci
+      - name: Pinned and checksummed Chrome (sets CHROME_PATH, including macOS)
+        run: bash .github/install-chrome.sh
       - name: npm test
         run: npm test

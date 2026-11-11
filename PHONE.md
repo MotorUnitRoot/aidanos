@@ -33,7 +33,7 @@ Open `http://<mac-lan-ip>:3847` in Safari → Add to Home Screen.
 
 ## Cloud Run (ready when Colby says go)
 
-`Dockerfile` already sets `PORT=8080` and `AIDANOS_HOST=0.0.0.0`, and installs `git` so Cloud Run can clone a private vault. The vault is a private git repo of markdown (target `MotorUnitRoot/aidanos-vault`). Not Drive, not a second database. The Mac keeps a working tree of that same repo; Cloud Run clones, serves, and commits on write.
+`Dockerfile` already sets `PORT=8080` and `AIDANOS_HOST=0.0.0.0`, and installs `git` so Cloud Run can clone a private vault. The vault is a private git repo of markdown (target `MotorUnitRoot/aidanos-vault`). Not Drive, not a second database. The Mac launchd agent starts the app from `~/Grok/motorunit/dashboard` and sets `AIDANOS_VAULT` to `~/Grok/motorunit`. Cloud Run clones, serves, and commits on write.
 
 When a GCP project is authorized:
 

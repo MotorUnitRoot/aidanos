@@ -98,7 +98,7 @@ A text merge that merely interleaves two sentences is not one of these. It looks
 
 The first cut uses one shared secret, called the token. You type the same token into the relay and into each app. The app sends it once, in the connection header (`Authorization: Bearer …`), not in the web address, so it does not show up in an ordinary address log. A wrong token is refused before any note is exchanged. The relay never prints the token and never writes it into an error line.
 
-The relay reads that token from the environment variable `AIDANOS_RELAY_TOKEN` or from a file (mode 0600) named by `AIDANOS_RELAY_TOKEN_FILE`. It is not accepted on the command line. It must be at least 32 characters. Too many wrong guesses from the same address are refused for a while. The Mac and iPhone apps store the token in the Keychain, and the field is masked. This is a single password for every device you own. It is not an account system. It is enough for a private relay. A token per device comes before this relay is ever reachable from outside the house.
+The relay reads that token from the environment variable `AIDANOS_RELAY_TOKEN` or from a file (mode 0600) named by `AIDANOS_RELAY_TOKEN_FILE`. It is not accepted on the command line. It must be at least 32 characters. Too many wrong guesses from the same address are refused for a while. The Mac and iPhone apps store the token in the Keychain, and the field is masked. This is a single password for every device you own. It is not an account system. It is restricted to loopback or the owner's trusted Tailscale devices. A token per device comes before this relay is ever reachable from outside the house.
 
 ## What the relay writes, and when git gets a copy
 
@@ -119,7 +119,9 @@ Git runs on a timer, every five minutes unless `AIDANOS_RELAY_GIT_INTERVAL_MS` s
 
 By default the relay binds to `127.0.0.1` only. That is this computer, and no other computer can connect. That is the standing rule.
 
-To reach the relay from the iPhone on your home network, start it with `--lan`. It then listens on `127.0.0.1` and on one private address. It prefers a home-network address (`192.168.x.x`) over other private addresses, and it skips VPN tunnel interfaces. `--lan-address` chooses a specific private address. It does not listen on every interface. The token is still required. At startup it prints a warning that home-network traffic is unencrypted and the token is the only protection, then the `ws://` address to type into the phone. It does not print the token. If the Mac has no private address, `--lan` stops and says so.
+For the iPhone, `--lan` now means **Tailscale only**, not the home network. The running local `tailscale status --json` must report the selected address as this node's own address, and that IPv4 must exist on a local interface in `100.64.0.0/10`. The relay binds only that address plus `127.0.0.1`. `--lan-address` goes through the same checks. Missing/stopped Tailscale, an unverified CGNAT address, home-network addresses, public addresses, and wildcard binding are refused. Tailscale provides encryption and device authentication; both devices must be on the same trusted, restricted tailnet. The existing bearer token is still required. There is no application-level TLS or QR pairing in this cut. Never proxy, port-forward, enable Funnel, or publish this relay. A future public relay still needs its own security design and per-device tokens.
+
+`POST /reset` is disabled by default. Opt-in simulator reset additionally requires a loopback-only relay and both the remote and local socket addresses to be loopback. If any network listener is enabled, reset is refused on every listener, including loopback. Neither forwarding headers nor a correct bearer token can bypass that gate. The current matching relay markers remain required before deletion.
 
 A dropped socket, sleep, or airplane mode reconnects on its own, waiting a second and then longer, up to 30 seconds. The app shows Connecting, Connected, or Reconnecting. It does not say Connected while the socket is down. A note created after the connection, including the next day's note, syncs on that same connection. The app moves to the new day.
 
@@ -155,6 +157,6 @@ automerge-repo-swift, the Swift twin of the relay's library, is not linked in th
 3. Still open: the git backup runs every five minutes. A different rhythm, or a backup only when you ask, is not decided.
 4. Edit starts with both versions, one after the other.
 5. Still open: day notes stay at `log/YYYY-MM-DD.md`, matching the web app.
-6. Per-device tokens come before the relay ever leaves the house. This cut still uses one shared token, which is enough while it only listens on this Mac or the home network.
+6. Per-device tokens come before the relay ever leaves the house. This cut still uses one shared token, and is restricted to this Mac or the owner's trusted Tailscale devices; it is not a public relay.
 7. Still open: when automerge-repo-swift moves to Automerge 0.7, the Apple apps may switch onto its WebSocket code. The protocol would stay the same.
 8. Still open: a free Apple ID build expires every seven days and has to be reinstalled from Xcode until the paid developer account finishes.

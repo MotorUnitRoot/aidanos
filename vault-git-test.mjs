@@ -270,6 +270,39 @@ async function authOriginIsEmbedded() {
   }
 }
 
+async function seedSkipsPlantedLinks() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-seed-link-"));
+  const dest = path.join(tmp, "dest");
+  const outside = path.join(tmp, "outside");
+  fs.mkdirSync(dest);
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(dest, "maps"));
+  fs.mkdirSync(path.join(dest, "aidanos"));
+  const broken = path.join(outside, "not-created.md");
+  fs.symlinkSync(broken, path.join(dest, "aidanos", "active-horse.md"));
+  try {
+    const seeded = await seedBundledVault(dest, path.join(root, "vault"));
+    assert(seeded === true, "seed still copies around a planted link");
+    assert(fs.readdirSync(outside).length === 0, "seed wrote through a destination link");
+    assert(!fs.existsSync(broken), "broken link created a file outside the vault");
+    assert(fs.lstatSync(path.join(dest, "maps")).isSymbolicLink(), "folder link was replaced");
+    assert(
+      fs.lstatSync(path.join(dest, "aidanos", "active-horse.md")).isSymbolicLink(),
+      "file link was replaced",
+    );
+    assert(
+      fs.readFileSync(path.join(dest, "README.md"), "utf8").includes("this folder is the disk"),
+      "seed skipped a normal file",
+    );
+    assert(
+      fs.existsSync(path.join(dest, "family-room-to-office", "map.md")),
+      "seed skipped a normal folder",
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 function seedDoesNotOverwrite() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-seed-"));
   const dest = path.join(tmp, "dest");
@@ -415,6 +448,7 @@ function historyNames(cwd) {
 try {
   authUrlShaping();
   await seedDoesNotOverwrite();
+  await seedSkipsPlantedLinks();
   await liveGitSync();
   await authOriginIsEmbedded();
   await bundledSeedWhenCloneFails();

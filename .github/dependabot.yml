@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Ordinary version updates wait 7 days (cooldown.default-days).
+  # Dependabot security updates are a separate feed and are not delayed by this cooldown.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

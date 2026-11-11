@@ -6,27 +6,13 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const chrome = ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
-  .find((p) => fs.existsSync(p)) || "";
-
-async function loadChromium() {
-  try {
-    return (await import("playwright-core")).chromium;
-  } catch (e) {}
-  const local = "/tmp/pw/node_modules/playwright-core/index.mjs";
-  if (fs.existsSync(local)) return (await import(local)).chromium;
-  return null;
-}
-
-if (!chrome) {
-  console.log("skip  question caret: chrome is not installed");
-  process.exit(0);
-}
-const chromium = await loadChromium();
-if (!chromium) {
-  console.log("skip  question caret: playwright-core is not installed");
-  process.exit(0);
-}
+// CI and local runs use the same pinned, checksummed browser. Missing browser
+// dependencies fail, rather than silently turning a browser check into a skip.
+const chrome = process.env.CHROME_PATH ||
+  ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
+    .find((p) => fs.existsSync(p));
+if (!chrome) throw new Error("Chrome is required for question-caret-test (set CHROME_PATH).");
+const { chromium } = await import("playwright-core");
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);

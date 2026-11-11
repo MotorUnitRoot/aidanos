@@ -1,7 +1,7 @@
+#!/usr/bin/env node
 import { runDiagnosticSecurityRegressions } from "./test/child-diagnostics-regressions.mjs";
 import { spawnWithLog as spawn } from "./test/child-diagnostics.mjs";
 import { fixtureEnv } from "./test/child-diagnostics.mjs";
-#!/usr/bin/env node
 // Every symlink under the vault is refused, including one that stays inside.
 // The error names that path. A symlinked vault root refuses to start.
 // An unexpected write stops the process. An unexpected read fails that request.

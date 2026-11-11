@@ -1,5 +1,5 @@
-import { fixtureEnv } from "./test/child-diagnostics.mjs";
 #!/usr/bin/env node
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
 import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import os from "node:os";

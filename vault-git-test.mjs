@@ -1,6 +1,6 @@
+#!/usr/bin/env node
 import { spawnWithLog as spawn } from "./test/child-diagnostics.mjs";
 import { fixtureEnv } from "./test/child-diagnostics.mjs";
-#!/usr/bin/env node
 import { randomTestPort } from "./test/ports.mjs";
 import { childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";

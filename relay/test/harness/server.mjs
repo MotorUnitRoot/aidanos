@@ -2,7 +2,8 @@
 // test-mode switch and cannot enable HTTP reset, even with inherited test env.
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { parseArgs, startRelay, startupLines } from "../../src/server.mjs";
+import { parseArgs } from "../../src/server.mjs";
+import { startRelay, startupLines } from "./reset-relay.mjs";
 
 export function parseHarnessArgs(argv) {
   if (!argv.includes("--test-mode")) throw new Error("The disposable test relay requires --test-mode.");

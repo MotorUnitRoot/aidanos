@@ -6,8 +6,9 @@ import http from "node:http";
 import { WebSocket } from "ws";
 import { trustedRelayHosts } from "../src/request-safety.mjs";
 import path from "node:path";
-import { assertNoServe, hasProxyHints, readServeStatus, resetTestMode } from "../src/reset-safety.mjs";
-import { parseArgs, startRelay } from "../src/server.mjs";
+import { assertNoServe, hasProxyHints, readServeStatus, resetTestMode } from "./harness/reset-safety.mjs";
+import { parseArgs, startRelay as startProductionRelay } from "../src/server.mjs";
+import { startRelay } from "./harness/reset-relay.mjs";
 import { parseHarnessArgs } from "./harness/server.mjs";
 
 const TOKEN = "aidanos-test-token-0123456789abcdef";
@@ -54,7 +55,7 @@ test("production and missing-test-mode requests cannot reset even with the opt-i
   ];
   for (const extra of cases) {
     const dir = await tempDir();
-    const relay = await startRelay(options(dir, extra));
+    const relay = await startProductionRelay(options(dir, extra));
     try {
       const sentinel = path.join(relay.vault, "keep.md");
       await fs.writeFile(sentinel, "keep fixture\n");

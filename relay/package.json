@@ -17,5 +17,11 @@
     "@automerge/automerge-repo-storage-nodefs": "2.6.0-alpha.3",
     "bs58check": "4.0.0",
     "ws": "8.22.0"
-  }
+  },
+  "files": [
+    "src/*.mjs",
+    "scripts/reject-optional-native.sh",
+    "Acknowledgements.txt",
+    "Dockerfile"
+  ]
 }

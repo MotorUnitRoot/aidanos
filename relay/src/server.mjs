@@ -11,7 +11,6 @@ import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import { listenHosts } from "./bind.mjs";
 import { relayRequestAllowed, trustedRelayHosts } from "./request-safety.mjs";
-import { assertNoServe, hasProxyHints, readServeStatus, resetTestMode } from "./reset-safety.mjs";
 import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import { createMirror } from "./mirror.mjs";
@@ -29,14 +28,6 @@ export const LAN_WARNING =
   "WARNING: --lan is Tailscale-only. Both devices must use the same trusted tailnet; never proxy or forward this relay onto a home or public network.";
 
 const CLIENT_MARKERS = ["actor", "storage-id", "index"];
-
-// Test-only deletion: production ignores reset opt-in. Proxy hints are refused,
-// not trusted as an alternative to a loopback socket or test-harness mode.
-export function resetAllowed({ enabled, testMode, hosts, remoteAddress, localAddress, headers }) {
-  const loopback = (ip) => ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
-  return enabled === true && testMode === true && !hasProxyHints(headers) && hosts.length > 0 && hosts.every((host) => host === "127.0.0.1") &&
-    loopback(remoteAddress) && loopback(localAddress);
-}
 
 export function tokensMatch(expected, got) {
   const left = Buffer.from(String(expected || ""));
@@ -187,30 +178,6 @@ export function startupLines({ lan, port, phone }) {
   if (lan) lines.push(LAN_WARNING);
   if (phone) lines.push("PHONE ws://" + phone + ":" + port);
   return lines;
-}
-
-function isInsideDirectory(parent, child) {
-  const root = path.resolve(parent);
-  const target = path.resolve(child);
-  if (root === target) return true;
-  const prefix = root.endsWith(path.sep) ? root : root + path.sep;
-  return target.startsWith(prefix);
-}
-
-async function emptyDirectory(dir) {
-  // One name at a time. A parallel delete races a mirror rename and macOS
-  // then returns ENOTEMPTY for the directory. A missing directory is already empty:
-  // wiping the notes folder also removes a data folder that lives inside it.
-  let names;
-  try {
-    names = await fs.readdir(dir);
-  } catch (error) {
-    if (error && error.code === "ENOENT") return;
-    throw error;
-  }
-  for (const name of names) {
-    await fs.rm(path.join(dir, name), { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
-  }
 }
 
 // Create only. O_EXCL refuses an existing path, and O_NOFOLLOW refuses a symlink,
@@ -384,14 +351,6 @@ async function claimRelayFolders(vault, dataDir) {
   return id;
 }
 
-async function ownedMarkerId(vault, dataDir) {
-  const vaultId = relayMarkerId(await readMarker(path.join(vault, ".aidanos", "relay-folder")));
-  const dataId = relayMarkerId(await readMarker(path.join(dataDir, "relay-folder")));
-  const outsideId = relayMarkerId(await readMarker(relayIdFile(vault)));
-  if (!vaultId || vaultId !== dataId || vaultId !== outsideId) return "";
-  return vaultId;
-}
-
 async function assertNotClientVault(vault) {
   for (const name of CLIENT_MARKERS) {
     try {
@@ -448,24 +407,9 @@ export async function startRelay(options = {}) {
     interfaces: options.interfaces,
     choose: options.lanAddress || "",
   });
-  const testMode = resetTestMode(options.testMode, env);
-  const allowReset = testMode && (options.allowReset === true || env.AIDANOS_RELAY_ALLOW_RESET === "1");
-  // This authority is read only in explicit test mode, never a production path.
-  const resetAdminToken = allowReset ? String(options.resetAdminToken ?? env.AIDANOS_RELAY_RESET_ADMIN_TOKEN ?? "") : "";
-  if (allowReset) {
-    if (resetAdminToken.length < MIN_TOKEN_LENGTH || /\s/.test(resetAdminToken) || tokensMatch(token, resetAdminToken)) {
-      throw new Error("Test reset requires a separate admin credential of at least 32 non-whitespace characters.");
-    }
-    if (hosts.some((host) => host !== "127.0.0.1")) {
-      throw new Error("Test reset requires loopback-only listeners; do not combine it with --lan.");
-    }
-    // Refuse before claiming folders or binding sockets. Recheck per reset so
-    // enabling Serve/Funnel after startup cannot silently enable deletion.
-    assertNoServe(() => readServeStatus(env));
-  }
   const gitUrl = String(options.gitUrl ?? env.AIDANOS_RELAY_GIT_URL ?? "").trim();
   const gitToken = String(options.gitToken ?? env.AIDANOS_RELAY_GIT_TOKEN ?? "").trim();
-  const secrets = [token, resetAdminToken, gitToken, gitUrl].filter(Boolean);
+  const secrets = [token, gitToken, gitUrl].filter(Boolean);
   const trustedHosts = trustedRelayHosts(env.AIDANOS_RELAY_TRUSTED_HOSTS);
   await assertNotClientVault(vault);
   await claimRelayFolders(vault, dataDir);
@@ -517,7 +461,6 @@ export async function startRelay(options = {}) {
   let bootedAt = new Date().toISOString();
   const servers = [];
   let live = null;
-  let resetChain = Promise.resolve();
   let api = null;
 
   async function openSession() {
@@ -552,73 +495,6 @@ export async function startRelay(options = {}) {
     return { repo, mirror, adapters };
   }
 
-  async function disposeSession(session) {
-    if (!session) return;
-    session.mirror.stop();
-    for (const entry of servers) {
-      for (const ws of [...entry.wss.clients]) ws.terminate();
-      // The adapter clears its ping timer on "close". Emitting it here does not
-      // mark the socket server shut, so the next test can still connect.
-      entry.wss.emit("close");
-      entry.wss.removeAllListeners();
-    }
-    // The folder is about to be deleted, so do not flush or write it again.
-    // Wait only for a rename that has already started.
-    await session.mirror.idle();
-    try {
-      session.repo.networkSubsystem.disconnect();
-    } catch {
-      // The adapter is already detached from the socket server.
-    }
-    try {
-      await session.repo.storageSubsystem?.close();
-    } catch {
-      // Closing storage is best effort. The directory is removed next.
-    }
-  }
-
-  async function rotate() {
-    const markerId = await ownedMarkerId(vault, dataDir);
-    if (!markerId) {
-      logSafe(secrets, "reset refused: the folder has no current relay marker");
-      return;
-    }
-    await disposeSession(live);
-    live = null;
-    let lastError;
-    const marker = relayMarkerText(markerId);
-    const dataInsideVault = isInsideDirectory(vault, dataDir);
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      try {
-        await emptyDirectory(vault);
-        // The default data folder is vault/.aidanos/relay. Emptying the notes
-        // folder already removed it, so do not try to empty a path that is gone.
-        if (!dataInsideVault) await emptyDirectory(dataDir);
-        await fs.mkdir(path.join(vault, ".aidanos"), { recursive: true });
-        await fs.mkdir(dataDir, { recursive: true });
-        await writeMarkerFile(path.join(vault, ".aidanos", "relay-folder"), marker);
-        await writeMarkerFile(path.join(dataDir, "relay-folder"), marker);
-        if (typeof options.beforeReopen === "function") await options.beforeReopen();
-        live = await openSession();
-        bootedAt = new Date().toISOString();
-        if (api) api.repo = live.repo;
-        logSafe(secrets, "reset complete");
-        if (typeof options.onReset === "function") options.onReset();
-        return;
-      } catch (error) {
-        lastError = error;
-        logSafe(secrets, "reset attempt failed:", error instanceof Error ? error.message : error);
-      }
-    }
-    throw lastError;
-  }
-
-  function scheduleReset() {
-    resetChain = resetChain.then(rotate).catch((error) => {
-      logSafe(secrets, "reset failed:", error instanceof Error ? error.message : error);
-    });
-  }
-
   for (const host of hosts) {
     const httpServer = http.createServer((req, res) => {
       if (!relayRequestAllowed(req, hosts, trustedHosts)) {
@@ -636,62 +512,6 @@ export async function startRelay(options = {}) {
           "cache-control": "no-store",
         });
         res.end(body);
-        return;
-      }
-      if (allowReset && req.method === "POST" && pathOnly === "/reset") {
-        if (!resetAllowed({ enabled: allowReset, testMode, hosts, headers: req.headers,
-          remoteAddress: req.socket.remoteAddress, localAddress: req.socket.localAddress })) {
-          res.writeHead(404, { "content-length": 0 });
-          res.end();
-          return;
-        }
-        const ip = clientAddress(req);
-        if (blocked(ip) || !tokensMatch(resetAdminToken, bearerToken(req.headers.authorization))) {
-          if (!blocked(ip)) noteFailure(ip);
-          res.writeHead(401, { "content-length": 0 });
-          res.end();
-          return;
-        }
-        try {
-          assertNoServe(() => readServeStatus(env));
-        } catch {
-          res.writeHead(503, { "content-length": 0 });
-          res.end();
-          return;
-        }
-        ownedMarkerId(vault, dataDir)
-          .then((markerId) => {
-            if (res.writableEnded) return;
-            if (!markerId) {
-              const refused = "reset refused";
-              res.writeHead(409, {
-                "content-type": "text/plain",
-                "content-length": Buffer.byteLength(refused),
-                "cache-control": "no-store",
-              });
-              res.end(refused);
-              return;
-            }
-            const body = JSON.stringify({ ok: true, resetting: true });
-            res.writeHead(200, {
-              "content-type": "application/json",
-              "content-length": Buffer.byteLength(body),
-              "cache-control": "no-store",
-            });
-            res.end(body);
-            logSafe(secrets, "resetting");
-            // The iOS simulator shares this process. Empty the folder here instead
-            // of exiting: starting Node again while the simulator is up takes
-            // longer than the tests will wait. Only the explicit test harness can enable this.
-            scheduleReset();
-          })
-          .catch((error) => {
-            logSafe(secrets, "reset failed:", error instanceof Error ? error.message : error);
-            if (!res.headersSent) {
-              res.writeHead(500, { "content-length": 0 });
-              res.end();
-            }
-          });
         return;
       }
       res.writeHead(404, { "content-length": 0 });
@@ -806,7 +626,6 @@ export async function startRelay(options = {}) {
     },
     healthURL: "http://127.0.0.1:" + boundPort + "/health",
     async close() {
-      await resetChain.catch(() => {});
       const session = live;
       live = null;
       if (session) session.mirror.stop();

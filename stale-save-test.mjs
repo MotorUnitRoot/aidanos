@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -171,7 +172,7 @@ async function liveTwoClients() {
   fs.utimesSync(dayPath, past, past);
   fs.utimesSync(notePath, past, past);
 
-  const port = 21000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
@@ -300,7 +301,7 @@ async function liveSameTextAndLock() {
   fs.writeFileSync(otherPath, "base\n", "utf8");
   fs.writeFileSync(notePath, "loaded note\n", "utf8");
 
-  const port = 23000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {

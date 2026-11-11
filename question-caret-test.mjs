@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,7 +22,7 @@ function assert(cond, msg) {
 const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-questions-"));
 fs.cpSync(path.join(root, "vault"), vault, { recursive: true });
 const answersPath = path.join(vault, "family-room-to-office", "answers.md");
-const port = 22000 + Math.floor(Math.random() * 2000);
+const port = randomTestPort();
 const child = spawn(process.execPath, ["server.mjs"], {
   cwd: root,
   env: {

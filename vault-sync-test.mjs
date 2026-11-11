@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomTestPort } from "./test/ports.mjs";
 import { childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";
 import os from "node:os";
@@ -244,7 +245,7 @@ async function livePull() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 26000 + Math.floor(Math.random() * 1000);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const childA = spawnServer(serverEnv(portA, vaultA, bare, { AIDANOS_VAULT_GIT_SYNC_MS: "400" }));
   const childB = spawnServer(serverEnv(portB, vaultB, bare, { AIDANOS_VAULT_GIT_SYNC_MS: "400" }));
@@ -293,7 +294,7 @@ async function sameFileKeepsBoth() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 28000 + Math.floor(Math.random() * 1000);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -372,7 +373,7 @@ async function refusedPushIsShown() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 30000 + Math.floor(Math.random() * 1000);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -430,7 +431,7 @@ async function noRemoteUnchanged() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-local-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault, { recursive: true });
-  const port = 32000 + Math.floor(Math.random() * 1000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -479,7 +480,7 @@ async function divergedDifferentFiles() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 33000 + Math.floor(Math.random() * 800);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -561,7 +562,7 @@ async function mixedOverlapAndDisjoint() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 34000 + Math.floor(Math.random() * 800);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -668,7 +669,7 @@ async function conflictSurvivesDaySwitch() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 35000 + Math.floor(Math.random() * 800);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -741,7 +742,7 @@ async function strayFileLeftAlone() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 36000 + Math.floor(Math.random() * 800);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -812,7 +813,7 @@ async function otherNoteSurvivesConflict() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 41000 + Math.floor(Math.random() * 400);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -870,7 +871,7 @@ async function otherNoteSurvivesConflictOffline() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 43000 + Math.floor(Math.random() * 400);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -926,7 +927,7 @@ async function pendingSurvivesRestart() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 45000 + Math.floor(Math.random() * 400);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -980,14 +981,14 @@ async function pendingSurvivesRestart() {
   }
 }
 
-async function withChoiceThenSecondEdit(portBase, resolve, chosen, fn) {
+async function withChoiceThenSecondEdit(resolve, chosen, fn) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-stale-"));
   const bare = seedBare(tmp);
   const vaultA = path.join(tmp, "a");
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = portBase + Math.floor(Math.random() * 200);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -1045,7 +1046,7 @@ async function joinHiddenUntilEveryConflictIsChosen() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 45100 + Math.floor(Math.random() * 400);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -1096,7 +1097,7 @@ async function joinHiddenUntilEveryConflictIsChosen() {
 }
 
 async function staleChoiceAfterKeepMine() {
-  await withChoiceThenSecondEdit(46100, "keep", "B1\n", async (ctx) => {
+  await withChoiceThenSecondEdit("keep", "B1\n", async (ctx) => {
     const nudge = await putDay(ctx.baseB, "2026-10-17", "nudge compare\n", 0);
     assert(nudge.res.ok, "nudge " + nudge.res.status);
     const again = await waitFor(async () => {
@@ -1113,7 +1114,7 @@ async function staleChoiceAfterKeepMine() {
 }
 
 async function staleChoiceAfterTakeTheirs() {
-  await withChoiceThenSecondEdit(47100, "theirs", "A1\n", async (ctx) => {
+  await withChoiceThenSecondEdit("theirs", "A1\n", async (ctx) => {
     const nudge = await putDay(ctx.baseB, "2026-10-17", "nudge compare\n", 0);
     assert(nudge.res.ok, "nudge " + nudge.res.status);
     const again = await waitFor(async () => {
@@ -1131,7 +1132,7 @@ async function staleChoiceAfterTakeTheirs() {
 
 async function staleChoiceAfterEdit() {
   const edited = "edited on B\n";
-  await withChoiceThenSecondEdit(48100, "edit", edited, async (ctx) => {
+  await withChoiceThenSecondEdit("edit", edited, async (ctx) => {
     const nudge = await putDay(ctx.baseB, "2026-10-17", "nudge compare\n", 0);
     assert(nudge.res.ok, "nudge " + nudge.res.status);
     const again = await waitFor(async () => {
@@ -1148,7 +1149,7 @@ async function staleChoiceAfterEdit() {
 }
 
 async function staleChoiceBeforeMerge() {
-  await withChoiceThenSecondEdit(49100, "keep", "B1\n", async (ctx) => {
+  await withChoiceThenSecondEdit("keep", "B1\n", async (ctx) => {
     const joined = await fetch(ctx.baseB + "/api/sync", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

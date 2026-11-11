@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -28,7 +29,7 @@ assert(!capture.includes("landDoorQueryOnToday"), "Capture thoughts does not lan
 console.log("pass  Door map path, empty Get to Work stays empty");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = 18500 + Math.floor(Math.random() * 2000);
+const PORT = randomTestPort();
 const origin = `http://127.0.0.1:${PORT}`;
 const vault = await fs.promises.mkdtemp(path.join(os.tmpdir(), "aidanos-door-"));
 await fs.promises.mkdir(path.join(vault, "log"), { recursive: true });

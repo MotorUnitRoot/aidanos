@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomTestPort } from "./test/ports.mjs";
 import { childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";
 import os from "node:os";
@@ -93,7 +94,7 @@ async function liveGitSync() {
   git(["remote", "add", "origin", bare], seed);
   git(["push", "-u", "origin", "HEAD"], seed);
 
-  const port = 21000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort(2);
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -239,7 +240,7 @@ async function authOriginIsEmbedded() {
   fs.mkdirSync(vault, { recursive: true });
   const token = "ghp_shape_test_" + String(Date.now());
   const publicUrl = "https://127.0.0.1:1/MotorUnitRoot/aidanos-vault.git";
-  const port = 23000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -327,7 +328,7 @@ async function bundledSeedWhenCloneFails() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-seed-live-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault, { recursive: true });
-  const port = 24000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -380,7 +381,7 @@ async function seededNotesStayUntracked() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-seed-untracked-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault, { recursive: true });
-  const port = 25000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -115,7 +116,7 @@ async function liveVaultAbi() {
   fs.writeFileSync(outside, "SECRET_OUTSIDE\n", "utf8");
   fs.symlinkSync(outside, path.join(vault, "maps", "leak.md"));
 
-  const port = 19000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {

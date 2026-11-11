@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -389,7 +390,7 @@ async function pngRoundTrip() {
   fs.mkdirSync(path.join(vault, "family-room-to-office"), { recursive: true });
   fs.mkdirSync(path.join(vault, "maps"), { recursive: true });
   fs.writeFileSync(path.join(vault, "maps", "secret.txt"), "SECRET_TXT\n");
-  const port = 18600 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
@@ -458,7 +459,7 @@ async function pngSymlinkStaysInJob() {
   fs.mkdirSync(logDir, { recursive: true });
   const day = path.join(logDir, "2026-10-09.md");
   fs.writeFileSync(day, "SECRET_DAY_NOTE\n");
-  const port = 20600 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
@@ -608,7 +609,7 @@ async function pngReadIsOnlyThePicture() {
   const job = path.join(vault, "family-room-to-office");
   fs.mkdirSync(job, { recursive: true });
   fs.mkdirSync(path.join(vault, "maps"), { recursive: true });
-  const port = 24600 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -271,7 +272,7 @@ async function liveCopyDeleteAndOpen() {
   for (const name of ["reply-to-a-letter.md", "the-reply.md", "file-a-receipt.md", "the-receipt.md"]) {
     fs.copyFileSync(path.join(root, "vault", "maps", name), path.join(vault, "maps", name));
   }
-  const port = 18100 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {

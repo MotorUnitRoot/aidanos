@@ -149,6 +149,16 @@ final class TodayModel: ObservableObject {
         }
     }
 
+    func pairExactRelay() {
+        do {
+            let exact = try AidanSession.canonicalRelayAddress(address)
+            session?.disconnect()
+            UserDefaults.standard.set(exact, forKey: "aidanos.approvedRelayAddress")
+            address = exact
+            status = "Exact relay address paired. Changing it requires re-pairing."
+        } catch { status = String(describing: error) }
+    }
+
     func connect() {
         UserDefaults.standard.set(address, forKey: "aidanos.relayAddress")
         if RelayTokenStore.save(token) {
@@ -157,10 +167,11 @@ final class TodayModel: ObservableObject {
         guard let session else { return }
         status = ConnectionState.connecting.label
         let url = address
+        let approved = UserDefaults.standard.string(forKey: "aidanos.approvedRelayAddress")
         let secret = token
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                try session.connect(relayURL: url, token: secret)
+                try session.connect(relayURL: url, token: secret, approvedRelayURL: approved)
                 Task { @MainActor in self?.publishConflict() }
             } catch {
                 Task { @MainActor in

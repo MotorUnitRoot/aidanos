@@ -21,6 +21,7 @@ struct TodayScreen: View {
                 .textFieldStyle(.roundedBorder)
             SecureField("Token", text: $model.token)
                 .textFieldStyle(.roundedBorder)
+            Button("Pair this exact relay") { model.pairExactRelay() }
             Button("Connect") { model.connect() }
             if let conflict = model.conflict {
                 Text(conflict.reason)

@@ -38,10 +38,24 @@ final class RelayAddressTests: XCTestCase {
 
     func testLoopbackNeedsExplicitTestException() throws {
         XCTAssertThrowsError(try RelayAddress("ws://127.0.0.1:3750", allowTestLoopback: false))
+        #if DEBUG
         XCTAssertEqual(try RelayAddress("ws://127.0.0.1:3750", allowTestLoopback: true).host, "127.0.0.1")
+        #else
+        XCTAssertThrowsError(try RelayAddress("ws://127.0.0.1:3750", allowTestLoopback: true))
+        #endif
         for raw in ["ws://localhost:3750", "ws://[::1]:3750", "ws://[fd7a:115c:a1e0::1]:3750"] {
             XCTAssertThrowsError(try RelayAddress(raw, allowTestLoopback: false))
         }
+    }
+
+    func testExactPairedAddressRequiredBeforeCredentialUse() throws {
+        let paired = "wss://relay.tail.ts.net:443/"
+        XCTAssertEqual(try RelayAddress.approved(paired, paired: paired).canonicalURL, paired)
+        for candidate in ["wss://other.tail.ts.net:443/", "wss://relay.tail.ts.net:444/", "wss://100.100.1.20:443/", "wss://relay.tail.ts.net"] {
+            XCTAssertThrowsError(try RelayAddress.approved(candidate, paired: paired))
+        }
+        XCTAssertThrowsError(try RelayAddress.approved(paired, paired: nil))
+        XCTAssertThrowsError(try RelayAddress.approved(paired, paired: ""))
     }
 
     func testValidPortsAndSecureDefault() throws {

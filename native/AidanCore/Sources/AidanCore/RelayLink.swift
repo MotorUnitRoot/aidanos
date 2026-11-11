@@ -21,9 +21,9 @@ final class RelayLink {
     private var ready: (() -> Void)?
     private var failed: ((Error) -> Void)?
 
-    func connect(url: String, token: String, peerId: String, storageId: String, host: SyncHost) throws {
+    func connect(url: String, token: String, approvedRelayURL: String?, peerId: String, storageId: String, host: SyncHost) throws {
         _ = signal(SIGPIPE, SIG_IGN)
-        let parsed = try RelayAddress(url)
+        let parsed = try RelayAddress.approved(url, paired: approvedRelayURL)
         self.peerId = peerId
         self.storageId = storageId
         self.host = host
@@ -435,6 +435,16 @@ struct RelayAddress {
         #endif
     }
 
+    static func approved(_ raw: String, paired: String?) throws -> RelayAddress {
+        let address = try RelayAddress(raw)
+        if raw == paired { return address }
+        #if DEBUG
+        // Existing simulator fixtures only; never compiled into release.
+        if paired == nil && testLoopback && address.host == "127.0.0.1" { return address }
+        #endif
+        throw AidanError.protocol("Pair this exact relay address before connecting; address changes require re-pairing.")
+    }
+
     static func isTailscaleIPv4(_ host: String) -> Bool {
         let parts = host.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 4 else { return false }
@@ -459,7 +469,11 @@ struct RelayAddress {
             throw AidanError.protocol("Use ws://100.x.y.z:3750 or a verified wss://relay.tail.ts.net address.")
         }
         let secure = scheme == "wss"
+        #if DEBUG
         let testLocal = allowTestLoopback && host == "127.0.0.1"
+        #else
+        let testLocal = false
+        #endif
         // MagicDNS requires authenticated TLS, never plaintext DNS + a bearer
         // token. Direct ws uses a literal CGNAT IP (no DNS/rebinding fallback).
         guard Self.isTailscaleIPv4(host) || (secure && Self.isMagicDNS(host)) || testLocal else {

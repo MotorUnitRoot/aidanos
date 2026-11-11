@@ -11,6 +11,9 @@ import { parseArgs, startRelay as startProductionRelay } from "../src/server.mjs
 import { startRelay } from "./harness/reset-relay.mjs";
 import { parseHarnessArgs } from "./harness/server.mjs";
 
+import { noServeFixture } from "./harness/fixture-env.mjs";
+const productionFixture = await noServeFixture();
+
 const TOKEN = "aidanos-test-token-0123456789abcdef";
 const ADMIN_TOKEN = "aidanos-admin-fixture-9876543210abcdef";
 const auth = { authorization: "Bearer " + ADMIN_TOKEN };
@@ -55,7 +58,7 @@ test("production and missing-test-mode requests cannot reset even with the opt-i
   ];
   for (const extra of cases) {
     const dir = await tempDir();
-    const relay = await startProductionRelay(options(dir, extra));
+    const relay = await startProductionRelay(options(dir, { ...extra, env: { ...extra.env, PATH: productionFixture.dir } }));
     try {
       const sentinel = path.join(relay.vault, "keep.md");
       await fs.writeFile(sentinel, "keep fixture\n");

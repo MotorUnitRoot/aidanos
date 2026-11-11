@@ -3,7 +3,9 @@
 Native sync and the Safari home-screen web app are different paths. These steps
 are for the native Mac/iPhone sync cut. Do not use the old home-Wi-Fi `--lan`,
 wildcard `AIDANOS_HOST=0.0.0.0`, or historical quick-tunnel instructions for notes.
-Nothing here authorizes a deploy or a public relay.
+Nothing here authorizes a deploy or a public relay. Loopback is not proof of locality;
+a same-machine headerless proxy cannot be identified by a socket address. Production
+refuses forwarding hints and configured/unreadable Serve/Funnel state on every route.
 
 ## Connect the native iPhone and Mac
 

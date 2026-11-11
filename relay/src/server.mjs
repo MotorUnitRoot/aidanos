@@ -9,6 +9,7 @@ import { Repo, isValidDocumentId } from "@automerge/automerge-repo";
 import { decode } from "@automerge/automerge-repo/helpers/cbor.js";
 import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
+import { assertNoServe, hasProxyHints, readServeStatus } from "./exposure-safety.mjs";
 import { listenHosts } from "./bind.mjs";
 import { relayRequestAllowed, trustedRelayHosts } from "./request-safety.mjs";
 import { backupOnce } from "./git.mjs";
@@ -386,6 +387,8 @@ function listen(server, host, port) {
 
 export async function startRelay(options = {}) {
   const env = options.env || process.env;
+  // Loopback is a bind scope, not proof that the caller is local or unproxied.
+  assertNoServe(() => readServeStatus(env));
   const token =
     options.token != null && String(options.token) !== ""
       ? tokenWithoutTrailingNewline(options.token)
@@ -497,10 +500,13 @@ export async function startRelay(options = {}) {
 
   for (const host of hosts) {
     const httpServer = http.createServer((req, res) => {
-      if (!relayRequestAllowed(req, hosts, trustedHosts)) {
+      if (hasProxyHints(req.headers) || !relayRequestAllowed(req, hosts, trustedHosts)) {
         res.writeHead(403, { "content-length": 0 });
         res.end();
         return;
+      }
+      try { assertNoServe(() => readServeStatus(env)); } catch {
+        res.writeHead(503, { "content-length": 0 }); res.end(); return;
       }
       const pathOnly = String(req.url || "").split("?")[0];
       if (pathOnly === "/health") {
@@ -522,9 +528,12 @@ export async function startRelay(options = {}) {
     const wss = new WebSocketServer({ noServer: true, maxPayload: cap });
     const entry = { httpServer, host, wss };
     httpServer.on("upgrade", (req, socket, head) => {
-      if (!relayRequestAllowed(req, hosts, trustedHosts)) {
+      if (hasProxyHints(req.headers) || !relayRequestAllowed(req, hosts, trustedHosts)) {
         socket.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
+      }
+      try { assertNoServe(() => readServeStatus(env)); } catch {
+        socket.end("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"); return;
       }
       if (!live) {
         socket.destroy();

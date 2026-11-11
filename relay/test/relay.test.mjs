@@ -24,11 +24,15 @@ import {
   relayIdFile,
   relayMarkerId,
   relayMarkerText,
-  startRelay,
+  startRelay as startProductionRelay,
   startupLines,
 } from "../src/server.mjs";
 
 import { resetAllowed, startRelay as startResetRelay } from "./harness/reset-relay.mjs";
+
+import { noServeFixture } from "./harness/fixture-env.mjs";
+const productionFixture = await noServeFixture();
+const startRelay = (options) => startProductionRelay({ env: productionFixture.env, ...options });
 
 const TOKEN = "aidanos-test-token-0123456789abcdef";
 const ADMIN_TOKEN = "aidanos-admin-fixture-9876543210abcdef";

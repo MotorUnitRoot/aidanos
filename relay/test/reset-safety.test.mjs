@@ -181,9 +181,17 @@ test("a header-stripping loopback proxy with the sync token cannot reset", async
 test("foreign Host or any browser Origin fails closed for HTTP and WebSocket, with or without sync token", async () => {
   const dir = await tempDir();
   const relay = await startRelay(options(dir));
+  // fetch deliberately discards caller-supplied Host. Use the raw Node HTTP
+  // client so this negative test sends the hostile authority on the wire.
+  const httpStatus = (headers) => new Promise((resolve, reject) => {
+    const req = http.get(relay.healthURL, { headers }, (res) => {
+      res.resume(); resolve(res.statusCode);
+    });
+    req.on("error", reject);
+  });
   const upgradeStatus = (headers) => new Promise((resolve, reject) => {
     const ws = new WebSocket(relay.url, { headers });
-    ws.on("unexpected-response", (_req, res) => { res.resume(); ws.terminate(); resolve(res.statusCode); });
+    ws.on("unexpected-response", (_req, res) => { resolve(res.statusCode); res.resume(); ws.terminate(); });
     ws.on("open", () => { ws.terminate(); resolve(101); });
     ws.on("error", reject);
   });
@@ -191,7 +199,7 @@ test("foreign Host or any browser Origin fails closed for HTTP and WebSocket, wi
     for (const extra of [{ host: "foreign.example:3750" }, { origin: "https://foreign.example" }]) {
       for (const token of ["", TOKEN]) {
         const headers = { ...extra, ...(token ? { authorization: "Bearer " + token } : {}) };
-        assert.equal((await fetch(relay.healthURL, { headers })).status, 403);
+        assert.equal(await httpStatus(headers), 403);
         assert.equal(await upgradeStatus(headers), 403);
       }
     }

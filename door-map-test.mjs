@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawn } from "node:child_process";
+import { spawnWithLog as spawn, childStartupError } from "./test/child-diagnostics.mjs";
 import { fileURLToPath } from "node:url";
 
 const src = fs.readFileSync(new URL("./app.js", import.meta.url), "utf8");
@@ -61,14 +61,17 @@ async function cleanup() {
 process.on("exit", () => { try { child.kill("SIGKILL"); } catch {} });
 
 try {
+  let healthy = false;
   const t0 = Date.now();
   while (Date.now() - t0 < 8000) {
+    if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode);
     try {
       const r = await fetch(origin + "/api/health");
-      if (r.ok) break;
+      if (r.ok) { healthy = true; break; }
     } catch {}
     await sleep(40);
   }
+  if (!healthy) throw childStartupError(child, "health timeout");
   const search = await fetch(origin + "/api/search?q=receipt");
   const hits = (await search.json()).hits || [];
   const mapHit = hits.find((h) => String(h.path).includes("file-a-receipt"));

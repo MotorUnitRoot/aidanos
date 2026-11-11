@@ -2,7 +2,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
+import { spawnWithLog as spawn, childStartupError } from "./test/child-diagnostics.mjs";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -404,15 +405,17 @@ async function pngRoundTrip() {
   });
   const base = "http://127.0.0.1:" + port;
   try {
+    let healthy = false;
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
-      if (child.exitCode != null) throw new Error("server exited");
+      if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode);
       try {
         const res = await fetch(base + "/api/health");
-        if (res.ok) break;
+        if (res.ok) { healthy = true; break; }
       } catch {}
       await new Promise((r) => setTimeout(r, 40));
     }
+    if (!healthy) throw childStartupError(child, "health timeout");
     const outside = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/note.png"), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -476,15 +479,17 @@ async function pngSymlinkStaysInJob() {
     body: JSON.stringify({ png: PNG }),
   });
   try {
+    let healthy = false;
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
-      if (child.exitCode != null) throw new Error("server exited");
+      if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode);
       try {
         const res = await fetch(base + "/api/health");
-        if (res.ok) break;
+        if (res.ok) { healthy = true; break; }
       } catch {}
       await new Promise((r) => setTimeout(r, 40));
     }
+    if (!healthy) throw childStartupError(child, "health timeout");
     const walkPut = await putPng("family-room-to-office/walk.png");
     assert(walkPut.ok, "walk.png in the real folder");
     fs.unlinkSync(path.join(job, "walk.png"));
@@ -625,15 +630,17 @@ async function pngReadIsOnlyThePicture() {
     body: JSON.stringify({ png }),
   });
   try {
+    let healthy = false;
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
-      if (child.exitCode != null) throw new Error("server exited");
+      if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode);
       try {
         const res = await fetch(base + "/api/health");
-        if (res.ok) break;
+        if (res.ok) { healthy = true; break; }
       } catch {}
       await new Promise((r) => setTimeout(r, 40));
     }
+    if (!healthy) throw childStartupError(child, "health timeout");
     const secret = path.join(vault, "maps", "secret.txt");
     fs.writeFileSync(secret, "SECRET_HARD_LINK\n");
     fs.linkSync(secret, path.join(job, "plan.png"));

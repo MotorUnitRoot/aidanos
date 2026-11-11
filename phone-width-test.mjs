@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync, spawn } from "node:child_process";
+import { childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -89,6 +90,7 @@ function spawnServer(port, vault) {
   child.stdout.on("data", (chunk) => { log += chunk; });
   child.stderr.on("data", (chunk) => { log += chunk; });
   child.log = () => log;
+  child._log = child.log;
   return child;
 }
 
@@ -110,6 +112,7 @@ const chrome = spawn(chromeBin(), [
 ], { stdio: ["ignore", "pipe", "pipe"] });
 chrome.stdout.on("data", (chunk) => { chromeLog.push(String(chunk)); });
 chrome.stderr.on("data", (chunk) => { chromeLog.push(String(chunk)); });
+chrome._log = () => chromeLog.join("");
 
 function stop() {
   chrome.kill("SIGKILL");
@@ -126,7 +129,7 @@ try {
       } catch {}
       await sleep(80);
     }
-    throw new Error("health " + port + " " + child.log().slice(-400));
+    throw childStartupError(child, "health " + port);
   }
   await waitHealth(portA, childA);
   await waitHealth(portB, childB);
@@ -169,7 +172,7 @@ try {
       await sleep(100);
     }
   }
-  assert(version, "Chrome did not open a debugger. " + chromeLog.join("").slice(-800));
+  if (!version) throw childStartupError(chrome, "Chrome did not open a debugger.");
   const ws = new WebSocket(version.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => {
     ws.addEventListener("open", resolve);

@@ -2,10 +2,12 @@
 // Every symlink under the vault is refused, including one that stays inside.
 // The error names that path. A symlinked vault root refuses to start.
 // An unexpected write stops the process. An unexpected read fails that request.
+import { captureChildLog, childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import net from "node:net";
+import { PassThrough } from "node:stream";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { gitEnv, readWorktree, vaultRel, worktreePath } from "./server.mjs";
@@ -210,7 +212,7 @@ async function waitHealth(base, child) {
   const deadline = Date.now() + 12000;
   let last = "";
   while (Date.now() < deadline) {
-    if (child.exitCode != null) throw new Error("server exited " + child.exitCode);
+    if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode);
     try {
       const res = await fetch(base + "/api/health");
       if (res.ok) return;
@@ -219,7 +221,7 @@ async function waitHealth(base, child) {
     }
     await new Promise((r) => setTimeout(r, 80));
   }
-  throw new Error("health timeout " + last);
+  throw childStartupError(child, "health timeout " + last);
 }
 
 async function stop(child) {
@@ -922,7 +924,7 @@ async function symlinkedVaultRootRefused() {
   try {
     await waitExit(child, 4000);
     const log = child._log();
-    assert(child.exitCode != null, "server stayed up with a symlinked vault");
+    assert(child.exitCode != null, childStartupError(child, "server stayed up with a symlinked vault").message);
     assert(log.includes(link), "startup did not name the configured path");
     assert(log.includes("Point AIDANOS_VAULT at the real folder."), "startup did not say to point at the real folder");
     assert(!log.includes("ROOT_SECRET"), "startup read the linked vault");
@@ -2102,6 +2104,18 @@ async function pausedWordingFollowsTheVault() {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
+
+// sync-path-flake-ticket: failures must retain both child output streams.
+const diagnosticChild = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough(), exitCode: 1 });
+diagnosticChild.stdout.write("stdout startup detail\n");
+diagnosticChild.stderr.write("stderr bind cause\n");
+let startupFailure;
+try { await waitHealth("", diagnosticChild); } catch (err) { startupFailure = err; }
+assert(startupFailure && startupFailure.message.includes("server exited 1"), "startup failure remains a failure");
+assert(startupFailure.message.includes("stdout startup detail") && startupFailure.message.includes("stderr bind cause"), "startup failure retains both child streams");
+assert(childStartupError({ _log: () => "" }, "health timeout").message.includes("no child output captured"), "empty startup output is explicit");
+diagnosticChild.stdout.end();
+diagnosticChild.stderr.end();
 
 checkWiring();
 await pathChecks();

@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawnWithLog as spawn, childStartupError } from "./test/child-diagnostics.mjs";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -196,7 +196,7 @@ async function waitHealth(base, child) {
   let last = "";
   while (Date.now() < deadline) {
     if (child.exitCode != null) {
-      throw new Error("server exited " + child.exitCode + " " + last);
+      throw childStartupError(child, "server exited " + child.exitCode + " " + last);
     }
     try {
       const res = await fetch(base + "/api/health");
@@ -206,7 +206,7 @@ async function waitHealth(base, child) {
     }
     await new Promise((r) => setTimeout(r, 80));
   }
-  throw new Error("health timeout " + last);
+  throw childStartupError(child, "health timeout " + last);
 }
 
 async function liveSearchAndLand() {

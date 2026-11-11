@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -25,7 +26,7 @@ async function waitHealth(base, child) {
   let last = "";
   while (Date.now() < deadline) {
     if (child.exitCode != null) {
-      throw new Error("server exited " + child.exitCode + " " + last);
+      throw childStartupError(child, "server exited " + child.exitCode + " " + last);
     }
     try {
       const res = await fetch(base + "/api/health");
@@ -35,7 +36,7 @@ async function waitHealth(base, child) {
     }
     await new Promise((r) => setTimeout(r, 80));
   }
-  throw new Error("health timeout " + last);
+  throw childStartupError(child, "health timeout " + last);
 }
 
 function spawnServer(env) {

@@ -11,7 +11,9 @@ final class RelayLink {
     private let queue = DispatchQueue(label: "aidanos.relay")
     private let readQueue = DispatchQueue(label: "aidanos.relay.read")
     private let lock = NSLock()
+    #if DEBUG
     private var socket: Int32 = -1
+    #endif
     private var secureTransport: RelayTLS?
     private var running = false
     private var serverId = ""
@@ -21,7 +23,7 @@ final class RelayLink {
     private var ready: (() -> Void)?
     private var failed: ((Error) -> Void)?
 
-    func connect(url: String, token: String, approvedRelayURL: String?, peerId: String, storageId: String, host: SyncHost) throws {
+    func connect(url: String, token: String, approvedRelayURL: String?, pairing: RelayPairing?, peerId: String, storageId: String, host: SyncHost) throws {
         _ = signal(SIGPIPE, SIG_IGN)
         let parsed = try RelayAddress.approved(url, paired: approvedRelayURL)
         self.peerId = peerId
@@ -31,12 +33,17 @@ final class RelayLink {
         do {
             if parsed.secure {
                 let transport = RelayTLS()
-                try transport.connect(address: parsed, token: token)
+                guard let pairing else { throw AidanError.protocol("Scan the approved Mac pairing QR before connecting.") }
+                try transport.connect(address: parsed, pairing: pairing, token: token)
                 secureTransport = transport
             } else {
+                #if DEBUG
                 let fd = try connectTCP(host: parsed.host, port: parsed.port)
                 socket = fd
                 try upgrade(fd: fd, address: parsed, token: token)
+                #else
+                throw AidanError.protocol("Release builds require paired WSS.")
+                #endif
             }
         } catch {
             close()
@@ -69,13 +76,17 @@ final class RelayLink {
     func close() {
         lock.lock()
         running = false
+        #if DEBUG
         let fd = socket
         socket = -1
+        #endif
         let transport = secureTransport
         secureTransport = nil
         lock.unlock()
         transport?.close()
+        #if DEBUG
         if fd >= 0 { _ = shutdown(fd, Int32(SHUT_RDWR)); _ = closeFd(fd) }
+        #endif
     }
 
     func kick(_ docId: String) {
@@ -128,7 +139,11 @@ final class RelayLink {
     private func readLoop() {
         while true {
             lock.lock()
+            #if DEBUG
             let alive = running && (socket >= 0 || secureTransport != nil)
+            #else
+            let alive = running && secureTransport != nil
+            #endif
             lock.unlock()
             if !alive { return }
             do {
@@ -139,8 +154,12 @@ final class RelayLink {
                         throw AidanError.payloadTooLarge
                     }
                 } else {
+                    #if DEBUG
                     guard let rawFrame = try readFrame() else { continue }
                     frame = rawFrame
+                    #else
+                    throw AidanError.protocol("Secure relay transport unavailable.")
+                    #endif
                 }
                 let failure = ErrorBox()
                 let done = DispatchSemaphore(value: 0)
@@ -207,9 +226,14 @@ final class RelayLink {
 
     private func send(_ data: Data) throws {
         if let transport = secureTransport { try transport.send(data); return }
+        #if DEBUG
         try sendFrame(opcode: 0x2, payload: data)
+        #else
+        throw AidanError.protocol("Secure relay transport unavailable.")
+        #endif
     }
 
+    #if DEBUG
     /// Clients mask every frame, including the pong that answers the relay's ping.
     private func sendFrame(opcode: UInt8, payload: Data) throws {
         var header = Data()
@@ -398,6 +422,7 @@ final class RelayLink {
             offset += wrote
         }
     }
+    #endif
 }
 
 private final class ErrorBox: @unchecked Sendable {
@@ -462,11 +487,16 @@ struct RelayAddress {
     }
 
     init(_ raw: String, allowTestLoopback: Bool = RelayAddress.testLoopback) throws {
+        #if DEBUG
+        let schemes = ["ws", "wss"]
+        #else
+        let schemes = ["wss"]
+        #endif
         guard let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
-              ["ws", "wss"].contains(scheme), let host = url.host?.lowercased(), !host.isEmpty,
+              schemes.contains(scheme), let host = url.host?.lowercased(), !host.isEmpty,
               url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
               url.path.isEmpty || url.path == "/" else {
-            throw AidanError.protocol("Use ws://100.x.y.z:3750 or a verified wss://relay.tail.ts.net address.")
+            throw AidanError.protocol("Use the exact paired relay address.")
         }
         let secure = scheme == "wss"
         #if DEBUG
@@ -474,8 +504,8 @@ struct RelayAddress {
         #else
         let testLocal = false
         #endif
-        // MagicDNS requires authenticated TLS, never plaintext DNS + a bearer
-        // token. Direct ws uses a literal CGNAT IP (no DNS/rebinding fallback).
+        // This is syntax validation only, never proof of peer identity/encryption.
+        // Credential use also requires exact pairing; release requires pinned TLS.
         guard Self.isTailscaleIPv4(host) || (secure && Self.isMagicDNS(host)) || testLocal else {
             throw AidanError.protocol("Credentials are sent only to Tailscale IPv4 or verified wss:// .ts.net endpoints.")
         }
@@ -515,6 +545,7 @@ private func encodeSync(type: String, sender: String, target: String, docId: Str
     ]).encode()
 }
 
+#if DEBUG
 private func connectTCP(host: String, port: UInt16) throws -> Int32 {
     var hints = addrinfo()
     hints.ai_family = AF_INET
@@ -571,3 +602,5 @@ private func closeFd(_ fd: Int32) -> Int32 {
     return Glibc.close(fd)
     #endif
 }
+
+#endif

@@ -81,6 +81,7 @@ public final class AidanSession: SyncHost {
     private var watcher: DispatchSourceTimer?
     private let peerId: String
     private let storageId: String
+    private var relayPairing: RelayPairing?
     private var approvedRelayURL: String?
     private var desiredURL: String?
     private var desiredToken: String?
@@ -304,13 +305,19 @@ public final class AidanSession: SyncHost {
         try RelayAddress(raw).canonicalURL
     }
 
-    public func connect(relayURL: String, token: String, approvedRelayURL: String? = nil) throws {
+    public func connect(relayURL: String, token: String, approvedRelayURL: String? = nil, pairing: RelayPairing? = nil) throws {
         // Reject a wrong peer before storing credentials or scheduling reconnect.
-        _ = try RelayAddress.approved(relayURL, paired: approvedRelayURL)
+        let approval = pairing?.address ?? approvedRelayURL
+        let target = try RelayAddress.approved(relayURL, paired: approval)
+        if target.secure {
+            guard let pairing else { throw AidanError.protocol("Scan the approved Mac pairing QR first.") }
+            _ = try pairing.validatedAddress()
+        }
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { throw AidanError.authRejected }
         lock.lock()
-        self.approvedRelayURL = approvedRelayURL
+        self.relayPairing = pairing
+        self.approvedRelayURL = approval
         desiredURL = relayURL
         desiredToken = trimmed
         reconnectAttempt = 0
@@ -629,9 +636,11 @@ public final class AidanSession: SyncHost {
         }
         let peer = peerId
         let storage = storageId
+        let approved = approvedRelayURL
+        let pairing = relayPairing
         lock.unlock()
         do {
-            try next.connect(url: url, token: token, approvedRelayURL: approvedRelayURL, peerId: peer, storageId: storage, host: self)
+            try next.connect(url: url, token: token, approvedRelayURL: approved, pairing: pairing, peerId: peer, storageId: storage, host: self)
             lock.lock()
             reconnectAttempt = 0
             lock.unlock()

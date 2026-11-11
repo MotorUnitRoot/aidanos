@@ -1,3 +1,4 @@
+import Foundation
 @testable import AidanCore
 import XCTest
 
@@ -5,10 +6,14 @@ import XCTest
 final class RelayAddressTests: XCTestCase {
     func testDirectTailscaleIPv4AndBoundaries() throws {
         for host in ["100.64.0.0", "100.100.1.20", "100.127.255.255"] {
+            #if DEBUG
             let address = try RelayAddress("ws://\(host):3750", allowTestLoopback: false)
             XCTAssertEqual(address.host, host)
             XCTAssertEqual(address.port, 3750)
             XCTAssertFalse(address.secure)
+            #else
+            XCTAssertThrowsError(try RelayAddress("ws://\(host):3750", allowTestLoopback: false))
+            #endif
         }
         for host in ["100.63.255.255", "100.128.0.0", "10.1.2.3", "192.168.1.20", "203.0.113.8"] {
             XCTAssertThrowsError(try RelayAddress("ws://\(host):3750", allowTestLoopback: false))
@@ -58,11 +63,27 @@ final class RelayAddressTests: XCTestCase {
         XCTAssertThrowsError(try RelayAddress.approved(paired, paired: ""))
     }
 
+    func testPairingBindsNameIPAddressAndSPKI() throws {
+        let pin = "sha256/" + Data(repeating: 7, count: 32).base64EncodedString()
+        let bytes = try JSONSerialization.data(withJSONObject: ["version": 1, "address": "wss://relay.tail.ts.net:3750/", "ipv4": "100.100.1.20", "spki": pin])
+        let pairing = try RelayPairing(qrData: bytes)
+        XCTAssertNoThrow(try pairing.destination(pairing.address, resolvedIPv4: ["100.100.1.20"]))
+        for answers in [[], ["100.100.1.21"], ["203.0.113.7"], ["100.100.1.20", "203.0.113.7"]] {
+            XCTAssertThrowsError(try pairing.destination(pairing.address, resolvedIPv4: answers))
+        }
+        XCTAssertThrowsError(try pairing.destination("wss://other.tail.ts.net:3750/", resolvedIPv4: ["100.100.1.20"]))
+        XCTAssertThrowsError(try RelayPairing(qrData: Data("{\"version\":1,\"address\":\"wss://relay.tail.ts.net:3750/\",\"ipv4\":\"100.100.1.20\",\"spki\":\"bad\"}".utf8)))
+    }
+
     func testValidPortsAndSecureDefault() throws {
         for port in [0, 65536] {
             XCTAssertThrowsError(try RelayAddress("ws://100.100.1.20:\(port)", allowTestLoopback: false))
         }
         XCTAssertEqual(try RelayAddress("wss://100.100.1.20", allowTestLoopback: false).port, 443)
+        #if DEBUG
         XCTAssertEqual(try RelayAddress("ws://100.100.1.20:65535", allowTestLoopback: false).port, 65535)
+        #else
+        XCTAssertThrowsError(try RelayAddress("ws://100.100.1.20:65535", allowTestLoopback: false))
+        #endif
     }
 }

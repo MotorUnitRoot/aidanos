@@ -53,6 +53,7 @@ enum RelayTokenStore {
 final class TodayModel: ObservableObject {
     @Published var text = ""
     @Published var address: String
+    @Published var pairingQRString = ""
     @Published var token: String
     @Published var status = "Not connected"
     @Published var conflict: NoteConflict?
@@ -67,6 +68,10 @@ final class TodayModel: ObservableObject {
     init() {
         let defaults = UserDefaults.standard
         address = defaults.string(forKey: "aidanos.relayAddress") ?? ""
+        if let saved = defaults.data(forKey: "aidanos.relayPairingV1"),
+           let pairing = try? RelayPairing(qrData: saved), let encoded = try? JSONEncoder().encode(pairing) {
+            pairingQRString = String(data: encoded, encoding: .utf8) ?? ""
+        }
         let stored = RelayTokenStore.load()
         if stored.isEmpty, let old = defaults.string(forKey: "aidanos.relayToken"), !old.isEmpty {
             token = old
@@ -149,6 +154,20 @@ final class TodayModel: ObservableObject {
         }
     }
 
+    func importPairingQR(_ raw: String) {
+        do {
+            let pairing = try RelayPairing(qrData: Data(raw.utf8))
+            let encoded = try JSONEncoder().encode(pairing)
+            session?.disconnect()
+            UserDefaults.standard.set(encoded, forKey: "aidanos.relayPairingV1")
+            UserDefaults.standard.set(pairing.address, forKey: "aidanos.approvedRelayAddress")
+            address = pairing.address
+            pairingQRString = String(data: encoded, encoding: .utf8) ?? ""
+            status = "Paired exact address, IP and key. Key changes require a new Mac QR."
+        } catch { status = "Invalid pairing QR; trust was not changed." }
+    }
+
+    #if DEBUG
     func pairExactRelay() {
         do {
             let exact = try AidanSession.canonicalRelayAddress(address)
@@ -159,6 +178,8 @@ final class TodayModel: ObservableObject {
         } catch { status = String(describing: error) }
     }
 
+    #endif
+
     func connect() {
         UserDefaults.standard.set(address, forKey: "aidanos.relayAddress")
         if RelayTokenStore.save(token) {
@@ -167,11 +188,12 @@ final class TodayModel: ObservableObject {
         guard let session else { return }
         status = ConnectionState.connecting.label
         let url = address
+        let pairing = UserDefaults.standard.data(forKey: "aidanos.relayPairingV1").flatMap { try? RelayPairing(qrData: $0) }
         let approved = UserDefaults.standard.string(forKey: "aidanos.approvedRelayAddress")
         let secret = token
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                try session.connect(relayURL: url, token: secret, approvedRelayURL: approved)
+                try session.connect(relayURL: url, token: secret, approvedRelayURL: approved, pairing: pairing)
                 Task { @MainActor in self?.publishConflict() }
             } catch {
                 Task { @MainActor in

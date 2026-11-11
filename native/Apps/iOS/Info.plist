@@ -33,5 +33,7 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Scan the relay pairing QR displayed on your approved Mac.</string>
 </dict>
 </plist>

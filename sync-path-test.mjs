@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { assertLoggerConfidentiality } from "./test/logger-regressions.mjs";
 import { runDiagnosticSecurityRegressions } from "./test/child-diagnostics-regressions.mjs";
 import { spawnWithLog as spawn } from "./test/child-diagnostics.mjs";
 import { fixtureEnv } from "./test/child-diagnostics.mjs";
@@ -1673,14 +1674,25 @@ function containsBytes(dir, needle) {
   return false;
 }
 
+function errorLoggersNeverInspectCauses() {
+  const lines = [];
+  const logger = new Function("os", "console", sliceFn("// Closed error logging:", "function notesStayLocalSentence(") + "return logSafe;")(
+    os, { error: (...parts) => { assert(parts.every((part) => typeof part === "string"), "raw error object reached console"); lines.push(parts.join(" ")); } },
+  );
+  assertLoggerConfidentiality(assert, logger, lines);
+  const appSource = fs.readFileSync(path.join(root, "app.js"), "utf8");
+  assert(appSource.includes('console.error("search failed")') && !appSource.includes("console.error(e)"), "browser search logger must not inspect an Error object");
+}
+
 async function stopReasonsRetainInternalCause() {
   // Evaluate the exact private helpers, without exporting a production test API.
-  const helpers = new Function(
+  const helpers = new Function("os",
+    sliceFn("// Closed error logging:", "function notesStayLocalSentence(") +
     sliceFn("// Application reasons are a closed enum", "function throwIfStop(") +
     sliceFn("function parentChanged(", "function pauseBackgroundSync(") +
     sliceFn("function stopLine(", "function stopAfterResponse(") +
     "return { tagStop, parentChanged, stopLine };",
-  )();
+  )(os);
   const cause = Object.assign(new Error("opaque filesystem cause"), { code: "ESTALE", syscall: "lstat" });
   assert(helpers.tagStop(cause, "write") === cause, "tagging a filesystem Error must preserve its identity");
   assert(helpers.stopLine(cause) === "stopped: write ESTALE", "an OS ESTALE must have no parent-change reason");
@@ -2231,6 +2243,7 @@ await rejectedPushStaysUp();
 await gitSafetyAndIndexLink();
 await pngDirectoryDoesNotStop();
 await pauseClearsOnlyAfterSuccess();
+errorLoggersNeverInspectCauses();
 await stopReasonsRetainInternalCause();
 await filesystemEstaleStopsWithoutParentReason();
 await swappedParentWritesNothing();

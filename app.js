@@ -3533,7 +3533,7 @@ async function runAsk(q) {
       li.className = "ask-miss";
       li.textContent = aborted ? "Couldn't search. Trying again." : ("Couldn't search." + (e && e.message ? " " + String(e.message).slice(0, 60) : ""));
       hits.appendChild(li);
-      console.error(e);
+      console.error("search failed");
     }
     if (gen !== state.askGen) return;
   }

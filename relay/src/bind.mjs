@@ -1,4 +1,5 @@
 import os from "node:os";
+import { relayChildEnv } from "./child-env.mjs";
 import { isIPv4 } from "node:net";
 import { execFileSync } from "node:child_process";
 
@@ -11,12 +12,14 @@ export function isTailscaleIPv4(ip) {
 // A CGNAT address alone is not proof of encryption. Require the running local
 // Tailscale daemon to identify it as this node's address. Never log its status:
 // it can contain details of other devices on the tailnet.
-export function tailscaleAddresses(readStatus = () => execFileSync("tailscale", ["status", "--json"], {
+export function tailscaleAddresses(readStatus, env = process.env) {
+  const read = readStatus || (() => execFileSync("tailscale", ["status", "--json"], {
+  env: relayChildEnv(env),
   encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024,
   stdio: ["ignore", "pipe", "pipe"],
-})) {
+}));
   try {
-    const status = JSON.parse(readStatus());
+    const status = JSON.parse(read());
     if (status.BackendState === "Running" && Array.isArray(status.Self?.TailscaleIPs)) {
       return status.Self.TailscaleIPs.filter(isTailscaleIPv4);
     }
@@ -29,10 +32,10 @@ export function tailscaleAddresses(readStatus = () => execFileSync("tailscale", 
 // Default is loopback only. --lan now means Tailscale only, never home Wi-Fi.
 // Both automatic and explicit selection require a local address AND daemon proof.
 export function listenHosts({ lan = false, interfaces = os.networkInterfaces(), choose,
-  tailscaleIPs } = {}) {
+  tailscaleIPs, env = process.env } = {}) {
   const hosts = ["127.0.0.1"];
   if (!lan && !choose) return { hosts, phone: null };
-  const verified = tailscaleIPs ?? tailscaleAddresses();
+  const verified = tailscaleIPs ?? tailscaleAddresses(undefined, env);
   const local = Object.values(interfaces || {}).flat().filter((addr) =>
     (addr.family === "IPv4" || addr.family === 4) && !addr.internal &&
     isTailscaleIPv4(addr.address) && verified.includes(addr.address),

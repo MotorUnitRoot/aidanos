@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { X509Certificate, createHash } from "node:crypto";
+import { relayChildEnv } from "../src/child-env.mjs";
 import { checkServerIdentity } from "node:tls";
 import { WebSocket } from "ws";
 import { loadRelayTLS, pairingRecord } from "../src/tls.mjs";
@@ -52,4 +53,12 @@ test("direct Node TLS serves sync; default production trust refuses test CA and 
     await fs.writeFile(f.status, '{"AllowFunnel":{"fixture:443":true}}\n');
     assert.equal(await connect({ ca: fixture.ca, checkServerIdentity: pinned(approved) }), 503);
   } finally { await relay.close(); }
+});
+
+test("production children and native trust policy exclude TLS secrets and test anchors", async () => {
+  const env = relayChildEnv({ PATH: "/usr/bin", HOME: "/fixture", TMPDIR: "/fixture/tmp", AIDANOS_RELAY_TOKEN: "SYNTHETIC_SYNC", AIDANOS_RELAY_TLS_KEY_FILE: "SYNTHETIC_PATH", NODE_EXTRA_CA_CERTS: "SYNTHETIC_CA" });
+  assert.deepEqual(Object.keys(env).sort(), ["HOME", "PATH", "TAILSCALE_BE_CLI", "TMPDIR"]);
+  const production = await fs.readFile(new URL("../../native/AidanCore/Sources/AidanCore/RelayTLS.swift", import.meta.url), "utf8");
+  assert.doesNotMatch(production, /SecTrustSetAnchorCertificates|fixture\.ts\.net|SYNTHETIC_CA/);
+  assert.match(production, /SecTrustEvaluateWithError/); assert.match(production, /fingerprint == pairing\.spki/);
 });

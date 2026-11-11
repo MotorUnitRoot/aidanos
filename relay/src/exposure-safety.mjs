@@ -1,6 +1,7 @@
 import { accessSync, constants } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
+import { relayChildEnv } from "./child-env.mjs";
 
 export function hasProxyHints(headers = {}) {
   return Object.keys(headers).some((name) =>
@@ -27,7 +28,7 @@ export function readServeStatus(env = process.env) {
   if (!executable) return null;
   try {
     return execFileSync(executable, ["serve", "status", "--json"], {
-      env: Object.fromEntries(["PATH", "HOME", "TMPDIR", "XDG_RUNTIME_DIR"].filter((key) => env[key] != null).map((key) => [key, env[key]]).concat([["TAILSCALE_BE_CLI", "1"]])), encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024,
+      env: relayChildEnv(env), encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024,
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch {

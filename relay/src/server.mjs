@@ -416,7 +416,7 @@ export async function startRelay(options = {}) {
   const port = options.port == null ? portFromEnv(env) : Number(options.port);
   const { hosts, phone } = listenHosts({
     lan: Boolean(options.lan) || Boolean(options.lanAddress),
-    interfaces: options.interfaces,
+    interfaces: options.interfaces, env,
     choose: options.lanAddress || "",
   });
   if (options.pairingFile && (!tls || !phone)) throw new Error("Pairing output requires TLS and a daemon-confirmed Tailscale listener.");

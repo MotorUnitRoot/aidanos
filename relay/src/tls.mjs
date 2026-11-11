@@ -7,7 +7,17 @@ import { X509Certificate, createHash, createPrivateKey } from "node:crypto";
 import { createSecureContext } from "node:tls";
 import { isTailscaleIPv4 } from "./bind.mjs";
 
-const codeRoot = fileURLToPath(new URL("../../", import.meta.url));
+const codeRoot = fileURLToPath(new URL("../", import.meta.url));
+class TLSConfigurationError extends Error {}
+async function codeRoots() {
+  const roots = [codeRoot]; let current = path.resolve(codeRoot);
+  for (;;) {
+    try { await fs.lstat(path.join(current, ".git")); roots.push(current); break; }
+    catch (error) { if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error; }
+    const parent = path.dirname(current); if (parent === current) break; current = parent;
+  }
+  return roots;
+}
 export function validTLSName(name) {
   return typeof name === "string" && name === name.toLowerCase() && name.endsWith(".ts.net") && name.length <= 253 &&
     name.split(".").every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label));
@@ -15,9 +25,9 @@ export function validTLSName(name) {
 const inside = (parent, child) => { const rel = path.relative(parent, child); return rel === "" || (!rel.startsWith(".." + path.sep) && rel !== ".." && !path.isAbsolute(rel)); };
 async function safeLocation(file, forbidden) {
   const resolved = await fs.realpath(file);
-  for (const root of [codeRoot, ...forbidden]) {
+  for (const root of [...await codeRoots(), ...forbidden]) {
     let real; try { real = await fs.realpath(root); } catch (error) { if (error.code !== "ENOENT") throw error; real = path.resolve(root); }
-    if (inside(real, resolved)) throw new Error("TLS files must be outside the repository, vault and relay data.");
+    if (inside(real, resolved)) throw new TLSConfigurationError("TLS files must be outside the repository, vault and relay data.");
   }
   return resolved;
 }
@@ -33,16 +43,16 @@ export async function loadRelayTLS({ name, certFile, keyFile, forbidden = [] }) 
       const stat = await handle.stat();
       if (!stat.isFile() || before.isSymbolicLink() || before.ino !== stat.ino || before.dev !== stat.dev ||
           (stat.mode & 0o7777) !== 0o600 || typeof process.getuid !== "function" || stat.uid !== process.getuid() ||
-          await fs.realpath(keyFile) !== location) throw new Error("TLS private key must be a relay-owned regular 0600 file, not a symlink.");
+          await fs.realpath(keyFile) !== location) throw new TLSConfigurationError("TLS private key must be a relay-owned regular 0600 file, not a symlink.");
       key = await handle.readFile();
     } finally { await handle.close(); }
     await safeLocation(certFile, forbidden);
     const cert = await fs.readFile(certFile);
-    if (cert.includes(Buffer.from("PRIVATE KEY"))) throw new Error("Certificate chain must not contain a private key.");
+    if (cert.includes(Buffer.from("PRIVATE KEY"))) throw new TLSConfigurationError("Certificate chain must not contain a private key.");
     const leaf = new X509Certificate(cert);
     if (leaf.checkHost(name, { subject: "never", wildcards: false, partialWildcards: false, multiLabelWildcards: false }) !== name ||
         Date.parse(leaf.validFrom) > Date.now() || Date.parse(leaf.validTo) <= Date.now() || !leaf.checkPrivateKey(createPrivateKey(key))) {
-      throw new Error("TLS certificate/key must match the exact relay name and current validity.");
+      throw new TLSConfigurationError("TLS certificate/key must match the exact relay name and current validity.");
     }
     const context = { key, cert, minVersion: "TLSv1.2" };
     createSecureContext(context);
@@ -50,7 +60,7 @@ export async function loadRelayTLS({ name, certFile, keyFile, forbidden = [] }) 
     return { context, name, spki };
   } catch (error) {
     // Never embed OpenSSL errors, certificate/key contents, or input paths.
-    if (/0600|outside the repository|Certificate chain|exact relay name/.test(error.message)) throw error;
+    if (error instanceof TLSConfigurationError) throw error;
     throw new Error("TLS material refused; check private-key ownership/mode and the exact certificate/name.");
   }
 }
@@ -62,7 +72,7 @@ export function pairingRecord({ name, port, ip, spki }) {
 }
 export async function writePairingFile(file, record, forbidden) {
   const parent = await fs.realpath(path.dirname(file));
-  for (const root of [codeRoot, ...forbidden]) if (inside(path.resolve(root), parent)) throw new Error("Pairing display file must be outside repo/vault/data.");
+  for (const root of [...await codeRoots(), ...forbidden]) if (inside(path.resolve(root), parent)) throw new Error("Pairing display file must be outside repo/vault/data.");
   try { const old = await fs.lstat(file); if (!old.isFile() || old.isSymbolicLink() || old.uid !== process.getuid()) throw new Error("Pairing output must be a relay-owned regular file."); }
   catch (error) { if (error.code !== "ENOENT") throw error; }
   const temp = path.join(parent, ".aidanos-pairing-" + process.pid + ".json");

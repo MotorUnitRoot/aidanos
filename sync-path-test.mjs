@@ -1673,6 +1673,84 @@ function containsBytes(dir, needle) {
   return false;
 }
 
+async function stopReasonsRetainInternalCause() {
+  // Evaluate the exact private helpers, without exporting a production test API.
+  const helpers = new Function(
+    sliceFn("// Application reasons are a closed enum", "function throwIfStop(") +
+    sliceFn("function parentChanged(", "function pauseBackgroundSync(") +
+    sliceFn("function stopLine(", "function stopAfterResponse(") +
+    "return { tagStop, parentChanged, stopLine };",
+  )();
+  const cause = Object.assign(new Error("opaque filesystem cause"), { code: "ESTALE", syscall: "lstat" });
+  assert(helpers.tagStop(cause, "write") === cause, "tagging a filesystem Error must preserve its identity");
+  assert(helpers.stopLine(cause) === "stopped: write ESTALE", "an OS ESTALE must have no parent-change reason");
+  const changed = helpers.parentChanged("write", cause);
+  assert(changed.cause === cause && changed.code === "ESTALE" && changed.reason === "parent-changed", "replacement lost its internal filesystem cause");
+  assert(helpers.stopLine(changed) === "stopped: write ESTALE reason=parent-changed", "parent-change reason missing");
+  const foreign = { code: "ESTALE", message: "opaque non-Error cause" };
+  assert(helpers.tagStop(foreign, "write").cause === foreign, "non-Error replacement lost its cause");
+  for (const reason of ["parent", "parent-changed opaque", "opaque filesystem cause", "", null]) {
+    const err = Object.assign(new Error("opaque filesystem cause", { cause }), { code: "ESTALE", reason });
+    assert(helpers.stopLine(helpers.tagStop(err, "write")) === "stopped: write ESTALE", "unknown reason or internal cause reached the stop log");
+  }
+  // Exercise the actual wrapping catches with a fault from the fs boundary.
+  const check = new Function("fs", "parentChanged", sliceFn("async function assertParents(", "function reservedDirName(") + "return assertParents;")(
+    { lstat: async () => { throw cause; } }, helpers.parentChanged,
+  );
+  let caught;
+  try { await check([{ abs: "fixture" }]); } catch (err) { caught = err; }
+  assert(caught?.cause === cause && caught.reason === "parent-changed", "assertParents discarded the underlying filesystem error");
+}
+
+async function filesystemEstaleStopsWithoutParentReason() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-os-estale-"));
+  const vault = path.join(tmp, "vault");
+  const notes = path.join(vault, "notes");
+  fs.mkdirSync(notes, { recursive: true });
+  const before = fs.lstatSync(notes);
+  const port = randomTestPort();
+  // Deterministic OS-error fault injection at open(), not parentChanged(). No
+  // NFS/FUSE mount is available here; the errno/errno number/syscall are OS-shaped.
+  // This wrapper is test-only: production gets no new hook or environment flag.
+  const source = `
+    import fs from "node:fs/promises";
+    import os from "node:os";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+    const open = fs.open.bind(fs);
+    fs.open = async (file, ...args) => {
+      if (String(file).startsWith(path.join(process.env.AIDANOS_VAULT, "notes", "stale.md.")) && String(file).endsWith(".tmp")) {
+        throw Object.assign(new Error("opaque filesystem cause"), { code: "ESTALE", errno: -os.constants.errno.ESTALE, syscall: "open", path: file });
+      }
+      return open(file, ...args);
+    };
+    process.argv[1] = path.resolve("server.mjs");
+    await import(pathToFileURL(process.argv[1]).href);
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+    cwd: root, env: { PORT: String(port), AIDANOS_VAULT: vault, AIDANOS_VAULT_GIT_URL: "" }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  try {
+    const base = "http://127.0.0.1:" + port;
+    await waitHealth(base, child);
+    const res = await fetch(base + "/api/file?path=notes/stale.md", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ markdown: "must not be written\n" }),
+    });
+    assert(res.status === 500 && (await res.json()).error === "internal error", "filesystem ESTALE must fail closed with 500");
+    await waitExit(child, 4000);
+    assert(child.exitCode === 1, "filesystem ESTALE must stop the process");
+    const record = child._diagnostics().find((item) => item.summary === "stopped: write ESTALE");
+    assert(record?.code === "ESTALE" && record.reason === undefined, "filesystem ESTALE lost its exact no-reason diagnostic");
+    assert(!child._log().includes("reason=parent-changed"), "filesystem ESTALE was misreported as a parent swap");
+    const after = fs.lstatSync(notes);
+    assert(before.ino === after.ino && before.dev === after.dev && after.isDirectory() && !after.isSymbolicLink(), "OS-error fixture unexpectedly changed the parent");
+    assert(fs.readdirSync(notes).length === 0, "filesystem ESTALE left note or temporary bytes");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 async function swappedParentWritesNothing() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-swap-"));
   const vault = path.join(tmp, "vault");
@@ -1724,7 +1802,7 @@ async function swappedParentWritesNothing() {
     await waitExit(child, 4000);
     assert(child.exitCode != null, "swapped parent left the server up");
     if (status) assert(status === 500, "swapped parent got " + status + " " + text);
-    assert(child._log().includes("stopped: write ESTALE"), "swapped parent log was " + child._log());
+    assert(child._log().includes("stopped: write ESTALE reason=parent-changed"), "swapped parent log was " + child._log());
     assert(!containsBytes(outside, note), "swapped parent wrote the note outside the vault");
     assert(!containsBytes(real, note), "swapped parent wrote the note into the old folder");
     assert(fs.readFileSync(path.join(outside, "marker.md"), "utf8") === "unchanged\n", "outside file changed");
@@ -2153,6 +2231,8 @@ await rejectedPushStaysUp();
 await gitSafetyAndIndexLink();
 await pngDirectoryDoesNotStop();
 await pauseClearsOnlyAfterSuccess();
+await stopReasonsRetainInternalCause();
+await filesystemEstaleStopsWithoutParentReason();
 await swappedParentWritesNothing();
 await folderTargetsStayUp();
 await folderAppearsDuringWriteStops();

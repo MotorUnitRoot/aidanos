@@ -1162,8 +1162,8 @@ async function writeVaultText(rel, text) {
   let after;
   try {
     after = await fs.lstat(parent);
-  } catch {
-    throw parentChanged();
+  } catch (cause) {
+    throw parentChanged(undefined, cause);
   }
   if (!seen || after.isSymbolicLink() || !after.isDirectory() || after.dev !== seen.dev || after.ino !== seen.ino) {
     throw parentChanged();
@@ -2539,7 +2539,7 @@ async function atomicWriteFile(filePath, markdown, beforeRename) {
     if (openedId) await unlinkIfSameFile(tmpPath, openedId);
     const code = e && e.code;
     if ((code === "EISDIR" || code === "ENOTDIR") && !e.aidanosStop) {
-      const err = new Error("not a file");
+      const err = new Error("not a file", { cause: e });
       err.code = code;
       throw err;
     }
@@ -2606,8 +2606,14 @@ function clientRefusal(err) {
   return refusalMessage(err);
 }
 
+// Application reasons are a closed enum, separate from the OS errno namespace.
+const stopReasons = new Set(["parent-changed"]);
+function stopReasonSuffix(err) {
+  return stopReasons.has(err?.reason) ? " reason=" + err.reason : "";
+}
+
 function tagStop(err, step) {
-  const error = err instanceof Error ? err : new Error("failed");
+  const error = err instanceof Error ? err : new Error("failed", { cause: err });
   error.aidanosStop = step;
   if (!error.code) error.code = "EIO";
   return error;
@@ -2617,10 +2623,13 @@ function throwIfStop(err) {
   if (err && err.aidanosStop) throw err;
 }
 
-function parentChanged(step) {
-  const err = new Error("parent changed");
-  // A stale checked parent is a real errno, not a private free-text code.
+function parentChanged(step, cause) {
+  const err = new Error("parent changed", cause === undefined ? undefined : { cause });
+  // ESTALE maps a detected parent change into the errno contract; the reason
+  // distinguishes this application detection from an OS stale file handle.
+  // Preserve any replaced filesystem error internally, never as log text.
   err.code = "ESTALE";
+  err.reason = "parent-changed";
   return tagStop(err, step || "write");
 }
 
@@ -2637,7 +2646,7 @@ function pauseBackgroundSync(err) {
   vaultGit.error = "sync paused";
   const step = err && err.aidanosStop ? String(err.aidanosStop) : "git";
   const code = err && err.code ? String(err.code) : "EIO";
-  console.error("sync paused: " + step + " " + code);
+  console.error("sync paused: " + step + " " + code + stopReasonSuffix(err));
 }
 
 async function assertRealVaultRoot() {
@@ -2716,8 +2725,8 @@ async function snapshotParents(filePath) {
     let st;
     try {
       st = await fs.lstat(cursor);
-    } catch {
-      throw parentChanged();
+    } catch (cause) {
+      throw parentChanged(undefined, cause);
     }
     if (st.isSymbolicLink()) throw symlinkError(vaultRel(cursor));
     if (!st.isDirectory()) throw new Error("bad path");
@@ -2731,8 +2740,8 @@ async function assertParents(seen) {
     let st;
     try {
       st = await fs.lstat(item.abs);
-    } catch {
-      throw parentChanged();
+    } catch (cause) {
+      throw parentChanged(undefined, cause);
     }
     if (st.isSymbolicLink() || !st.isDirectory() || st.dev !== item.dev || st.ino !== item.ino) {
       throw parentChanged();
@@ -2813,7 +2822,7 @@ function stopLine(err) {
   const step = err && err.aidanosStop ? String(err.aidanosStop) : "write";
   const code = err && err.code ? String(err.code) : "EIO";
   if (!/^[a-z]+$/.test(step) || !/^[A-Za-z0-9_]+$/.test(code)) return "stopped: write EIO";
-  return "stopped: " + step + " " + code;
+  return "stopped: " + step + " " + code + stopReasonSuffix(err);
 }
 
 function stopAfterResponse(res, err) {

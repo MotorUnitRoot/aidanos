@@ -111,6 +111,22 @@ export async function runEnumDiagnosticRegressions(assert) {
     assert(child._diagnostics().length === count, "non-enum error code must be dropped, not normalized or masked");
   }
   child.stdout.end(); child.stderr.end();
+  for (const stream of ["stdout", "stderr"]) for (const marker of ["stopped:", "sync paused:"]) {
+    const reasoned = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough() }, { secrets: ["parent-changed", "ESTA"] });
+    reasoned[stream].write(marker + " write ESTALE reason=parent-");
+    assert(reasoned._diagnostics().length === 0, "unfinished reason must not be published");
+    reasoned[stream].write("changed\n");
+    const record = reasoned._diagnostics()[0];
+    assert(record?.reason === "parent-changed" && record.code === "ESTALE", "closed reason/errno must survive fixture overlap");
+    assert(reasoned._log() === marker + " write ESTALE reason=parent-changed\n", "reason must remain exact");
+    for (const invalid of ["", "parent", "parent-changed_extra", "parent-changed opaque", "PARENT", "opaque-secret", "parent-changed\rjunk"]) {
+      reasoned[stream].write(marker + " write ESTALE reason=" + invalid + "\n");
+      assert(reasoned._diagnostics().length === 1, "unknown/free-text reason must be dropped in full");
+    }
+    reasoned[stream].write(marker + " write ESTALE\n");
+    assert(reasoned._diagnostics().length === 2 && reasoned._diagnostics()[1].reason === undefined, "OS errno must not acquire an application reason");
+    reasoned.stdout.end(); reasoned.stderr.end();
+  }
   const signal = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough() });
   for (const name of Object.keys(os.constants.signals)) {
     signal.signalCode = name;

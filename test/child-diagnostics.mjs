@@ -61,6 +61,7 @@ const operations = ["write", "read", "rename", "git", "open", "stat", "unlink", 
 // prefix generically. Any future Node code must be added explicitly by name.
 const errorCodes = new Set(Object.keys(os.constants.errno));
 const signalNames = new Set(Object.keys(os.constants.signals));
+const stopReasons = new Set(["parent-changed"]);
 const warningKeys = ["credential.helper", "http.extraheader", "core.askpass", "core.fsmonitor", "core.hookspath", "core.sshcommand", "include.path"].sort();
 // Public fixture paths are rejected if unsafe; they are never free-text masked.
 function publicFixtureValue(value, secrets) {
@@ -71,7 +72,9 @@ function allowedDiagnostics(fields = {}, secrets = []) {
   const lines = [];
   const add = (summary, marker, fields = {}) => lines.push(Object.freeze({ summary, marker, ...fields }));
   for (const marker of ["stopped:", "sync paused:"]) for (const operation of operations) for (const code of errorCodes) {
-    add(marker + " " + operation + " " + code, marker, { operation, code });
+    const summary = marker + " " + operation + " " + code;
+    add(summary, marker, { operation, code });
+    for (const reason of stopReasons) add(summary + " reason=" + reason, marker, { operation, code, reason });
   }
   for (let bits = 1; bits < 2 ** warningKeys.length; bits += 1) {
     const keys = warningKeys.filter((_key, index) => bits & (1 << index));
@@ -98,6 +101,7 @@ export function captureChildLog(child, context = {}) {
   // can corrupt a real errno merely because it overlaps a registered fixture.
   const retain = (record) => {
     if (record.code !== undefined && !errorCodes.has(record.code)) return;
+    if (record.reason !== undefined && !stopReasons.has(record.reason)) return;
     records.push(Object.freeze({ ...record }));
   };
   for (const name of ["stdout", "stderr"]) {

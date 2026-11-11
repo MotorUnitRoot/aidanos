@@ -30,6 +30,7 @@ import {
 } from "../src/server.mjs";
 
 const TOKEN = "aidanos-test-token-0123456789abcdef";
+const ADMIN_TOKEN = "aidanos-admin-fixture-9876543210abcdef";
 
 const exec = promisify(execFile);
 
@@ -88,17 +89,24 @@ test("Tailscale proof fails closed on missing, stopped, or malformed daemon stat
 });
 
 test("reset is loopback-only and unavailable with any network listener", () => {
-  const local = { enabled: true, hosts: ["127.0.0.1"],
+  const local = { enabled: true, testMode: true, hosts: ["127.0.0.1"],
     remoteAddress: "127.0.0.1", localAddress: "127.0.0.1" };
   assert.equal(resetAllowed(local), true);
   assert.equal(resetAllowed({ ...local, enabled: false }), false);
+  assert.equal(resetAllowed({ ...local, testMode: false }), false);
   assert.equal(resetAllowed({ ...local, hosts: [] }), false);
   assert.equal(resetAllowed({ ...local, hosts: ["127.0.0.1", "100.100.1.20"] }), false);
   for (const ip of ["100.100.1.20", "192.168.1.20", "203.0.113.8", "", undefined]) {
     assert.equal(resetAllowed({ ...local, remoteAddress: ip }), false);
     assert.equal(resetAllowed({ ...local, localAddress: ip }), false);
   }
-  assert.equal(resetAllowed({ ...local, remoteAddress: "::ffff:127.0.0.1" }), true);
+  for (const ip of ["::1", "::ffff:127.0.0.1"]) {
+    assert.equal(resetAllowed({ ...local, remoteAddress: ip }), true);
+    assert.equal(resetAllowed({ ...local, localAddress: ip }), true);
+  }
+  for (const name of ["Forwarded", "X-Forwarded-For", "x-forwarded-proto", "Tailscale-User-Login"]) {
+    assert.equal(resetAllowed({ ...local, headers: { [name]: "" } }), false);
+  }
 });
 
 test("every relay log line starts with a timestamp", () => {
@@ -652,7 +660,7 @@ function importDoc(repo, docId, value) {
   return repo.import(Automerge.save(Automerge.from(value)), { docId });
 }
 
-test("reset is off unless a supervisor asked for it", async () => {
+test("reset is absent outside its explicit test harness", async () => {
   const dir = await tempDir();
   const relay = await startRelay({
     token: TOKEN,
@@ -680,6 +688,9 @@ test("an allowed reset checks the token and empties the folder", async () => {
     port: 0,
     gitUrl: "",
     allowReset: true,
+    resetAdminToken: ADMIN_TOKEN,
+    testMode: true,
+    env: { NODE_ENV: "test", PATH: "" },
     onReset: () => {
       resets += 1;
     },
@@ -703,7 +714,7 @@ test("an allowed reset checks the token and empties the folder", async () => {
     assert.equal(resets, 0);
     const accepted = await fetch(relay.healthURL.replace("/health", "/reset"), {
       method: "POST",
-      headers: { Authorization: "Bearer " + TOKEN },
+      headers: { Authorization: "Bearer " + ADMIN_TOKEN },
     });
     assert.equal(accepted.status, 200);
     assert.deepEqual(await accepted.json(), { ok: true, resetting: true });
@@ -812,6 +823,9 @@ test("an old relay marker does not authorize a notes folder or a reset", async (
       port: 0,
       gitUrl: "",
       allowReset: true,
+    resetAdminToken: ADMIN_TOKEN,
+    testMode: true,
+    env: { NODE_ENV: "test", PATH: "" },
     }),
     /notes|git remote/,
   );
@@ -831,6 +845,9 @@ test("an old relay marker does not authorize a notes folder or a reset", async (
     port: 0,
     gitUrl: "",
     allowReset: true,
+    resetAdminToken: ADMIN_TOKEN,
+    testMode: true,
+    env: { NODE_ENV: "test", PATH: "" },
   });
   try {
     await fs.writeFile(path.join(own, ".aidanos", "relay-folder"), "relay\n");
@@ -841,7 +858,7 @@ test("an old relay marker does not authorize a notes folder or a reset", async (
     await fs.writeFile(path.join(own, ".git", "HEAD"), "ref: refs/heads/main\n");
     const denied = await fetch(relay.healthURL.replace("/health", "/reset"), {
       method: "POST",
-      headers: { Authorization: "Bearer " + TOKEN },
+      headers: { Authorization: "Bearer " + ADMIN_TOKEN },
     });
     assert.equal(denied.status, 409);
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -958,6 +975,9 @@ test("reset recreates a data folder inside the notes folder", async () => {
     port: 0,
     gitUrl: "",
     allowReset: true,
+    resetAdminToken: ADMIN_TOKEN,
+    testMode: true,
+    env: { NODE_ENV: "test", PATH: "" },
   });
   try {
     const data = path.join(vault, ".aidanos", "relay");
@@ -974,7 +994,7 @@ test("reset recreates a data folder inside the notes folder", async () => {
     const previous = relay.repo;
     const accepted = await fetch(relay.healthURL.replace("/health", "/reset"), {
       method: "POST",
-      headers: { Authorization: "Bearer " + TOKEN },
+      headers: { Authorization: "Bearer " + ADMIN_TOKEN },
     });
     assert.equal(accepted.status, 200);
     const deadline = Date.now() + 5000;
@@ -1015,6 +1035,9 @@ test("a failed reset makes health report sync down", async () => {
     port: 0,
     gitUrl: "",
     allowReset: true,
+    resetAdminToken: ADMIN_TOKEN,
+    testMode: true,
+    env: { NODE_ENV: "test", PATH: "" },
     beforeReopen() {
       throw new Error("forced reset failure");
     },
@@ -1022,7 +1045,7 @@ test("a failed reset makes health report sync down", async () => {
   try {
     const accepted = await fetch(relay.healthURL.replace("/health", "/reset"), {
       method: "POST",
-      headers: { Authorization: "Bearer " + TOKEN },
+      headers: { Authorization: "Bearer " + ADMIN_TOKEN },
     });
     assert.equal(accepted.status, 200);
     const deadline = Date.now() + 5000;
@@ -1092,6 +1115,9 @@ test("wrong reset guesses count toward the block", async () => {
     port: 0,
     gitUrl: "",
     allowReset: true,
+    resetAdminToken: ADMIN_TOKEN,
+    testMode: true,
+    env: { NODE_ENV: "test", PATH: "" },
     guessLimit: 2,
     guessBlockMs: 60_000,
   });
@@ -1103,7 +1129,7 @@ test("wrong reset guesses count toward the block", async () => {
       });
     assert.equal((await reset("Bearer nope")).status, 401);
     assert.equal((await reset("Bearer nope")).status, 401);
-    assert.equal((await reset("Bearer " + TOKEN)).status, 401);
+    assert.equal((await reset("Bearer " + ADMIN_TOKEN)).status, 401);
   } finally {
     await relay.close();
   }

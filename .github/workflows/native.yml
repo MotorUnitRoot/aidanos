@@ -96,8 +96,10 @@ jobs:
               rm -rf "$vault" "$data"
               mkdir -p "$vault" "$data"
               AIDANOS_RELAY_TOKEN=aidanos-test-token-0123456789abcdef \
+                NODE_ENV=test \
+                AIDANOS_RELAY_RESET_ADMIN_TOKEN=aidanos-admin-fixture-9876543210abcdef \
                 AIDANOS_RELAY_ALLOW_RESET=1 \
-                node src/server.mjs --port 3757 \
+                node test/harness/server.mjs --test-mode --port 3757 \
                 --vault "$vault" --data "$data" >> "$log" 2>&1
               code=$?
               echo "relay stopped ($code)" >> "$log"

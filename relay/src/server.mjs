@@ -10,6 +10,8 @@ import { decode } from "@automerge/automerge-repo/helpers/cbor.js";
 import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import { listenHosts } from "./bind.mjs";
+import { relayRequestAllowed, trustedRelayHosts } from "./request-safety.mjs";
+import { assertNoServe, hasProxyHints, readServeStatus, resetTestMode } from "./reset-safety.mjs";
 import { backupOnce } from "./git.mjs";
 import { INDEX_ID } from "./ids.mjs";
 import { createMirror } from "./mirror.mjs";
@@ -28,11 +30,11 @@ export const LAN_WARNING =
 
 const CLIENT_MARKERS = ["actor", "storage-id", "index"];
 
-// Do not trust forwarding headers. Reset must arrive on this machine's socket,
-// and is unavailable on every listener whenever a network listener is enabled.
-export function resetAllowed({ enabled, hosts, remoteAddress, localAddress }) {
+// Test-only deletion: production ignores reset opt-in. Proxy hints are refused,
+// not trusted as an alternative to a loopback socket or test-harness mode.
+export function resetAllowed({ enabled, testMode, hosts, remoteAddress, localAddress, headers }) {
   const loopback = (ip) => ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
-  return enabled === true && hosts.length > 0 && hosts.every((host) => host === "127.0.0.1") &&
+  return enabled === true && testMode === true && !hasProxyHints(headers) && hosts.length > 0 && hosts.every((host) => host === "127.0.0.1") &&
     loopback(remoteAddress) && loopback(localAddress);
 }
 
@@ -446,9 +448,25 @@ export async function startRelay(options = {}) {
     interfaces: options.interfaces,
     choose: options.lanAddress || "",
   });
+  const testMode = resetTestMode(options.testMode, env);
+  const allowReset = testMode && (options.allowReset === true || env.AIDANOS_RELAY_ALLOW_RESET === "1");
+  // This authority is read only in explicit test mode, never a production path.
+  const resetAdminToken = allowReset ? String(options.resetAdminToken ?? env.AIDANOS_RELAY_RESET_ADMIN_TOKEN ?? "") : "";
+  if (allowReset) {
+    if (resetAdminToken.length < MIN_TOKEN_LENGTH || /\s/.test(resetAdminToken) || tokensMatch(token, resetAdminToken)) {
+      throw new Error("Test reset requires a separate admin credential of at least 32 non-whitespace characters.");
+    }
+    if (hosts.some((host) => host !== "127.0.0.1")) {
+      throw new Error("Test reset requires loopback-only listeners; do not combine it with --lan.");
+    }
+    // Refuse before claiming folders or binding sockets. Recheck per reset so
+    // enabling Serve/Funnel after startup cannot silently enable deletion.
+    assertNoServe(() => readServeStatus(env));
+  }
   const gitUrl = String(options.gitUrl ?? env.AIDANOS_RELAY_GIT_URL ?? "").trim();
   const gitToken = String(options.gitToken ?? env.AIDANOS_RELAY_GIT_TOKEN ?? "").trim();
-  const secrets = [token, gitToken, gitUrl].filter(Boolean);
+  const secrets = [token, resetAdminToken, gitToken, gitUrl].filter(Boolean);
+  const trustedHosts = trustedRelayHosts(env.AIDANOS_RELAY_TRUSTED_HOSTS);
   await assertNotClientVault(vault);
   await claimRelayFolders(vault, dataDir);
   const guessLimit = Number(options.guessLimit ?? 5);
@@ -497,7 +515,6 @@ export async function startRelay(options = {}) {
   }
 
   let bootedAt = new Date().toISOString();
-  const allowReset = options.allowReset === true;
   const servers = [];
   let live = null;
   let resetChain = Promise.resolve();
@@ -604,6 +621,11 @@ export async function startRelay(options = {}) {
 
   for (const host of hosts) {
     const httpServer = http.createServer((req, res) => {
+      if (!relayRequestAllowed(req, hosts, trustedHosts)) {
+        res.writeHead(403, { "content-length": 0 });
+        res.end();
+        return;
+      }
       const pathOnly = String(req.url || "").split("?")[0];
       if (pathOnly === "/health") {
         const syncUp = live != null;
@@ -616,17 +638,24 @@ export async function startRelay(options = {}) {
         res.end(body);
         return;
       }
-      if (req.method === "POST" && pathOnly === "/reset") {
-        if (!resetAllowed({ enabled: allowReset, hosts,
+      if (allowReset && req.method === "POST" && pathOnly === "/reset") {
+        if (!resetAllowed({ enabled: allowReset, testMode, hosts, headers: req.headers,
           remoteAddress: req.socket.remoteAddress, localAddress: req.socket.localAddress })) {
           res.writeHead(404, { "content-length": 0 });
           res.end();
           return;
         }
         const ip = clientAddress(req);
-        if (blocked(ip) || !tokensMatch(token, bearerToken(req.headers.authorization))) {
+        if (blocked(ip) || !tokensMatch(resetAdminToken, bearerToken(req.headers.authorization))) {
           if (!blocked(ip)) noteFailure(ip);
           res.writeHead(401, { "content-length": 0 });
+          res.end();
+          return;
+        }
+        try {
+          assertNoServe(() => readServeStatus(env));
+        } catch {
+          res.writeHead(503, { "content-length": 0 });
           res.end();
           return;
         }
@@ -653,7 +682,7 @@ export async function startRelay(options = {}) {
             logSafe(secrets, "resetting");
             // The iOS simulator shares this process. Empty the folder here instead
             // of exiting: starting Node again while the simulator is up takes
-            // longer than the tests will wait. Off unless allowReset is set.
+            // longer than the tests will wait. Only the explicit test harness can enable this.
             scheduleReset();
           })
           .catch((error) => {
@@ -673,6 +702,10 @@ export async function startRelay(options = {}) {
     const wss = new WebSocketServer({ noServer: true, maxPayload: cap });
     const entry = { httpServer, host, wss };
     httpServer.on("upgrade", (req, socket, head) => {
+      if (!relayRequestAllowed(req, hosts, trustedHosts)) {
+        socket.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+      }
       if (!live) {
         socket.destroy();
         return;
@@ -843,7 +876,6 @@ async function main() {
       vault: args.vault || undefined,
       data: args.data || undefined,
       port: args.port == null || Number.isNaN(args.port) ? undefined : args.port,
-      allowReset: process.env.AIDANOS_RELAY_ALLOW_RESET === "1",
     });
   } catch (error) {
     logSafe(

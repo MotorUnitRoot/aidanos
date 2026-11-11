@@ -15,6 +15,11 @@ private func uniqueNote(_ name: String) -> String {
 }
 
 final class SyncTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        setenv("AIDANOS_CLIENT_TEST_MODE", "1", 1)
+    }
+
     func testAirplaneModeMerge() throws {
         let relay = try TestRelay.start()
         defer { relay.stop() }
@@ -650,10 +655,10 @@ final class SyncTests: XCTestCase {
     }
 
     func testRelayPortAbove65535IsRefused() throws {
-        XCTAssertThrowsError(try RelayAddress("ws://127.0.0.1:65536")) { error in
+        XCTAssertThrowsError(try RelayAddress("ws://127.0.0.1:65536", allowTestLoopback: true)) { error in
             XCTAssertEqual(error as? AidanError, .protocol("The relay port must be between 1 and 65535."))
         }
-        XCTAssertEqual(try RelayAddress("ws://127.0.0.1:65535").port, 65535)
+        XCTAssertEqual(try RelayAddress("ws://127.0.0.1:65535", allowTestLoopback: true).port, 65535)
     }
 }
 
@@ -749,6 +754,7 @@ private final class TestRelay {
     #endif
 
     static func start() throws -> TestRelay {
+        setenv("AIDANOS_CLIENT_TEST_MODE", "1", 1)
         #if os(iOS)
         let relay = TestRelay(url: "ws://127.0.0.1:3757", token: testToken, vault: nil)
         try relay.resetSharedRelay()
@@ -815,7 +821,7 @@ private final class TestRelay {
         var request = URLRequest(url: resetURL)
         request.httpMethod = "POST"
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer aidanos-admin-fixture-9876543210abcdef", forHTTPHeaderField: "Authorization")
         let done = DispatchSemaphore(value: 0)
         var status = 0
         URLSession.shared.dataTask(with: request) { _, response, _ in

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import { constants } from "node:fs";
 import path from "node:path";
 import { X509Certificate, createHash } from "node:crypto";
 import { relayChildEnv } from "../src/child-env.mjs";
@@ -99,6 +100,51 @@ test("TLS rechecks the opened key after reading for a new hardlink or changed in
     assert.equal((await fs.lstat(fixture.keyFile)).nlink, 1);
     assert((await loadRelayTLS(config)).context, "unchanged key must still be accepted");
   }
+});
+test("TLS refuses rename-aside plus pathname replacement while reading the original descriptor", async (t) => {
+  assert((await loadRelayTLS(config)).context, "healthy pre-swap load must succeed");
+  const backup = path.join(fixture.dir, "retained-original.key");
+  const original = await fs.lstat(fixture.keyFile);
+  const open = fs.open.bind(fs), readFile = fs.readFile.bind(fs);
+  let opens = 0, reads = 0, swapped = false, handle;
+  const mockedOpen = t.mock.method(fs, "open", async (...args) => {
+    const opened = await open(...args);
+    if (args[0] !== fixture.keyFile) return opened;
+    handle = opened; opens += 1;
+    assert.equal(args[1] & constants.O_NOFOLLOW, constants.O_NOFOLLOW);
+    const read = opened.readFile.bind(opened);
+    t.mock.method(opened, "readFile", async (...readArgs) => {
+      reads += 1;
+      const bytes = await read(...readArgs);
+      await fs.rename(fixture.keyFile, backup);
+      swapped = true;
+      await fs.copyFile(path.join(fixture.dir, "rotated.key"), fixture.keyFile);
+      await fs.chmod(fixture.keyFile, 0o600);
+      const held = await opened.stat(), replacement = await fs.lstat(fixture.keyFile);
+      assert.equal(held.ino, original.ino);
+      assert.equal(held.nlink, 1, "retained old inode must defeat a descriptor-only check");
+      assert.notEqual(replacement.ino, held.ino, "fixture must really replace the pathname");
+      return bytes;
+    });
+    return opened;
+  });
+  const mockedRead = t.mock.method(fs, "readFile", async (file, ...args) => {
+    assert.notEqual(file, fixture.keyFile, "key bytes must only be read through the original descriptor");
+    return readFile(file, ...args);
+  });
+  try {
+    await assert.rejects(loadRelayTLS(config), { message: "TLS private key changed while reading; require the same relay-owned regular single-link 0600 file." });
+    assert.equal(opens, 1); assert.equal(reads, 1); assert.equal(swapped, true);
+    assert.equal(handle.fd, -1, "the original descriptor must close on refusal");
+  } finally {
+    mockedOpen.mock.restore(); mockedRead.mock.restore();
+    if (swapped) {
+      await fs.rm(fixture.keyFile, { force: true });
+      await fs.rename(backup, fixture.keyFile);
+    }
+  }
+  assert.equal((await fs.lstat(fixture.keyFile)).ino, original.ino);
+  assert((await loadRelayTLS(config)).context, "healthy post-cleanup load must succeed");
 });
 test("local CA rotation changes the SPKI; pairing data binds exact name, port, IPv4 and pin", async () => {
   const first = await loadRelayTLS(config);

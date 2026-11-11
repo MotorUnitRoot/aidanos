@@ -586,7 +586,7 @@ export async function startRelay(options = {}) {
         ws.on = listen;
         ws.addListener = listen;
         ws.on("error", (error) => {
-          logSafe(secrets, "sync connection closed:", error instanceof Error ? error.message : error);
+          logSafe(secrets, "sync connection closed:", error);
         });
         ws.on("message", (data) => {
           logSyncFrame("in", data, secrets);
@@ -627,7 +627,7 @@ export async function startRelay(options = {}) {
   if (gitUrl && interval > 0) {
     gitTimer = setInterval(() => {
       runBackup().catch((error) => {
-        logSafe(secrets, "git backup failed:", error instanceof Error ? error.message : error);
+        logSafe(secrets, "git backup failed:", error);
       });
     }, interval);
     if (gitTimer.unref) gitTimer.unref();
@@ -728,7 +728,7 @@ async function main() {
   } catch (error) {
     logSafe(
       [process.env.AIDANOS_RELAY_TOKEN, process.env.AIDANOS_RELAY_GIT_TOKEN],
-      error instanceof Error ? error.message : error,
+      "relay startup failed:", error,
     );
     process.exit(1);
   }

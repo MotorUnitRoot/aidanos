@@ -154,7 +154,7 @@ export async function backupOnce({ vault, gitUrl, gitToken, secrets, env = proce
   try {
     await pushBranch(vault, url, token, branch, hidden);
   } catch (error) {
-    logSafe(hidden, "git backup push failed:", error instanceof Error ? error.message : error);
+    logSafe(hidden, "git backup push failed:", error);
     return { skipped: false, committed: true, pushed: false };
   }
   return { skipped: false, committed: true, pushed: true };

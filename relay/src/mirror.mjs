@@ -205,7 +205,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
         lastWritten.set(notePath, merged);
         incorporated.set(notePath, fileHash);
       } catch (error) {
-        logSafe(secrets, "fold-in failed for", notePath, error instanceof Error ? error.message : error);
+        logSafe(secrets, "fold-in failed for", error);
       }
     }
   }
@@ -255,7 +255,7 @@ export function createMirror({ repo, vault, debounceMs = 400, secrets = [] }) {
       await foldOutside();
       await writeNotes();
     }).catch((error) => {
-      logSafe(secrets, "mirror failed:", error instanceof Error ? error.message : error);
+      logSafe(secrets, "mirror failed:", error);
     });
     return chain;
   }

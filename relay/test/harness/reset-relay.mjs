@@ -608,7 +608,7 @@ export async function startRelay(options = {}) {
         return;
       } catch (error) {
         lastError = error;
-        logSafe(secrets, "reset attempt failed:", error instanceof Error ? error.message : error);
+        logSafe(secrets, "reset attempt failed:", error);
       }
     }
     throw lastError;
@@ -616,7 +616,7 @@ export async function startRelay(options = {}) {
 
   function scheduleReset() {
     resetChain = resetChain.then(rotate).catch((error) => {
-      logSafe(secrets, "reset failed:", error instanceof Error ? error.message : error);
+      logSafe(secrets, "reset failed:", error);
     });
   }
 
@@ -687,7 +687,7 @@ export async function startRelay(options = {}) {
             scheduleReset();
           })
           .catch((error) => {
-            logSafe(secrets, "reset failed:", error instanceof Error ? error.message : error);
+            logSafe(secrets, "reset failed:", error);
             if (!res.headersSent) {
               res.writeHead(500, { "content-length": 0 });
               res.end();
@@ -745,7 +745,7 @@ export async function startRelay(options = {}) {
         ws.on = listen;
         ws.addListener = listen;
         ws.on("error", (error) => {
-          logSafe(secrets, "sync connection closed:", error instanceof Error ? error.message : error);
+          logSafe(secrets, "sync connection closed:", error);
         });
         ws.on("message", (data) => {
           logSyncFrame("in", data, secrets);
@@ -785,7 +785,7 @@ export async function startRelay(options = {}) {
   if (gitUrl && interval > 0) {
     gitTimer = setInterval(() => {
       runBackup().catch((error) => {
-        logSafe(secrets, "git backup failed:", error instanceof Error ? error.message : error);
+        logSafe(secrets, "git backup failed:", error);
       });
     }, interval);
     if (gitTimer.unref) gitTimer.unref();

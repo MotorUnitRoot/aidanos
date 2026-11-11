@@ -1,3 +1,4 @@
+import { assertLoggerConfidentiality } from "../../test/logger-regressions.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -134,6 +135,13 @@ test("every relay log line starts with a timestamp", () => {
     console.error = write;
   }
   assert.match(seen[0], /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z LISTENING 127\.0\.0\.1 3757$/);
+});
+
+test("relay logger omits direct and nested causes, AggregateError entries and arbitrary bodies", () => {
+  const lines = [], write = console.error;
+  console.error = (...parts) => { assert(parts.every((part) => typeof part === "string")); lines.push(parts.join(" ")); };
+  try { assertLoggerConfidentiality((condition, message) => assert(condition, message), (...parts) => logSafe([], ...parts), lines); }
+  finally { console.error = write; }
 });
 
 test("a sync frame log names the type, document, and heads", () => {

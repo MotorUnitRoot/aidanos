@@ -16,7 +16,7 @@ import { assertNoServe, hasProxyHints, readServeStatus, resetTestMode } from "./
 import { backupOnce } from "../../src/git.mjs";
 import { INDEX_ID } from "../../src/ids.mjs";
 import { createMirror } from "../../src/mirror.mjs";
-import { logSafe, stampLine } from "../../src/redact.mjs";
+import { logSafe } from "../../src/redact.mjs";
 import { logSyncFrame } from "../../src/sync-log.mjs";
 
 const DEFAULT_PORT = 3750;

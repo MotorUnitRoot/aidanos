@@ -65,6 +65,7 @@ try {
   if (!healthy) throw childStartupError(child, "health timeout");
 
   browser = await chromium.launch({
+    env: fixtureEnv(),
     executablePath: chrome,
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],

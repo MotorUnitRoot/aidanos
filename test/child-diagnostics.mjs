@@ -16,7 +16,7 @@ export function fixtureEnv(extra = {}, runtime = process.env) {
   // Inherit runtime locations only, NEVER tokens, private-key paths, proxy,
   // NODE_OPTIONS, credential helpers, or arbitrary ambient configuration.
   const env = { PATH: runtime.PATH || "/usr/bin:/bin", HOME: home, TMPDIR: os.tmpdir(),
-    GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "/bin/false",
+    GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0",
     AIDANOS_VAULT_GIT_TOKEN: "", GITHUB_TOKEN: "" };
   for (const [key, value] of Object.entries(extra)) {
     if (value != null && (fixtureKeys.has(key) || /^GIT_(?:DIR|COMMON_DIR|WORK_TREE|CONFIG_(?:COUNT|PARAMETERS|KEY_\d+|VALUE_\d+)|GLOB_PATHSPECS|LITERAL_PATHSPECS)$/.test(key))) env[key] = String(value);

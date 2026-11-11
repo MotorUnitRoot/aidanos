@@ -4,6 +4,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
+import { fixtureEnv } from "../../test/child-diagnostics.mjs";
+import { fixtureGitArgs, fixtureGitEnv } from "../../test/fixture-process.mjs";
+import { assertFixtureGitIsolation } from "../../test/fixture-process-regressions.mjs";
 import crypto from "node:crypto";
 import net from "node:net";
 import { promisify } from "node:util";
@@ -44,8 +47,12 @@ async function tempDir() {
 }
 
 function git(args, cwd) {
-  return exec("git", args, { cwd });
+  return exec("git", fixtureGitArgs(args), { cwd, env: fixtureGitEnv() });
 }
+
+test("fixture Git cannot see ambient helpers, credentials or askpass", async () => {
+  await assertFixtureGitIsolation(assert, git);
+});
 
 test("listen addresses stay loopback unless verified Tailscale is requested", () => {
   const interfaces = {
@@ -884,7 +891,7 @@ test("git does not see an unrelated secret", async () => {
   const bare = path.join(dir, "empty.git");
   const bin = path.join(dir, "bin");
   const log = path.join(dir, "git-env.txt");
-  const realGit = (await exec("which", ["git"])).stdout.trim();
+  const realGit = (await exec("which", ["git"], { env: fixtureEnv() })).stdout.trim();
   await fs.mkdir(bin);
   const script =
     "#!/bin/sh\nenv >> " + JSON.stringify(log) + "\nexec " + JSON.stringify(realGit) + ' "$@"\n';

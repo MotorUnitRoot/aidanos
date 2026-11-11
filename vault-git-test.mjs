@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { spawnWithLog as spawn } from "./test/child-diagnostics.mjs";
 import { fixtureEnv } from "./test/child-diagnostics.mjs";
+import { assertFixtureGitIsolation } from "./test/fixture-process-regressions.mjs";
 import { randomTestPort } from "./test/ports.mjs";
 import { childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync } from "./test/fixture-process.mjs";
 import { fileURLToPath } from "node:url";
 import { authenticatedGitUrl, redactSecrets, sanitizeGitError, seedBundledVault } from "./server.mjs";
 
@@ -23,6 +24,8 @@ function git(args, cwd) {
     stdio: ["ignore", "pipe", "pipe"],
   });
 }
+
+await assertFixtureGitIsolation(assert, git);
 
 async function waitHealth(base, child) {
   const deadline = Date.now() + 12000;

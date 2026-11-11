@@ -1,3 +1,4 @@
+import { fixtureEnv } from "../../../test/child-diagnostics.mjs";
 import { accessSync, constants } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
@@ -32,7 +33,7 @@ export function readServeStatus(env = process.env) {
   if (!executable) return null;
   try {
     return execFileSync(executable, ["serve", "status", "--json"], {
-      env, encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024,
+      env: fixtureEnv({ PATH: env.PATH }), encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024,
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch {

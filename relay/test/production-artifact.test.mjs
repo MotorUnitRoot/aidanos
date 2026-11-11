@@ -38,7 +38,7 @@ test("built npm and Docker production file sets contain no reset implementation 
     const text = await fs.readFile(path.join(staging, name), "utf8");
     assert.doesNotMatch(text, /resetAdminToken|RESET_ADMIN_TOKEN|allowReset|resetAllowed|function rotate\(|function emptyDirectory\(|["']\/reset["']/);
   }
-  execFileSync("tar", ["-xf", path.join(dir, packed.filename), "-C", dir], { stdio: ["ignore", "pipe", "pipe"] });
+  execFileSync("tar", ["-xf", path.join(dir, packed.filename), "-C", dir], { stdio: ["ignore", "pipe", "pipe"], env: { PATH: process.env.PATH, HOME: dir, TMPDIR: os.tmpdir() } });
   await fs.symlink(path.join(root, "node_modules"), path.join(dir, "package", "node_modules"), "dir");
   const production = await import(pathToFileURL(path.join(dir, "package", "src", "server.mjs")));
   assert.equal(production.resetAllowed, undefined);

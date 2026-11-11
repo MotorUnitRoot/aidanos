@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { spawnWithLog as spawn } from "./test/child-diagnostics.mjs";
 import { fixtureEnv } from "./test/child-diagnostics.mjs";
-import { execFileSync } from "node:child_process";
+import { assertFixtureGitIsolation } from "./test/fixture-process-regressions.mjs";
+import { execFileSync } from "./test/fixture-process.mjs";
 import { childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";
 import net from "node:net";
@@ -45,6 +46,8 @@ function freePort() {
 function git(args, cwd) {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }
+
+await assertFixtureGitIsolation(assert, git);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));

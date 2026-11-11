@@ -2,6 +2,7 @@
 import { runDiagnosticSecurityRegressions } from "./test/child-diagnostics-regressions.mjs";
 import { spawnWithLog as spawn } from "./test/child-diagnostics.mjs";
 import { fixtureEnv } from "./test/child-diagnostics.mjs";
+import { assertFixtureGitIsolation } from "./test/fixture-process-regressions.mjs";
 // Every symlink under the vault is refused, including one that stays inside.
 // The error names that path. A symlinked vault root refuses to start.
 // An unexpected write stops the process. An unexpected read fails that request.
@@ -12,7 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import net from "node:net";
 import { PassThrough } from "node:stream";
-import { execFileSync } from "node:child_process";
+import { execFileSync } from "./test/fixture-process.mjs";
 import { fileURLToPath } from "node:url";
 import { gitEnv, readWorktree, vaultRel, worktreePath } from "./server.mjs";
 
@@ -2123,6 +2124,9 @@ diagnosticChild.stdout.end();
 diagnosticChild.stderr.end();
 
 await runDiagnosticSecurityRegressions(assert);
+await assertFixtureGitIsolation(assert, git);
+await assertFixtureGitIsolation(assert, (args, cwd) => gitQuiet(cwd, args));
+await assertFixtureGitIsolation(assert, (args, cwd) => gitWithEnv(args, cwd));
 
 checkWiring();
 await pathChecks();

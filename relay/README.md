@@ -18,7 +18,9 @@ Tailscale encrypts transport; the bearer token is still required. Never publish,
 proxy, port-forward or enable Funnel on this relay. No QR pairing or public TLS
 server is included here.
 
-Reset is test-only. Its HTTP handler is unavailable unless the explicit harness
+Reset implementation, routing, deletion and admin-token handling exist only in the
+excluded disposable test server; production startRelay has no enabling option.
+That isolated fixture requires the explicit harness
 flag (`--test-mode`), `NODE_ENV=test`, reset opt-in, and a separate admin credential
 are supplied together. The admin credential must differ from the sync token.
 The simulator's fixed dummy values are test fixtures, not production secrets.
@@ -48,7 +50,6 @@ These are for the later cloud relay ticket. They are not fixed here.
 - Move `@automerge/automerge-repo`, `automerge-repo-network-websocket`, and `automerge-repo-storage-nodefs` off `2.6.0-alpha.3` onto a stable release.
 - The `bytes` 1.6.0 advisory GHSA-434x-w66g-qw3r comes in through automerge-swift 0.7.2. Re-check it when automerge-swift releases a fix.
 - A flood of addresses can push older entries out of the 1024-address failure list early. There is no test for that cap.
-- An `Origin` check is needed if login by cookie or a token in the URL is ever added. The relay does not look at `Origin` today.
 - Storage ids inside `remote-subscription-change` messages are not checked. That message is only handled when remote-heads gossip is turned on, and this relay does not turn it on.
 - The Docker image has no data folder owned by `node`, and `CMD` does not pass `--vault`, so the image does not start as written.
 - A failed parent write leaves a half-marked vault that has to be cleaned up by hand.

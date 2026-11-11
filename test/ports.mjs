@@ -1,4 +1,5 @@
-// Test-only fallback: production server.mjs rejects PORT=0, so do not change it.
+// The root web server maps PORT=0 to its 3847 default, not an OS-assigned port.
+// Relay fixtures do support port 0/readback; this helper covers random web ports.
 // Keep random listeners out of Linux and macOS client ephemeral ranges.
 // This is selection, not a reservation/retry: existing bind failures still fail.
 import { readFileSync } from "node:fs";

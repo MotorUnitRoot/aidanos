@@ -45,7 +45,10 @@ function emptyConfig(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   // Accept only absent/empty maps. Unknown or nonempty configuration is unsafe,
   // including disabled-looking Funnel entries and new Serve schema fields.
-  return Object.values(value).every(emptyConfig);
+  const maps = new Set(["TCP", "Web", "Services", "AllowFunnel"]);
+  return Object.entries(value).every(([key, map]) => maps.has(key) &&
+    (map === null || (typeof map === "object" && !Array.isArray(map) && Object.keys(map).length === 0)),
+  );
 }
 
 export function assertNoServe(readStatus = readServeStatus) {

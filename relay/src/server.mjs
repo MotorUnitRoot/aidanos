@@ -1,4 +1,3 @@
-import http from "node:http";
 import https from "node:https";
 import { loadRelayTLS, pairingRecord, writePairingFile } from "./tls.mjs";
 import { constants as fsConstants, writeSync } from "node:fs";
@@ -183,7 +182,10 @@ export function nodeRequirement(version = process.versions.node) {
 export function startupLines({ lan, port, phone, tlsName }) {
   const lines = ["LISTENING 127.0.0.1 " + port];
   if (lan) lines.push(LAN_WARNING);
-  if (phone) lines.push("PHONE " + (tlsName ? "wss://" + tlsName : "ws://" + phone) + ":" + port);
+  if (phone) {
+    if (!tlsName) throw new Error("Production sync requires TLS.");
+    lines.push("PHONE wss://" + tlsName + ":" + port);
+  }
   return lines;
 }
 
@@ -419,7 +421,7 @@ export async function startRelay(options = {}) {
     interfaces: options.interfaces, env,
     choose: options.lanAddress || "",
   });
-  if (options.pairingFile && (!tls || !phone)) throw new Error("Pairing output requires TLS and a daemon-confirmed Tailscale listener.");
+  if (options.pairingFile && !phone) throw new Error("Pairing output requires TLS and a daemon-confirmed Tailscale listener.");
   const gitUrl = String(options.gitUrl ?? env.AIDANOS_RELAY_GIT_URL ?? "").trim();
   const gitToken = String(options.gitToken ?? env.AIDANOS_RELAY_GIT_TOKEN ?? "").trim();
   const secrets = [token, gitToken, gitUrl].filter(Boolean);
@@ -510,7 +512,7 @@ export async function startRelay(options = {}) {
 
   for (const host of hosts) {
     const handler = (req, res) => {
-      if (hasProxyHints(req.headers) || !relayRequestAllowed(req, hosts, trustedHosts, tls?.name)) {
+      if (hasProxyHints(req.headers) || !relayRequestAllowed(req, hosts, trustedHosts, tls.name)) {
         res.writeHead(403, { "content-length": 0 });
         res.end();
         return;
@@ -533,13 +535,13 @@ export async function startRelay(options = {}) {
       res.writeHead(404, { "content-length": 0 });
       res.end();
     };
-    const httpServer = tls ? https.createServer(tls.context, handler) : http.createServer(handler);
+    const httpServer = https.createServer(tls.context, handler);
     const rawCap = options.maxPayload != null ? options.maxPayload : env.AIDANOS_MAX_PAYLOAD;
     const cap = payloadLimit(rawCap);
     const wss = new WebSocketServer({ noServer: true, maxPayload: cap });
     const entry = { httpServer, host, wss };
     httpServer.on("upgrade", (req, socket, head) => {
-      if (hasProxyHints(req.headers) || !relayRequestAllowed(req, hosts, trustedHosts, tls?.name)) {
+      if (hasProxyHints(req.headers) || !relayRequestAllowed(req, hosts, trustedHosts, tls.name)) {
         socket.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
       }
@@ -608,7 +610,7 @@ export async function startRelay(options = {}) {
     boundPort = await listen(entry.httpServer, entry.host, port);
   }
 
-  const pairing = tls && phone ? pairingRecord({ name: tls.name, ip: phone, port: boundPort, spki: tls.spki }) : null;
+  const pairing = phone ? pairingRecord({ name: tls.name, ip: phone, port: boundPort, spki: tls.spki }) : null;
   const interval = gitInterval(options.gitIntervalMs, env);
   let gitTimer = null;
   async function runBackup() {
@@ -633,9 +635,9 @@ export async function startRelay(options = {}) {
 
   api = {
     port: boundPort,
-    url: (tls ? "wss://" : "ws://") + "127.0.0.1:" + boundPort,
-    tlsName: tls?.name || "", pairing,
-    phone: phone ? (tls ? "wss://" + tls.name : "ws://" + phone) + ":" + boundPort : null,
+    url: "wss://127.0.0.1:" + boundPort,
+    tlsName: tls.name, pairing,
+    phone: phone ? "wss://" + tls.name + ":" + boundPort : null,
     hosts,
     vault,
     repo: live.repo,
@@ -646,7 +648,7 @@ export async function startRelay(options = {}) {
     async backupNow() {
       return runBackup();
     },
-    healthURL: (tls ? "https://" : "http://") + "127.0.0.1:" + boundPort + "/health",
+    healthURL: "https://127.0.0.1:" + boundPort + "/health",
     async close() {
       const session = live;
       live = null;

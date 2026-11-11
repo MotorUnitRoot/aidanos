@@ -7,13 +7,37 @@ import { relayChildEnv } from "../src/child-env.mjs";
 import { checkServerIdentity } from "node:tls";
 import { WebSocket } from "ws";
 import { loadRelayTLS, pairingRecord } from "../src/tls.mjs";
-import { startRelay } from "../src/server.mjs";
+import { parseArgs, startRelay } from "../src/server.mjs";
 import { localTLSFixture } from "./harness/tls-fixture.mjs";
 import { noServeFixture } from "./harness/fixture-env.mjs";
+import { parseDevArgs, startDevRelay } from "./harness/dev-plaintext.mjs";
 const fixture = await localTLSFixture();
 const config = { ...fixture, forbidden: [] };
 const pin = (cert) => "sha256/" + createHash("sha256").update(new X509Certificate(cert).publicKey.export({ type: "spki", format: "der" })).digest("base64");
 
+test("production refuses sync without TLS regardless of legacy dev options or environment", async () => {
+  await assert.rejects(loadRelayTLS({}), /requires TLS/);
+  assert.throws(() => parseArgs(["--dev-plaintext"]), /Unknown argument/);
+  const f = await noServeFixture();
+  await assert.rejects(startRelay({ token: "tls-sync-fixture-0123456789abcdef", port: 0, gitUrl: "",
+    vault: path.join(f.dir, "vault"), data: path.join(f.dir, "data"), devPlaintext: true, allowPlaintext: true,
+    env: { ...f.env, NODE_ENV: "development", AIDANOS_RELAY_DEV_PLAINTEXT: "1" } }), /requires TLS/);
+  await assert.rejects(fs.stat(path.join(f.dir, "vault")), { code: "ENOENT" });
+});
+test("excluded disposable dev entry requires its explicit flag and never exposes network or reset", async () => {
+  assert.throws(() => parseDevArgs([]), /explicit --dev-plaintext/);
+  assert.equal(parseDevArgs(["--dev-plaintext", "--port", "0"]).port, 0);
+  assert.throws(() => startDevRelay({}), /explicit --dev-plaintext/);
+  assert.throws(() => startDevRelay({ lan: true }, { devPlaintext: true }), /loopback-only/);
+  const f = await noServeFixture();
+  const relay = await startDevRelay({ token: "dev-sync-fixture-0123456789abcdef", port: 0, gitUrl: "",
+    vault: path.join(f.dir, "vault"), data: path.join(f.dir, "data"), env: f.env,
+    testMode: true, allowReset: true, resetAdminToken: "dev-admin-fixture-0123456789abcdef" }, { devPlaintext: true });
+  try {
+    assert.match(relay.url, /^ws:\/\/127\.0\.0\.1:/);
+    assert.equal((await fetch(relay.healthURL.replace("/health", "/reset"), { method: "POST" })).status, 404);
+  } finally { await relay.close(); }
+});
 test("TLS private key is relay-owned 0600, outside notes/code, and never a symlink", async () => {
   await fs.chmod(fixture.keyFile, 0o644);
   await assert.rejects(loadRelayTLS(config), /0600/);
@@ -24,6 +48,18 @@ test("TLS private key is relay-owned 0600, outside notes/code, and never a symli
   await assert.rejects(loadRelayTLS({ ...config, forbidden: [fixture.dir] }), /outside/);
   await assert.rejects(loadRelayTLS({ ...config, name: "wrong.fixture.ts.net" }), /exact relay name/);
   await assert.rejects(loadRelayTLS({ ...config, keyFile: path.join(fixture.dir, "rotated.key") }), /exact relay name/);
+});
+test("TLS refuses a hardlinked alias in the forbidden vault and nonregular keys before reading", async () => {
+  const vault = path.join(fixture.dir, "hardlink-vault"); await fs.mkdir(vault);
+  const alias = path.join(vault, "alias.key"); await fs.link(fixture.keyFile, alias);
+  try {
+    assert.equal((await fs.lstat(fixture.keyFile)).nlink, 2);
+    await assert.rejects(loadRelayTLS({ ...config, forbidden: [vault] }), /single-link/);
+  } finally { await fs.unlink(alias); }
+  assert.equal((await fs.lstat(fixture.keyFile)).nlink, 1);
+  assert((await loadRelayTLS({ ...config, forbidden: [vault] })).context);
+  const directory = path.join(fixture.dir, "directory-key"); await fs.mkdir(directory);
+  await assert.rejects(loadRelayTLS({ ...config, keyFile: directory }), /regular single-link/);
 });
 test("local CA rotation changes the SPKI; pairing data binds exact name, port, IPv4 and pin", async () => {
   const first = await loadRelayTLS(config);

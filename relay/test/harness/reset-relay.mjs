@@ -861,4 +861,3 @@ function gitInterval(override, env = process.env) {
   if (raw == null || String(raw).trim() === "") return 300000;
   return Number(raw);
 }
-

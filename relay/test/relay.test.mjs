@@ -8,7 +8,8 @@ import { fixtureEnv } from "../../test/child-diagnostics.mjs";
 import { fixtureGitArgs, fixtureGitEnv } from "../../test/fixture-process.mjs";
 import { assertFixtureGitIsolation } from "../../test/fixture-process-regressions.mjs";
 import crypto from "node:crypto";
-import net from "node:net";
+import tls from "node:tls";
+import { tlsOptions, clientTLS, fetch } from "./harness/production-tls.mjs";
 import { promisify } from "node:util";
 import { WebSocket } from "ws";
 import * as Automerge from "@automerge/automerge";
@@ -35,7 +36,7 @@ import { resetAllowed, startRelay as startResetRelay } from "./harness/reset-rel
 
 import { noServeFixture } from "./harness/fixture-env.mjs";
 const productionFixture = await noServeFixture();
-const startRelay = (options) => startProductionRelay({ ...options, env: { ...productionFixture.env, ...options.env } });
+const startRelay = (options) => startProductionRelay({ ...tlsOptions, ...options, env: { ...productionFixture.env, ...options.env } });
 
 const TOKEN = "aidanos-test-token-0123456789abcdef";
 const ADMIN_TOKEN = "aidanos-admin-fixture-9876543210abcdef";
@@ -219,7 +220,7 @@ test("a bad frame does not stop the relay", async () => {
   });
   try {
     await sendUnmaskedPong(relay.port);
-    const health = await fetch("http://127.0.0.1:" + relay.port + "/health");
+    const health = await fetch(relay.healthURL);
     assert.equal(health.status, 200);
     const opened = await connect(relay.url, TOKEN);
     assert.equal(opened.opened, true);
@@ -418,8 +419,10 @@ test("token is read from the environment or a 0600 file, never the command line"
   await fs.chmod(file, 0o600);
   assert.equal(await loadToken({ AIDANOS_RELAY_TOKEN_FILE: file }), TOKEN);
   await assert.rejects(loadToken({ AIDANOS_RELAY_TOKEN: "too-short" }), /32/);
-  const lines = startupLines({ lan: true, port: 3750, phone: "100.100.1.20" });
+  const lines = startupLines({ lan: true, port: 3750, phone: "100.100.1.20", tlsName: tlsOptions.tlsName });
   assert.equal(lines.includes(LAN_WARNING), true);
+  assert.equal(lines.includes("PHONE wss://" + tlsOptions.tlsName + ":3750"), true);
+  assert.throws(() => startupLines({ phone: "100.100.1.20", port: 3750 }), /requires TLS/);
   assert.match(LAN_WARNING, /Tailscale-only/);
   assert.match(LAN_WARNING, /never proxy or forward/);
 });
@@ -569,7 +572,7 @@ test("the relay message cap is 32 MB", async () => {
   });
   try {
     const result = await new Promise((resolve) => {
-      const ws = new WebSocket(relay.url, { headers: { Authorization: "Bearer " + TOKEN } });
+      const ws = new WebSocket(relay.url, { ...clientTLS, headers: { Authorization: "Bearer " + TOKEN } });
       ws.on("open", () => {
         ws.send(Buffer.alloc(2_000_000, 7));
       });
@@ -613,7 +616,7 @@ test("an oversized frame does not stop the relay", async () => {
   });
   try {
     await new Promise((resolve) => {
-      const ws = new WebSocket(relay.url, { headers: { Authorization: "Bearer " + TOKEN } });
+      const ws = new WebSocket(relay.url, { ...clientTLS, headers: { Authorization: "Bearer " + TOKEN } });
       const done = () => resolve();
       ws.on("open", () => ws.send(Buffer.alloc(200, 1)));
       ws.on("close", done);
@@ -648,7 +651,7 @@ test("the relay logs the handshake it sends and receives", async () => {
       peerMetadata: { storageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", isEphemeral: false },
     });
     await new Promise((resolve, reject) => {
-      const ws = new WebSocket(relay.url, { headers: { Authorization: "Bearer " + TOKEN } });
+      const ws = new WebSocket(relay.url, { ...clientTLS, headers: { Authorization: "Bearer " + TOKEN } });
       const timer = setTimeout(() => reject(new Error("no peer")), 3000);
       ws.on("error", (error) => {
         clearTimeout(timer);
@@ -1240,7 +1243,7 @@ async function filesUnder(root) {
 
 function expectClosed(url, frames) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url, { headers: { Authorization: "Bearer " + TOKEN } });
+    const ws = new WebSocket(url, { ...clientTLS, headers: { Authorization: "Bearer " + TOKEN } });
     const timer = setTimeout(() => {
       ws.terminate();
       reject(new Error("connection stayed open"));
@@ -1258,11 +1261,11 @@ function expectClosed(url, frames) {
 
 function sendUnmaskedPong(port) {
   return new Promise((resolve, reject) => {
-    const socket = net.connect(port, "127.0.0.1");
+    const socket = tls.connect({ ...clientTLS, port, host: "127.0.0.1" });
     const key = crypto.randomBytes(16).toString("base64");
     let seenHeader = false;
     socket.on("error", reject);
-    socket.on("connect", () => {
+    socket.on("secureConnect", () => {
       socket.write(
         "GET / HTTP/1.1\r\n" +
           "Host: 127.0.0.1:" + port + "\r\n" +
@@ -1289,6 +1292,7 @@ function sendUnmaskedPong(port) {
 function connect(url, token) {
   return new Promise((resolve) => {
     const ws = new WebSocket(url, {
+      ...clientTLS,
       headers: { Authorization: "Bearer " + token },
     });
     let settled = false;

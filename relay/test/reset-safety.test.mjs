@@ -1,4 +1,5 @@
 import test from "node:test";
+import { tlsOptions, fetch } from "./harness/production-tls.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -58,7 +59,7 @@ test("production and missing-test-mode requests cannot reset even with the opt-i
   ];
   for (const extra of cases) {
     const dir = await tempDir();
-    const relay = await startProductionRelay(options(dir, { ...extra, env: { ...extra.env, PATH: productionFixture.dir } }));
+    const relay = await startProductionRelay(options(dir, { ...tlsOptions, ...extra, env: { ...extra.env, PATH: productionFixture.dir } }));
     try {
       const sentinel = path.join(relay.vault, "keep.md");
       await fs.writeFile(sentinel, "keep fixture\n");

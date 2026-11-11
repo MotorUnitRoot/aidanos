@@ -32,18 +32,19 @@ async function safeLocation(file, forbidden) {
   return resolved;
 }
 export async function loadRelayTLS({ name, certFile, keyFile, forbidden = [] }) {
-  if (!name && !certFile && !keyFile) return null; // Existing debug/direct-ws mode, not a release client path.
+  if (!name && !certFile && !keyFile) throw new Error("Production sync requires TLS; configure the exact name, certificate and private-key files.");
   if (!validTLSName(name) || !certFile || !keyFile) throw new Error("TLS requires one exact lowercase MagicDNS name, certificate file and private-key file.");
   try {
-    const location = await safeLocation(keyFile, forbidden);
     const before = await fs.lstat(keyFile);
+    if (!before.isFile() || before.nlink !== 1) throw new TLSConfigurationError("TLS private key must be a relay-owned regular single-link 0600 file, not a symlink or hardlink.");
+    const location = await safeLocation(keyFile, forbidden);
     const handle = await fs.open(keyFile, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
     let key;
     try {
       const stat = await handle.stat();
-      if (!stat.isFile() || before.isSymbolicLink() || before.ino !== stat.ino || before.dev !== stat.dev ||
+      if (!stat.isFile() || stat.nlink !== 1 || before.isSymbolicLink() || before.ino !== stat.ino || before.dev !== stat.dev ||
           (stat.mode & 0o7777) !== 0o600 || typeof process.getuid !== "function" || stat.uid !== process.getuid() ||
-          await fs.realpath(keyFile) !== location) throw new TLSConfigurationError("TLS private key must be a relay-owned regular 0600 file, not a symlink.");
+          await fs.realpath(keyFile) !== location) throw new TLSConfigurationError("TLS private key must be a relay-owned regular single-link 0600 file, not a symlink or hardlink.");
       key = await handle.readFile();
     } finally { await handle.close(); }
     await safeLocation(certFile, forbidden);

@@ -1,11 +1,13 @@
 # Relay
 
-The relay is the small sync server the iPhone and Mac apps talk to. How to run it is in `docs/native/TRY-IT.md`. The design notes are in `docs/native/DESIGN.md`.
+The relay is the small sync server the iPhone and Mac apps talk to. The release path is in [PHONE.md](../PHONE.md) and [TLS notes](../docs/native/TLS.md). The old TRY-IT walkthrough is archival, not current production startup instructions.
 
 ## Network and reset safety
 
 Loopback limits the bind surface; it does **not** prove locality or identify a
-header-stripping same-machine proxy. Use bearer authority plus encrypted transport
+header-stripping same-machine proxy carrying a valid sync token: it is
+indistinguishable from a direct authorized client. This is the accepted limit, not
+a universal proxy detector. The boundary is the sync token plus TLS. Use that authority
 and narrow tailnet grants. Forwarding hints are rejected on all production routes,
 never treated as evidence of trust. Production fails closed on absent/erroring
 Tailscale CLI or any configured Serve/Funnel/Services state.
@@ -14,9 +16,10 @@ Loopback (`127.0.0.1`) is the default. `--lan` / `--lan-address` accept only a l
 `100.64.0.0/10` address confirmed by the running Tailscale daemon as this node's own
 address. Both devices need Tailscale on the same trusted tailnet. A CGNAT address
 without daemon confirmation is refused, as are ordinary LAN and public addresses.
-Tailscale encrypts transport; the bearer token is still required. Never publish,
-proxy, port-forward or enable Funnel on this relay. No QR pairing or public TLS
-server is included here.
+Production refuses to start without TLS, including on loopback. Direct Node TLS
+and public QR pairing metadata are implemented; tailnet HTTPS/CT enablement is
+still pending. The sync token is also required. Never publish, proxy, port-forward
+or enable Serve/Funnel on this relay.
 
 Reset implementation, routing, deletion and admin-token handling exist only in the
 excluded disposable test server; production startRelay has no enabling option.
@@ -38,11 +41,13 @@ admin authority; these guards are not permission to proxy a test relay.
 HTTP and WebSocket requests require exact listener/TLS-name Host authority and no
 browser Origin. The native release path uses direct Node TLS plus explicit QR
 pairing of exact address, IPv4 and DER-SPKI. No Serve/Funnel or TLS frontend.
-A .ts.net suffix or CGNAT syntax is not peer/encryption proof. The old direct ws
-path remains debug/disposable only; it is not the release path. See PHONE.md.
+A .ts.net suffix or CGNAT syntax is not peer/encryption proof. Plaintext exists only in the excluded loopback disposable dev entry, explicitly
+flagged --dev-plaintext; neither production options nor env can enable it. DEBUG
+clients retain their fixture ws code only; release contains none. See PHONE.md.
 
 TLS files are supplied through --tls-name/--tls-cert-file/--tls-key-file; the private
-key must be a separate relay-owned 0600 non-symlink outside repo/vault/data. Never
+key must be a separate relay-owned regular single-link 0600 file (no symlink or
+hardlink) outside repo/vault/data. Never
 put PEM/key material in env, child processes, logs, QR or Docker image. Only public
 pairing metadata is written by --pairing-file. Actual Tailscale renewal generates
 a fresh key in inspected source: restart and explicitly re-pair from the Mac QR;

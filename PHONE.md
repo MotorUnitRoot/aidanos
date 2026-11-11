@@ -17,7 +17,7 @@ After those later approvals, the intended operator-controlled setup is:
    The relay accepts only a local IPv4 in **100.64.0.0/10**, confirmed by the daemon.
 2. The operator obtains that exact name's certificate using `tailscale cert`, never
    Serve/Funnel. Keep its private key in a separate **relay-user-owned 0600 file**,
-   outside repo, notes vault and relay data. Never paste a key into an env var,
+   outside repo, notes vault and relay data, with exactly one hardlink. Never paste a key into an env var,
    token field, QR, log, image or chat. `tailscale cert` issuance/HTTPS enablement
    has **not** been performed by this task. File-based renewal remains manual.
 3. Node terminates TLS itself. Future command shape (paths/names are placeholders,
@@ -30,7 +30,9 @@ After those later approvals, the intended operator-controlled setup is:
      --pairing-file "$HOME/.config/aidanos-relay/pairing.json"
    ```
    Retain the separate masked sync-token/token-file setup. No bearer is in the QR.
-   The key is checked for owner/mode, symlinks, location and matching cert/name.
+   Production refuses startup without TLS, including on loopback. The key is checked
+   for regular-file/single-link status, owner/mode, symlinks, location and matching
+   cert/name. Production has no dev/plaintext env or option switch.
 4. In the Mac app, open the **public pairing JSON** generated locally by the relay.
    Its QR binds the exact `wss://name:port/`, exact Tailscale IPv4, and SHA256 SPKI.
    On the real iPhone, use **Pair / re-pair from Mac QR**, grant camera permission,
@@ -46,8 +48,10 @@ After those later approvals, the intended operator-controlled setup is:
 Production refuses missing/erroring/malformed/nonempty `tailscale serve status
 --json` at startup and rechecks on every HTTP/sync request. Forwarded,
 X-Forwarded-* and Tailscale-* hints are rejected, never trusted. Loopback is only
-bind scope: it cannot distinguish a header-stripping same-machine proxy. Authority
-comes from the bearer plus approved encrypted peer, not a claim of locality.
+bind scope: a local proxy that strips hints and holds a valid sync token cannot
+be distinguished from a direct authorized client. This is the accepted limit,
+not universal proxy detection. The boundary is the sync token plus TLS and the
+approved paired peer, never a claim of locality.
 Production artifacts contain no reset routing, admin authority or deletion code.
 Only the excluded disposable test server has reset; never combine it with a proxy.
 
@@ -58,18 +62,21 @@ An unchanged cached `tailscale cert` result is **not** a key-reuse guarantee. Pl
 for **QR re-pair after each actual renewal/key change**. Restart Node with the new
 separate certificate/key files, reload its local public pairing JSON on the Mac,
 and explicitly rescan on the phone. Old pins refuse; nothing silently accepts a
-new key merely because the CA signed it. Full research and scope limits are in
-`/workspace/dev/reports/pr44-tls-design.md` (deployment note, not a repo-local link).
+new key merely because the CA signed it. Sources, scope and refresh rules are in
+the in-repo [TLS design notes](docs/native/TLS.md#renewal-and-sources).
 
-## Existing direct ws path: DEBUG/disposable only, NOT release
+## Plaintext fixtures only — excluded from production
 
-The server's existing direct `ws://100.x:port` mode remains unchanged. A CGNAT
-address alone does not prove peer identity or actual protected routing. No new
-trust is assigned to it. It is **not a release-client path**, and must not be used
-for real notes. Explicit debug/simulator fixtures retain their old ws path; release
-contains no loopback or plaintext credential exception. Ordinary home Wi-Fi,
-wildcard binds, public endpoints, Serve/Funnel, reverse proxies and quick tunnels
-are not supported. IPv6 is not used in this cut; there is no Wi-Fi fallback.
+The production relay never starts sync without TLS. The excluded source-only
+`relay/test/harness/dev-plaintext.mjs` requires explicit `--dev-plaintext`, binds
+only loopback, and forcibly disables reset. It is absent from npm packages and
+Docker input; production never imports it and has no env/option bypass. It is
+for disposable synthetic fixtures only, never real notes or credentials.
+
+The native raw ws/loopback code is `#if DEBUG` only; no release binary path may
+contain or enable it. The former production `ws://100.x:port` setup is no longer
+supported, even on a tailnet. Ordinary home Wi-Fi, wildcard/public binds,
+Serve/Funnel, proxies and tunnels are not supported. IPv6 is not used here.
 
 ## Verify on a real Mac/iPhone before real notes
 

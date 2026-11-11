@@ -1,8 +1,10 @@
-> **Superseding release transport:** use [PHONE.md](../../PHONE.md). Release now
-> requires direct Node TLS and explicit Mac-QR pairing of exact name/IP/SPKI;
-> HTTPS/CT enablement is still pending. The historical direct-ws walkthrough below
-> is retained ONLY for DEBUG disposable fixtures, not a release or real-note path.
-> No Serve/Funnel or proxy is supported. Swift and device gates remain open.
+> **ARCHIVAL, NOT RUNNABLE PRODUCTION INSTRUCTIONS.** Use [PHONE.md](../../PHONE.md).
+> Production now refuses startup without direct Node TLS and exact QR pairing;
+> the old plaintext commands below will refuse. HTTPS/CT consent is still pending.
+> The only plaintext dev entry is excluded `relay/test/harness/dev-plaintext.mjs`,
+> requires explicit `--dev-plaintext`, and is loopback-only with reset disabled.
+> Do not run the old tailnet-ws walkthrough or use real notes. No Serve/Funnel or
+> proxy is supported; Swift and device gates remain open.
 
 # Try the sync
 

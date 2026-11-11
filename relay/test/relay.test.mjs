@@ -400,6 +400,8 @@ test("token is read from the environment or a 0600 file, never the command line"
   const dir = await tempDir();
   const file = path.join(dir, "token");
   await fs.writeFile(file, TOKEN + "\n", { mode: 0o644 });
+  // Creation modes are masked by umask; make the permissive fixture explicit.
+  await fs.chmod(file, 0o644);
   await assert.rejects(loadToken({ AIDANOS_RELAY_TOKEN_FILE: file }), /0600/);
   await fs.chmod(file, 0o600);
   assert.equal(await loadToken({ AIDANOS_RELAY_TOKEN_FILE: file }), TOKEN);

@@ -2619,7 +2619,8 @@ function throwIfStop(err) {
 
 function parentChanged(step) {
   const err = new Error("parent changed");
-  err.code = "PARENT";
+  // A stale checked parent is a real errno, not a private free-text code.
+  err.code = "ESTALE";
   return tagStop(err, step || "write");
 }
 

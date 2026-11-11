@@ -78,5 +78,47 @@ export async function runDiagnosticSecurityRegressions(assert) {
   const finished = once(streamed, "close"); streamed.stdin.end();
   const [streamedCode] = await finished;
   assert(streamedCode === 0 && streamed._log() === "server exited 0\n", "only typed exit metadata may follow arbitrary child output");
+  await runEnumDiagnosticRegressions(assert);
+}
 
+// Closed enum values survive registered-secret overlap; raw bodies never do.
+export async function runEnumDiagnosticRegressions(assert) {
+  const { default: os } = await import("node:os");
+  for (const secret of ["EACC", "ACCE", "SYNTHETIC_OVERLAP_ONLY"]) {
+    const child = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough() }, { secrets: [secret], fixtureOnly: true });
+    child.stdout.write(secret.slice(0, 1));
+    assert(child._log() === "", "unfinished fixture body must remain absent");
+    child.stdout.write(secret.slice(1) + "\n");
+    child.stderr.write(secret + "\nstopped: write EACC");
+    assert(child._log() === "", "an unfinished enum must not be published");
+    child.stderr.write("ES\n");
+    assert(child._log() === "stopped: write EACCES\n", "errno must survive secret overlap exactly");
+    const records = child._diagnostics();
+    assert(records.length === 1 && records[0].code === "EACCES" && records[0].summary === "stopped: write EACCES", "typed errno was masked or changed");
+    const error = childStartupError(child);
+    const output = JSON.stringify([child._log(), records, error.message, error.stack]);
+    assert(!output.split("EACCES").join("").includes(secret), "registered fixture escaped anywhere outside the approved errno");
+    child.stdout.end(); child.stderr.end();
+  }
+  const child = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough() });
+  for (const code of Object.keys(os.constants.errno)) {
+    child.stdout.write("stopped: write " + code + "\n");
+    assert(child._diagnostics().at(-1).code === code, "OS errno must match exactly without masking");
+  }
+  const count = child._diagnostics().length;
+  for (const invalid of ["PARENT", "ERROR", "EACC", "EACCES_extra", "ERR_UNLISTED_DIAGNOSTIC", "EACCES opaque"]) {
+    child.stdout.write("stopped: write " + invalid + "\n");
+    assert(child._diagnostics().length === count, "non-enum error code must be dropped, not normalized or masked");
+  }
+  child.stdout.end(); child.stderr.end();
+  const signal = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough() });
+  for (const name of Object.keys(os.constants.signals)) {
+    signal.signalCode = name;
+    assert(signal._log() === "child signal " + name + "\n", "OS signal must survive exactly");
+  }
+  for (const invalid of ["SIGTERM_extra", "SIG_UNLISTED", "SIGTERM opaque", "", 9, undefined]) {
+    signal.signalCode = invalid;
+    assert(signal._log() === "", "non-enum signal must be dropped, not masked or coerced");
+  }
+  signal.stdout.end(); signal.stderr.end();
 }

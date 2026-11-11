@@ -1724,7 +1724,7 @@ async function swappedParentWritesNothing() {
     await waitExit(child, 4000);
     assert(child.exitCode != null, "swapped parent left the server up");
     if (status) assert(status === 500, "swapped parent got " + status + " " + text);
-    assert(child._log().includes("stopped: write PARENT"), "swapped parent log was " + child._log());
+    assert(child._log().includes("stopped: write ESTALE"), "swapped parent log was " + child._log());
     assert(!containsBytes(outside, note), "swapped parent wrote the note outside the vault");
     assert(!containsBytes(real, note), "swapped parent wrote the note into the old folder");
     assert(fs.readFileSync(path.join(outside, "marker.md"), "utf8") === "unchanged\n", "outside file changed");

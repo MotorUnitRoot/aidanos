@@ -1,5 +1,6 @@
 import { PassThrough } from "node:stream";
 import { once } from "node:events";
+import { randomBytes } from "node:crypto";
 import process from "node:process";
 import { captureChildLog, childStartupError, fixtureEnv, spawnWithLog } from "./child-diagnostics.mjs";
 
@@ -29,4 +30,28 @@ export async function runDiagnosticSecurityRegressions(assert) {
   const [code] = await once(launched, "close");
   assert(code === 0 && !launched._log().includes(sync), "actual fixture child diagnostic leaked its synthetic token");
   child.stdout.end(); child.stderr.end();
+  const unregistered = randomBytes(32).toString("hex");
+  const noContext = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough() });
+  noContext.stdout.write(unregistered.slice(0, 17)); noContext.stderr.write("unregistered short sentinel");
+  noContext.stdout.write(unregistered.slice(17));
+  const omittedError = childStartupError(noContext, "failure " + unregistered);
+  for (const text of [noContext._log(), omittedError.message, omittedError.stack, String(omittedError)]) {
+    assert(!text.includes(unregistered) && !text.includes("unregistered short sentinel"), "default capture exposed unregistered body text");
+  }
+  const patterns = [unregistered, randomBytes(48).toString("base64"), "ghz_SYNTHETIC_UNREGISTERED_ONLY", "github_pat_SYNTHETIC_UNREGISTERED_ONLY", "sk-SYNTHETIC_UNREGISTERED_ONLY", "Bearer SYNTHETIC_BEARER_UNREGISTERED", "https://fixtureuser:fixturepass@example.invalid/"];
+  const shaped = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough() }, { fixtureOnly: true });
+  for (const value of patterns) {
+    const split = Math.floor(value.length / 2);
+    shaped.stdout.write(value.slice(0, split)); shaped.stderr.write("safe diagnostic cause\n"); shaped.stdout.write(value.slice(split) + "\n");
+  }
+  for (const value of patterns) assert(!shaped._log().includes(value), "unregistered token-shaped fixture escaped pattern redaction");
+  assert(shaped._log().includes("safe diagnostic cause"), "pattern masking lost safe diagnostic cause");
+  const external = "fixture input outside environment";
+  const nonEnv = spawnWithLog(process.execPath, ["-e", "process.stdout.write(process.argv[1])", external], {
+    fixtureSecrets: [external], stdio: ["ignore", "pipe", "pipe"],
+  });
+  const [externalCode] = await once(nonEnv, "close");
+  assert(externalCode === 0 && !nonEnv._log().includes(external), "explicit non-environment fixture secret escaped capture");
+  for (const fake of [noContext, shaped]) { fake.stdout.end(); fake.stderr.end(); }
+
 }

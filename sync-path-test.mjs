@@ -2111,7 +2111,7 @@ assert(randomTestPort(2, () => 1 - Number.EPSILON) + 1 === TEST_PORT_MAX, "adjac
 assert(TEST_PORT_MIN === 10000 && TEST_PORT_MAX === 29999 && TEST_PORT_MAX < 32768 && TEST_PORT_MAX < 49152, "fixed test port range stays below standard Linux/macOS ephemeral ports");
 
 // sync-path-flake-ticket: failures must retain both child output streams.
-const diagnosticChild = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough(), exitCode: 1 });
+const diagnosticChild = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough(), exitCode: 1 }, { fixtureOnly: true });
 diagnosticChild.stdout.write("stdout startup detail\n");
 diagnosticChild.stderr.write("stderr bind cause\n");
 let startupFailure;

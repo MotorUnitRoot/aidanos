@@ -43,7 +43,11 @@ export function redactChildLog(value, secrets = []) {
   for (const pattern of [
     /\b(?:authorization|proxy-authorization)\s*[:=]\s*[^\r\n]*/gi,
     /\bBearer\s+[^\s]+/gi,
-    /\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+)/g,
+    /\b(?:github_pat_[A-Za-z0-9_]+|gh[a-z0-9]*_[A-Za-z0-9_-]+)/gi,
+    /\bsk-[A-Za-z0-9_-]+/gi,
+    /(?<![A-Za-z0-9])[A-Fa-f0-9]{32,}(?![A-Za-z0-9])/g,
+    /(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/_=-])/g,
+    /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])/g,
     /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?/g,
     /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|$)/g,
     /(?:https?|wss?):\/\/[^\s/@]+:[^\s/@]+@/gi,
@@ -51,7 +55,16 @@ export function redactChildLog(value, secrets = []) {
   return out;
 }
 
-export function captureChildLog(child, { secrets = [] } = {}) {
+export function captureChildLog(child, context) {
+  const secrets = Array.isArray(context?.secrets) ? context.secrets : [];
+  const trusted = context?.fixtureOnly === true || secrets.length > 0;
+  if (!trusted) {
+    // No context is NEVER permission to retain/print arbitrary child body text.
+    for (const name of ["stdout", "stderr"]) child[name].on("data", () => {});
+    child._redact = () => "[child text omitted: trusted fixture context required]";
+    child._log = child._redact;
+    return child;
+  }
   const streams = { stdout: "", stderr: "" }, events = [];
   for (const name of ["stdout", "stderr"]) child[name].on("data", (chunk) => {
     const text = String(chunk), offset = streams[name].length;
@@ -66,9 +79,15 @@ export function captureChildLog(child, { secrets = [] } = {}) {
 }
 
 export function spawnWithLog(command, args, options = {}) {
-  const env = fixtureEnv(options.env);
+  const { fixtureSecrets = [], ...spawnOptions } = options;
+  if (!Array.isArray(fixtureSecrets) || fixtureSecrets.some((value) => typeof value !== "string")) {
+    throw new TypeError("Non-environment fixture secrets must be explicit strings");
+  }
+  // Positive environment allowlist, equivalent to env -i plus fixture inputs.
+  // Sync/admin/TLS/ambient credential values are never inherited by default.
+  const env = fixtureEnv(spawnOptions.env);
   const secrets = Object.entries(env).filter(([name]) => /TOKEN|SECRET|PASSWORD/.test(name)).map(([, value]) => value);
-  return captureChildLog(spawn(command, args, { ...options, env }), { secrets });
+  return captureChildLog(spawn(command, args, { ...spawnOptions, env }), { fixtureOnly: true, secrets: [...secrets, ...fixtureSecrets] });
 }
 
 export function childStartupError(child, message) {

@@ -200,9 +200,9 @@ async function pathChecks() {
   }
 }
 
-function spawnServer(env) {
+function spawnServer(env, fixtureDiagnostics = {}) {
   const child = spawn(process.execPath, ["server.mjs"], {
-    cwd: root,
+    fixtureDiagnostics, cwd: root,
     env: { ...fixtureEnv(), AIDANOS_VAULT_GIT_RETRY_MS: "0", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1348,7 +1348,7 @@ async function aggregateSkipsLinks() {
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
-  });
+  }, { symlinkPaths: ["notes/alias.md", "notes/gone", "notes/line?break?.md", "log/2026-01-06.md", "log/box", "aidanos/active-horse.md", "aidanos/skin.css", "extra"] });
   const base = "http://127.0.0.1:" + port;
   const secrets = ["SKIP_FILE_SECRET", "SKIP_DAY_SECRET", "SKIP_TASK_SECRET", "SKIP_DIR_SECRET"];
   function noSecrets(text, label) {
@@ -2113,12 +2113,12 @@ assert(TEST_PORT_MIN === 10000 && TEST_PORT_MAX === 29999 && TEST_PORT_MAX < 327
 
 // sync-path-flake-ticket: failures must retain both child output streams.
 const diagnosticChild = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough(), exitCode: 1 }, { fixtureOnly: true });
-diagnosticChild.stdout.write("stdout startup detail\n");
-diagnosticChild.stderr.write("stderr bind cause\n");
+diagnosticChild.stdout.write("stopped: write EACCES\n");
+diagnosticChild.stderr.write("sync paused: git EACCES\n");
 let startupFailure;
 try { await waitHealth("", diagnosticChild); } catch (err) { startupFailure = err; }
 assert(startupFailure && startupFailure.message.includes("server exited 1"), "startup failure remains a failure");
-assert(startupFailure.message.includes("stdout startup detail") && startupFailure.message.includes("stderr bind cause"), "startup failure retains both child streams");
+assert(startupFailure.message.includes("stopped: write EACCES") && startupFailure.message.includes("sync paused: git EACCES"), "startup failure retains allowlisted markers from both child streams");
 assert(childStartupError({ _log: () => "" }, "health timeout").message.includes("no child output captured"), "empty startup output is explicit");
 diagnosticChild.stdout.end();
 diagnosticChild.stderr.end();

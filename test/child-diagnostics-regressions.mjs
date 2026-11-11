@@ -2,7 +2,7 @@ import { PassThrough } from "node:stream";
 import { once } from "node:events";
 import { randomBytes } from "node:crypto";
 import process from "node:process";
-import { captureChildLog, childStartupError, fixtureEnv, spawnWithLog } from "./child-diagnostics.mjs";
+import { captureChildLog, childStartupError, fixtureEnv, spawnWithLog, redactChildLog } from "./child-diagnostics.mjs";
 
 export async function runDiagnosticSecurityRegressions(assert) {
   const sync = "SYNTHETIC_SYNC_ONLY_0123456789abcdef", admin = "SYNTHETIC_ADMIN_ONLY_9876543210abcdef";
@@ -10,6 +10,7 @@ export async function runDiagnosticSecurityRegressions(assert) {
   child.stdout.write(sync.slice(0, 13));
   assert(!child._log().includes(sync.slice(0, 13)), "partial known fixture token leaked");
   child.stderr.write("stderr cause " + admin + "\n");
+  child.stderr.write("stopped: write EACCES\n");
   child.stdout.write(sync.slice(13) + "\nAuthorization: Bear");
   child.stdout.write("er SYNTHETIC_HEADER_ONLY\n");
   child.stderr.write("github_pat_SYNTHETIC_PATTERN_ONLY\n-----BEGIN PRIVATE KEY-----\nSYNTHETIC_ONLY");
@@ -18,7 +19,7 @@ export async function runDiagnosticSecurityRegressions(assert) {
   for (const raw of [sync, admin, "SYNTHETIC_HEADER_ONLY", "github_pat_SYNTHETIC_PATTERN_ONLY", "SYNTHETIC_ONLY"]) {
     assert(!child._log().includes(raw) && !message.includes(raw), "fixture credential leaked from diagnostic boundary");
   }
-  assert(message.includes("stderr cause") && message.includes("secrets redacted"), "safe cause disappeared");
+  assert(message.includes("stopped: write EACCES") && message.includes("structured diagnostics"), "allowlisted cause disappeared");
   const env = fixtureEnv({ PORT: "12345", AIDANOS_RELAY_TLS_KEY: "SYNTHETIC_PRIVATE_PATH", UNKNOWN_SECRET: sync },
     { PATH: process.env.PATH, GITHUB_TOKEN: sync, NODE_OPTIONS: "SYNTHETIC_INJECT", HTTPS_PROXY: admin });
   assert(env.GITHUB_TOKEN === "" && !env.NODE_OPTIONS && !env.HTTPS_PROXY && !env.UNKNOWN_SECRET && !env.AIDANOS_RELAY_TLS_KEY,
@@ -51,7 +52,8 @@ export async function runDiagnosticSecurityRegressions(assert) {
     shaped.stdout.write(value.slice(0, split)); shaped.stderr.write("safe diagnostic cause\n"); shaped.stdout.write(value.slice(split) + "\n");
   }
   for (const value of patterns) assert(!shaped._log().includes(value), "unregistered token-shaped fixture escaped pattern redaction");
-  assert(shaped._log().includes("safe diagnostic cause"), "pattern masking lost safe diagnostic cause");
+  assert(shaped._log() === "", "fixtureOnly must not retain even apparently safe arbitrary body text");
+  for (const value of patterns) assert(!redactChildLog(value).includes(value), "standalone pattern masking regressed");
   const external = "fixture input outside environment";
   const nonEnv = spawnWithLog(process.execPath, ["-e", "process.stdout.write(process.argv[1])", external], {
     fixtureSecrets: [external], stdio: ["ignore", "pipe", "pipe"],
@@ -59,5 +61,22 @@ export async function runDiagnosticSecurityRegressions(assert) {
   const [externalCode] = await once(nonEnv, "close");
   assert(externalCode === 0 && !nonEnv._log().includes(external), "explicit non-environment fixture secret escaped capture");
   for (const fake of [noContext, shaped]) { fake.stdout.end(); fake.stderr.end(); }
+
+  // Real spawn, read between writes before newline/completion. No secret registry.
+  const opaque = "q7V!";
+  const pieces = [unregistered.slice(0, 11), unregistered.slice(11) + "\n", opaque, "\n"];
+  const source = "const p=JSON.parse(process.argv[1]);let i=0;process.stdin.on('data',()=>process.stdout.write(p[i++]));process.stdin.on('end',()=>process.exit(0));";
+  const streamed = spawnWithLog(process.execPath, ["-e", source, JSON.stringify(pieces)], { stdio: ["pipe", "pipe", "pipe"] });
+  for (let index = 0; index < pieces.length; index += 1) {
+    const arrived = once(streamed.stdout, "data"); streamed.stdin.write("next"); await arrived;
+    assert(streamed._log() === "" && streamed._diagnostics().length === 0, "mid-chunk arbitrary data affected structured diagnostics");
+    const error = childStartupError(streamed, opaque + unregistered);
+    for (const text of [error.message, error.stack, String(error)]) {
+      assert(!text.includes(opaque) && !text.includes(unregistered.slice(0, 11)) && !text.includes(unregistered), "mid-chunk prefix or short opaque value escaped");
+    }
+  }
+  const finished = once(streamed, "close"); streamed.stdin.end();
+  const [streamedCode] = await finished;
+  assert(streamedCode === 0 && streamed._log() === "server exited 0\n", "only typed exit metadata may follow arbitrary child output");
 
 }

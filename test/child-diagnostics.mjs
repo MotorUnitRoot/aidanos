@@ -25,9 +25,8 @@ export function fixtureEnv(extra = {}, runtime = process.env) {
   return env;
 }
 
-// Same-length masks preserve incremental _log().slice(previousLength) callers.
-// Reprocess COMPLETE per-stream buffers so tokens split/interleaved across chunks
-// cannot bypass redaction, and never expose those raw buffers through the API.
+// Standalone best-effort masking for explicit synthetic inputs only. Capture does
+// not rely on regexes: it omits bodies, including every unfinished token prefix.
 export function redactChildLog(value, secrets = []) {
   let out = String(value);
   const mask = (text) => "*".repeat(text.length);
@@ -55,43 +54,92 @@ export function redactChildLog(value, secrets = []) {
   return out;
 }
 
-export function captureChildLog(child, context) {
-  const secrets = Array.isArray(context?.secrets) ? context.secrets : [];
-  const trusted = context?.fixtureOnly === true || (secrets.length > 0 && secrets.every((value) => typeof value === "string" && value.length > 0));
-  if (!trusted) {
-    // No context is NEVER permission to retain/print arbitrary child body text.
-    for (const name of ["stdout", "stderr"]) child[name].on("data", () => {});
-    child._redact = () => "[child text omitted: trusted fixture context required]";
-    child._log = child._redact;
-    return child;
+// Only these finite schemas may become diagnostics. Child bytes are NEVER stored.
+const operations = ["write", "read", "rename", "git", "open", "stat", "unlink", "mkdir"];
+const errorCodes = ["EACCES", "EPERM", "EISDIR", "ENOTDIR", "ENOENT", "EIO", "ELOOP", "ENOSPC", "EROFS", "PARENT", "ERROR"];
+const warningKeys = ["credential.helper", "http.extraheader", "core.askpass", "core.fsmonitor", "core.hookspath", "core.sshcommand", "include.path"].sort();
+function allowedDiagnostics(fields = {}) {
+  const lines = [];
+  const add = (summary, marker, fields = {}) => lines.push(Object.freeze({ summary, marker, ...fields }));
+  for (const marker of ["stopped:", "sync paused:"]) for (const operation of operations) for (const code of errorCodes) {
+    add(marker + " " + operation + " " + code, marker, { operation, code });
   }
-  const streams = { stdout: "", stderr: "" }, events = [];
-  for (const name of ["stdout", "stderr"]) child[name].on("data", (chunk) => {
-    const text = String(chunk), offset = streams[name].length;
-    streams[name] += text; events.push({ name, offset, length: text.length });
-  });
-  child._redact = (text) => redactChildLog(text, secrets);
+  for (let bits = 1; bits < 2 ** warningKeys.length; bits += 1) {
+    const keys = warningKeys.filter((_key, index) => bits & (1 << index));
+    add("vault git config: " + keys.join(", "), "git-config-warning", { keys: Object.freeze(keys) });
+  }
+  add("Point AIDANOS_VAULT at the real folder.", "configured-vault-refused");
+  // These values come from explicit public fixture inputs, NEVER child text.
+  const configured = fields.configuredVault;
+  if (typeof configured === "string" && configured.startsWith(os.tmpdir() + path.sep) && !/[\r\n]/.test(configured) && redactChildLog(configured) === configured) {
+    add(configured, "configured-vault", { configuredVault: configured });
+  }
+  for (const relative of fields.symlinkPaths || []) {
+    if (typeof relative !== "string" || !/^(?:(notes|log|aidanos)\/[A-Za-z0-9?._/-]+|extra)$/.test(relative) || relative.includes("..") || redactChildLog(relative) !== relative) throw new TypeError("Invalid public fixture path");
+    add("skipped symlink: " + relative, "skipped-symlink", { relativePath: relative });
+  }
+  return lines;
+}
+export function captureChildLog(child, context = {}) {
+  const schema = allowedDiagnostics(context?.fields), records = [];
+  const symlinks = (context?.fields?.symlinkPaths || []).slice();
+  const secrets = Array.isArray(context?.secrets) ? context.secrets.filter((value) => typeof value === "string" && value.length) : [];
+  const clean = (value) => typeof value === "string" ? redactChildLog(value, secrets) : Array.isArray(value) ? value.map(clean) : value;
+  const retain = (record) => records.push(Object.freeze(Object.fromEntries(Object.entries(record).map(([key, value]) => [key, clean(value)]))));
+  for (const name of ["stdout", "stderr"]) {
+    // The incremental matcher retains candidate IDs/position only, not a line,
+    // prefix, chunk, or arbitrary child byte. No partial match is ever exposed.
+    let matches = schema, position = 0, carriage = false;
+    const prefix = "skipped symlink: ";
+    let prefixAt = 0, pathAt = 0, pathMatches = symlinks, chosen = [], separator = false, rejected = false;
+    const resetPaths = () => { prefixAt = 0; pathAt = 0; pathMatches = symlinks; chosen = []; separator = false; rejected = false; };
+    const finishPath = () => pathMatches.find((value) => value.length === pathAt);
+    child[name].on("data", (chunk) => {
+      for (const char of String(chunk)) {
+        if (char === "\n") {
+          const record = matches?.find((entry) => entry.summary.length === position);
+          if (record) retain({ stream: name, ...record });
+          if (!record && !rejected && prefixAt === prefix.length && !separator) {
+            const last = finishPath();
+            if (last) { const paths = [...chosen, last]; retain({ stream: name, marker: "skipped-symlink", paths: Object.freeze(paths), summary: prefix + paths.join(", ") }); }
+          }
+          resetPaths(); matches = schema; position = 0; carriage = false;
+        } else if (char === "\r" && !carriage) {
+          carriage = true;
+        } else {
+          if (!rejected) {
+            if (prefixAt < prefix.length) { if (char === prefix[prefixAt]) prefixAt += 1; else rejected = true; }
+            else if (separator) { if (char === " ") { separator = false; pathAt = 0; pathMatches = symlinks; } else rejected = true; }
+            else if (char === ",") { const matched = finishPath(); if (matched && chosen.length < 64) { chosen.push(matched); separator = true; } else rejected = true; }
+            else { pathMatches = pathMatches.filter((value) => value[pathAt] === char); pathAt += 1; if (!pathMatches.length) rejected = true; }
+          }
+          matches = carriage ? null : matches?.filter((entry) => entry.summary[position] === char);
+          if (!matches?.length) matches = null;
+          position += 1;
+        }
+      }
+    });
+  }
+  child._diagnostics = () => records.map((record) => ({ ...record }));
+  child._redact = () => "[unstructured child text omitted]";
   child._log = () => {
-    const safe = Object.fromEntries(Object.entries(streams).map(([key, text]) => [key, child._redact(text)]));
-    return child._redact(events.map(({ name, offset, length }) => safe[name].slice(offset, offset + length)).join(""));
+    const lines = records.map((record) => record.summary);
+    if (Number.isInteger(child.exitCode) && child.exitCode >= 0 && child.exitCode <= 255) lines.push("server exited " + child.exitCode);
+    if (["SIGTERM", "SIGKILL", "SIGINT", "SIGABRT", "SIGHUP", "SIGSEGV"].includes(child.signalCode)) lines.push("child signal " + child.signalCode);
+    return lines.length ? lines.join("\n") + "\n" : "";
   };
   return child;
 }
-
 export function spawnWithLog(command, args, options = {}) {
-  const { fixtureSecrets = [], ...spawnOptions } = options;
-  if (!Array.isArray(fixtureSecrets) || fixtureSecrets.some((value) => typeof value !== "string")) {
-    throw new TypeError("Non-environment fixture secrets must be explicit strings");
-  }
-  // Positive environment allowlist, equivalent to env -i plus fixture inputs.
-  // Sync/admin/TLS/ambient credential values are never inherited by default.
+  const { fixtureSecrets = [], fixtureDiagnostics = {}, ...spawnOptions } = options;
+  if (!Array.isArray(fixtureSecrets) || fixtureSecrets.some((value) => typeof value !== "string")) throw new TypeError("Invalid fixture secret registry");
   const env = fixtureEnv(spawnOptions.env);
-  const secrets = Object.entries(env).filter(([name]) => /TOKEN|SECRET|PASSWORD/.test(name)).map(([, value]) => value);
-  return captureChildLog(spawn(command, args, { ...spawnOptions, env }), { fixtureOnly: true, secrets: [...secrets, ...fixtureSecrets] });
+  // Registry/fixtureOnly flags never enable bodies. Only typed public fields do.
+  const fields = { ...fixtureDiagnostics, configuredVault: env.AIDANOS_VAULT || env.AIDANOS_VAULT_CLONE };
+  allowedDiagnostics(fields); // Validate before spawning; never orphan a child.
+  return captureChildLog(spawn(command, args, { ...spawnOptions, env }), { fields, secrets: fixtureSecrets });
 }
-
-export function childStartupError(child, message) {
-  const safe = child._redact || redactChildLog;
-  const log = safe(child._log());
-  return new Error(safe(message) + "\nchild stdout/stderr (secrets redacted):\n" + (log || "(no child output captured)"));
+export function childStartupError(child) {
+  const log = typeof child._diagnostics === "function" ? child._log() : "";
+  return new Error("child startup failed; structured diagnostics only:\n" + (log || "(no child output captured)"));
 }

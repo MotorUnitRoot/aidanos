@@ -2,6 +2,7 @@
 // Keep random listeners out of Linux and macOS client ephemeral ranges.
 // This is selection, not a reservation/retry: existing bind failures still fail.
 import { readFileSync } from "node:fs";
+import process from "node:process";
 
 export const TEST_PORT_MIN = 10000;
 export const TEST_PORT_MAX = 29999;

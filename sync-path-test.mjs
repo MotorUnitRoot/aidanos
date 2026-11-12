@@ -1549,6 +1549,9 @@ async function pauseClearsOnlyAfterSuccess() {
   });
   const base = "http://127.0.0.1:" + port;
   const localOnly = "Sync is paused. Notes are saved on this computer only.";
+  // sync-path-flake-ticket: when a timed sync wait fails, include the server's
+  // structured diagnostics (child._log) so a macOS flake can be read from CI.
+  const withServerLog = (msg) => msg + "\nserver log (structured diagnostics only):\n" + (child._log() || "(no child output captured)");
   function showBare(rel) {
     try {
       return gitQuiet(bare, ["show", "HEAD:" + rel]);
@@ -1607,7 +1610,7 @@ async function pauseClearsOnlyAfterSuccess() {
     while (showBare("notes/timer.md") !== "timer note\n" && Date.now() < timerDeadline) {
       await new Promise((r) => setTimeout(r, 50));
     }
-    assert(showBare("notes/timer.md") === "timer note\n", "restarted timers did not sync the note");
+    assert(showBare("notes/timer.md") === "timer note\n", withServerLog("restarted timers did not sync the note"));
 
     await pauseWithChmod();
     const queued = await putNote("notes/queued.md", "queued note\n");
@@ -1629,7 +1632,7 @@ async function pauseClearsOnlyAfterSuccess() {
     while (showBare("notes/queued.md") !== "queued note\n" && Date.now() < queuedDeadline) {
       await new Promise((r) => setTimeout(r, 50));
     }
-    assert(showBare("notes/queued.md") === "queued note\n", "queued note did not sync after resume");
+    assert(showBare("notes/queued.md") === "queued note\n", withServerLog("queued note did not sync after resume"));
     const open = await fetch(base + "/api/health");
     const openBody = await open.json();
     assert(!openBody.git.paused && openBody.git.error !== "sync paused", "resume left the pause on");

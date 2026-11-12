@@ -1,0 +1,33 @@
+{
+  "originHash" : "a790767623d42af461bfad40c99e3389eef1d5e1be6371604555a3d91314742a",
+  "pins" : [
+    {
+      "identity" : "automerge-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/automerge/automerge-swift",
+      "state" : {
+        "revision" : "aa45d17ac92cef2b8ded63b47e65a28dc85e3418",
+        "version" : "0.7.2"
+      }
+    },
+    {
+      "identity" : "swift-asn1",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-asn1.git",
+      "state" : {
+        "revision" : "3b6410f7dee09eb33cdd26260c5fd47fda19b0e2",
+        "version" : "1.7.3"
+      }
+    },
+    {
+      "identity" : "swift-crypto",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-crypto.git",
+      "state" : {
+        "revision" : "95ba0316a9b733e92bb6b071255ff46263bbe7dc",
+        "version" : "3.15.1"
+      }
+    }
+  ],
+  "version" : 3
+}

@@ -1,0 +1,11 @@
+// Change this one line if Xcode says the bundle id is already taken.
+// The iPhone app becomes $(PRODUCT_BUNDLE_IDENTIFIER_PREFIX).ios
+// and the Mac app becomes $(PRODUCT_BUNDLE_IDENTIFIER_PREFIX).macos.
+PRODUCT_BUNDLE_IDENTIFIER_PREFIX = com.motorunit.aidanos
+
+// Automatic signing. The team is not set here: pick your Personal Team in Xcode.
+CODE_SIGN_STYLE = Automatic
+
+IPHONEOS_DEPLOYMENT_TARGET = 17.0
+MACOSX_DEPLOYMENT_TARGET = 14.0
+SWIFT_VERSION = 5.0

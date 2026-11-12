@@ -1,8 +1,13 @@
 #!/usr/bin/env node
+import { spawnWithLog as spawn } from "./test/child-diagnostics.mjs";
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
+import { assertFixtureGitIsolation } from "./test/fixture-process-regressions.mjs";
+import { randomTestPort } from "./test/ports.mjs";
+import { childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync } from "./test/fixture-process.mjs";
 import { fileURLToPath } from "node:url";
 import { authenticatedGitUrl, redactSecrets, sanitizeGitError, seedBundledVault } from "./server.mjs";
 
@@ -20,12 +25,14 @@ function git(args, cwd) {
   });
 }
 
+await assertFixtureGitIsolation(assert, git);
+
 async function waitHealth(base, child) {
   const deadline = Date.now() + 12000;
   let last = "";
   while (Date.now() < deadline) {
     if (child.exitCode != null) {
-      throw new Error("server exited " + child.exitCode + " " + last);
+      throw childStartupError(child, "server exited " + child.exitCode + " " + last);
     }
     try {
       const res = await fetch(base + "/api/health");
@@ -35,19 +42,15 @@ async function waitHealth(base, child) {
     }
     await new Promise((r) => setTimeout(r, 80));
   }
-  throw new Error("health timeout " + last);
+  throw childStartupError(child, "health timeout " + last);
 }
 
 function spawnServer(env) {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
-    env: { ...process.env, AIDANOS_VAULT_GIT_RETRY_MS: "0", ...env },
+    env: { ...fixtureEnv(), AIDANOS_VAULT_GIT_RETRY_MS: "0", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let log = "";
-  child.stderr.on("data", (buf) => { log += String(buf); });
-  child.stdout.on("data", (buf) => { log += String(buf); });
-  child._log = () => log;
   return child;
 }
 
@@ -92,7 +95,7 @@ async function liveGitSync() {
   git(["remote", "add", "origin", bare], seed);
   git(["push", "-u", "origin", "HEAD"], seed);
 
-  const port = 21000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort(2);
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -238,7 +241,7 @@ async function authOriginIsEmbedded() {
   fs.mkdirSync(vault, { recursive: true });
   const token = "ghp_shape_test_" + String(Date.now());
   const publicUrl = "https://127.0.0.1:1/MotorUnitRoot/aidanos-vault.git";
-  const port = 23000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -326,7 +329,7 @@ async function bundledSeedWhenCloneFails() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-seed-live-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault, { recursive: true });
-  const port = 24000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -379,7 +382,7 @@ async function seededNotesStayUntracked() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-seed-untracked-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault, { recursive: true });
-  const port = 25000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",

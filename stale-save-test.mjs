@@ -1,8 +1,10 @@
 #!/usr/bin/env node
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
+import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawnWithLog as spawn, childStartupError } from "./test/child-diagnostics.mjs";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -105,7 +107,7 @@ async function waitHealth(base, child) {
   const deadline = Date.now() + 8000;
   let last = "";
   while (Date.now() < deadline) {
-    if (child.exitCode != null) throw new Error("server exited " + child.exitCode + " " + last);
+    if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode + " " + last);
     try {
       const res = await fetch(base + "/api/health");
       if (res.ok) return;
@@ -114,7 +116,7 @@ async function waitHealth(base, child) {
     }
     await new Promise((r) => setTimeout(r, 40));
   }
-  throw new Error("health timeout " + last);
+  throw childStartupError(child, "health timeout " + last);
 }
 
 async function stop(child) {
@@ -171,11 +173,11 @@ async function liveTwoClients() {
   fs.utimesSync(dayPath, past, past);
   fs.utimesSync(notePath, past, past);
 
-  const port = 21000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,
@@ -185,11 +187,8 @@ async function liveTwoClients() {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let errOut = "";
-  child.stderr.on("data", (buf) => { errOut += String(buf); });
-  child.stdout.on("data", (buf) => { errOut += String(buf); });
   const base = "http://127.0.0.1:" + port;
-  const fail = (msg) => new Error(msg + (errOut ? " :: " + errOut.slice(-400) : ""));
+  const fail = (msg) => new Error(msg + (child._log() ? " :: " + child._log().slice(-400) : ""));
 
   try {
     await waitHealth(base, child);
@@ -300,11 +299,11 @@ async function liveSameTextAndLock() {
   fs.writeFileSync(otherPath, "base\n", "utf8");
   fs.writeFileSync(notePath, "loaded note\n", "utf8");
 
-  const port = 23000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,
@@ -314,11 +313,8 @@ async function liveSameTextAndLock() {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let errOut = "";
-  child.stderr.on("data", (buf) => { errOut += String(buf); });
-  child.stdout.on("data", (buf) => { errOut += String(buf); });
   const base = "http://127.0.0.1:" + port;
-  const fail = (msg) => new Error(msg + (errOut ? " :: " + errOut.slice(-400) : ""));
+  const fail = (msg) => new Error(msg + (child._log() ? " :: " + child._log().slice(-400) : ""));
   const putDay = (day, markdown, mtime) => fetch(base + "/api/day?date=" + day, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },

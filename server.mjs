@@ -160,12 +160,29 @@ export function sanitizeGitError(msg, secrets) {
   return redactSecrets(msg, secrets).replace(/\s+/g, " ").trim().slice(0, 180) || "git failed";
 }
 
+// Closed error logging: no object inspection, coercion, stacks or recursive causes.
+const logMessages = new Set([
+  "error", "log watch", "unhandled rejection", "vault seed:", "vault git retry:",
+  "vault git:", "vault git clone:", "vault git init:", "vault pending:", "refused:",
+  "request failed:", "vault seed: bundled sample", "git not available",
+  "vault path is not a git checkout",
+]);
+const logErrorCodes = new Set([...Object.keys(os.constants.errno), "ERR_STREAM_PREMATURE_CLOSE"]);
+function ownLogField(value, field) {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) return undefined;
+  try { return Object.getOwnPropertyDescriptor(value, field)?.value; } catch { return undefined; }
+}
+function safeLogCode(error) {
+  const code = ownLogField(error, "code");
+  return logErrorCodes.has(code) ? code : "EIO";
+}
+function safeLogPart(part) {
+  if (typeof part === "string") return logMessages.has(part) ? part : "error";
+  const message = ownLogField(part, "message");
+  return (logMessages.has(message) ? message : "error") + " code=" + safeLogCode(part);
+}
 function logSafe(...parts) {
-  const text = parts.map((part) => {
-    if (part instanceof Error) return redactSecrets(part.stack || part.message || "error");
-    return redactSecrets(part);
-  }).join(" ");
-  console.error(text);
+  console.error(parts.length ? parts.map(safeLogPart).join(" ") : "error");
 }
 
 function notesStayLocalSentence() {
@@ -470,13 +487,13 @@ export async function seedBundledVault(dest, src) {
   return true;
 }
 
-async function seedBundledVaultIfNeeded(reason) {
+async function seedBundledVaultIfNeeded() {
   try {
     const seeded = await seedBundledVault(VAULT, bundledVaultDir());
-    if (seeded) console.error("vault seed: bundled sample after " + String(reason || "git miss"));
+    if (seeded) logSafe("vault seed: bundled sample");
     return seeded;
   } catch (e) {
-    console.error("vault seed:", sanitizeGitError(e && e.message || "seed failed"));
+    logSafe("vault seed:", e);
     return false;
   }
 }
@@ -486,7 +503,7 @@ function scheduleVaultGitRetry() {
   setTimeout(() => {
     enqueueVaultGit(() => retryVaultGit()).catch((e) => {
       vaultGit.error = sanitizeGitError(e && e.message || "retry failed");
-      console.error("vault git retry:", vaultGit.error);
+      logSafe("vault git retry:", e);
     });
   }, GIT_RETRY_MS).unref();
 }
@@ -531,7 +548,7 @@ async function initVaultGit() {
     await runGit(["--version"], { timeoutMs: 4000 });
   } catch {
     vaultGit.error = "git not available";
-    console.error("vault git:", vaultGit.error);
+    logSafe("vault git:");
     await seedBundledVaultIfNeeded("git missing");
     return;
   }
@@ -558,13 +575,13 @@ async function initVaultGit() {
         vaultGit.error = "";
       } catch (e) {
         vaultGit.error = sanitizeGitError(e && e.message || "clone failed");
-        console.error("vault git clone:", vaultGit.error);
+        logSafe("vault git clone:", e);
         await seedBundledVaultIfNeeded("clone failed");
         try {
           await runGit(["-C", VAULT, "init", "-b", "main"], { timeoutMs: 8000 });
           await ensureOrigin(VAULT);
         } catch (initErr) {
-          console.error("vault git init:", sanitizeGitError(initErr && initErr.message));
+          logSafe("vault git init:", initErr);
         }
         scheduleVaultGitRetry();
       }
@@ -578,13 +595,13 @@ async function initVaultGit() {
       return;
     }
     vaultGit.error = "vault path is not a git checkout";
-    console.error("vault git:", vaultGit.error);
+    logSafe("vault git:");
   } catch (e) {
     if (e && e.code) {
       pauseBackgroundSync(tagStop(e, "git"));
     } else {
       vaultGit.error = sanitizeGitError(e && e.message || "vault git failed");
-      console.error("vault git:", vaultGit.error);
+      logSafe("vault git:");
     }
     await seedBundledVaultIfNeeded("vault git failed");
     if (!vaultGit.syncPaused) scheduleVaultGitRetry();
@@ -611,7 +628,7 @@ function setGitError(msg) {
   const next = msg ? sanitizeGitError(msg) : "";
   if (next === vaultGit.error) return;
   vaultGit.error = next;
-  if (next) console.error("vault git:", next);
+  if (next) logSafe("vault git:");
 }
 
 let vaultWork = Promise.resolve();
@@ -647,7 +664,7 @@ function persistPending() {
     fsSync.writeFileSync(tmp, body, { encoding: "utf8", flag: "w" });
     fsSync.renameSync(tmp, file);
   } catch (e) {
-    console.error("vault pending:", sanitizeGitError(e && e.message || "save failed"));
+    logSafe("vault pending:", e);
   }
 }
 
@@ -1162,8 +1179,8 @@ async function writeVaultText(rel, text) {
   let after;
   try {
     after = await fs.lstat(parent);
-  } catch {
-    throw parentChanged();
+  } catch (cause) {
+    throw parentChanged(undefined, cause);
   }
   if (!seen || after.isSymbolicLink() || !after.isDirectory() || after.dev !== seen.dev || after.ino !== seen.ino) {
     throw parentChanged();
@@ -2539,7 +2556,7 @@ async function atomicWriteFile(filePath, markdown, beforeRename) {
     if (openedId) await unlinkIfSameFile(tmpPath, openedId);
     const code = e && e.code;
     if ((code === "EISDIR" || code === "ENOTDIR") && !e.aidanosStop) {
-      const err = new Error("not a file");
+      const err = new Error("not a file", { cause: e });
       err.code = code;
       throw err;
     }
@@ -2606,8 +2623,16 @@ function clientRefusal(err) {
   return refusalMessage(err);
 }
 
+// Application reasons are a closed enum, separate from the OS errno namespace.
+const stopReasons = new Set(["parent-changed"]);
+const stopOperations = new Set(["write", "read", "rename", "git", "open", "stat", "unlink", "mkdir"]);
+function stopReasonSuffix(err) {
+  const reason = ownLogField(err, "reason");
+  return stopReasons.has(reason) ? " reason=" + reason : "";
+}
+
 function tagStop(err, step) {
-  const error = err instanceof Error ? err : new Error("failed");
+  const error = err instanceof Error ? err : new Error("failed", { cause: err });
   error.aidanosStop = step;
   if (!error.code) error.code = "EIO";
   return error;
@@ -2617,9 +2642,13 @@ function throwIfStop(err) {
   if (err && err.aidanosStop) throw err;
 }
 
-function parentChanged(step) {
-  const err = new Error("parent changed");
-  err.code = "PARENT";
+function parentChanged(step, cause) {
+  const err = new Error("parent changed", cause === undefined ? undefined : { cause });
+  // ESTALE maps a detected parent change into the errno contract; the reason
+  // distinguishes this application detection from an OS stale file handle.
+  // Preserve any replaced filesystem error internally, never as log text.
+  err.code = "ESTALE";
+  err.reason = "parent-changed";
   return tagStop(err, step || "write");
 }
 
@@ -2634,9 +2663,10 @@ function pauseBackgroundSync(err) {
     vaultGit.timer = null;
   }
   vaultGit.error = "sync paused";
-  const step = err && err.aidanosStop ? String(err.aidanosStop) : "git";
-  const code = err && err.code ? String(err.code) : "EIO";
-  console.error("sync paused: " + step + " " + code);
+  const operation = ownLogField(err, "aidanosStop");
+  const step = stopOperations.has(operation) ? operation : "git";
+  const code = safeLogCode(err);
+  console.error("sync paused: " + step + " " + code + stopReasonSuffix(err));
 }
 
 async function assertRealVaultRoot() {
@@ -2715,8 +2745,8 @@ async function snapshotParents(filePath) {
     let st;
     try {
       st = await fs.lstat(cursor);
-    } catch {
-      throw parentChanged();
+    } catch (cause) {
+      throw parentChanged(undefined, cause);
     }
     if (st.isSymbolicLink()) throw symlinkError(vaultRel(cursor));
     if (!st.isDirectory()) throw new Error("bad path");
@@ -2730,8 +2760,8 @@ async function assertParents(seen) {
     let st;
     try {
       st = await fs.lstat(item.abs);
-    } catch {
-      throw parentChanged();
+    } catch (cause) {
+      throw parentChanged(undefined, cause);
     }
     if (st.isSymbolicLink() || !st.isDirectory() || st.dev !== item.dev || st.ino !== item.ino) {
       throw parentChanged();
@@ -2804,15 +2834,15 @@ function isClientAbort(err) {
 
 function refuse(res, err) {
   const msg = typeof err === "string" ? err : publicPathError(err);
-  console.error("refused: " + oneLine(msg));
+  logSafe("refused:", err);
   return json(res, 400, { error: msg });
 }
 
 function stopLine(err) {
-  const step = err && err.aidanosStop ? String(err.aidanosStop) : "write";
-  const code = err && err.code ? String(err.code) : "EIO";
-  if (!/^[a-z]+$/.test(step) || !/^[A-Za-z0-9_]+$/.test(code)) return "stopped: write EIO";
-  return "stopped: " + step + " " + code;
+  const operation = ownLogField(err, "aidanosStop");
+  const step = stopOperations.has(operation) ? operation : "write";
+  const code = safeLogCode(err);
+  return "stopped: " + step + " " + code + stopReasonSuffix(err);
 }
 
 function stopAfterResponse(res, err) {
@@ -3631,14 +3661,14 @@ const server = http.createServer(async (req, res) => {
     }
     const refusal = clientRefusal(err);
     if (refusal) {
-      console.error("refused: " + oneLine(refusal));
+      logSafe("refused:", err);
       if (res.headersSent) return;
       return json(res, 400, { error: refusal });
     }
     // Only a tagged write, rename, unlink, or git step stops the process.
     // A cut-off upload, a long name, and a background sync failure stay up.
     if (err && err.aidanosStop) return stopAfterResponse(res, err);
-    console.error("request failed: " + (err && err.code ? String(err.code) : "ERROR"));
+    logSafe("request failed:", err);
     if (res.headersSent) return;
     return json(res, 500, { error: "internal error" });
   }
@@ -3690,7 +3720,7 @@ if (isMainModule()) {
   // Write and sync failures exit from the request path, where the operation is known.
   // This log is redacted: no vault path, token, or note body.
   process.on("unhandledRejection", (reason) => {
-    const err = reason instanceof Error ? reason : new Error(String(reason || "error"));
+    const err = reason instanceof Error ? reason : new Error("unhandled rejection", { cause: reason });
     logSafe("unhandled rejection", err);
   });
   boot().catch((err) => {

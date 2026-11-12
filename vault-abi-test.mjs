@@ -1,8 +1,10 @@
 #!/usr/bin/env node
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
+import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawnWithLog as spawn, childStartupError } from "./test/child-diagnostics.mjs";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -92,7 +94,7 @@ async function waitHealth(base, child) {
   let last = "";
   while (Date.now() < deadline) {
     if (child.exitCode != null) {
-      throw new Error("server exited " + child.exitCode + " " + last);
+      throw childStartupError(child, "server exited " + child.exitCode + " " + last);
     }
     try {
       const res = await fetch(base + "/api/health");
@@ -102,7 +104,7 @@ async function waitHealth(base, child) {
     }
     await new Promise((r) => setTimeout(r, 80));
   }
-  throw new Error("health timeout " + last);
+  throw childStartupError(child, "health timeout " + last);
 }
 
 async function liveVaultAbi() {
@@ -115,11 +117,11 @@ async function liveVaultAbi() {
   fs.writeFileSync(outside, "SECRET_OUTSIDE\n", "utf8");
   fs.symlinkSync(outside, path.join(vault, "maps", "leak.md"));
 
-  const port = 19000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,
@@ -129,15 +131,12 @@ async function liveVaultAbi() {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let errOut = "";
-  child.stderr.on("data", (buf) => { errOut += String(buf); });
-  child.stdout.on("data", (buf) => { errOut += String(buf); });
   const base = "http://127.0.0.1:" + port;
   const step = async (name, fn) => {
     try {
       return await fn();
     } catch (e) {
-      throw new Error(name + ": " + (e && e.message || e) + (errOut ? " :: " + errOut.slice(-400) : ""));
+      throw new Error(name + ": " + (e && e.message || e) + (child._log() ? " :: " + child._log().slice(-400) : ""));
     }
   };
   try {

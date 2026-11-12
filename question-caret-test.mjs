@@ -1,32 +1,20 @@
 #!/usr/bin/env node
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
+import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawnWithLog as spawn, childStartupError } from "./test/child-diagnostics.mjs";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const chrome = ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
-  .find((p) => fs.existsSync(p)) || "";
-
-async function loadChromium() {
-  try {
-    return (await import("playwright-core")).chromium;
-  } catch (e) {}
-  const local = "/tmp/pw/node_modules/playwright-core/index.mjs";
-  if (fs.existsSync(local)) return (await import(local)).chromium;
-  return null;
-}
-
-if (!chrome) {
-  console.log("skip  question caret: chrome is not installed");
-  process.exit(0);
-}
-const chromium = await loadChromium();
-if (!chromium) {
-  console.log("skip  question caret: playwright-core is not installed");
-  process.exit(0);
-}
+// CI and local runs use the same pinned, checksummed browser. Missing browser
+// dependencies fail, rather than silently turning a browser check into a skip.
+const chrome = process.env.CHROME_PATH ||
+  ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
+    .find((p) => fs.existsSync(p));
+if (!chrome) throw new Error("Chrome is required for question-caret-test (set CHROME_PATH).");
+const { chromium } = await import("playwright-core");
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
@@ -35,11 +23,11 @@ function assert(cond, msg) {
 const vault = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-questions-"));
 fs.cpSync(path.join(root, "vault"), vault, { recursive: true });
 const answersPath = path.join(vault, "family-room-to-office", "answers.md");
-const port = 22000 + Math.floor(Math.random() * 2000);
+const port = randomTestPort();
 const child = spawn(process.execPath, ["server.mjs"], {
   cwd: root,
   env: {
-    ...process.env,
+    ...fixtureEnv(),
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
@@ -64,17 +52,20 @@ async function waitForFile(pred) {
 }
 
 try {
+  let healthy = false;
   const deadline = Date.now() + 8000;
   while (Date.now() < deadline) {
-    if (child.exitCode != null) throw new Error("server exited");
+    if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode);
     try {
       const res = await fetch(base + "/api/health");
-      if (res.ok) break;
+      if (res.ok) { healthy = true; break; }
     } catch (e) {}
     await new Promise((r) => setTimeout(r, 40));
   }
+  if (!healthy) throw childStartupError(child, "health timeout");
 
   browser = await chromium.launch({
+    env: fixtureEnv(),
     executablePath: chrome,
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],

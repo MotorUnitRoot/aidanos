@@ -1,8 +1,11 @@
 #!/usr/bin/env node
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
+import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync } from "./test/fixture-process.mjs";
+import { spawnWithLog as spawn, childStartupError } from "./test/child-diagnostics.mjs";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -388,11 +391,11 @@ async function pngRoundTrip() {
   fs.mkdirSync(path.join(vault, "family-room-to-office"), { recursive: true });
   fs.mkdirSync(path.join(vault, "maps"), { recursive: true });
   fs.writeFileSync(path.join(vault, "maps", "secret.txt"), "SECRET_TXT\n");
-  const port = 18600 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,
@@ -404,15 +407,17 @@ async function pngRoundTrip() {
   });
   const base = "http://127.0.0.1:" + port;
   try {
+    let healthy = false;
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
-      if (child.exitCode != null) throw new Error("server exited");
+      if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode);
       try {
         const res = await fetch(base + "/api/health");
-        if (res.ok) break;
+        if (res.ok) { healthy = true; break; }
       } catch {}
       await new Promise((r) => setTimeout(r, 40));
     }
+    if (!healthy) throw childStartupError(child, "health timeout");
     const outside = await fetch(base + "/api/file?path=" + encodeURIComponent("maps/note.png"), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -455,11 +460,11 @@ async function pngSymlinkStaysInJob() {
   fs.mkdirSync(logDir, { recursive: true });
   const day = path.join(logDir, "2026-10-09.md");
   fs.writeFileSync(day, "SECRET_DAY_NOTE\n");
-  const port = 20600 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,
@@ -476,15 +481,17 @@ async function pngSymlinkStaysInJob() {
     body: JSON.stringify({ png: PNG }),
   });
   try {
+    let healthy = false;
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
-      if (child.exitCode != null) throw new Error("server exited");
+      if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode);
       try {
         const res = await fetch(base + "/api/health");
-        if (res.ok) break;
+        if (res.ok) { healthy = true; break; }
       } catch {}
       await new Promise((r) => setTimeout(r, 40));
     }
+    if (!healthy) throw childStartupError(child, "health timeout");
     const walkPut = await putPng("family-room-to-office/walk.png");
     assert(walkPut.ok, "walk.png in the real folder");
     fs.unlinkSync(path.join(job, "walk.png"));
@@ -603,11 +610,11 @@ async function pngReadIsOnlyThePicture() {
   const job = path.join(vault, "family-room-to-office");
   fs.mkdirSync(job, { recursive: true });
   fs.mkdirSync(path.join(vault, "maps"), { recursive: true });
-  const port = 24600 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,
@@ -625,15 +632,17 @@ async function pngReadIsOnlyThePicture() {
     body: JSON.stringify({ png }),
   });
   try {
+    let healthy = false;
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
-      if (child.exitCode != null) throw new Error("server exited");
+      if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode);
       try {
         const res = await fetch(base + "/api/health");
-        if (res.ok) break;
+        if (res.ok) { healthy = true; break; }
       } catch {}
       await new Promise((r) => setTimeout(r, 40));
     }
+    if (!healthy) throw childStartupError(child, "health timeout");
     const secret = path.join(vault, "maps", "secret.txt");
     fs.writeFileSync(secret, "SECRET_HARD_LINK\n");
     fs.linkSync(secret, path.join(job, "plan.png"));

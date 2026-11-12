@@ -1,8 +1,13 @@
 #!/usr/bin/env node
+import { spawnWithLog as spawn } from "./test/child-diagnostics.mjs";
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
+import { assertFixtureGitIsolation } from "./test/fixture-process-regressions.mjs";
+import { randomTestPort } from "./test/ports.mjs";
+import { childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync } from "./test/fixture-process.mjs";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -19,16 +24,14 @@ function git(args, cwd) {
   });
 }
 
+await assertFixtureGitIsolation(assert, git);
+
 function spawnServer(env) {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
-    env: { ...process.env, AIDANOS_VAULT_GIT_RETRY_MS: "0", ...env },
+    env: { ...fixtureEnv(), AIDANOS_VAULT_GIT_RETRY_MS: "0", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let log = "";
-  child.stderr.on("data", (buf) => { log += String(buf); });
-  child.stdout.on("data", (buf) => { log += String(buf); });
-  child._log = () => log;
   return child;
 }
 
@@ -36,7 +39,7 @@ async function waitHealth(base, child) {
   const deadline = Date.now() + 12000;
   let last = "";
   while (Date.now() < deadline) {
-    if (child.exitCode != null) throw new Error("server exited " + child.exitCode + " " + last);
+    if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode + " " + last);
     try {
       const res = await fetch(base + "/api/health");
       if (res.ok) return res;
@@ -45,7 +48,7 @@ async function waitHealth(base, child) {
     }
     await new Promise((r) => setTimeout(r, 80));
   }
-  throw new Error("health timeout " + last);
+  throw childStartupError(child, "health timeout " + last);
 }
 
 async function stop(child) {
@@ -192,6 +195,9 @@ function assertClientSurfacesConflict() {
   assert(openDayFn.includes("leavingDay && !conflictOpen"), "day switch does not re-save an open conflict");
   const surface = app.slice(app.indexOf("function surfaceGitConflict("), app.indexOf("async function surfaceOpenGitConflict("));
   assert(surface.indexOf("data.join") < surface.indexOf("data.left"), "an unrelated file stays off the other-copy sheet");
+  assert(surface.indexOf("conflicts.length") < surface.indexOf("openGitJoin("), "Bring them in stays hidden while any conflict is unresolved");
+  const afterChoice = app.slice(app.indexOf("function afterGitChoice("), app.indexOf("function gitConflictForOpenPage("));
+  assert(afterChoice.indexOf("conflicts.length") < afterChoice.indexOf("openGitJoin("), "a remaining conflict hides Bring them in");
   assert(keepFn.includes("afterGitChoice(") && takeFn.includes("afterGitChoice("), "a choice looks for changes still waiting");
   assert(app.includes("function afterGitChoice(") && app.slice(app.indexOf("function afterGitChoice("), app.indexOf("function gitConflictForOpenPage(")).includes("openGitJoin("), "a choice opens the other-copy sheet when changes are still waiting");
   assert(app.includes("function resolveGitJoin("), "join waits for the click");
@@ -240,7 +246,7 @@ async function livePull() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 26000 + Math.floor(Math.random() * 1000);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const childA = spawnServer(serverEnv(portA, vaultA, bare, { AIDANOS_VAULT_GIT_SYNC_MS: "400" }));
   const childB = spawnServer(serverEnv(portB, vaultB, bare, { AIDANOS_VAULT_GIT_SYNC_MS: "400" }));
@@ -289,7 +295,7 @@ async function sameFileKeepsBoth() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 28000 + Math.floor(Math.random() * 1000);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -368,7 +374,7 @@ async function refusedPushIsShown() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 30000 + Math.floor(Math.random() * 1000);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -426,7 +432,7 @@ async function noRemoteUnchanged() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-local-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault, { recursive: true });
-  const port = 32000 + Math.floor(Math.random() * 1000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -475,7 +481,7 @@ async function divergedDifferentFiles() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 33000 + Math.floor(Math.random() * 800);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -557,7 +563,7 @@ async function mixedOverlapAndDisjoint() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 34000 + Math.floor(Math.random() * 800);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -664,7 +670,7 @@ async function conflictSurvivesDaySwitch() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 35000 + Math.floor(Math.random() * 800);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -737,7 +743,7 @@ async function strayFileLeftAlone() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 36000 + Math.floor(Math.random() * 800);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -808,7 +814,7 @@ async function otherNoteSurvivesConflict() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 41000 + Math.floor(Math.random() * 400);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -866,7 +872,7 @@ async function otherNoteSurvivesConflictOffline() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 43000 + Math.floor(Math.random() * 400);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -922,7 +928,7 @@ async function pendingSurvivesRestart() {
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = 45000 + Math.floor(Math.random() * 400);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -976,14 +982,14 @@ async function pendingSurvivesRestart() {
   }
 }
 
-async function withChoiceThenSecondEdit(portBase, resolve, chosen, fn) {
+async function withChoiceThenSecondEdit(resolve, chosen, fn) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-stale-"));
   const bare = seedBare(tmp);
   const vaultA = path.join(tmp, "a");
   const vaultB = path.join(tmp, "b");
   fs.mkdirSync(vaultA, { recursive: true });
   fs.mkdirSync(vaultB, { recursive: true });
-  const portA = portBase + Math.floor(Math.random() * 200);
+  const portA = randomTestPort(2);
   const portB = portA + 1;
   const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
   const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
@@ -1034,8 +1040,65 @@ async function withChoiceThenSecondEdit(portBase, resolve, chosen, fn) {
   }
 }
 
+async function joinHiddenUntilEveryConflictIsChosen() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-sync-join-set-"));
+  const bare = seedBare(tmp);
+  const vaultA = path.join(tmp, "a");
+  const vaultB = path.join(tmp, "b");
+  fs.mkdirSync(vaultA, { recursive: true });
+  fs.mkdirSync(vaultB, { recursive: true });
+  const portA = randomTestPort(2);
+  const portB = portA + 1;
+  const extra = { AIDANOS_VAULT_GIT_SYNC_MS: "0" };
+  const childA = spawnServer(serverEnv(portA, vaultA, bare, extra));
+  const childB = spawnServer(serverEnv(portB, vaultB, bare, extra));
+  const baseB = "http://127.0.0.1:" + portB;
+  const first = "2026-10-19";
+  const second = "2026-10-20";
+  try {
+    await waitHealth("http://127.0.0.1:" + portA, childA);
+    await waitHealth(baseB, childB);
+    commitFile(vaultA, "log/" + first + ".md", "A one\n", "A first");
+    commitFile(vaultA, "log/" + second + ".md", "A two\n", "A second");
+    commitFile(vaultA, "log/2026-10-21.md", "only on A\n", "A waiting");
+    git(["push", "origin", "HEAD"], vaultA);
+    commitFile(vaultB, "log/" + first + ".md", "B one\n", "B first");
+    commitFile(vaultB, "log/" + second + ".md", "B two\n", "B second");
+    const trigger = await putDay(baseB, "2026-10-18", "trigger compare\n", 0);
+    assert(trigger.res.ok, "trigger " + trigger.res.status);
+    const opened = await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      const paths = (body.conflicts || []).map((item) => item && item.path).sort();
+      return paths.join(",") === "log/" + first + ".md,log/" + second + ".md" && body.join !== true ? body : "";
+    }, 8000, "both conflicts before any choice");
+    assert(opened.join !== true, "Bring them in is hidden while both notes are unresolved");
+    const one = opened.conflicts.find((item) => item.path === "log/" + first + ".md");
+    const keptOne = await putDay(baseB, first, "B one\n", one.mtime, "keep");
+    assert(keptOne.res.ok, "first choice " + keptOne.res.status + " " + JSON.stringify(keptOne.body));
+    const midway = await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      const hit = (body.conflicts || []).find((item) => item && item.path === "log/" + second + ".md");
+      return hit && body.join !== true ? body : "";
+    }, 8000, "second conflict still open");
+    assert(midway.join !== true, "Bring them in stays hidden after only one choice");
+    assert((midway.conflicts || []).some((item) => item.path === "log/" + second + ".md"), "the other note is still a conflict");
+    const two = midway.conflicts.find((item) => item.path === "log/" + second + ".md");
+    const keptTwo = await putDay(baseB, second, "B two\n", two.mtime, "keep");
+    assert(keptTwo.res.ok, "second choice " + keptTwo.res.status + " " + JSON.stringify(keptTwo.body));
+    const offered = await waitFor(async () => {
+      const body = await (await fetch(baseB + "/api/sync")).json();
+      return body.join === true && !(body.conflicts || []).length ? body : "";
+    }, 8000, "Bring them in after every choice");
+    assert(offered.join === true, "Bring them in is shown once every conflicting note has a choice");
+  } finally {
+    await stop(childA);
+    await stop(childB);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 async function staleChoiceAfterKeepMine() {
-  await withChoiceThenSecondEdit(46100, "keep", "B1\n", async (ctx) => {
+  await withChoiceThenSecondEdit("keep", "B1\n", async (ctx) => {
     const nudge = await putDay(ctx.baseB, "2026-10-17", "nudge compare\n", 0);
     assert(nudge.res.ok, "nudge " + nudge.res.status);
     const again = await waitFor(async () => {
@@ -1052,7 +1115,7 @@ async function staleChoiceAfterKeepMine() {
 }
 
 async function staleChoiceAfterTakeTheirs() {
-  await withChoiceThenSecondEdit(47100, "theirs", "A1\n", async (ctx) => {
+  await withChoiceThenSecondEdit("theirs", "A1\n", async (ctx) => {
     const nudge = await putDay(ctx.baseB, "2026-10-17", "nudge compare\n", 0);
     assert(nudge.res.ok, "nudge " + nudge.res.status);
     const again = await waitFor(async () => {
@@ -1070,7 +1133,7 @@ async function staleChoiceAfterTakeTheirs() {
 
 async function staleChoiceAfterEdit() {
   const edited = "edited on B\n";
-  await withChoiceThenSecondEdit(48100, "edit", edited, async (ctx) => {
+  await withChoiceThenSecondEdit("edit", edited, async (ctx) => {
     const nudge = await putDay(ctx.baseB, "2026-10-17", "nudge compare\n", 0);
     assert(nudge.res.ok, "nudge " + nudge.res.status);
     const again = await waitFor(async () => {
@@ -1087,7 +1150,7 @@ async function staleChoiceAfterEdit() {
 }
 
 async function staleChoiceBeforeMerge() {
-  await withChoiceThenSecondEdit(49100, "keep", "B1\n", async (ctx) => {
+  await withChoiceThenSecondEdit("keep", "B1\n", async (ctx) => {
     const joined = await fetch(ctx.baseB + "/api/sync", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1113,6 +1176,7 @@ try {
   await refusedPushIsShown();
   await divergedDifferentFiles();
   await mixedOverlapAndDisjoint();
+  await joinHiddenUntilEveryConflictIsChosen();
   await conflictSurvivesDaySwitch();
   await strayFileLeftAlone();
   await otherNoteSurvivesConflict();

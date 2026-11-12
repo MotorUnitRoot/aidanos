@@ -1,70 +1,107 @@
-# AidanOS phone cut (PWA)
+# AidanOS on iPhone — paired direct TLS design, not deployment approval
 
-Weekend path: Progressive Web App via Safari **Add to Home Screen**. Not App Store. Vault stays markdown (`AIDANOS_VAULT` / sibling `vault/`). One web app on desktop and phone — same Door, same Capture.
+**Tailnet HTTPS enablement is still Colby's pending decision.** Nothing here
+turns it on, requests a real certificate, provisions a key, deploys a service or
+authorizes real notes. Swift/apps and real-device behavior remain unbuilt/unverified.
 
-## Live sit URL (tonight)
+## Release path: direct Node TLS, no Serve/Funnel
 
-https://beach-candy-projects-retained.trycloudflare.com
+Choose a neutral Mac machine name **before** enabling HTTPS or obtaining any cert.
+Certificate Transparency publishes the machine and tailnet DNS names permanently.
+See [Tailscale's CT warning](https://tailscale.com/kb/1153/enabling-https).
+Wait for the explicit HTTPS decision, CISO/Reviewer review, and device checks below.
 
-Shop tunnel in front of 3847. Quick tunnel — fine for a sit and overnight while it stays up; not the forever host.
+After those later approvals, the intended operator-controlled setup is:
+1. Both devices join the intended trusted tailnet; restrict grants and Mac firewall
+   to those devices/port. Confirm the Mac's exact MagicDNS name and `tailscale ip -4`.
+   The relay accepts only a local IPv4 in **100.64.0.0/10**, confirmed by the daemon.
+2. The operator obtains that exact name's certificate using `tailscale cert`, never
+   Serve/Funnel. Keep its private key in a separate **relay-user-owned 0600 file**,
+   outside repo, notes vault and relay data, with exactly one hardlink. Never paste a key into an env var,
+   token field, QR, log, image or chat. `tailscale cert` issuance/HTTPS enablement
+   has **not** been performed by this task. File-based renewal remains manual.
+3. Node terminates TLS itself. Future command shape (paths/names are placeholders,
+   not instructions to enable HTTPS now):
+   ```sh
+   node src/server.mjs --vault "$HOME/aidanos-relay-notes" --lan \
+     --tls-name relay.example-tail.ts.net \
+     --tls-cert-file "$HOME/.config/aidanos-relay/relay.crt" \
+     --tls-key-file "$HOME/.config/aidanos-relay/relay.key" \
+     --pairing-file "$HOME/.config/aidanos-relay/pairing.json"
+   ```
+   Retain the separate masked sync-token/token-file setup. No bearer is in the QR.
+   Production refuses startup without TLS, including on loopback. The key is checked
+   for regular-file/single-link status, owner/mode, symlinks, location and matching
+   cert/name. Production has no dev/plaintext env or option switch.
+4. In the Mac app, open the **public pairing JSON** generated locally by the relay.
+   Its QR binds the exact `wss://name:port/`, exact Tailscale IPv4, and SHA256 SPKI.
+   On the real iPhone, use **Pair / re-pair from Mac QR**, grant camera permission,
+   and scan the QR physically shown on the approved Mac. Enter the sync token only
+   in its masked field. Pairing is explicit, never learned from a network peer.
+5. Both apps compare the exact approved address. Before connecting, IPv4 DNS answers
+   must equal the stored 100.x address; the socket targets that literal IP to avoid
+   a second DNS lookup. TLS verifies the approved DNS hostname through system trust
+   **and** the stored DER-SPKI pin. A public CA signature alone is never sufficient.
+   Other names/ports, changed/public DNS answers, bad certificates or keys fail closed.
+   No redirects or plaintext fallback. Release raw ws code is compiled out.
 
-## Door locks (both surfaces)
+Production refuses missing/erroring/malformed/nonempty `tailscale serve status
+--json` at startup and rechecks on every HTTP/sync request. Forwarded,
+X-Forwarded-* and Tailscale-* hints are rejected, never trusted. Loopback is only
+bind scope: a local proxy that strips hints and holds a valid sync token cannot
+be distinguished from a direct authorized client. This is the accepted limit,
+not universal proxy detection. The boundary is the sync token plus TLS and the
+approved paired peer, never a claim of locality.
+Production artifacts contain no reset routing, admin authority or deletion code.
+Only the excluded disposable test server has reset; never combine it with a proxy.
 
-1. **Get to Work** and **Capture thoughts** sit side by side, same hairline.
-2. **Capture thoughts** opens a blank Capture note (empty paper) — no week strip, no day agenda rail.
-3. **Get to Work** opens Today (week chrome). Empty Get to Work opens empty Today paper.
+## Renewal and re-pair
 
-## Add to Home Screen (iPhone)
+The inspected Tailscale issuance source generates a fresh key on actual renewal.
+An unchanged cached `tailscale cert` result is **not** a key-reuse guarantee. Plan
+for **QR re-pair after each actual renewal/key change**. Restart Node with the new
+separate certificate/key files, reload its local public pairing JSON on the Mac,
+and explicitly rescan on the phone. Old pins refuse; nothing silently accepts a
+new key merely because the CA signed it. Sources, scope and refresh rules are in
+the in-repo [TLS design notes](docs/native/TLS.md#renewal-and-sources).
 
-1. Open the URL above in **Safari** (not Chrome).
-2. Tap **Share** → **Add to Home Screen**.
-3. Name stays **AidanOS**; tap **Add**.
-4. Launch from the home screen icon — runs standalone.
+## Plaintext fixtures only — excluded from production
 
-## LAN bind (his Mac, his vault) — usable tonight without GCP
+The production relay never starts sync without TLS. The excluded source-only
+`relay/test/harness/dev-plaintext.mjs` requires explicit `--dev-plaintext`, binds
+only loopback, and forcibly disables reset. It is absent from npm packages and
+Docker input; production never imports it and has no env/option bypass. It is
+for disposable synthetic fixtures only, never real notes or credentials.
 
-Default bind is localhost only. For phone on the same Wi‑Fi against `~/Grok/motorunit`:
+The native raw ws/loopback code is `#if DEBUG` only; no release binary path may
+contain or enable it. The former production `ws://100.x:port` setup is no longer
+supported, even on a tailnet. Ordinary home Wi-Fi, wildcard/public binds,
+Serve/Funnel, proxies and tunnels are not supported. IPv6 is not used here.
 
-```bash
-AIDANOS_HOST=0.0.0.0 AIDANOS_VAULT=~/Grok/motorunit PORT=3847 node server.mjs
-```
+## Verify on a real Mac/iPhone before real notes
 
-Open `http://<mac-lan-ip>:3847` in Safari → Add to Home Screen.
+**None of the Apple/device checks below have run on the Linux box.**
+- [ ] Build AidanCore tests and both apps in Debug AND Release; inspect release
+      absence of raw ws/loopback paths. Run the new pairing, DER-SPKI and trust tests.
+- [ ] Confirm neutral naming, then obtain Colby's separate HTTPS/CT consent before
+      certificate issuance. Confirm grants, own Tailscale IP and firewall scope.
+- [ ] Direct Node WSS works without Serve/Funnel, with a valid exact-name cert.
+      Verify IP-directed URLSession plus explicit DNS hostname validation on-device.
+- [ ] Mac public-JSON QR display and real-iPhone camera pairing/re-pair work. QR and
+      app preferences contain no bearer/private key. Address edits cannot reuse trust.
+- [ ] VPN-off, wrong/public/changed IPv4 DNS answers and wrong authority/port refuse
+      before any credential is sent; no reconnection silently updates pairing.
+- [ ] CA-valid wrong SPKI, expired/untrusted cert, wrong name and redirects refuse.
+      Renew/rotate the key: old phone pin refuses until a new physically approved QR.
+- [ ] Edit only dummy notes; test airplane mode, sleep/wake and reconnect on both
+      devices; verify identical markdown, no lost edits and no unexpected exposure.
+- [ ] Production `/reset` is absent even with arbitrary old flags/env/options;
+      inspect production npm/Docker file sets. No test CA/harness in app/image.
+- [ ] Independent CISO/Reviewer/Designer approval and Colby's separate push/workflow,
+      merge and deployment decisions remain open. Do not use real notes beforehand.
 
-## Cloud Run (ready when Colby says go)
+## Safari home-screen app
 
-`Dockerfile` already sets `PORT=8080` and `AIDANOS_HOST=0.0.0.0`, and installs `git` so Cloud Run can clone a private vault. The vault is a private git repo of markdown (target `MotorUnitRoot/aidanos-vault`). Not Drive, not a second database. The Mac launchd agent starts the app from `~/Grok/motorunit/dashboard` and sets `AIDANOS_VAULT` to `~/Grok/motorunit`. Cloud Run clones, serves, and commits on write.
-
-When a GCP project is authorized:
-
-```bash
-# from the aidanos repo root (after live Door files are on main)
-# Also set AIDANOS_VAULT_GIT_URL and a token secret (AIDANOS_VAULT_GIT_TOKEN or GITHUB_TOKEN).
-gcloud run deploy aidanos \
-  --source . \
-  --region us-west1 \
-  --allow-unauthenticated \
-  --set-env-vars "AIDANOS_HOST=0.0.0.0,AIDANOS_VAULT_GIT_URL=https://github.com/MotorUnitRoot/aidanos-vault.git" \
-  --port 8080
-```
-
-If the vault remote is not created yet, the service still boots. Local writes succeed; push failures show on `/api/health` as `git.error`. Do not put the token in the command line if you can bind it as a secret.
-
-Then point Safari / Add to Home Screen at the Cloud Run HTTPS URL. Until then: keep the tunnel or use LAN.
-
-## Overnight without waiting on GCP
-
-1. Keep 3847 up and the Cloudflare tunnel pointed at it (shop process).
-2. Or run LAN bind on his Mac with his real vault (best day-to-day disk).
-3. Cloud Run when Aide/Colby unlocks a GCP project — recipe above, no Apple Developer.
-
-## Morning sit (Designer)
-
-1. Safari on iPhone → open the HTTPS URL → Share → Add to Home Screen → launch AidanOS.
-2. Door: buttons side by side, same hairline; Capture → blank note; Get to Work → Today.
-3. Type a line on Today; leave and return — it stays.
-4. Bounce if buttons are stacked, Capture lands on Today week chrome, or a CRM screen shows.
-
-## Note for Aide-de-camp
-
-Overnight cut is a PWA (not TestFlight). Code has LAN bind (`AIDANOS_HOST`), responsive Door/Today, Capture blank note, manifest, service worker, and a Cloud Run Dockerfile. Live sit URL is the Cloudflare quick tunnel above. His MotorUnit vault on the Mac remains the real disk for day-to-day. Not blocked on Apple Developer. Durable public host = Cloud Run when a GCP project is ready; until then tunnel + LAN keep the phone usable.
+The PWA is a different, separately approved HTTPS web-app URL; it is not this WSS
+relay. Historical quick-tunnel URLs are not verified services. No hosting or public
+exposure is authorized by this runbook.

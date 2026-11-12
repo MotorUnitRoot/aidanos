@@ -1,8 +1,10 @@
 #!/usr/bin/env node
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
+import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawnWithLog as spawn, childStartupError } from "./test/child-diagnostics.mjs";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -252,7 +254,7 @@ async function waitHealth(base, child) {
   const deadline = Date.now() + 8000;
   let last = "";
   while (Date.now() < deadline) {
-    if (child.exitCode != null) throw new Error("server exited " + child.exitCode + " " + last);
+    if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode + " " + last);
     try {
       const res = await fetch(base + "/api/health");
       if (res.ok) return;
@@ -261,7 +263,7 @@ async function waitHealth(base, child) {
     }
     await new Promise((r) => setTimeout(r, 80));
   }
-  throw new Error("health timeout " + last);
+  throw childStartupError(child, "health timeout " + last);
 }
 
 async function liveCopyDeleteAndOpen() {
@@ -271,11 +273,11 @@ async function liveCopyDeleteAndOpen() {
   for (const name of ["reply-to-a-letter.md", "the-reply.md", "file-a-receipt.md", "the-receipt.md"]) {
     fs.copyFileSync(path.join(root, "vault", "maps", name), path.join(vault, "maps", name));
   }
-  const port = 18100 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
     env: {
-      ...process.env,
+      ...fixtureEnv(),
       PORT: String(port),
       AIDANOS_HOST: "127.0.0.1",
       AIDANOS_VAULT: vault,

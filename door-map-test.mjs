@@ -1,8 +1,10 @@
 #!/usr/bin/env node
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
+import { randomTestPort } from "./test/ports.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawn } from "node:child_process";
+import { spawnWithLog as spawn, childStartupError } from "./test/child-diagnostics.mjs";
 import { fileURLToPath } from "node:url";
 
 const src = fs.readFileSync(new URL("./app.js", import.meta.url), "utf8");
@@ -28,7 +30,7 @@ assert(!capture.includes("landDoorQueryOnToday"), "Capture thoughts does not lan
 console.log("pass  Door map path, empty Get to Work stays empty");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = 18500 + Math.floor(Math.random() * 2000);
+const PORT = randomTestPort();
 const origin = `http://127.0.0.1:${PORT}`;
 const vault = await fs.promises.mkdtemp(path.join(os.tmpdir(), "aidanos-door-"));
 await fs.promises.mkdir(path.join(vault, "log"), { recursive: true });
@@ -41,7 +43,7 @@ await fs.promises.writeFile(path.join(vault, "log", DATE + ".md"), "", "utf8");
 const child = spawn(process.execPath, [path.join(__dirname, "server.mjs")], {
   cwd: __dirname,
   env: {
-    ...process.env,
+    ...fixtureEnv(),
     PORT: String(PORT),
     AIDANOS_HOST: "127.0.0.1",
     AIDANOS_VAULT: vault,
@@ -61,14 +63,17 @@ async function cleanup() {
 process.on("exit", () => { try { child.kill("SIGKILL"); } catch {} });
 
 try {
+  let healthy = false;
   const t0 = Date.now();
   while (Date.now() - t0 < 8000) {
+    if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode);
     try {
       const r = await fetch(origin + "/api/health");
-      if (r.ok) break;
+      if (r.ok) { healthy = true; break; }
     } catch {}
     await sleep(40);
   }
+  if (!healthy) throw childStartupError(child, "health timeout");
   const search = await fetch(origin + "/api/search?q=receipt");
   const hits = (await search.json()).hits || [];
   const mapHit = hits.find((h) => String(h.path).includes("file-a-receipt"));

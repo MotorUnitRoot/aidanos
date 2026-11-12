@@ -1,12 +1,20 @@
 #!/usr/bin/env node
+import { assertLoggerConfidentiality } from "./test/logger-regressions.mjs";
+import { runDiagnosticSecurityRegressions } from "./test/child-diagnostics-regressions.mjs";
+import { spawnWithLog as spawn } from "./test/child-diagnostics.mjs";
+import { fixtureEnv } from "./test/child-diagnostics.mjs";
+import { assertFixtureGitIsolation } from "./test/fixture-process-regressions.mjs";
 // Every symlink under the vault is refused, including one that stays inside.
 // The error names that path. A symlinked vault root refuses to start.
 // An unexpected write stops the process. An unexpected read fails that request.
+import { randomTestPort, TEST_PORT_MIN, TEST_PORT_MAX } from "./test/ports.mjs";
+import { captureChildLog, childStartupError } from "./test/child-diagnostics.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import net from "node:net";
-import { spawn, execFileSync } from "node:child_process";
+import { PassThrough } from "node:stream";
+import { execFileSync } from "./test/fixture-process.mjs";
 import { fileURLToPath } from "node:url";
 import { gitEnv, readWorktree, vaultRel, worktreePath } from "./server.mjs";
 
@@ -193,16 +201,12 @@ async function pathChecks() {
   }
 }
 
-function spawnServer(env) {
+function spawnServer(env, fixtureDiagnostics = {}) {
   const child = spawn(process.execPath, ["server.mjs"], {
-    cwd: root,
-    env: { ...process.env, AIDANOS_VAULT_GIT_RETRY_MS: "0", ...env },
+    fixtureDiagnostics, cwd: root,
+    env: { ...fixtureEnv(), AIDANOS_VAULT_GIT_RETRY_MS: "0", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let log = "";
-  child.stderr.on("data", (buf) => { log += String(buf); });
-  child.stdout.on("data", (buf) => { log += String(buf); });
-  child._log = () => log;
   return child;
 }
 
@@ -210,7 +214,7 @@ async function waitHealth(base, child) {
   const deadline = Date.now() + 12000;
   let last = "";
   while (Date.now() < deadline) {
-    if (child.exitCode != null) throw new Error("server exited " + child.exitCode);
+    if (child.exitCode != null) throw childStartupError(child, "server exited " + child.exitCode);
     try {
       const res = await fetch(base + "/api/health");
       if (res.ok) return;
@@ -219,7 +223,7 @@ async function waitHealth(base, child) {
     }
     await new Promise((r) => setTimeout(r, 80));
   }
-  throw new Error("health timeout " + last);
+  throw childStartupError(child, "health timeout " + last);
 }
 
 async function stop(child) {
@@ -262,7 +266,7 @@ async function liveSyncDoesNotFollowOutside() {
 
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault);
-  const port = 28000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -571,7 +575,7 @@ async function httpPaths() {
   const outsideDay = "OUTSIDE_DAY\n";
   fs.writeFileSync(path.join(outside, "2026-01-05.md"), outsideDay);
   fs.writeFileSync(path.join(outside, "2026-01-06.md"), "- [ ] OUTSIDE_TASK_SENTINEL\n");
-  const port = 30000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -710,7 +714,7 @@ async function planAndSkinDoNotServeGit() {
   const sentinel = "GIT_CONFIG_SENTINEL";
   const config = path.join(vault, ".git", "config");
   fs.appendFileSync(config, "\n# " + sentinel + "\n");
-  const port = 34000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -763,7 +767,7 @@ async function readErrorStaysUp() {
   fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
   const note = path.join(vault, "notes", "secret.md");
   fs.writeFileSync(note, "NOTE_BODY_SECRET\n");
-  const port = 33000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -806,7 +810,7 @@ async function writeErrorStops() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-ro-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault);
-  const port = 32000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -871,7 +875,7 @@ async function nestedAndFileSymlinks() {
   await refusesNamed(() => worktreePath("notes/box/gone/note.md", vault), "notes/box/gone");
   assert(fs.readFileSync(path.join(outside, "secret.md"), "utf8") === "NESTED_SECRET\n", "nested link was followed");
 
-  const port = 35000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -910,7 +914,7 @@ async function symlinkedVaultRootRefused() {
   fs.mkdirSync(real);
   fs.writeFileSync(path.join(real, "note.md"), "ROOT_SECRET\n");
   fs.symlinkSync(real, link);
-  const port = 36000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -922,7 +926,7 @@ async function symlinkedVaultRootRefused() {
   try {
     await waitExit(child, 4000);
     const log = child._log();
-    assert(child.exitCode != null, "server stayed up with a symlinked vault");
+    assert(child.exitCode != null, childStartupError(child, "server stayed up with a symlinked vault").message);
     assert(log.includes(link), "startup did not name the configured path");
     assert(log.includes("Point AIDANOS_VAULT at the real folder."), "startup did not say to point at the real folder");
     assert(!log.includes("ROOT_SECRET"), "startup read the linked vault");
@@ -979,7 +983,7 @@ async function abortAndLongNameStayUp() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-len-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
-  const port = 37000 + Math.floor(Math.random() * 2000);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -1062,7 +1066,7 @@ async function syncRequestStops() {
   gitQuiet(tmp, ["init", "-b", "main", vault]);
   gitQuiet(vault, ["config", "user.email", "t@local"]);
   gitQuiet(vault, ["config", "user.name", "t"]);
-  const port = 37200 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const token = "TOKEN_SENTINEL_sync";
   const child = spawnServer({
     PORT: String(port),
@@ -1120,7 +1124,7 @@ async function backgroundSyncPauses() {
   gitQuiet(tmp, ["init", "-b", "main", vault]);
   gitQuiet(vault, ["config", "user.email", "t@local"]);
   gitQuiet(vault, ["config", "user.name", "t"]);
-  const port = 37400 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const token = "TOKEN_SENTINEL_bg";
   const child = spawnServer({
     PORT: String(port),
@@ -1170,7 +1174,7 @@ async function bootSyncPauses() {
   fs.mkdirSync(vault);
   gitQuiet(tmp, ["init", "--bare", "-b", "main", bare]);
   fs.chmodSync(vault, 0);
-  const port = 37600 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const token = "TOKEN_SENTINEL_boot";
   const child = spawnServer({
     PORT: String(port),
@@ -1206,7 +1210,7 @@ async function rejectedPushStaysUp() {
   gitQuiet(tmp, ["init", "-b", "main", vault]);
   gitQuiet(vault, ["config", "user.email", "t@local"]);
   gitQuiet(vault, ["config", "user.name", "t"]);
-  const port = 37800 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -1254,7 +1258,7 @@ async function gitSafetyAndIndexLink() {
   gitQuiet(src, ["add", "target.md", "link.md", "log/day-target.md", "log/2026-04-01.md"]);
   gitQuiet(src, ["commit", "-m", "link"]);
   gitQuiet(src, ["push", "origin", "HEAD"]);
-  const port = 38000 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -1337,7 +1341,7 @@ async function aggregateSkipsLinks() {
   fs.symlinkSync(path.join(outside, "box"), path.join(vault, "log", "box"));
   fs.symlinkSync(path.join(outside, "secret.md"), path.join(vault, "aidanos", "active-horse.md"));
   fs.symlinkSync(path.join(outside, "secret.md"), path.join(vault, "aidanos", "skin.css"));
-  const port = 38200 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -1345,7 +1349,7 @@ async function aggregateSkipsLinks() {
     AIDANOS_VAULT_GIT_URL: "",
     AIDANOS_VAULT_GIT_TOKEN: "",
     GITHUB_TOKEN: "",
-  });
+  }, { symlinkPaths: ["notes/alias.md", "notes/gone", "notes/line?break?.md", "log/2026-01-06.md", "log/box", "aidanos/active-horse.md", "aidanos/skin.css", "extra"] });
   const base = "http://127.0.0.1:" + port;
   const secrets = ["SKIP_FILE_SECRET", "SKIP_DAY_SECRET", "SKIP_TASK_SECRET", "SKIP_DIR_SECRET"];
   function noSecrets(text, label) {
@@ -1438,7 +1442,7 @@ async function parentSymlinkIsNotFollowed() {
   fs.mkdirSync(outside);
   fs.writeFileSync(path.join(outside, "marker.md"), "unchanged\n");
   fs.symlinkSync(outside, path.join(vault, "linked"));
-  const port = 38400 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -1472,7 +1476,7 @@ async function pngDirectoryDoesNotStop() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-pngdir-"));
   const vault = path.join(tmp, "vault");
   fs.mkdirSync(vault);
-  const port = 38600 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -1532,7 +1536,7 @@ async function pauseClearsOnlyAfterSuccess() {
   gitQuiet(vault, ["commit", "-m", "init"]);
   gitQuiet(vault, ["remote", "add", "origin", bare]);
   gitQuiet(vault, ["push", "-u", "origin", "HEAD"]);
-  const port = 38800 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -1545,6 +1549,9 @@ async function pauseClearsOnlyAfterSuccess() {
   });
   const base = "http://127.0.0.1:" + port;
   const localOnly = "Sync is paused. Notes are saved on this computer only.";
+  // sync-path-flake-ticket: when a timed sync wait fails, include the server's
+  // structured diagnostics (child._log) so a macOS flake can be read from CI.
+  const withServerLog = (msg) => msg + "\nserver log (structured diagnostics only):\n" + (child._log() || "(no child output captured)");
   function showBare(rel) {
     try {
       return gitQuiet(bare, ["show", "HEAD:" + rel]);
@@ -1603,7 +1610,7 @@ async function pauseClearsOnlyAfterSuccess() {
     while (showBare("notes/timer.md") !== "timer note\n" && Date.now() < timerDeadline) {
       await new Promise((r) => setTimeout(r, 50));
     }
-    assert(showBare("notes/timer.md") === "timer note\n", "restarted timers did not sync the note");
+    assert(showBare("notes/timer.md") === "timer note\n", withServerLog("restarted timers did not sync the note"));
 
     await pauseWithChmod();
     const queued = await putNote("notes/queued.md", "queued note\n");
@@ -1625,7 +1632,7 @@ async function pauseClearsOnlyAfterSuccess() {
     while (showBare("notes/queued.md") !== "queued note\n" && Date.now() < queuedDeadline) {
       await new Promise((r) => setTimeout(r, 50));
     }
-    assert(showBare("notes/queued.md") === "queued note\n", "queued note did not sync after resume");
+    assert(showBare("notes/queued.md") === "queued note\n", withServerLog("queued note did not sync after resume"));
     const open = await fetch(base + "/api/health");
     const openBody = await open.json();
     assert(!openBody.git.paused && openBody.git.error !== "sync paused", "resume left the pause on");
@@ -1670,6 +1677,95 @@ function containsBytes(dir, needle) {
   return false;
 }
 
+function errorLoggersNeverInspectCauses() {
+  const lines = [];
+  const logger = new Function("os", "console", sliceFn("// Closed error logging:", "function notesStayLocalSentence(") + "return logSafe;")(
+    os, { error: (...parts) => { assert(parts.every((part) => typeof part === "string"), "raw error object reached console"); lines.push(parts.join(" ")); } },
+  );
+  assertLoggerConfidentiality(assert, logger, lines);
+  const appSource = fs.readFileSync(path.join(root, "app.js"), "utf8");
+  assert(appSource.includes('console.error("search failed")') && !appSource.includes("console.error(e)"), "browser search logger must not inspect an Error object");
+}
+
+async function stopReasonsRetainInternalCause() {
+  // Evaluate the exact private helpers, without exporting a production test API.
+  const helpers = new Function("os",
+    sliceFn("// Closed error logging:", "function notesStayLocalSentence(") +
+    sliceFn("// Application reasons are a closed enum", "function throwIfStop(") +
+    sliceFn("function parentChanged(", "function pauseBackgroundSync(") +
+    sliceFn("function stopLine(", "function stopAfterResponse(") +
+    "return { tagStop, parentChanged, stopLine };",
+  )(os);
+  const cause = Object.assign(new Error("opaque filesystem cause"), { code: "ESTALE", syscall: "lstat" });
+  assert(helpers.tagStop(cause, "write") === cause, "tagging a filesystem Error must preserve its identity");
+  assert(helpers.stopLine(cause) === "stopped: write ESTALE", "an OS ESTALE must have no parent-change reason");
+  const changed = helpers.parentChanged("write", cause);
+  assert(changed.cause === cause && changed.code === "ESTALE" && changed.reason === "parent-changed", "replacement lost its internal filesystem cause");
+  assert(helpers.stopLine(changed) === "stopped: write ESTALE reason=parent-changed", "parent-change reason missing");
+  const foreign = { code: "ESTALE", message: "opaque non-Error cause" };
+  assert(helpers.tagStop(foreign, "write").cause === foreign, "non-Error replacement lost its cause");
+  for (const reason of ["parent", "parent-changed opaque", "opaque filesystem cause", "", null]) {
+    const err = Object.assign(new Error("opaque filesystem cause", { cause }), { code: "ESTALE", reason });
+    assert(helpers.stopLine(helpers.tagStop(err, "write")) === "stopped: write ESTALE", "unknown reason or internal cause reached the stop log");
+  }
+  // Exercise the actual wrapping catches with a fault from the fs boundary.
+  const check = new Function("fs", "parentChanged", sliceFn("async function assertParents(", "function reservedDirName(") + "return assertParents;")(
+    { lstat: async () => { throw cause; } }, helpers.parentChanged,
+  );
+  let caught;
+  try { await check([{ abs: "fixture" }]); } catch (err) { caught = err; }
+  assert(caught?.cause === cause && caught.reason === "parent-changed", "assertParents discarded the underlying filesystem error");
+}
+
+async function filesystemEstaleStopsWithoutParentReason() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-os-estale-"));
+  const vault = path.join(tmp, "vault");
+  const notes = path.join(vault, "notes");
+  fs.mkdirSync(notes, { recursive: true });
+  const before = fs.lstatSync(notes);
+  const port = randomTestPort();
+  // Deterministic OS-error fault injection at open(), not parentChanged(). No
+  // NFS/FUSE mount is available here; the errno/errno number/syscall are OS-shaped.
+  // This wrapper is test-only: production gets no new hook or environment flag.
+  const source = `
+    import fs from "node:fs/promises";
+    import os from "node:os";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+    const open = fs.open.bind(fs);
+    fs.open = async (file, ...args) => {
+      if (String(file).startsWith(path.join(process.env.AIDANOS_VAULT, "notes", "stale.md.")) && String(file).endsWith(".tmp")) {
+        throw Object.assign(new Error("opaque filesystem cause"), { code: "ESTALE", errno: -os.constants.errno.ESTALE, syscall: "open", path: file });
+      }
+      return open(file, ...args);
+    };
+    process.argv[1] = path.resolve("server.mjs");
+    await import(pathToFileURL(process.argv[1]).href);
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+    cwd: root, env: { PORT: String(port), AIDANOS_VAULT: vault, AIDANOS_VAULT_GIT_URL: "" }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  try {
+    const base = "http://127.0.0.1:" + port;
+    await waitHealth(base, child);
+    const res = await fetch(base + "/api/file?path=notes/stale.md", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ markdown: "must not be written\n" }),
+    });
+    assert(res.status === 500 && (await res.json()).error === "internal error", "filesystem ESTALE must fail closed with 500");
+    await waitExit(child, 4000);
+    assert(child.exitCode === 1, "filesystem ESTALE must stop the process");
+    const record = child._diagnostics().find((item) => item.summary === "stopped: write ESTALE");
+    assert(record?.code === "ESTALE" && record.reason === undefined, "filesystem ESTALE lost its exact no-reason diagnostic");
+    assert(!child._log().includes("reason=parent-changed"), "filesystem ESTALE was misreported as a parent swap");
+    const after = fs.lstatSync(notes);
+    assert(before.ino === after.ino && before.dev === after.dev && after.isDirectory() && !after.isSymbolicLink(), "OS-error fixture unexpectedly changed the parent");
+    assert(fs.readdirSync(notes).length === 0, "filesystem ESTALE left note or temporary bytes");
+  } finally {
+    await stop(child);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 async function swappedParentWritesNothing() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aidanos-swap-"));
   const vault = path.join(tmp, "vault");
@@ -1679,7 +1775,7 @@ async function swappedParentWritesNothing() {
   fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
   fs.mkdirSync(outside);
   fs.writeFileSync(path.join(outside, "marker.md"), "unchanged\n");
-  const port = 39000 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const note = Buffer.from("0123456789abcd");
   assert(note.length === 14, "note is not 14 bytes");
   const child = spawnServer({
@@ -1721,7 +1817,7 @@ async function swappedParentWritesNothing() {
     await waitExit(child, 4000);
     assert(child.exitCode != null, "swapped parent left the server up");
     if (status) assert(status === 500, "swapped parent got " + status + " " + text);
-    assert(child._log().includes("stopped: write PARENT"), "swapped parent log was " + child._log());
+    assert(child._log().includes("stopped: write ESTALE reason=parent-changed"), "swapped parent log was " + child._log());
     assert(!containsBytes(outside, note), "swapped parent wrote the note outside the vault");
     assert(!containsBytes(real, note), "swapped parent wrote the note into the old folder");
     assert(fs.readFileSync(path.join(outside, "marker.md"), "utf8") === "unchanged\n", "outside file changed");
@@ -1741,7 +1837,7 @@ async function folderTargetsStayUp() {
   fs.mkdirSync(dayDir, { recursive: true });
   fs.mkdirSync(noteDir, { recursive: true });
   fs.mkdirSync(pngDir, { recursive: true });
-  const port = 39200 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -1788,7 +1884,7 @@ async function folderAppearsDuringWriteStops() {
   const hold = path.join(tmp, "hold");
   const dayDir = path.join(vault, "log", "2026-04-03.md");
   fs.mkdirSync(path.join(vault, "log"), { recursive: true });
-  const port = 39100 + Math.floor(Math.random() * 100);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -1850,7 +1946,7 @@ async function renameFailureStops() {
   const hold = path.join(tmp, "hold");
   fs.mkdirSync(notes, { recursive: true });
   fs.writeFileSync(path.join(notes, "page.md"), "old\n");
-  const port = 39300 + Math.floor(Math.random() * 100);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -1923,7 +2019,7 @@ async function ownGitConfigIsLeftAlone() {
   gitQuiet(vault, ["config", "protocol.allow", "never"]);
   gitQuiet(vault, ["config", "core.hooksPath", ownHooks]);
   gitQuiet(vault, ["config", "credential.helper", "SECRET_HELPER_VALUE"]);
-  const port = 39500 + Math.floor(Math.random() * 100);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -1978,7 +2074,7 @@ async function oldSafetyKeysAreRemoved() {
   gitQuiet(vault, ["config", "core.editor", "vim"]);
   gitQuiet(vault, ["config", "credential.helper", "SECRET_HELPER_VALUE"]);
   gitQuiet(vault, ["config", "http.extraheader", "SECRET_HEADER_VALUE"]);
-  const port = 39400 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -2021,7 +2117,7 @@ async function oldSafetyKeysAreRemoved() {
 }
 
 async function pausedSentenceFor(vault, bare, extra) {
-  const port = 39600 + Math.floor(Math.random() * 200);
+  const port = randomTestPort();
   const child = spawnServer({
     PORT: String(port),
     AIDANOS_HOST: "127.0.0.1",
@@ -2103,6 +2199,28 @@ async function pausedWordingFollowsTheVault() {
   }
 }
 
+// Keep both members of adjacent-port fixtures inside the non-ephemeral range.
+assert(randomTestPort(2, () => 0) === TEST_PORT_MIN, "test port lower boundary");
+assert(randomTestPort(2, () => 1 - Number.EPSILON) + 1 === TEST_PORT_MAX, "adjacent test port upper boundary");
+assert(TEST_PORT_MIN === 10000 && TEST_PORT_MAX === 29999 && TEST_PORT_MAX < 32768 && TEST_PORT_MAX < 49152, "fixed test port range stays below standard Linux/macOS ephemeral ports");
+
+// sync-path-flake-ticket: failures must retain both child output streams.
+const diagnosticChild = captureChildLog({ stdout: new PassThrough(), stderr: new PassThrough(), exitCode: 1 }, { fixtureOnly: true });
+diagnosticChild.stdout.write("stopped: write EACCES\n");
+diagnosticChild.stderr.write("sync paused: git EACCES\n");
+let startupFailure;
+try { await waitHealth("", diagnosticChild); } catch (err) { startupFailure = err; }
+assert(startupFailure && startupFailure.message.includes("server exited 1"), "startup failure remains a failure");
+assert(startupFailure.message.includes("stopped: write EACCES") && startupFailure.message.includes("sync paused: git EACCES"), "startup failure retains allowlisted markers from both child streams");
+assert(childStartupError({ _log: () => "" }, "health timeout").message.includes("no child output captured"), "empty startup output is explicit");
+diagnosticChild.stdout.end();
+diagnosticChild.stderr.end();
+
+await runDiagnosticSecurityRegressions(assert);
+await assertFixtureGitIsolation(assert, git);
+await assertFixtureGitIsolation(assert, (args, cwd) => gitQuiet(cwd, args));
+await assertFixtureGitIsolation(assert, (args, cwd) => gitWithEnv(args, cwd));
+
 checkWiring();
 await pathChecks();
 await inodeGitDir();
@@ -2128,6 +2246,9 @@ await rejectedPushStaysUp();
 await gitSafetyAndIndexLink();
 await pngDirectoryDoesNotStop();
 await pauseClearsOnlyAfterSuccess();
+errorLoggersNeverInspectCauses();
+await stopReasonsRetainInternalCause();
+await filesystemEstaleStopsWithoutParentReason();
 await swappedParentWritesNothing();
 await folderTargetsStayUp();
 await folderAppearsDuringWriteStops();

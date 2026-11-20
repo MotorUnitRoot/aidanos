@@ -42,8 +42,14 @@ jobs:
 
   # Workflow source for this event is the default branch, not the PR head.
   # Checkout stays on github.sha. checks:write and statuses:write live only here.
+  # Gate: only comments from the repo owner, org members, or collaborators
+  # start this job. The script's own permission check (write, maintain, or
+  # admin) stays as the second layer, since COLLABORATOR includes read access.
+  # Inputs: the script reads event data from GITHUB_EVENT_PATH. Any new input
+  # must go through env: and be quoted in the shell. Never put an expression
+  # with event data straight into a run: line.
   independent-review-on-comment:
-    if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     name: independent-review-on-comment
     runs-on: ubuntu-latest
     permissions:

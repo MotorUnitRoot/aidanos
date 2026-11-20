@@ -11,13 +11,18 @@
  *
  * The pull_request job only reads. The issue_comment job, whose workflow
  * file comes from the default branch, publishes the check and commit status
- * on the PR head.
+ * on the PR head under its own name, independent-review/comment, so the two
+ * results can't be confused with each other.
  */
 import fs from "node:fs";
 
 const PASS_PREFIX = "Independent review: PASS";
 const BLOCK_PREFIX = "Independent review: BLOCK";
 const REVIEW_ROLES = new Set(["admin", "maintain", "write"]);
+// Name of the pull_request job's check (independent-review.yml, job name).
+export const PR_CHECK_NAME = "independent-review";
+// Check run name and status context published by the issue_comment job.
+export const COMMENT_CHECK_NAME = "independent-review/comment";
 
 export function commentKind(body, headSha) {
   const text = String(body || "")
@@ -165,6 +170,15 @@ export function selfTest() {
 
   const text = summaryFor(pass, sha);
   assert(text.includes(sha) && text.includes("write, maintain, or admin"), "summary");
+
+  assert(COMMENT_CHECK_NAME === "independent-review/comment", "comment check name");
+  assert(COMMENT_CHECK_NAME !== PR_CHECK_NAME, "comment and pull_request names differ");
+  const check = checkRunPayload(sha, "success", text, "");
+  assert(check.name === "independent-review/comment", "check run name");
+  assert(check.name !== PR_CHECK_NAME, "check run name differs from pull_request job");
+  const status = statusPayload(sha, "failure", text, "");
+  assert(status.context === "independent-review/comment", "status context");
+  assert(status.context !== PR_CHECK_NAME, "status context differs from pull_request job");
   console.log("independent-review self-test ok");
 }
 
@@ -246,40 +260,49 @@ async function commentsFromReviewers(owner, repo, comments) {
   return accepted;
 }
 
-async function publishCheck(owner, repo, headSha, conclusion, summary) {
+function runUrl() {
   const server = process.env.GITHUB_SERVER_URL || "https://github.com";
   const runId = process.env.GITHUB_RUN_ID;
   const repository = process.env.GITHUB_REPOSITORY;
+  return runId && repository ? `${server}/${repository}/actions/runs/${runId}` : undefined;
+}
+
+export function checkRunPayload(headSha, conclusion, summary, url) {
+  return {
+    name: COMMENT_CHECK_NAME,
+    head_sha: headSha,
+    status: "completed",
+    conclusion,
+    completed_at: new Date().toISOString(),
+    details_url: url || undefined,
+    output: {
+      title: conclusion === "success" ? "Independent review passed" : "Independent review failed",
+      summary,
+    },
+  };
+}
+
+export function statusPayload(headSha, conclusion, summary, url) {
+  const description = summary.split("\n").find((line) => line.trim()) || "Independent review";
+  return {
+    state: conclusion === "success" ? "success" : "failure",
+    context: COMMENT_CHECK_NAME,
+    description: description.slice(0, 140),
+    target_url: url || undefined,
+  };
+}
+
+async function publishCheck(owner, repo, headSha, conclusion, summary) {
   await gh(`/repos/${owner}/${repo}/check-runs`, {
     method: "POST",
-    body: {
-      name: "independent-review",
-      head_sha: headSha,
-      status: "completed",
-      conclusion,
-      completed_at: new Date().toISOString(),
-      details_url: runId && repository ? `${server}/${repository}/actions/runs/${runId}` : undefined,
-      output: {
-        title: conclusion === "success" ? "Independent review passed" : "Independent review failed",
-        summary,
-      },
-    },
+    body: checkRunPayload(headSha, conclusion, summary, runUrl()),
   });
 }
 
 async function publishStatus(owner, repo, headSha, conclusion, summary) {
-  const server = process.env.GITHUB_SERVER_URL || "https://github.com";
-  const runId = process.env.GITHUB_RUN_ID;
-  const repository = process.env.GITHUB_REPOSITORY;
-  const description = summary.split("\n").find((line) => line.trim()) || "Independent review";
   await gh(`/repos/${owner}/${repo}/statuses/${headSha}`, {
     method: "POST",
-    body: {
-      state: conclusion === "success" ? "success" : "failure",
-      context: "independent-review",
-      description: description.slice(0, 140),
-      target_url: runId && repository ? `${server}/${repository}/actions/runs/${runId}` : undefined,
-    },
+    body: statusPayload(headSha, conclusion, summary, runUrl()),
   });
 }
 
